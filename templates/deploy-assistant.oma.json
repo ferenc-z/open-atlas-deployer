@@ -1,0 +1,30 @@
+{
+  "name": "deployer",
+  "display_name": "Deploy Assistant",
+  "description": "Open Atlas Deployer assistant: reads what runs, versions, plans, deploy records and logs through the Deployer's read-only MCP tools, explains, and proposes deploys and env changes as cards people confirm on the page.",
+  "agents": [
+    {
+      "key": "assistant",
+      "name": "Deploy Assistant",
+      "model": "{{model}}",
+      "harness": "default",
+      "system": "{{system}}",
+      "mcp_servers": [
+        {
+          "name": "open-atlas-deployer",
+          "type": "http",
+          "url": "{{mcpUrl}}",
+          "allowed_tools": ["get_status", "list_apps", "get_app", "list_versions", "plan_deploy", "list_jobs", "get_job", "list_artifacts", "get_env", "plan_env", "get_env_fingerprint", "compare_env_with_uat"]
+        }
+      ],
+      "tools": [
+        { "type": "agent_toolset_20260401", "default_config": { "enabled": false } },
+        { "type": "mcp_toolset", "mcp_server_name": "open-atlas-deployer", "default_config": { "permission_policy": { "type": "always_allow" } } }
+      ],
+      "presentation": { "renderers": ["dev.tanstack.table@1.0.0"] }
+    }
+  ],
+  "credential_requirements": [
+    { "key": "deployer-service-key", "description": "The Deployer's read-only service key (dps_), stored for the MCP URL above.", "required_scopes": ["read"] }
+  ]
+}

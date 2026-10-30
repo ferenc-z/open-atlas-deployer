@@ -1,11 +1,12 @@
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
 import * as api from "./api.ts";
 import type { AuditEntry, Manifest, Me, Principal, RegisteredApp, StatusView } from "./api.ts";
 import { DeployPanel, History, JobPanel, JobState, KIND } from "./Deploy.tsx";
 import { EnvPage } from "./Env.tsx";
 import { Artifacts } from "./Artifacts.tsx";
+import { AssistantPanel, KeysPage } from "./Assistant.tsx";
 
-type Tab = "status" | "history" | "artifacts" | "env" | "registry" | "audit";
+type Tab = "status" | "history" | "artifacts" | "env" | "registry" | "keys" | "audit";
 type Panel = { kind: "deploy"; app: string; initial?: { version: string; pinFrom?: string } } | { kind: "job"; id: string } | undefined;
 
 const VERDICT: Record<string, { label: string; tone: string }> = {
@@ -34,6 +35,8 @@ export function App() {
   const [me, setMe] = useState<Me | undefined>();
   const [tab, setTab] = useState<Tab>("status");
   const [panel, setPanel] = useState<Panel>();
+  const [assistant, setAssistant] = useState(false);
+  const actions = useMemo(() => ({ openPlan: (app: string, version: string, pinFrom?: string) => { setPanel({ kind: "deploy", app, initial: { version, ...(pinFrom ? { pinFrom } : {}) } }); setTab("status"); } }), []);
   const load = useCallback(() => { api.me().then(setMe, () => setMe(undefined)); }, []);
   useEffect(load, [load]);
 
@@ -42,24 +45,26 @@ export function App() {
   const p = me.principal;
   return (
     <>
-      <Header principal={p} environment={me.environment} tab={tab} setTab={setTab} onSignedOut={load} />
+      <Header principal={p} environment={me.environment} tab={tab} setTab={setTab} onSignedOut={load} assistant={assistant} toggleAssistant={() => setAssistant(!assistant)} />
       {p.via === "emergency" && <div className="banner bad">正在使用紧急账号：Workbench 无法访问。每个操作都记入审计；Workbench 恢复后请改用 Workbench 登录。</div>}
       {p.stale && <div className="banner warn">Workbench 暂时没有响应，正在使用最近一次确认的登录（15 分钟内有效）。</div>}
       {p.actAs && <div className="banner info">{p.actAs.administrator} 正在以 {p.displayName} 的身份使用 Workbench，这里的权限也按 {p.displayName} 计算。</div>}
-      <main>
+      {assistant && <AssistantPanel workbenchUrl={me.workbenchUrl} {...(me.environment ? { environment: me.environment } : {})} page={tab} {...(panel?.kind === "deploy" ? { app: panel.app } : {})} actions={actions} onClose={() => setAssistant(false)} />}
+      <main className={assistant ? "with-assistant" : ""}>
         {tab === "status" && <Status panel={panel} setPanel={setPanel} isAdmin={p.permissions.includes("admin")} />}
         {tab === "artifacts" && <Artifacts />}
         {tab === "history" && <History onBack={(j) => { setPanel({ kind: "deploy", app: j.app, initial: { version: j.version, pinFrom: j.id } }); setTab("status"); }} />}
         {tab === "env" && <EnvPage />}
         {tab === "registry" && <Registry principal={p} />}
+        {tab === "keys" && <KeysPage isAdmin={p.permissions.includes("admin")} />}
         {tab === "audit" && p.permissions.includes("admin") && <Audit />}
       </main>
     </>
   );
 }
 
-function Header({ principal, environment, tab, setTab, onSignedOut }: { principal: Principal; environment?: string; tab: Tab; setTab: (t: Tab) => void; onSignedOut: () => void }) {
-  const tabs: [Tab, string][] = [["status", "状态"], ["history", "部署记录"], ["artifacts", "制品"], ["env", "环境变量"], ["registry", "应用注册表"], ...(principal.permissions.includes("admin") ? [["audit", "审计"] as [Tab, string]] : [])];
+function Header({ principal, environment, tab, setTab, onSignedOut, assistant, toggleAssistant }: { principal: Principal; environment?: string; tab: Tab; setTab: (t: Tab) => void; onSignedOut: () => void; assistant: boolean; toggleAssistant: () => void }) {
+  const tabs: [Tab, string][] = [["status", "状态"], ["history", "部署记录"], ["artifacts", "制品"], ["env", "环境变量"], ["registry", "应用注册表"], ["keys", "API key"], ...(principal.permissions.includes("admin") ? [["audit", "审计"] as [Tab, string]] : [])];
   return (
     <header>
       <div className="brand">Open Atlas Deployer{environment && <span className="env">{environment.toUpperCase()}</span>}</div>
@@ -67,6 +72,7 @@ function Header({ principal, environment, tab, setTab, onSignedOut }: { principa
       <div className="who">
         <span title={principal.groups.join(", ") || "无组"}>{principal.displayName}</span>
         <span className="muted">{principal.isAdmin ? "管理员" : principal.groups.filter((g) => g.startsWith("deploy-")).join(" · ")}</span>
+        {principal.via === "workbench" && <button className={assistant ? "active" : ""} onClick={toggleAssistant}>问助手</button>}
         {principal.via === "emergency" && <button className="link" onClick={() => api.emergencyLogout().then(onSignedOut)}>退出</button>}
       </div>
     </header>
@@ -141,7 +147,7 @@ function Status({ panel, setPanel, isAdmin }: { panel: Panel; setPanel: (p: Pane
           : <><span className="badge bad">执行器离线</span> <span className="muted">{data.executor.reason}；可以查看，但不能构建和部署</span></>}
       </p>
       {data.peer && "error" in data.peer && <p className="banner warn">无法确认 UAT 记录：{data.peer.error}。只有已正式发布的版本、或管理员跳过晋级规则才能部署。</p>}
-      {panel?.kind === "deploy" && <DeployPanel key={`${panel.app}-${panel.initial?.pinFrom ?? ""}`} app={panel.app} isAdmin={isAdmin} {...(panel.initial ? { initial: panel.initial } : {})} onClose={() => setPanel(undefined)} onJob={(id) => setPanel({ kind: "job", id })} />}
+      {panel?.kind === "deploy" && <DeployPanel key={`${panel.app}-${panel.initial?.version ?? ""}-${panel.initial?.pinFrom ?? ""}`} app={panel.app} isAdmin={isAdmin} {...(panel.initial ? { initial: panel.initial } : {})} onClose={() => setPanel(undefined)} onJob={(id) => setPanel({ kind: "job", id })} />}
       {panel?.kind === "job" && <JobPanel id={panel.id} onClose={() => { setPanel(undefined); refresh(); }} />}
       <table className="status">
         <thead><tr><th>应用</th><th>期望版本</th>{peerApps && <th>{peerName} 现在</th>}<th>清单</th><th>状态</th><th></th></tr></thead>

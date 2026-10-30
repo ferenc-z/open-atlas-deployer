@@ -26,6 +26,8 @@ import type { DeployDriver } from "../src/server/drivers/types.ts";
 import { WorkbenchAdmin } from "../src/server/drivers/workbench.ts";
 import { WorkbenchAppDriver } from "../src/server/drivers/workbench-app.ts";
 import { McpClient } from "../src/server/mcp-client.ts";
+import { Keys } from "../src/server/keys.ts";
+import { Diagnoser } from "../src/server/diagnose.ts";
 import { fakeServices, fakeState, sha256, tarGz, type FakeState } from "./fakes.ts";
 
 const SESSION = "open_atlas_workbench_session";
@@ -70,7 +72,7 @@ function setup(options: SetupOptions = {}) {
   writeFileSync(environmentFile, JSON.stringify({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", registries: {}, apps: { shop: { version: "1.2.0" } } }));
   const config: Config = {
     bind: "127.0.0.1", port: 0, basePath: "/deploy", dataDir: dir, workbenchUrl: "http://workbench:8090", workbenchPublicUrl: "/",
-    environmentFile, observeUrls: {}, secureCookies: false, webDir: join(dir, "web"), templatesDir: join(dir, "templates"), peerKeySha256: options.peerKeys ?? [], githubApi: "https://api.github.com",
+    environmentFile, observeUrls: {}, secureCookies: false, webDir: join(dir, "web"), templatesDir: join(dir, "templates"), peerKeySha256: options.peerKeys ?? [], githubApi: "https://api.github.com", omaVaults: [],
     ...(options.emergency ? { emergencyPasswordHash: hashPassword(options.emergency) } : {}),
   };
   let now = Date.parse("2026-10-30T10:00:00Z");
@@ -89,12 +91,13 @@ function setup(options: SetupOptions = {}) {
   }
   const released = options.released ?? { value: false };
   const releases = { release: async (repo: string, tag: string) => (released.value ? { released: true, detail: `${repo} 的 ${tag} 已正式发布` } : { released: false, detail: `${repo} 的 ${tag} 没有 GitHub Release` }) };
-  let phase5: { drivers: DeployDriver[]; bundles: Bundles; contracts: ContractDocs } | undefined;
+  let phase5: { drivers: DeployDriver[]; bundles: Bundles; contracts: ContractDocs; workbench: WorkbenchAdmin } | undefined;
   if (options.services) {
     const f = fakeServices(options.services);
     writeFileSync(join(dir, "wb.key"), options.services.workbench.key);
     const wb = new WorkbenchAdmin("http://workbench:8090", join(dir, "wb.key"), f);
     phase5 = {
+      workbench: wb,
       drivers: [
         new WorkbenchAppDriver(wb),
         new StudioGraphDriver(new McpClient("http://studio.test/mcp", () => ({ authorization: "Bearer oaw_v1.test" }), f), join(dir, "templates")),
@@ -104,12 +107,13 @@ function setup(options: SetupOptions = {}) {
       contracts: new ContractDocs(undefined, f, "https://api.github.test"),
     };
   }
-  const deployments = new Deployments(store, handoff, observer, environmentFile, { ...(peer ? { peer } : {}), releases, now: () => now, ...phase5 });
+  const deployments = new Deployments(store, handoff, observer, environmentFile, { ...(peer ? { peer } : {}), releases, now: () => now, ...(phase5 ? { drivers: phase5.drivers, bundles: phase5.bundles, contracts: phase5.contracts } : {}) });
   const versions = new Versions(undefined, (async () => Response.json([{ name: "shop-1.2.0" }, { name: "v9" }, { name: "shop-1.10.0" }])) as typeof fetch);
   const example = { text: "" };
   const schemas = new Schemas(undefined, join(dir, "templates"), (async () => new Response(example.text)) as typeof fetch);
   const env = new EnvManager(store, deployments, schemas, new SecretBox(Buffer.alloc(32, 7).toString("base64")), "shared-compare-key");
-  const app = createApp({ config, store, sessions, observer, deployments, versions, env, ...(peer ? { peer } : {}) });
+  const keys = phase5 ? new Keys(store, phase5.workbench, () => now) : undefined;
+  const app = createApp({ config, store, sessions, observer, deployments, versions, env, ...(peer ? { peer } : {}), ...(keys ? { keys } : {}) });
   const request = (path: string, init: RequestInit & { as?: string; cookie?: string } = {}) => {
     const headers = new Headers(init.headers);
     const cookies = [init.as ? `${SESSION}=${init.as}` : "", init.cookie ?? ""].filter(Boolean).join("; ");
@@ -118,7 +122,7 @@ function setup(options: SetupOptions = {}) {
   };
   const beat = () => writeFileSync(join(dir, "handoff", "executor.json"), JSON.stringify({ version: "0.3.0", protocols: [1], kinds: ["build", "deploy", "env", "env-read", "bundle", "db-migration"], at: new Date(now).toISOString(), project: "open-atlas", registries: [], databaseBackup: {}, busy: null }));
   mkdirSync(join(dir, "handoff"), { recursive: true });
-  return { app, request, store, users, workbench, dir, beat, example, released, advance: (ms: number) => { now += ms; } };
+  return { app, request, store, users, workbench, dir, beat, example, released, deployments, advance: (ms: number) => { now += ms; } };
 }
 
 const shop = { v: 1, app: "shop", appliesFrom: "1.0.0", release: { repo: "acme/shop", tag: "v{version}", manifest: "package.json" },
@@ -735,4 +739,122 @@ test("missing settings and credentials block the plan and say where to set them"
   assert.ok(blocking.some((m: string) => m.startsWith("studio-graph/graph") && m.includes("apps.book.settings.graph.graph")));
   assert.ok(blocking.some((m: string) => m.startsWith("oma-agent/settings") && m.includes("{{model}}、{{mcpUrl}}")));
   assert.ok(blocking.some((m: string) => m.startsWith("workbench-app/unreachable") && m.includes("HTTP 401")));
+});
+
+// Phase 6: API keys, /mcp, failure diagnosis through OMA.
+
+const bearer = (t: ReturnType<typeof setup>, path: string, key: string, init: RequestInit = {}) =>
+  t.request(path, { ...init, headers: { authorization: `Bearer ${key}`, "content-type": "application/json", ...(init.headers ?? {}) } });
+let rpcId = 0;
+async function mcp(t: ReturnType<typeof setup>, key: string, method: string, params?: unknown) {
+  const r = await bearer(t, "/mcp", key, { method: "POST", body: JSON.stringify({ jsonrpc: "2.0", id: ++rpcId, method, ...(params ? { params } : {}) }) });
+  return { status: r.status, body: await r.json() };
+}
+async function tool(t: ReturnType<typeof setup>, key: string, name: string, args: Record<string, unknown> = {}) {
+  const { body } = await mcp(t, key, "tools/call", { name, arguments: args });
+  return { isError: Boolean(body.result?.isError), value: JSON.parse(body.result.content[0].text) };
+}
+const makeKey = async (t: ReturnType<typeof setup>, as: string, body: Record<string, unknown>) => {
+  const r = await post(t, "/api/keys", as, body);
+  return { status: r.status, body: await r.json() };
+};
+
+test("a personal key acts as its owner as Workbench has them now; a key never makes a key", async () => {
+  const t = withBook();
+  const made = await makeKey(t, "uat", { name: "my laptop", days: 30 });
+  assert.equal(made.status, 201);
+  assert.match(made.body.key, /^dpk_/);
+  assert.equal(made.body.record.prefix, made.body.key.slice(0, 12));
+  assert.ok(!JSON.stringify(t.store.listKeys()).includes(made.body.key), "only the SHA-256 is kept");
+  assert.equal((await makeKey(t, "uat", { kind: "service", name: "assistant", days: 30 })).status, 403, "service keys are for administrators");
+  assert.equal((await makeKey(t, "uat", { name: "x", days: 400 })).status, 400);
+
+  const key = made.body.key as string;
+  const status = await bearer(t, "/api/status", key);
+  assert.equal(status.status, 200);
+  const viaKey = await bearer(t, "/api/keys", key, { method: "POST", body: JSON.stringify({ name: "another", days: 1 }) });
+  assert.equal(viaKey.status, 403, "a key never makes a key");
+
+  t.s.workbench.users[0]!.roleIds = [];
+  assert.equal((await bearer(t, "/api/status", key)).status, 403, "out of the Groups: refused on the next call");
+  t.s.workbench.users[0]!.roleIds = ["r_uat"];
+  t.s.workbench.users[0]!.enabled = false;
+  assert.equal((await bearer(t, "/api/status", key)).status, 401);
+  t.s.workbench.users[0]!.enabled = true;
+  const { keys } = await (await t.request("/api/keys", { as: "uat" })).json();
+  assert.equal((await t.request(`/api/keys/${keys[0].id}`, { method: "DELETE", as: "uat", headers: { "x-csrf-token": "csrf-uat" } })).status, 200);
+  assert.equal((await bearer(t, "/api/status", key)).status, 401, "revoked");
+  t.advance(0);
+  assert.deepEqual(t.store.listAudit().filter((e) => e.action.startsWith("key.")).map((e) => e.action), ["key.revoke", "key.create"]);
+});
+
+test("/mcp: tools are the page's calls; a service key sees only the read-only ones", async () => {
+  const t = withBook();
+  t.beat();
+  const service = (await makeKey(t, "admin", { kind: "service", name: "deploy-assistant", days: 365 })).body.key as string;
+  const personal = (await makeKey(t, "uat", { name: "cli", days: 30 })).body.key as string;
+  assert.equal((await mcp(t, "dpk_wrong", "tools/list")).status, 401);
+  const init = await mcp(t, service, "initialize", { protocolVersion: "2025-03-26" });
+  assert.equal(init.body.result.serverInfo.name, "open-atlas-deployer");
+  const serviceTools = (await mcp(t, service, "tools/list")).body.result.tools as { name: string; annotations: { readOnlyHint: boolean } }[];
+  assert.ok(serviceTools.every((x) => x.annotations.readOnlyHint));
+  assert.ok(serviceTools.some((x) => x.name === "plan_deploy") && !serviceTools.some((x) => x.name === "deploy"));
+  const personalTools = (await mcp(t, personal, "tools/list")).body.result.tools as { name: string }[];
+  assert.ok(personalTools.some((x) => x.name === "deploy"));
+
+  const plan = await tool(t, service, "plan_deploy", { app: "book", version: "1.0.0" });
+  assert.equal(plan.isError, false);
+  assert.equal(plan.value.steps.length, 6);
+  assert.equal((await tool(t, service, "deploy", { app: "book", version: "1.0.0", request_id: "r1" })).value.finding.code, "mcp/unknown-tool", "no write tools for the service key");
+  assert.equal((await tool(t, service, "plan_deploy", { app: "book", version: "1.0.0", force: true })).value.finding.expected, "plan_deploy 没有参数 force");
+  assert.equal((await tool(t, service, "get_env", { app: "book" })).value.finding.code, "env/none", "a refusal is the route's own finding");
+
+  // A command with request_id: the retry returns the first answer, one job only.
+  const first = await tool(t, personal, "deploy", { app: "book", version: "1.0.0", request_id: "deploy-1" });
+  const again = await tool(t, personal, "deploy", { app: "book", version: "1.0.0", request_id: "deploy-1" });
+  assert.equal(first.isError, false);
+  assert.equal(again.value.job.id, first.value.job.id);
+  assert.equal(t.store.listJobs({ kind: "deploy" }).length, 1);
+  assert.equal((await tool(t, personal, "deploy", { app: "book", version: "1.0.0" })).value.finding.expected, "deploy 缺参数 request_id");
+  assert.ok(t.store.listAudit().some((e) => e.action === "mcp.deploy" && e.via === "key" && e.actor === "u@x"));
+});
+
+test("PROD execution, overriding promotion and revealing secrets take a browser session", async () => {
+  const t = withBook();
+  t.beat();
+  writeFileSync(join(t.dir, "environment.json"), JSON.stringify({ name: "prod", project: "open-atlas", bindIp: "127.0.0.1", registries: {}, apps: { workbench: { version: "1.24.0" }, book: { version: "1.0.0", settings: { graph: { graph: "acme/book" }, assistant: { model: "m", mcpUrl: "u" } } } } }));
+  const admin = (await makeKey(t, "admin", { name: "admin cli", days: 1 })).body.key as string;
+  const deploy = await tool(t, admin, "deploy", { app: "book", version: "1.0.0", request_id: "p1" });
+  assert.equal(deploy.value.finding.code, "auth/browser-only");
+  const override = await bearer(t, "/api/apps/book/plan", admin, { method: "POST", body: JSON.stringify({ version: "1.0.0", override: { reason: "hotfix now" } }) });
+  assert.equal((await override.json()).error, "auth/browser-only");
+  const reveal = await bearer(t, "/api/apps/book/env/reveal", admin, { method: "POST", body: JSON.stringify({ revision: 1, key: "X" }) });
+  assert.deepEqual([reveal.status, (await reveal.json()).error], [403, "auth/browser-only"]);
+  assert.equal((await tool(t, admin, "plan_deploy", { app: "book", version: "1.0.0" })).isError, false, "a key may still plan in PROD");
+});
+
+test("a failed deploy is diagnosed by the Deploy Assistant through OMA, and the record shows it", async () => {
+  const t = withBook();
+  t.beat();
+  writeFileSync(join(t.dir, "oma.key"), "oma_test");
+  const diagnoser = new Diagnoser(t.store, { url: "http://oma.test", keyFile: join(t.dir, "oma.key"), agent: "agent_assistant", environment: "env_1", vaults: ["vlt_1"], application: "app_deployer" },
+    () => "pulling\nlogbook-api: FATAL: password authentication failed for user \"authenticator\"\n", fakeServices(t.s), () => Date.parse("2026-10-30T10:00:00Z"));
+  t.deployments.onFailure = (job) => diagnoser.start(job);
+  const { job } = await (await post(t, "/api/apps/book/deploy", "uat", { version: "1.0.0" })).json();
+  finish(t, job.id, "rolled-back", { digests: {} });
+  await t.request("/api/jobs", { as: "viewer" });
+  const session = t.s.oma.sessions[0]!;
+  assert.deepEqual([session.body.agent, session.body.environment_id, session.body.vault_ids, session.body.app_id, session.body.correlation_id], ["agent_assistant", "env_1", ["vlt_1"], "app_deployer", job.id]);
+  assert.match(session.messages[0]!, /password authentication failed/);
+  assert.match(session.messages[0]!, /"state": "rolled-back"/);
+  assert.equal(t.store.job(job.id)!.diagnosis!.state, "running");
+
+  await diagnoser.poll();
+  assert.equal(t.store.job(job.id)!.diagnosis!.state, "running", "no answer yet");
+  t.s.oma.reply = "看了日志。\n```json\n{\"cause\": \"authenticator 的密码与库里不一致\", \"evidence\": [\"FATAL: password authentication failed\"], \"suggestion\": \"核对 AUTHENTICATOR_PASSWORD\", \"confidence\": \"high\"}\n```";
+  await diagnoser.poll();
+  const view = await (await t.request(`/api/jobs/${job.id}`, { as: "viewer" })).json();
+  assert.equal(view.job.diagnosis.state, "done");
+  assert.equal(view.job.diagnosis.cause, "authenticator 的密码与库里不一致");
+  assert.equal(view.record.diagnosis.confidence, "high");
 });

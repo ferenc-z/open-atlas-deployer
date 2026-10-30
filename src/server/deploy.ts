@@ -16,6 +16,7 @@ import { Handoff, newJobId } from "./handoff.ts";
 import type { Observer } from "./observe.ts";
 import type { Peer } from "./peer.ts";
 import { buildRequests, deployPermission, isProd, manifestRef, plan, type BundleInfo, type Plan, type PlanContext, type PromotionInput } from "./plan.ts";
+import { isKey } from "./keys.ts";
 import { DEPLOYER_TYPES, RolloutError, Runner, type Rollout, type RolloutStep } from "./rollout.ts";
 import type { Versions } from "./versions.ts";
 import { FINAL_STATES, type Actor, type ExecutorStatus, type Job, type Store } from "./store.ts";
@@ -49,6 +50,7 @@ export function deploymentRecord(job: Job, repo: string | undefined) {
     config_revision: typeof job.request.envRevision === "number" ? `${job.app}.env#${job.request.envRevision}` : null,
     deployed_at: job.state === "succeeded" ? job.finishedAt : null,
     observation: job.observation ?? null,
+    ...(job.diagnosis ? { diagnosis: job.diagnosis } : {}),
   };
 }
 
@@ -78,6 +80,8 @@ export class Deployments {
 
   /** The app's env file as last written to the server, decrypted (env manager), for ${KEY} in component settings. */
   envValues?: (app: string) => Record<string, string> | undefined;
+  /** Set when OMA is configured (phase 6, D24): a failed or rolled-back deploy is diagnosed. */
+  onFailure?: (job: Job) => Promise<void>;
 
   private peer: Peer | undefined;
   private releases: Pick<Versions, "release"> | undefined;
@@ -234,6 +238,7 @@ export class Deployments {
       pins = { from: from.id, digests: from.status?.result.digests ?? {} };
     }
     if (override) {
+      if (isKey(principal)) throw new DeployError(403, "auth/browser-only", "跳过晋级规则只认浏览器会话，API key 不行（§9.4）。");
       if (!principal.permissions.includes("admin")) throw new DeployError(403, "deploy/override-forbidden", "只有 Workbench 管理员能跳过晋级规则。");
       if (override.reason.trim().length < 4) throw new DeployError(400, "deploy/override-reason", "跳过晋级规则必须写明原因。");
     }
@@ -247,6 +252,7 @@ export class Deployments {
   }
 
   async deploy(principal: Principal, appId: string, version: string, options: { pinFrom?: string; acknowledgeManual?: boolean; override?: { reason: string } }): Promise<Job> {
+    if (isKey(principal) && isProd(this.environment().env)) throw new DeployError(403, "auth/browser-only", "PROD 的部署只认浏览器会话，API key 只能生成计划（§9.4）。");
     const p = await this.plan(principal, appId, version, options.pinFrom, options.override);
     const blocking = p.findings.filter((f) => f.blocking);
     if (blocking.length || !p.request) throw new DeployError(409, "deploy/blocked", "计划里有阻止部署的问题。", blocking.map((f) => f.message));
@@ -328,6 +334,7 @@ export class Deployments {
     this.recordArtifacts(job, status);
     if (job.kind === "deploy" && status.state === "succeeded") await this.observe(job);
     if (this.afterJob) await this.afterJob(job, status);
+    if (job.kind === "deploy" && (status.state === "failed" || status.state === "rolled-back") && this.onFailure) await this.onFailure(job);
   }
 
   /** The runner ends a deploy whose last steps were the Deployer's (or people's). */
@@ -343,6 +350,7 @@ export class Deployments {
   private checkPermission(principal: Principal, job: Job | undefined): Job {
     if (!job || job.kind !== "deploy") throw new DeployError(404, "job/unknown", "没有这个部署。");
     if (!this.canDeploy(principal)) throw new DeployError(403, "deploy/forbidden", "需要有部署这个环境的权限。");
+    if (isKey(principal) && isProd(this.environment().env)) throw new DeployError(403, "auth/browser-only", "PROD 的部署步骤只认浏览器会话（§9.4）。");
     return job;
   }
 

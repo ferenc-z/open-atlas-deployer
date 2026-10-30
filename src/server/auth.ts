@@ -12,7 +12,9 @@ export type Permission = "view" | "deploy-uat" | "deploy-prod" | "admin";
 export interface Principal {
   id: string;
   displayName: string;
-  via: "workbench" | "emergency";
+  /** key: a personal API key (its owner as Workbench has them now); service: the Deploy Assistant's read-only key. */
+  via: "workbench" | "emergency" | "key" | "service";
+  keyId?: string;
   groups: string[];
   isAdmin: boolean;
   permissions: Permission[];

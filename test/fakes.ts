@@ -41,9 +41,13 @@ export interface FakeState {
     apps: { id: string; version: string; previousVersion?: string; agentSlots?: Record<string, { name?: string; businessAgentId: string | null }> }[];
     agents: { id: string; name: string; agentId: string; enabled: boolean }[];
     key: string;
+    users: { email: string; displayName?: string; enabled: boolean; isAdmin: boolean; roleIds: string[] }[];
+    roles: { id: string; name: string; enabled: boolean }[];
   };
   studio: { draft: string; revision: number; uploaded?: string; queries: string[]; published: number; graph: string };
-  oma: { packages: number; revision: number; agents: string[]; failPublish?: boolean };
+  oma: { packages: number; revision: number; agents: string[]; failPublish?: boolean;
+    /** OMA's REST API (x-api-key oma_test): sessions the Deployer opens, and what the Agent answers in them. */
+    sessions: { id: string; body: Record<string, unknown>; messages: string[] }[]; reply: string };
 }
 
 export function fakeState(): FakeState {
@@ -51,9 +55,11 @@ export function fakeState(): FakeState {
     calls: [],
     assets: {},
     manifests: {},
-    workbench: { apps: [], agents: [], key: "wbk_test" },
+    workbench: { apps: [], agents: [], key: "wbk_test",
+      users: [{ email: "u@x", displayName: "U", enabled: true, isAdmin: false, roleIds: ["r_uat"] }, { email: "p@x", enabled: true, isAdmin: false, roleIds: ["r_prod"] }, { email: "a@x", enabled: true, isAdmin: true, roleIds: [] }],
+      roles: [{ id: "r_uat", name: "deploy-uat", enabled: true }, { id: "r_prod", name: "deploy-prod", enabled: true }] },
     studio: { graph: "acme/book", draft: '{:contract {:contract/family "atlas-semantic"}\n :workspace {:workspace/id "ws-uat"}\n :graph {:graph/id "g-uat" :graph/label "Book"}}', revision: 3, queries: [], published: 0 },
-    oma: { packages: 0, revision: 0, agents: [] },
+    oma: { packages: 0, revision: 0, agents: [], sessions: [], reply: "" },
   };
 }
 
@@ -118,6 +124,8 @@ export function fakeServices(s: FakeState): typeof fetch {
         return Response.json({ version: a.version });
       }
       if (url.pathname === "/api/workbench/admin/business-agents") return Response.json({ agents: wb.agents });
+      if (url.pathname === "/api/workbench/admin/users") return Response.json({ users: wb.users });
+      if (url.pathname === "/api/workbench/admin/roles") return Response.json({ roles: wb.roles });
       m = /^\/api\/workbench\/admin\/business-agents\/([^/]+)$/.exec(url.pathname);
       if (m && request.method === "PATCH") {
         const body = await request.json() as { agentId: string };
@@ -140,6 +148,23 @@ export function fakeServices(s: FakeState): typeof fetch {
         if (name === "publish_graph") { s.studio.published++; return { version: s.studio.published }; }
         throw new Error(`unknown tool ${name}`);
       });
+    }
+    if (url.host === "oma.test" && url.pathname.startsWith("/v1/")) {
+      if (request.headers.get("x-api-key") !== "oma_test") return new Response("no", { status: 401 });
+      if (url.pathname === "/v1/sessions" && request.method === "POST") {
+        const id = `sess_${s.oma.sessions.length + 1}`;
+        s.oma.sessions.push({ id, body: await request.json() as Record<string, unknown>, messages: [] });
+        return Response.json({ id });
+      }
+      const m = /^\/v1\/sessions\/([^/]+)\/events$/.exec(url.pathname);
+      const session = m && s.oma.sessions.find((x) => x.id === m[1]);
+      if (session && request.method === "POST") {
+        const body = await request.json() as { events: { content: { text: string }[] }[] };
+        session.messages.push(...body.events.map((e) => e.content.map((c) => c.text).join("")));
+        return Response.json({ ok: true });
+      }
+      if (session) return Response.json({ data: s.oma.reply ? [{ type: "user.message" }, { type: "agent.message", content: [{ type: "text", text: s.oma.reply }] }, { type: "session.status_idle" }] : [{ type: "user.message" }] });
+      return new Response("{}", { status: 404 });
     }
     if (url.host === "oma.test") {
       if (request.headers.get("authorization") !== "Bearer omab_test") return new Response("no", { status: 401 });

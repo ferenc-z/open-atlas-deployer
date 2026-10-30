@@ -2,6 +2,7 @@
 // this environment, and the app registry (admins change it). Everything sits under the base path
 // the reverse proxy serves the Deployer at (§9.1).
 
+import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
 import { Hono, type Context } from "hono";
@@ -13,6 +14,8 @@ import {
 import type { Config } from "./config.ts";
 import { DeployError, deploymentRecord, type Deployments } from "./deploy.ts";
 import type { EnvManager } from "./env.ts";
+import { KeyError, isKey, type Keys } from "./keys.ts";
+import { handleMcp } from "./mcp.ts";
 import { PeerError, type Peer, type PeerStatus } from "./peer.ts";
 import { environmentStatus, readHostState, type Observer } from "./observe.ts";
 import { StoreError, type Actor, type Store } from "./store.ts";
@@ -28,6 +31,8 @@ export interface Dependencies {
   env: EnvManager;
   /** PROD: UAT's Deployer (§6.3). */
   peer?: Peer;
+  /** Personal and service API keys (§9.4, phase 6); without them /mcp and bearer keys are off. */
+  keys?: Keys;
 }
 
 const reject = (c: Context, status: 400 | 401 | 403 | 404 | 409 | 429 | 503, code: string, message: string, details: string[] = []) =>
@@ -37,9 +42,12 @@ const actorOf = (p: Principal): Actor => ({ id: p.id, via: p.via });
 
 const TYPES: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".json": "application/json", ".ico": "image/x-icon" };
 
-export function createApp({ config, store, sessions, observer, deployments, versions, env: envVars, peer }: Dependencies): Hono {
+export function createApp({ config, store, sessions, observer, deployments, versions, env: envVars, peer, keys }: Dependencies): Hono {
   const throttle = new LoginThrottle();
   const api = new Hono();
+  // /mcp calls the API in-process as the key's principal: a one-time nonce with this process's secret, never from outside.
+  const internalSecret = randomBytes(24).toString("hex");
+  const internal = new Map<string, Principal>();
 
   async function emergency(c: Context): Promise<Principal | undefined> {
     const token = parseCookies(c.req.header("cookie")).get(EMERGENCY_COOKIE);
@@ -52,8 +60,23 @@ export function createApp({ config, store, sessions, observer, deployments, vers
 
   /** The principal, or the response that refuses the request. */
   async function authenticate(c: Context, need: Permission): Promise<Principal | Response> {
-    const fallback = await emergency(c);
-    let principal = fallback;
+    let principal: Principal | undefined;
+    const marker = c.req.header("x-deployer-internal");
+    if (marker) {
+      const [secret, nonce] = marker.split(".");
+      principal = secret === internalSecret && nonce ? internal.get(nonce) : undefined;
+      if (nonce) internal.delete(nonce);
+      if (!principal) return reject(c, 401, "auth/unauthenticated", "请先登录 Workbench。");
+    }
+    // A personal or service API key (§9.4): no cookie, no CSRF token.
+    const bearer = /^Bearer (\S+)$/.exec(c.req.header("authorization") ?? "")?.[1];
+    if (!principal && bearer && keys && /^dp[ks]_/.test(bearer)) {
+      try { principal = await keys.resolve(bearer); } catch (error) {
+        if (error instanceof KeyError) return reject(c, error.status, error.code, error.message);
+        throw error;
+      }
+    }
+    if (!principal) principal = await emergency(c);
     if (!principal) {
       const result = await sessions.resolve(c.req.header("cookie"));
       if (result.kind === "unavailable") return reject(c, 503, "auth/workbench-unavailable", "Workbench 暂时无法访问，无法确认登录。", config.emergencyPasswordHash ? ["emergency-available"] : []);
@@ -61,9 +84,69 @@ export function createApp({ config, store, sessions, observer, deployments, vers
       principal = result.principal;
     }
     if (!principal.permissions.includes(need)) return reject(c, 403, "auth/forbidden", need === "admin" ? "只有 Workbench 管理员能做这件事。" : "你不在 deploy-viewer、deploy-uat、deploy-prod 任何一个组里。");
-    if (c.req.method !== "GET" && c.req.header("x-csrf-token") !== principal.csrfToken) return reject(c, 403, "auth/csrf", "请求缺少有效的 CSRF 令牌，请刷新页面。");
+    if (!isKey(principal) && c.req.method !== "GET" && c.req.header("x-csrf-token") !== principal.csrfToken) return reject(c, 403, "auth/csrf", "请求缺少有效的 CSRF 令牌，请刷新页面。");
     return principal;
   }
+
+  // MCP (§10.4): every tool is one call to this API as the key's principal.
+  api.post("/mcp", async (c) => {
+    const bearer = /^Bearer (\S+)$/.exec(c.req.header("authorization") ?? "")?.[1];
+    if (!keys || !bearer || !/^dp[ks]_/.test(bearer)) {
+      c.header("www-authenticate", "Bearer");
+      return c.json({ jsonrpc: "2.0", id: null, error: { code: -32001, message: "a Deployer API key (dpk_ or dps_) is required" } }, 401);
+    }
+    let principal: Principal;
+    try { principal = await keys.resolve(bearer); } catch (error) {
+      if (error instanceof KeyError) return c.json({ jsonrpc: "2.0", id: null, error: { code: -32001, message: error.message } }, error.status);
+      throw error;
+    }
+    let message: unknown;
+    try { message = await c.req.json(); } catch { return c.json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } }, 400); }
+    const origin = new URL(c.req.url).origin;
+    const call = async (spec: { method: string; path: string; query?: Record<string, unknown>; body?: unknown }) => {
+      const nonce = randomBytes(12).toString("hex");
+      internal.set(nonce, principal);
+      const query = Object.entries(spec.query ?? {}).filter(([, v]) => v !== undefined && v !== null && v !== "").map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`).join("&");
+      const res = await api.fetch(new Request(`${origin}${spec.path}${query ? `?${query}` : ""}`, {
+        method: spec.method, headers: { "x-deployer-internal": `${internalSecret}.${nonce}`, ...(spec.body !== undefined ? { "content-type": "application/json" } : {}) },
+        ...(spec.body !== undefined ? { body: JSON.stringify(spec.body) } : {}),
+      }));
+      internal.delete(nonce);
+      return { status: res.status, body: await res.json().catch(() => null) };
+    };
+    const reply = await handleMcp(message, { principal, store, call });
+    return reply ? c.json(reply) : c.body(null, 202);
+  });
+  api.get("/mcp", (c) => c.json({ jsonrpc: "2.0", id: null, error: { code: -32601, message: "no event stream here; POST JSON-RPC to /mcp" } }, 405));
+
+  // API keys (§9.4): made and revoked on the page with a Workbench session; a key never makes a key.
+  const keyError = (c: Context, error: unknown) => {
+    if (error instanceof KeyError) return reject(c, error.status, error.code, error.message);
+    throw error;
+  };
+  api.get("/api/keys", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    if (!keys) return reject(c, 404, "key/not-configured", "API key 没有启用（需要 DEPLOYER_WORKBENCH_API_KEY_FILE，用来向 Workbench 确认 key 的主人）。");
+    return c.json({ keys: keys.list(p) });
+  });
+  api.post("/api/keys", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    if (!keys) return reject(c, 404, "key/not-configured", "API key 没有启用。");
+    const body = await c.req.json().catch(() => ({})) as { kind?: string; name?: string; days?: number };
+    try {
+      const made = keys.create(p, body.kind === "service" ? "service" : "personal", String(body.name ?? ""), Number(body.days ?? 90));
+      c.header("cache-control", "no-store");
+      return c.json(made, 201);
+    } catch (error) { return keyError(c, error); }
+  });
+  api.delete("/api/keys/:id", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    if (!keys) return reject(c, 404, "key/not-configured", "API key 没有启用。");
+    try { keys.revoke(p, c.req.param("id")); return c.json({ revoked: true }); } catch (error) { return keyError(c, error); }
+  });
 
   const environment = (): Environment => JSON.parse(readFileSync(config.environmentFile, "utf8"));
   const deployError = (c: Context, error: unknown) => {

@@ -60,6 +60,18 @@ export class WorkbenchAdmin {
 
   async switchVersion(id: string): Promise<{ version: string }> { return this.request("POST", `/api/workbench/admin/apps/${encodeURIComponent(id)}/switch-version`); }
   async setSettings(id: string, settings: Record<string, string>) { return this.request("PUT", `/api/workbench/admin/apps/${encodeURIComponent(id)}/settings`, settings); }
+  /** A person as Workbench has them now (personal API keys, §9.4): enabled, administrator, the names of their enabled Groups. */
+  async person(email: string): Promise<{ email: string; displayName: string; enabled: boolean; isAdmin: boolean; groups: string[] } | undefined> {
+    const [users, roles] = await Promise.all([
+      this.request("GET", "/api/workbench/admin/users") as Promise<{ users: { email: string; displayName?: string; enabled: boolean; isAdmin: boolean; roleIds?: string[] }[] }>,
+      this.request("GET", "/api/workbench/admin/roles") as Promise<{ roles: { id: string; name: string; enabled: boolean }[] }>,
+    ]);
+    const u = users.users.find((x) => x.email.toLowerCase() === email.toLowerCase());
+    if (!u) return undefined;
+    const names = new Map(roles.roles.filter((r) => r.enabled).map((r) => [r.id, r.name]));
+    return { email: u.email, displayName: u.displayName ?? u.email, enabled: u.enabled, isAdmin: u.isAdmin, groups: (u.roleIds ?? []).flatMap((id) => (names.has(id) ? [names.get(id)!] : [])) };
+  }
+
   async businessAgents(): Promise<BusinessAgent[]> { return ((await this.request("GET", "/api/workbench/admin/business-agents")) as { agents: BusinessAgent[] }).agents; }
   async pointAgent(id: string, agentId: string) { return this.request("PATCH", `/api/workbench/admin/business-agents/${encodeURIComponent(id)}`, { agentId }); }
 }

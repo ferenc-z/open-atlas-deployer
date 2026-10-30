@@ -7,6 +7,8 @@ import { loadConfig } from "./config.ts";
 import { Bundles } from "./bundle.ts";
 import { ContractDocs } from "./contracts.ts";
 import { Deployments } from "./deploy.ts";
+import { Diagnoser } from "./diagnose.ts";
+import { Keys } from "./keys.ts";
 import { OmaAgentDriver } from "./drivers/oma-agent.ts";
 import { StudioGraphDriver } from "./drivers/studio-graph.ts";
 import { WorkbenchAdmin } from "./drivers/workbench.ts";
@@ -42,9 +44,18 @@ const deployments = new Deployments(store, new Handoff(config.handoffDir), obser
   contracts: new ContractDocs(config.githubTokenFile, fetch, config.githubApi),
 });
 const env = new EnvManager(store, deployments, new Schemas(config.githubTokenFile, config.templatesDir), config.credentialKey ? new SecretBox(config.credentialKey) : undefined, config.compareKey);
-const app = createApp({ config, store, sessions: new WorkbenchSessions(config.workbenchUrl), observer, deployments, versions, env, peer });
+// Phase 6: personal and service API keys (need Workbench's API key to re-confirm owners), failure diagnosis through OMA.
+const keys = config.workbenchApiKeyFile ? new Keys(store, workbench) : undefined;
+const diagnoser = config.omaUrl && config.omaApiKeyFile && config.omaAgent
+  ? new Diagnoser(store, { url: config.omaUrl, keyFile: config.omaApiKeyFile, agent: config.omaAgent, ...(config.omaEnvironment ? { environment: config.omaEnvironment } : {}), vaults: config.omaVaults, ...(config.omaApplicationId ? { application: config.omaApplicationId } : {}) }, (id) => deployments.handoff.log(id))
+  : undefined;
+if (diagnoser) deployments.onFailure = (job) => diagnoser.start(job);
+const app = createApp({ config, store, sessions: new WorkbenchSessions(config.workbenchUrl), observer, deployments, versions, env, peer, ...(keys ? { keys } : {}) });
 // Job records follow the executor's status files even while nobody has the page open.
-setInterval(() => { deployments.sync().catch((error) => console.error("sync:", error)); }, 2_000).unref();
+setInterval(() => {
+  deployments.sync().catch((error) => console.error("sync:", error));
+  diagnoser?.poll().catch((error) => console.error("diagnose:", error));
+}, 2_000).unref();
 
 serve({ fetch: app.fetch, hostname: config.bind, port: config.port }, (info) => {
   console.log(`Open Atlas Deployer on http://${info.address}:${info.port}${config.basePath}/ (Workbench ${config.workbenchUrl})`);

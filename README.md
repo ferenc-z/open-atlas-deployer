@@ -7,7 +7,8 @@
 - 阶段 2：宿主机执行器（[executor/](executor/)），以及 `compose-service` 驱动、构建、部署、自动回滚、回到旧版、审计（见下面"阶段 2"一节）；
 - 阶段 3：环境变量管理，包括加密保存、版本、校验、写入服务器、UAT / PROD 对比（见下面"阶段 3"一节）；
 - 阶段 4：制品库、晋级规则，以及 PROD 的 Deployer 用只读 key 查 UAT 的记录（见下面"阶段 4"一节）；
-- 阶段 5：其余驱动（`workbench-app`、`studio-graph`、`oma-agent`、`db-migration`、`manual`）、Release 附件（bundle）、契约核对，一个应用的全部组件一次部署（见下面"阶段 5"一节）。
+- 阶段 5：其余驱动（`workbench-app`、`studio-graph`、`oma-agent`、`db-migration`、`manual`）、Release 附件（bundle）、契约核对，一个应用的全部组件一次部署（见下面"阶段 5"一节）；
+- 阶段 6：API key 与 `/mcp`、页面旁的 Deploy Assistant（Workbench 嵌入对话 + 卡片）、部署失败后经 OMA 自动诊断（见下面"阶段 6"一节）。
 
 阶段 5 起，Workbench 应用包、Agent、数据库迁移、Graph、人工步骤都有驱动，Logbook 这样由几种组件组成的应用也能一次部署。
 
@@ -49,6 +50,7 @@ Node 22.18 起直接运行 `.ts`（类型剥离），服务端不需要构建；
 | `DEPLOYER_STUDIO_BUILDER_URL` / `DEPLOYER_STUDIO_TOKEN_FILE` | 无 | Studio Builder MCP（如 `https://studio:9631/mcp`）和 workspace token（`oaw_v1.`，read + write），给 `studio-graph`。Studio 是自签证书时用 `NODE_EXTRA_CA_CERTS` 指向它的证书 |
 | `DEPLOYER_OMA_BUILDER_URL` / `DEPLOYER_OMA_BUILDER_KEY_FILE` | 无 | OMA Builder MCP 和它的 `BUILDER_MCP_API_KEY`，给 `oma-agent` |
 | `DEPLOYER_OMA_URL` / `DEPLOYER_OMA_API_KEY_FILE` | 无 | 可选：OMA 的 API 和 key，发布后归档更早的同名 agent；不设就不归档 |
+| `DEPLOYER_OMA_APPLICATION_ID` / `DEPLOYER_OMA_AGENT` / `DEPLOYER_OMA_ENVIRONMENT` / `DEPLOYER_OMA_VAULTS` | 无 | 接法 B：Deployer 自己开 OMA Session（失败诊断）用的 Application、Agent（Deploy Assistant 的 agent id）、Environment、Vault（放只读服务 key）。配了 `DEPLOYER_OMA_URL`、`DEPLOYER_OMA_API_KEY_FILE`、`DEPLOYER_OMA_AGENT` 才诊断 |
 | `DEPLOYER_GITHUB_API` | `https://api.github.com` | 下载 Release 附件、读 `release.json` 的 GitHub API（测试时换成替身）；执行器对应 `EXECUTOR_GITHUB_API` |
 
 ### 认人与授权（§9）
@@ -354,6 +356,72 @@ python3 /opt/open-atlas-deployer/executor/current/deployer_executor.py check
 - 首次安装里人做的部分照旧是人做：建 Studio 图和 Source、令牌、Business Agent、插件条目、数据导入。
 - Studio 图的撤回（发布回旧版本）。
 - 新版本时由 AI 在沙箱里重新生成 EDN（阶段 6 / 7）。
+
+## 阶段 6：AI 接入（§9.4、§10）
+
+### API key（§9.4）
+
+页面上"API key"一页：
+
+- **个人 key**（`dpk_`）：本人用 Workbench 登录生成，绑定本人；只显示一次，只存 SHA-256；有效期 1–365 天。每次调用都用 Workbench API key 向 Workbench 重新确认主人仍然启用、在哪些组，所以停用或移出组下一次调用就生效。能做的和主人在页面上一样，但 **PROD 的部署、写环境变量、勾选人工步骤，跳过晋级，查看密钥原值**只认浏览器会话（`auth/browser-only`）。
+- **服务 key**（`dps_`）：管理员生成，给 OMA Vault 里的 Deploy Assistant 用，只读，没有人在它背后。
+- 不能用 key 生成或吊销 key。生成、吊销都记审计。
+
+要启用 key，需要 `DEPLOYER_WORKBENCH_API_KEY_FILE`（向 Workbench 确认主人）。
+
+### `/mcp`
+
+`POST <base path>/mcp`，JSON-RPC（MCP streamable HTTP，只回 JSON），`Authorization: Bearer dpk_…` 或 `dps_…`。
+
+- 每个工具就是页面上的一个查询或命令，在进程内以 key 的身份调同一个接口，所以权限、校验、审计和页面完全一样；被拒绝时返回那个接口自己的 finding（`code / at / expected`）。
+- 只读工具：`get_status`、`list_apps`、`get_app`、`list_versions`、`plan_deploy`、`list_jobs`、`get_job`、`list_artifacts`、`get_env`、`plan_env`、`get_env_fingerprint`、`compare_env_with_uat`。服务 key 只看得到这些。
+- 命令：`deploy`、`build`、`set_env_values`、`apply_env`、`import_env`、`check_manual_item`、`stop_deploy`。必须带 `request_id`：同一个 `request_id` 重发，得到第一次的结果，不会做两次。
+- 没声明的参数按名字拒绝；每次调用记审计 `mcp.<工具>`。
+
+Claude Code 里用：
+
+```bash
+claude mcp add --transport http open-atlas-deployer https://<域名>/deploy/mcp --header "Authorization: Bearer dpk_…"
+```
+
+### 页面旁的 Deploy Assistant（接法 A）
+
+顶栏"问助手"打开右侧面板，嵌入 Workbench 的 `/embed/chat?app=deployer`。页面把当前环境、页面、应用作为上下文发给它。Agent 只读；它在回复里出的 ` ```app-actions ` 卡片，人点"应用"后，由页面以本人身份执行，只接受这四种操作，只接受 Workbench 源发来的消息：
+
+| 操作 | 页面做什么 |
+|---|---|
+| `plan_deploy` | 打开这个版本的部署计划，人还要在计划上确认部署 |
+| `plan_rollback` | 打开回到某次部署（`pin_from`）的计划 |
+| `build_artifact` | 开始构建 |
+| `set_env_value` | 保存一个新的环境变量版本（不写入服务器，写入要在环境变量页看计划后做） |
+
+在 Workbench 里登记的应用条目见 [examples/workbench-application.deployer.json](examples/workbench-application.deployer.json)（`put_plugin`），Business Agent 名为 "Deploy Assistant"。
+
+### Deploy Assistant 的发布
+
+- 提示词 [agents/deploy-assistant.md](agents/deploy-assistant.md)，包定义 [templates/deploy-assistant.oma.json](templates/deploy-assistant.oma.json)（只开 Deployer 的 MCP，`allowed_tools` 只列只读工具，沙箱工具关闭，表格渲染器），随 Deployer 一起发版。
+- 发布：
+
+```bash
+node bin/publish-assistant.ts <OMA Builder MCP 地址> <builder key 文件> <模型名> https://<域名>/deploy/mcp ./assistant-uat.json
+```
+
+  打印新的 agent id；把 Workbench 的 Business Agent "Deploy Assistant" 指向它，并设为 `DEPLOYER_OMA_AGENT`。OMA Vault 里按 MCP 地址存服务 key。
+- 用例：[docs/golden-cases.md](docs/golden-cases.md)（读、卡片、越权）。
+
+### 部署失败后的自动诊断（接法 B，D24）
+
+部署失败或回滚后，Deployer 用自己的 OMA Application 开一个 Session，把任务的状态、各步、执行器日志的最后 150 行、Deployer 步骤日志交给 Deploy Assistant，要求只读地判断原因，最后回一个 JSON（原因、日志原文依据、建议、把握）。结果存在任务上，任务详情和部署记录（`diagnosis`）里能看到；10 分钟没结果记为失败。没配 OMA 时不诊断，部署照常。
+
+### 测试与验证（2026-10-30）
+
+- `npm test`：63 个。阶段 6 新增：个人 key 跟着 Workbench 的启用和组走、key 不能生成 key、吊销；`/mcp` 的工具列表、服务 key 只读、未声明参数被拒、拒绝带原接口的 finding、`request_id` 重发不重复部署、审计；PROD 执行 / 跳过晋级 / 查看密钥原值拒绝 key；失败诊断开 Session 的参数、提示词里的日志、读回答写进部署记录。
+- 页面（API key 页、助手面板）已构建，没有在浏览器里对着真实的 Workbench 嵌入页试过。
+
+### 还没做
+
+- 真实 OMA、Workbench 上的发布与验证（O1–O4、Business Agent、Role、嵌入页、golden cases）。
+- 新版本的清单评估（D27）放到阶段 7，和接入评估共用任务令牌与草案工作区。
 
 ## 由清单生成 compose（§7.3，D11）
 

@@ -104,6 +104,13 @@ export const peerFingerprint = (id: string) => call<Fingerprint>("GET", envPath(
 // Phase 5: a deploy's manual step, ticked item by item, or stopped there.
 export const check = (job: string, component: string, index: number, checked: boolean) => call<{ job: Job }>("POST", `jobs/${encodeURIComponent(job)}/checks`, { component, index, checked });
 export const stopJob = (job: string) => call<{ job: Job }>("POST", `jobs/${encodeURIComponent(job)}/stop`);
+
+// Phase 6: API keys.
+import type { ApiKey } from "../server/keys.ts";
+export type ApiKeyView = ApiKey;
+export const keys = () => call<{ keys: ApiKey[] }>("GET", "keys");
+export const createKey = (kind: "personal" | "service", name: string, days: number) => call<{ key: string; record: ApiKey }>("POST", "keys", { kind, name, days });
+export const revokeKey = (id: string) => call<{ revoked: true }>("DELETE", `keys/${encodeURIComponent(id)}`);
 export const planWithOverride = (id: string, version: string, reason: string) => call<Plan>("POST", `apps/${encodeURIComponent(id)}/plan`, { version, override: { reason } });
 export const deployWithOverride = (id: string, version: string, acknowledgeManual: boolean, reason: string) =>
   call<{ job: Job }>("POST", `apps/${encodeURIComponent(id)}/deploy`, { version, acknowledgeManual, override: { reason } });

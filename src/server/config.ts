@@ -42,6 +42,11 @@ export interface Config {
   omaBuilderKeyFile?: string;
   omaUrl?: string;
   omaApiKeyFile?: string;
+  /** Interface B (phase 6): the Deployer's own OMA Application, and the Agent, Environment and Vaults its sessions use. */
+  omaApplicationId?: string;
+  omaAgent?: string;
+  omaEnvironment?: string;
+  omaVaults: string[];
   /** UAT side (§6.3): SHA-256 of the read-only keys PROD's Deployer may use on /api/peer/*. */
   peerKeySha256: string[];
   /** PROD side: UAT's Deployer as this one reaches it, and the file holding the read-only key. */
@@ -80,6 +85,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...(env.DEPLOYER_OMA_BUILDER_KEY_FILE ? { omaBuilderKeyFile: resolve(env.DEPLOYER_OMA_BUILDER_KEY_FILE) } : {}),
     ...(env.DEPLOYER_OMA_URL ? { omaUrl: env.DEPLOYER_OMA_URL } : {}),
     ...(env.DEPLOYER_OMA_API_KEY_FILE ? { omaApiKeyFile: resolve(env.DEPLOYER_OMA_API_KEY_FILE) } : {}),
+    ...(env.DEPLOYER_OMA_APPLICATION_ID ? { omaApplicationId: env.DEPLOYER_OMA_APPLICATION_ID } : {}),
+    ...(env.DEPLOYER_OMA_AGENT ? { omaAgent: env.DEPLOYER_OMA_AGENT } : {}),
+    ...(env.DEPLOYER_OMA_ENVIRONMENT ? { omaEnvironment: env.DEPLOYER_OMA_ENVIRONMENT } : {}),
+    omaVaults: (env.DEPLOYER_OMA_VAULTS ?? "").split(/[\s,]+/).filter(Boolean),
     peerKeySha256: (env.DEPLOYER_PEER_KEY_SHA256 ?? "").split(/[\s,]+/).filter(Boolean),
     ...(env.DEPLOYER_UAT_URL ? { uatUrl: env.DEPLOYER_UAT_URL } : {}),
     ...(env.DEPLOYER_UAT_KEY_FILE ? { uatKeyFile: resolve(env.DEPLOYER_UAT_KEY_FILE) } : {}),

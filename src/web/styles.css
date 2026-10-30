@@ -54,6 +54,11 @@ nav button.active { background: var(--bg); color: var(--text); font-weight: 600;
 .who { display: flex; gap: 10px; align-items: center; }
 
 main { padding: 20px 24px 48px; max-width: 1200px; margin: 0 auto; }
+main.with-assistant { margin-right: 440px; }
+.assistant { position: fixed; right: 0; top: 56px; bottom: 0; width: 420px; display: flex; flex-direction: column; background: var(--surface); border-left: 1px solid var(--border); z-index: 5; }
+.assistant .toolbar { padding: 8px 12px; margin: 0; }
+.assistant iframe { flex: 1; border: 0; width: 100%; }
+@media (max-width: 900px) { main.with-assistant { margin-right: 0; } .assistant { width: 100%; } }
 main.center { display: grid; place-items: center; min-height: 80vh; }
 
 .banner { padding: 8px 24px; font-size: 13px; }

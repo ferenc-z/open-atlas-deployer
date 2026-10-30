@@ -3,12 +3,14 @@
 // Rows are never rewritten: saving a manifest adds a revision, removing an app marks it removed.
 
 import { DatabaseSync } from "node:sqlite";
+import type { Diagnosis } from "./diagnose.ts";
+import type { ApiKey } from "./keys.ts";
 import type { Rollout } from "./rollout.ts";
 import type { Manifest } from "../compose/generate.ts";
 import { crossAppConflicts, validateManifest } from "../manifest/validate.ts";
 import { compareVersions } from "../manifest/version.ts";
 
-export interface Actor { id: string; via: "workbench" | "emergency" | "cli" }
+export interface Actor { id: string; via: "workbench" | "emergency" | "cli" | "key" | "service" }
 
 export interface ManifestRevision { appliesFrom: string; revision: number; savedAt: string; savedBy: string; note: string | null }
 export interface RegisteredApp { id: string; name: string; repo: string; addedAt: string; addedBy: string; manifests: ManifestRevision[] }
@@ -50,6 +52,12 @@ CREATE TABLE IF NOT EXISTS artifacts (
   app TEXT NOT NULL, service TEXT NOT NULL, digest TEXT NOT NULL, version TEXT NOT NULL, ref TEXT NOT NULL,
   origin TEXT NOT NULL, build TEXT, job TEXT NOT NULL, seen_at TEXT NOT NULL,
   PRIMARY KEY (app, service, digest));
+CREATE TABLE IF NOT EXISTS api_keys (
+  id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL, prefix TEXT NOT NULL, sha256 TEXT NOT NULL UNIQUE, owner TEXT NOT NULL,
+  created_at TEXT NOT NULL, expires_at TEXT NOT NULL, last_used_at TEXT, revoked_at TEXT);
+CREATE TABLE IF NOT EXISTS mcp_requests (
+  key_id TEXT NOT NULL, request_id TEXT NOT NULL, tool TEXT NOT NULL, response TEXT NOT NULL, at TEXT NOT NULL,
+  PRIMARY KEY (key_id, request_id));
 CREATE TABLE IF NOT EXISTS component_state (
   app TEXT NOT NULL, component TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, updated_at TEXT NOT NULL,
   PRIMARY KEY (app, component, key));
@@ -131,6 +139,8 @@ export interface Job {
   message: string | null;
   /** A deploy's steps in dependsOn order (phase 5): the executor's part, then the Deployer's and people's. */
   rollout: Rollout | null;
+  /** After a failed or rolled-back deploy: the Deploy Assistant's diagnosis (phase 6, D24). */
+  diagnosis: Diagnosis | null;
 }
 
 type Row = Record<string, any>;
@@ -141,12 +151,17 @@ const toEnvRevision = (r: Row): EnvRevision => ({
 });
 
 const parse = (s: string | null) => (s ? JSON.parse(s) : null);
+const toKey = (r: Row): ApiKey => ({
+  id: r.id, kind: r.kind, name: r.name, prefix: r.prefix, owner: r.owner, createdAt: r.created_at, expiresAt: r.expires_at,
+  lastUsedAt: r.last_used_at ?? null, revokedAt: r.revoked_at ?? null,
+});
 const toJob = (r: Row): Job => ({
   id: r.id, kind: r.kind, app: r.app, version: r.version, environment: r.environment, state: r.state,
   requestedBy: r.requested_by, via: r.via, requestedAt: r.requested_at, finishedAt: r.finished_at ?? null,
   fromVersion: r.from_version ?? null, manifest: r.manifest ?? null, pinFrom: r.pin_from ?? null,
   request: JSON.parse(r.request), status: parse(r.status), observation: parse(r.observation), message: r.message ?? null,
   rollout: parse(r.rollout ?? null),
+  diagnosis: parse(r.diagnosis ?? null),
 });
 
 export class Store {
@@ -159,7 +174,9 @@ export class Store {
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
     this.db.exec(SCHEMA);
     // Phase 5 added the rollout column; a state database from before gets it here.
-    if (!(this.db.prepare("PRAGMA table_info(jobs)").all() as Row[]).some((c) => c.name === "rollout")) this.db.exec("ALTER TABLE jobs ADD COLUMN rollout TEXT");
+    // Columns added after phase 1; a state database from before gets them here.
+    const columns = (this.db.prepare("PRAGMA table_info(jobs)").all() as Row[]).map((c) => c.name);
+    for (const column of ["rollout", "diagnosis"]) if (!columns.includes(column)) this.db.exec(`ALTER TABLE jobs ADD COLUMN ${column} TEXT`);
   }
 
   close() { this.db.close(); }
@@ -298,6 +315,47 @@ export class Store {
           ON CONFLICT (app, component, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`).run(app, component, key, JSON.stringify(value), this.stamp());
       },
     };
+  }
+
+  addKey(k: Omit<ApiKey, "createdAt" | "lastUsedAt" | "revokedAt"> & { sha256: string }, actor: Actor): ApiKey {
+    this.db.prepare("INSERT INTO api_keys (id, kind, name, prefix, sha256, owner, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(k.id, k.kind, k.name, k.prefix, k.sha256, k.owner, this.stamp(), k.expiresAt);
+    this.insertAudit(actor, "key.create", k.id, { kind: k.kind, name: k.name, prefix: k.prefix, expiresAt: k.expiresAt });
+    return this.listKeys().find((x) => x.id === k.id)!;
+  }
+
+  listKeys(): ApiKey[] {
+    return (this.db.prepare("SELECT * FROM api_keys ORDER BY created_at DESC").all() as Row[]).map(toKey);
+  }
+
+  keyBySha(sha: string): ApiKey | undefined {
+    const r = this.db.prepare("SELECT * FROM api_keys WHERE sha256 = ?").get(sha) as Row | undefined;
+    return r && toKey(r);
+  }
+
+  touchKey(id: string) { this.db.prepare("UPDATE api_keys SET last_used_at = ? WHERE id = ?").run(this.stamp(), id); }
+
+  revokeKey(id: string, actor: Actor) {
+    this.db.prepare("UPDATE api_keys SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL").run(this.stamp(), id);
+    this.insertAudit(actor, "key.revoke", id, null);
+  }
+
+  /** An MCP command's answer by request_id, so a retry does not do it twice (§10.4). */
+  mcpAnswer(keyId: string, requestId: string): { tool: string; response: unknown } | undefined {
+    const r = this.db.prepare("SELECT tool, response FROM mcp_requests WHERE key_id = ? AND request_id = ?").get(keyId, requestId) as Row | undefined;
+    return r && { tool: r.tool, response: JSON.parse(r.response) };
+  }
+
+  saveMcpAnswer(keyId: string, requestId: string, tool: string, response: unknown) {
+    this.db.prepare("INSERT OR IGNORE INTO mcp_requests (key_id, request_id, tool, response, at) VALUES (?, ?, ?, ?, ?)").run(keyId, requestId, tool, JSON.stringify(response), this.stamp());
+  }
+
+  setDiagnosis(id: string, diagnosis: Diagnosis) {
+    this.db.prepare("UPDATE jobs SET diagnosis = ? WHERE id = ?").run(JSON.stringify(diagnosis), id);
+  }
+
+  runningDiagnoses(): { job: string; diagnosis: Diagnosis }[] {
+    return (this.db.prepare("SELECT id, diagnosis FROM jobs WHERE diagnosis LIKE '%\"state\":\"running\"%'").all() as Row[]).map((r) => ({ job: r.id, diagnosis: JSON.parse(r.diagnosis) }));
   }
 
   setObservation(id: string, observation: unknown) {

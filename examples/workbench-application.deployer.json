@@ -1,0 +1,16 @@
+{
+  "id": "deployer",
+  "kind": "application",
+  "name": "Deployer",
+  "url": "https://<workbench 的域名>/deploy/",
+  "chat": {
+    "agent": { "name": "Deploy Assistant" },
+    "embed": true,
+    "hostOperations": ["plan_deploy", "plan_rollback", "build_artifact", "set_env_value"],
+    "starters": [
+      { "title": "有什么要升级", "q": "这个环境里各应用有哪些新版本？哪些在 UAT 已经跑过？" },
+      { "title": "为什么失败", "q": "最近一次失败的部署是什么原因？" },
+      { "title": "环境变量差异", "q": "这个应用的环境变量和 UAT 有什么不同？" }
+    ]
+  }
+}

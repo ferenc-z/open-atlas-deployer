@@ -15,7 +15,8 @@ import { covering } from "../manifest/version.ts";
 import type { Principal } from "./auth.ts";
 import { DeployError, type Deployments } from "./deploy.ts";
 import { newJobId } from "./handoff.ts";
-import { deployPermission } from "./plan.ts";
+import { isKey } from "./keys.ts";
+import { deployPermission, isProd } from "./plan.ts";
 import { fingerprint, type SecretBox } from "./secretbox.ts";
 import type { Actor, EnvRevision, ExecutorStatus, Job, Store, StoredEnv } from "./store.ts";
 import { readToken } from "./versions.ts";
@@ -175,6 +176,7 @@ export class EnvManager {
 
   reveal(principal: Principal, appId: string, revision: number, key: string): string {
     this.need(principal, "admin");
+    if (isKey(principal)) throw new DeployError(403, "auth/browser-only", "查看密钥原值只认浏览器会话，API key 不行（§9.4）。");
     const r = this.store.envRevision(appId, revision);
     const v = r?.values[key];
     if (!v) throw new DeployError(404, "env/key", `第 ${revision} 版没有 ${key}。`);
@@ -251,6 +253,7 @@ export class EnvManager {
   }
 
   apply(principal: Principal, appId: string, revision: number): Job {
+    if (isKey(principal) && isProd(this.deployments.environment().env)) throw new DeployError(403, "auth/browser-only", "PROD 的写入只认浏览器会话，API key 不行（§9.4）。");
     const p = this.plan(principal, appId, revision);
     const blocking = p.findings.filter((f) => f.blocking);
     if (blocking.length) throw new DeployError(409, "env/blocked", "计划里有阻止写入的问题。", blocking.map((f) => f.message));
