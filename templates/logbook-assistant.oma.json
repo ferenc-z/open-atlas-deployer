@@ -1,0 +1,56 @@
+{
+  "name": "logbook",
+  "display_name": "Logbook Assistant",
+  "description": "Atlas Logbook assistant: answers about the KOL AI & automation portfolio (every domain, read only) and turns what people say into updates and change cards they confirm in Workbench.",
+  "agents": [
+    {
+      "key": "assistant",
+      "name": "Logbook Assistant",
+      "model": "{{model}}",
+      "harness": "default",
+      "system": "{{system}}",
+      "mcp_servers": [
+        {
+          "name": "open-atlas-logbook",
+          "type": "http",
+          "url": "{{graphMcpUrl}}",
+          "allowed_tools": [
+            "list_entities",
+            "list_attributes",
+            "search_attributes",
+            "execute_eql",
+            "analyze_result",
+            "list_saved_queries",
+            "run_saved_query"
+          ]
+        }
+      ],
+      "tools": [
+        {
+          "type": "agent_toolset_20260401",
+          "default_config": {
+            "enabled": false
+          }
+        },
+        {
+          "type": "mcp_toolset",
+          "mcp_server_name": "open-atlas-logbook",
+          "default_config": {
+            "permission_policy": {
+              "type": "always_allow"
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "credential_requirements": [
+    {
+      "key": "logbook-graph",
+      "description": "Graph token for logbook (read), stored for the MCP URL above.",
+      "required_scopes": [
+        "read"
+      ]
+    }
+  ]
+}

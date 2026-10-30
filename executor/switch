@@ -1,0 +1,10 @@
+#!/bin/sh
+# Points the executor at an installed release and restarts it (design §8.6): sudo executor/switch <version>
+set -eu
+base=/opt/open-atlas-deployer/executor
+version=${1:?usage: switch <version>   (installed: $(ls "$base/releases" | tr '\n' ' '))}
+[ -d "$base/releases/$version" ] || { echo "not installed: $version" >&2; exit 1; }
+ln -sfn "releases/$version" "$base/current.tmp" && mv -T "$base/current.tmp" "$base/current"
+rm -f "${EXECUTOR_WORK:-/var/lib/open-atlas-deployer-executor}/upgrade-pending"
+systemctl restart open-atlas-deployer-executor
+echo "executor now on $version"

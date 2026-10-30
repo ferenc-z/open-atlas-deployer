@@ -1,0 +1,23 @@
+[Unit]
+Description=Open Atlas Deployer host executor (design §8.2, D29)
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Root, like the in-app upgrader: backups and restores keep the data directories' owners (Studio 10001,
+# Workbench 1000) and SELinux labels, and membership of the docker group is root-equivalent anyway.
+# What keeps this safe is that requests name fixed actions only and fragments pass the policy check.
+User=root
+EnvironmentFile=/etc/open-atlas-deployer/executor.env
+ExecStart=/opt/open-atlas-deployer/executor/launch.sh
+Restart=always
+RestartSec=5
+UMask=0022
+NoNewPrivileges=yes
+ProtectSystem=full
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

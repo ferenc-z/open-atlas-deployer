@@ -1,0 +1,411 @@
+# Open Atlas Deployer
+
+独立的部署控制应用（设计见 owner 知识库 `designs/open-atlas-deployer.md`）。现在完成了：
+
+- 阶段 0：由部署清单生成服务器的 compose 文件；
+- 阶段 1：骨架，即 Workbench 会话认人、Groups 授权、紧急账号、应用注册表、只读状态页；
+- 阶段 2：宿主机执行器（[executor/](executor/)），以及 `compose-service` 驱动、构建、部署、自动回滚、回到旧版、审计（见下面"阶段 2"一节）；
+- 阶段 3：环境变量管理，包括加密保存、版本、校验、写入服务器、UAT / PROD 对比（见下面"阶段 3"一节）；
+- 阶段 4：制品库、晋级规则，以及 PROD 的 Deployer 用只读 key 查 UAT 的记录（见下面"阶段 4"一节）；
+- 阶段 5：其余驱动（`workbench-app`、`studio-graph`、`oma-agent`、`db-migration`、`manual`）、Release 附件（bundle）、契约核对，一个应用的全部组件一次部署（见下面"阶段 5"一节）。
+
+阶段 5 起，Workbench 应用包、Agent、数据库迁移、Graph、人工步骤都有驱动，Logbook 这样由几种组件组成的应用也能一次部署。
+
+## 阶段 1：骨架
+
+```sh
+npm install
+npm run build:web                       # 页面 → dist/web
+node bin/import-manifests.ts data ../open-atlas-docs/docs/proposals/deploy-manifests   # 导入四份初始清单
+cp examples/uat.environment.json data/environment.json
+DEPLOYER_WORKBENCH_URL=http://workbench:8090 npm start   # http://<host>:8095/deploy/
+npm test && npm run typecheck
+```
+
+Node 22.18 起直接运行 `.ts`（类型剥离），服务端不需要构建；状态库用 Node 自带的 `node:sqlite`（`data/deployer.db`）。
+
+### 设置
+
+| 变量 | 缺省 | 含义 |
+|---|---|---|
+| `DEPLOYER_WORKBENCH_URL` | 必填 | Deployer 访问 Workbench 的地址（compose 网络里如 `http://workbench:8090`） |
+| `DEPLOYER_WORKBENCH_PUBLIC_URL` | `/` | 未登录时页面上"前往 Workbench 登录"的链接 |
+| `DEPLOYER_BASE_PATH` | `/deploy` | 反向代理挂载的路径，与 Workbench 同域名（§9.1）；构建页面时也读它 |
+| `DEPLOYER_BIND` / `DEPLOYER_PORT` | `0.0.0.0` / `8095` | |
+| `DEPLOYER_DATA` | `./data` | 状态库目录 |
+| `DEPLOYER_ENVIRONMENT_FILE` | `<data>/environment.json` | 本环境的期望状态：名称、登记的镜像仓库、每个应用的版本（格式同 [examples/uat.environment.json](examples/uat.environment.json)）；每次请求重新读 |
+| `DEPLOYER_HOST_STATE_FILE` | 无 | 执行器每 30 秒写一次的容器列表（`<root>/deployer/state/containers.jsonl`，只读挂载）；没有时状态页只显示应用自报的版本 |
+| `DEPLOYER_HANDOFF_DIR` | 无 | 与执行器共享的交接目录（`<root>/deployer/handoff`，读写挂载）；不设就只能看、不能构建和部署 |
+| `DEPLOYER_GITHUB_TOKEN_FILE` | 无 | GitHub 只读令牌，用来列出私有仓库的 tag，供选择版本 |
+| `DEPLOYER_OBSERVE_URLS` | 无 | JSON，服务名 → 地址；只在 compose 网络之外开发时用 |
+| `DEPLOYER_EMERGENCY_PASSWORD_HASH` | 无 | 紧急账号，`node bin/hash-password.ts` 从标准输入读密码生成；不设就没有紧急账号 |
+| `DEPLOYER_SECURE_COOKIES` | `true` | 紧急会话 cookie 带 `Secure` |
+| `DEPLOYER_CREDENTIAL_ENCRYPTION_KEY` | 无 | 32 字节、base64（`openssl rand -base64 32`），加密 env 里的密钥；不设就不启用环境变量管理。丢了它，库里的密钥就解不开了，要和状态库分开备份 |
+| `DEPLOYER_COMPARE_KEY` | 无 | UAT 与 PROD 的 Deployer 设成同一个值，对比时密钥才能比出"相同 / 不同"；不设只能看出两边是否都设置了 |
+| `DEPLOYER_TEMPLATES_DIR` | `./templates` | Deployer 自己的 env 模板（清单 `env.template`） |
+| `DEPLOYER_PEER_KEY_SHA256` | 无 | UAT 设：PROD 的 Deployer 所持只读 key 的 SHA-256（可多个，空格分隔）；不设就没有 `/api/peer/*` |
+| `DEPLOYER_UAT_URL` / `DEPLOYER_UAT_KEY_FILE` | 无 | PROD 设：UAT 的 Deployer 地址（含 base path，如 `http://uat-host:8095/deploy`），以及存只读 key 的文件（600）。key 用 `node bin/peer-key.ts` 生成 |
+| `DEPLOYER_WORKBENCH_API_KEY_FILE` | 无 | Workbench Administration → API keys 里的一把 key（文件 600），`workbench-app`、`oma-agent` 用它装应用包、把 Business Agent 指向新 agent |
+| `DEPLOYER_STUDIO_BUILDER_URL` / `DEPLOYER_STUDIO_TOKEN_FILE` | 无 | Studio Builder MCP（如 `https://studio:9631/mcp`）和 workspace token（`oaw_v1.`，read + write），给 `studio-graph`。Studio 是自签证书时用 `NODE_EXTRA_CA_CERTS` 指向它的证书 |
+| `DEPLOYER_OMA_BUILDER_URL` / `DEPLOYER_OMA_BUILDER_KEY_FILE` | 无 | OMA Builder MCP 和它的 `BUILDER_MCP_API_KEY`，给 `oma-agent` |
+| `DEPLOYER_OMA_URL` / `DEPLOYER_OMA_API_KEY_FILE` | 无 | 可选：OMA 的 API 和 key，发布后归档更早的同名 agent；不设就不归档 |
+| `DEPLOYER_GITHUB_API` | `https://api.github.com` | 下载 Release 附件、读 `release.json` 的 GitHub API（测试时换成替身）；执行器对应 `EXECUTOR_GITHUB_API` |
+
+### 认人与授权（§9）
+
+- 每个请求都把浏览器带来的 Workbench cookie（只转发 `open_atlas_workbench_session` 与 `open_atlas_workbench_csrf`）发给 Workbench `GET /api/workbench/session`，用 W1 返回的 `groups` 授权。用户被停用、移出组，下一个请求就生效。
+- 权限：`deploy-viewer` / `deploy-uat` / `deploy-prod` 任一能看；`deploy-uat`、`deploy-prod` 分别能部署对应环境（阶段 2 起用到）；Workbench 管理员全部权限，并且能维护注册表、看审计。不在任何一个组里的人看到"没有权限"。
+- 修改类请求要带 `x-csrf-token`，值是 Workbench 会话的 `csrfToken`。
+- Workbench 没有响应（连不上或 5xx）时，沿用 15 分钟内确认过的结果，页面顶部提示；Workbench 明确回答 401 时立即失效（§9.3）。
+- 管理员在 Workbench 里以别人的身份操作（act-as）时，权限按被代入的人算，页面上标出。
+
+### 紧急账号（§9.3）
+
+- 只在 Workbench 连不上时可用：登录前和每个请求都检查 Workbench `/health`，结果缓存 15 秒；Workbench 一恢复，紧急会话就不再被接受。
+- 密码只以 scrypt 哈希放在宿主机 env 文件里。失败 5 次后锁 15 分钟。会话 1 小时，cookie `HttpOnly; SameSite=Strict`，令牌只存 SHA-256。
+- 登录、登录失败、退出、所有修改都记审计，页面顶部一直显示红色提示。
+
+### 应用注册表（§4.3、§4.4、D27）
+
+- 注册表里每个应用只记应用名、显示名、仓库（取自清单的 `release.repo`）和它的清单；服务名、env 文件都在清单里。
+- 第一份清单就是登记。之后的清单不能换仓库，要换得先移除再重新登记，所以注册表是白名单，不接受任意地址。
+- 保存清单前按格式 v1 校验（`schema/` 里是 open-atlas-docs 那份 schema 的副本）。另外检查依赖存在、没有环，以及服务名、宿主机端口不和其他已登记应用冲突。
+- 每次保存是新的一版；改 `appliesFrom` 就从新版本起另立一份，按 `appliesFrom` 覆盖到下一份为止。历史可查看，可导出为 `deploy.json`。
+- 移除只做标记，清单历史保留。页面上管理员粘贴 JSON 保存；逐项配置的表单以后再做。
+
+### 状态页：每个环境跑着什么
+
+Deployer 容器不挂 Docker socket（§8.2），所以状态有两个来源：
+
+1. **宿主机容器列表**：执行器每 30 秒用 `docker ps` 导出本 compose 项目的容器，写成 JSON 行（先写临时文件再改名），Deployer 以只读方式挂载读取。文件超过 5 分钟没更新，页面标为"已过期"。阶段 1 时这件事由一个 cron 脚本做，阶段 2 已由执行器接手。
+
+2. **应用自报的版本**：只问自己构建的镜像（`company-registry`）。在 compose 网络里依次访问 `http://<服务名>:<容器端口>/meta/contracts`，读到的是镜像里的 `BUILD.json`（版本、commit、provides），结果缓存 30 秒。公共镜像不问。
+
+按组件对照期望版本给出判断：
+
+| 判断 | 含义 |
+|---|---|
+| 正常 | 在运行，有健康检查的是 healthy；标签版本与自报版本都和期望一致，或都没有 |
+| 版本不符 | 标签 `org.open-atlas.version` 或自报版本与期望不同 |
+| 启动中 / 异常 | 健康检查还在 starting / 容器没在运行或 unhealthy |
+| 没有容器 | 清单里的服务在宿主机上找不到 |
+| 未知 | 没有宿主机状态，也没有自报版本可比 |
+
+应用的判断取其中最差的一个。宿主机上有、但没有任何清单提到的容器，列为"未纳入清单"。比如迁移前 Dossier 的旧服务 `proxy`，清单里已经改名为 `dossier-proxy`。非容器组件（Workbench 应用包、Agent 等）阶段 5 起才显示状态。
+
+### 本地验证（2026-10-30）
+
+- 26 个测试：注册表、格式校验、版本区间、认人与授权、CSRF、Workbench 宕机的宽限期、紧急账号、限流、状态判断。
+- 用假 Workbench 加一份模拟的容器列表在浏览器里走了一遍，覆盖：
+  - 未登录页；
+  - 管理员看状态（Dossier 的 gotenberg 退出 → 异常，`dossier-proxy` 没有容器，旧 `proxy` 未纳入清单，Workbench 自报 1.24.0 而期望 1.23.1 → 版本不符）；
+  - 注册表详情，新存一份从 0.8.0 起适用的清单；
+  - 停掉 Workbench 后出现宽限期提示，清掉会话后用紧急账号登录。
+
+## 阶段 2：执行器、构建与部署
+
+### 分工（§8.2，D29）
+
+- **Deployer**（容器，没有 Docker socket，没有镜像仓库凭据）：负责计划、权限、记录、页面。它生成一个应用的 compose 片段和根文件，写成请求交给执行器。
+- **执行器**（[executor/deployer_executor.py](executor/deployer_executor.py)，宿主机 systemd 服务，root，只用 Python 3.9 标准库）：只做固定的几种任务：构建、部署，以及阶段 3 加的写 env、读 env；请求里从来不带命令。
+
+两边只通过交接目录交换文件，协议版本 1：
+
+| 文件 | 谁写 | 内容 |
+|---|---|---|
+| `requests/<id>.json` | Deployer | 一个任务 |
+| `jobs/<id>/request.json` | 执行器 | 领取请求时搬到这里 |
+| `jobs/<id>/status.json` | 执行器 | 状态、步骤、结果（digest、commit、备份文件） |
+| `jobs/<id>/log.txt` | 执行器 | 每条命令和输出。`compose config` 的输出含 env 取值，不记录 |
+| `jobs/<id>/env.content` | 执行器 | 读 env 任务取出的文件，0600，属主改成 Deployer；10 分钟后删除 |
+| `executor.json` | 执行器 | 心跳：版本、支持的协议和任务种类、登记的仓库、哪些应用配了数据库备份、正在执行什么 |
+
+心跳超过 30 秒或协议不符，页面显示执行器离线，计划里不能部署。
+
+### 构建（§5.2）
+
+只对清单里 `company-registry` 且带 `build` 的组件。按 Studio、Workbench、Dossier 现在的发布方式：
+
+1. 干净 clone 应用的 tag。
+2. 读这个 tag 的 `tools.lock`，取 open-atlas-release 对应的 `release-tools-<版本>`。
+3. 运行它的 `build-images.sh <app> --source <checkout> --platform … --registry <登记的前缀> --push`。
+4. 核对 `BUILD.json`：版本等于 tag、commit 等于 HEAD、`dirty: false`。记下推送后的 digest。
+
+`build.script` 只接受 `build-images.sh`，镜像名必须是它产出的 `open-atlas-<app>`，仓库必须在执行器配置的 `EXECUTOR_REGISTRIES` 里。PROD 不构建（§6.1）。构建需要 `deploy-uat` 组。
+
+### 部署（§8.1、§8.3）
+
+页面上的流程是：选版本（列出 release 仓库里符合 tag 格式的 tag）→ 生成计划 → 确认 → 看进度和日志。
+
+**计划会拒绝的情况**：
+- 没有权限（UAT 要 `deploy-uat`，PROD 要 `deploy-prod`）；
+- 没有覆盖这个版本的清单；
+- 有阶段 5 才支持的组件（Workbench 应用包、Agent、迁移、Graph、bundle）；
+- 自建镜像还没构建成功；
+- 执行器离线；
+- 这个应用已经有任务在进行；
+- 服务名或端口冲突。
+
+**人工步骤**：阶段 5 起不再在部署前确认，而是部署到那一步时暂停，逐项勾选后继续（见"阶段 5"）。`when: install` 的只在第一次部署时出现。
+
+计划里还有每个服务"现在 → 部署后"的镜像，以及片段的逐行差异。
+
+**执行器部署时依次做**：
+
+1. **取发布文件**：清单 `volumes.file` 引用的文件从 release tag 取出，先放在旁边，不动现有的。
+2. **拉取镜像并固定 digest**：片段里的 `image` 改写成 `仓库:tag@sha256:…`。自建镜像再核对一次镜像里的 `BUILD.json`。
+3. **校验**：用新片段跑 `docker compose config`。以下任一情况都拒绝，而且什么都不改：
+   - env 文件缺失；
+   - 有 `${KEY}` 没设；
+   - 违反策略：`privileged`、`cap_add`、`devices`、宿主机网络或 pid 等命名空间、`unconfined`、`build`、挂载 Docker socket、在应用目录和 `EXECUTOR_BIND_ROOTS` 之外的 bind 挂载、不在登记仓库里的镜像或 `latest` 公共镜像；
+   - 宿主机端口被本应用之外的容器占用。比如 Dossier 迁移时旧的 `proxy` 占着 18100，要先手工停掉。
+4. **备份**：暂停容器，打包数据目录（不含 `logs/`），每个应用保留 3 份。宿主机配了 `EXECUTOR_DB_DUMP_<APP>` 的，再导出数据库，导出失败就不部署（Dossier 的库在清单之外，沿用旧升级器的做法）。
+5. **切换**：留下上一版的片段、根文件和 `files/`；第一次接管时，旧的手写根文件另存为 `compose.yaml.before-deployer`。缺失的数据目录按镜像的 `USER` 设属主。
+6. **启动并验证**：只 `up` 这个应用的服务，不加 `--remove-orphans`，所以别的应用和还没迁移的旧容器不受影响。等每个服务都 running，有健康检查的要 healthy；默认等 300 秒，重启超过 3 次直接判失败。
+7. **失败自动回滚**：先存下容器日志。
+   - 换回上一版的片段和文件，重新启动；
+   - 上一版也起不来，就把数据目录改名留着，从备份恢复（有 `EXECUTOR_DB_RESTORE_<APP>` 的也恢复数据库），再启动。
+
+   结果是"已回滚"或"失败，需要人处理"。如果这是第一次经 Deployer 部署就失败，新容器会被移除。
+8. **成功后**：移除这个应用里已经不在清单中的服务（按 `org.open-atlas.app` 标签）。Deployer 再问一次 `/meta/contracts`，把观察到的版本写进部署记录。
+
+### 期望状态、部署记录、回到旧版
+
+- 每个应用的版本取自最近一次**成功**的部署；还没经 Deployer 部署过的，用 `environment.json` 里的版本。回滚了的部署不改变版本。
+- 根文件只 include 已经由 Deployer 部署过的应用，加上这次部署的应用，所以迁移可以一个应用一个应用来。
+- 每个部署任务带一份按 OMA `deployment-receipt:1` 取字段的记录（§8.5）。`config_revision` 是部署时服务器上的 env 版本（如 `dossier.env#7`），Deployer 还没接管 env 文件时为 null。
+- "部署记录"里任何一次成功的部署都可以"回到这一版"：请求里带上那次的 digest，拉取的是原样的镜像。用的清单是这个区间**当前**的那一版。
+- 构建、部署的请求和结果都记审计。
+
+### 执行器安装（§8.6）
+
+```sh
+sudo ./executor/install.sh          # /opt/open-atlas-deployer/executor/releases/<版本>，current 软链接，systemd 服务
+sudoedit /etc/open-atlas-deployer/executor.env   # 见 executor/executor.env.example
+sudo docker login ghcr.io           # 推送与拉取凭据只在宿主机 root 下
+sudo systemctl restart open-atlas-deployer-executor
+python3 /opt/open-atlas-deployer/executor/current/deployer_executor.py check
+```
+
+[executor/launch.sh](executor/launch.sh) 负责启动计数：有 `upgrade-pending` 标记时连续 3 次自检不过，就退回旧版本。[executor/switch](executor/switch) 用来手工切换版本。执行器随 Deployer 一起自升级的任务还没做：Deployer 还没有发布包，等它本身登记为应用（D16）时一起做。
+
+### 测试与验证（2026-10-30）
+
+- `npm test`：31 个测试。阶段 2 新增：计划的拒绝项、构建与部署请求的内容、部署记录、回滚后的期望版本、按 digest 回到旧版、PROD 不构建。
+- `python3 -m unittest executor/test_deployer_executor.py`：12 个测试。覆盖镜像来源规则、策略、端口占用、Compose 5 的缺变量警告格式、请求校验、心跳、中断任务的恢复。
+- **WSL 端到端**（Docker 29.9.2，Compose 5.6.1，本地镜像仓库）：用 busybox 做了一个三个版本的测试应用，真实跑了以下几种情况：
+  - 缺 env 文件 → 拒绝；
+  - 缺变量 → 拒绝；
+  - 部署 1.0.0 → 成功，镜像按 digest 固定，env 生效，数据目录可写；
+  - 启动即崩的 1.1.0 → 40 秒内自动回滚，页面仍是 v1；
+  - 部署 1.2.0 → 成功；
+  - 按 digest 回到 1.0.0 → 成功；
+  - 端口被外部容器占用 → 拒绝；
+  - `compose` 附加字段加了 `privileged` 和挂载 `/etc` → 被策略拒绝。
+
+  每次部署前都做了数据备份，所有拒绝都没有改动运行中的应用。页面上走通了生成计划、看片段差异、确认部署、看进度和日志、部署记录。
+
+  端到端过程中修了两个问题：交接目录不存在时执行器自检会失败；Compose 5 的缺变量警告格式没被认出来，导致缺变量没被拒绝。
+- **没有端到端验证的**：
+  - **真实构建**：需要 GitHub 令牌和 GHCR 推送权限，只做了单元测试里的拒绝项；
+  - **"上一版也起不来 → 从备份恢复数据和数据库"这一支**；
+  - **以 root 运行时数据目录的属主设置**：本地以普通用户运行，跳过了 chown。
+
+## 阶段 3：环境变量（§7.2）
+
+每个应用一个 env 文件（清单的 `env.file`，在部署根目录下），Deployer 是它唯一的维护者。页面上"环境变量"一页。
+
+### 接管：先从服务器导入
+
+第一次先点"从服务器导入"：执行器读出服务器上现有的文件，Deployer 存成第 1 版，并记为"服务器上的版本"。没导入之前不能写入，免得盲目覆盖。服务器上没有这个文件也算导入，记为空的一版。
+
+### 保存：每次修改是一个版本
+
+- 保存不会动服务器，只是多一个版本，记下谁、何时、改了哪些键。密钥只记"已修改"，审计里也一样。
+- 清单 `env.secrets` 列出的键，加上名字像密钥的键（以 `PASSWORD`、`SECRET`、`TOKEN`、`_KEY` 等结尾），都用 AES-256-GCM 加密保存。页面上遮盖显示，只有 Workbench 管理员能点"查看原值"，每次查看都记审计。
+- 编辑时页面拿不到密钥原值：留空表示不修改，提交为 `keep`。
+- 保存时带上基于哪一版。别人先保存了，就返回 409，请刷新后再改。
+- "回到这一版"：用旧版本的值另存为新版本，再走写入。
+
+### 校验
+
+- 对照应用 release tag 里的 `.env.example`（清单 `env.schema`，经 GitHub contents API 读取），或 Deployer 自己的模板（`env.template`）：不带 `#` 的 `KEY=` 是应设置的键，带 `#` 的 `#KEY=` 是已知的可选键。
+- 列出：缺少的键、多出来的键、可能改了名的键（编辑距离近，或末尾两段相同）。这些只提示，不阻止。
+- compose 片段里用到的 `${KEY}`（不带默认值的）没设置，会**阻止**写入，也会阻止部署。
+
+### 写入：先看计划
+
+- 计划列出改了哪些键、会重启哪些服务：`envFile: true` 的服务，加上 `environment` 里引用了改动键的服务。
+- 执行器：先把旧文件另存为 `<app>/.deployer/env.previous`，再以 0600 原子写入新文件。然后用 `compose config` 校验，缺变量就换回旧文件并拒绝。接着 `compose up -d`，只有配置变了的容器会重建；最后等健康检查。起不来就换回旧文件再起一次，任务状态记为"已回滚"。
+- 还没经 Deployer 部署过的应用：只写文件，不重启。
+- env 内容只在请求文件里出现（0600）。执行器领取后立刻从 `request.json` 里删掉，只留 sha256；Deployer 的任务记录里也只有哈希；日志不记录取值。
+- 部署计划会检查服务器上的 env：片段要用的 `${KEY}` 缺了就阻止部署；有还没写入的修改会提示。
+
+### UAT 与 PROD 对比
+
+"与另一环境对比"会给出本环境的指纹：非密钥给值，密钥给 HMAC（用 `DEPLOYER_COMPARE_KEY` 计算）。把它复制到另一个环境的 Deployer 页面里粘贴，就能逐键看相同还是不同。两个 Deployer 之间自动获取等阶段 4（§6.3）。
+
+### 接口
+
+`GET /api/apps/:id/env`（`?revision=`）、`PUT /api/apps/:id/env`、`POST …/env/revert`、`…/env/reveal`（仅管理员）、`…/env/plan`、`…/env/apply`、`…/env/import`、`GET …/env/fingerprint`。看需要 view，改、导入、写入需要本环境的部署权限。
+
+### 测试与验证（2026-10-30）
+
+- `npm test`：43 个测试。阶段 3 新增 env 文件的读写（包括引号、转义、多行）、`.env.example` 解析、校验与改名提示、受影响的服务、加密与防篡改；HTTP 流程覆盖导入、遮盖与查看原值、版本与冲突、回到旧版、计划与写入、部署前检查、部署记录的 `config_revision`、指纹。
+- `python3 -m unittest executor/test_deployer_executor.py`：16 个测试。新增哈希校验、领取后抹掉内容、只写不重启、读 env 并到期删除。
+- **WSL 端到端**（同阶段 2 的环境，加一个 `GREETING=crash` 就起不来的版本）：
+  - 手写的 env 部署（提示未接管）→ 导入；
+  - 改成带空格、`$`、单引号、`#` 的值 → 写入；容器里拿到的值和输入完全一致，文件权限 0600，请求、日志、状态库里都找不到密钥原文；
+  - 去掉片段要用的键 → 计划阻止；
+  - `GREETING=crash` → 服务起不来，自动换回旧文件，状态"已回滚"；
+  - 回到第 2 版 → 写入；只改密钥 → 历史里记"已修改"；
+  - 再部署 → 记录里 `config_revision` 为 `hello.env#6`；指纹、查看原值、审计都正常。
+
+  端到端时修了一个问题：值没变时，计划仍然列出要重启的服务。
+
+## 阶段 4：制品与晋级（§6）
+
+### 制品（§6.1）
+
+页面上"制品"一页：每个镜像按 `应用 + 服务 + digest` 记一条，记下来源（本环境构建、按 tag 拉取、取自 UAT 的 digest、按 digest 回到旧版）、`BUILD.json`、首次出现的任务，以及本环境每次用到它的部署和结果。构建成功、部署结束（成功、失败、回滚都算，只要拉到了 digest）时自动记录。
+
+### 晋级规则（§6.2）
+
+环境名是 `prod` 时，每个部署计划先判断能不能晋级，按顺序：
+
+1. **回到本环境部署成功过的那一版**（`pinFrom`）：那些 digest 当时已经满足规则。
+2. **UAT 部署成功过**：向 UAT 的 Deployer 查这个版本最近一次成功的部署，**按它的 digest 部署**，所以 PROD 跑的就是 UAT 验证过的镜像，PROD 不构建。要观察期的应用，在 PROD 的 `environment.json` 里给它设 `uatSoakHours`；运行时间算到 UAT 用下一次成功部署替换它为止。
+3. **已正式发布**：自己的镜像要求 release tag 有 GitHub Release，而且不是草稿或预发布；只用公共镜像的，要求都钉了版本号（不能是 `latest`）。这时按 tag 拉取。
+4. 都不满足：`deploy/not-promoted` 阻止部署，原因写明（UAT 没跑过、运行时间不够、连不上 UAT、没有 Release）。**Workbench 管理员**可以填写原因跳过：计划上标"管理员跳过"，审计记 `deploy.promotion-override`（原因和没满足的条件）。
+
+晋级依据写进部署请求，任务详情和制品页上都能看到。
+
+### 两个 Deployer 之间（§6.3）
+
+- UAT 开放只读的 `/api/peer/*`，只认只读 key（`Authorization: Bearer dpr_…`），Workbench 会话不行：
+  - `status`：每个应用最近一次成功部署的版本和 digest；
+  - `apps/:id/deployments?version=`：成功部署的记录（何时部署、何时被替换、env 版本）；
+  - `apps/:id/env/fingerprint`：env 指纹。
+- PROD：状态页多一列"UAT 现在"，版本不同时标"可晋级"；连不上 UAT 时页面顶部提示，只有已发布的版本或管理员跳过才能部署。环境变量对比自动取 UAT 的指纹，不用再复制粘贴（取不到时仍可粘贴）。
+- PROD 对 UAT 的请求缓存 30 秒，超时 5 秒。
+
+### 测试与验证（2026-10-30）
+
+- `npm test`：49 个测试。阶段 4 新增：制品记录与部署去向、peer API 只认只读 key、PROD 按 UAT 的 digest 部署、不满足规则时拒绝、Release 放行、管理员跳过要有原因并记审计、连不上 UAT 的提示、观察期、经 peer API 对比 env。测试里 UAT 和 PROD 是两个真实的应用实例，PROD 的请求直接打到 UAT 实例上。
+- **WSL 端到端**：同一台 Docker 上起 UAT、PROD 两个 Deployer，各自一个执行器、一个 compose 项目，共用本地镜像仓库：
+  - UAT 部署 1.3.0 → PROD 计划按 UAT 的记录晋级 → 部署后两边容器的镜像 digest 完全相同；
+  - PROD 部署 UAT 没跑过的 1.2.0 → 被拒绝；管理员填写原因后部署成功，审计里有原因；
+  - 回到 PROD 的 1.3.0 部署 → 依据为"本环境部署成功过"；
+  - 制品页显示两个 digest 的来源和晋级依据；状态页显示 UAT 版本；env 指纹经 peer API 取到；
+  - 停掉 UAT 的 Deployer → PROD 计划写明"无法确认 UAT 记录"，状态页顶部提示。
+
+### 还没做
+
+- **契约核对（§6.4）**：用制品的 provides / requires 对照其他应用的实际版本。阶段表里没有排它；Logbook 这类有 requires 的应用要到阶段 5 才能由 Deployer 部署，建议在阶段 5 一起做。
+- **接入评估登记的外部仓库第一次上 PROD 必须先过 UAT**（§6.2 例外）：要等阶段 7 有了接入评估才有这类仓库。
+- **真实 GitHub Release 查询**：只在测试里用了假的回答；端到端里的测试仓库不存在，所以总是"没有 Release"。
+
+## 阶段 5：一个应用的全部组件一次部署（§4.2）
+
+### 部署按 `dependsOn` 的顺序走
+
+计划列出每个组件一步：谁来做（执行器 / Deployer / 人）、现在 → 部署后、对用户的影响。执行时：
+
+1. **执行器的部分先做**（`compose-service`、`db-migration`，一个执行器任务）：和阶段 2 一样拉取、校验、备份、切换；有迁移时先只启动数据库，执行迁移，再启动其余服务，等健康检查。失败照旧自动回滚。
+2. **然后 Deployer 依次调用各服务**：`studio-graph` → Studio Builder MCP，`workbench-app` → Workbench Administration API，`oma-agent` → OMA Builder MCP + Workbench。每一步 apply 之后核对一次。
+3. **`manual` 处暂停**：页面上逐项勾选（记下谁、何时，记审计），全部勾选后继续；也可以在这一步停止部署。`when: install` 的只在第一次部署时出现。
+
+某个 Deployer 步骤失败时，按相反顺序撤回它之前的 Deployer 步骤（Workbench 切回上一版、Business Agent 指回原来的 agent）；做不到撤回的（Studio 图已经发布）写明"未撤回"。容器已经通过健康检查，保持新版本，任务记为失败，需要时在部署记录里回到上一版。宿主机的组件不能依赖 Deployer 或人工的组件（计划拒绝 `deploy/order`）。没有容器的应用不需要执行器。
+
+### Release 附件（bundle，§5.1）
+
+清单有 `bundle` 时，Deployer 下载 Release 附件（存在数据目录 `bundles/` 下，只下载一次），按包里的 `SHA256SUMS` 核对（`SHA256SUMS` 列出自己的那一行跳过），整个包的 sha256 就是它的 digest：记进部署记录（`artifact_digest.bundle`）和制品页，PROD 晋级时要与 UAT 那次部署的一致（`deploy/bundle-changed`）。执行器要挂载的文件和迁移脚本也从这个包里取：执行器自己下载，核对与计划时的 sha256 相同，只解出普通文件（链接、`..` 一律拒绝）。
+
+### 各驱动
+
+| 驱动 | 做什么 | 这个环境要配的 |
+|---|---|---|
+| `workbench-app` | bundle 就是业务包：核对 `app/app.json` 的版本，上传安装（slot 按名字绑定），写 `settings`（`${KEY}` 取自 env 文件）；撤回 = `switch-version` | `DEPLOYER_WORKBENCH_API_KEY_FILE` |
+| `studio-graph` | 取图的草稿 → 上传 Deployer 保存的 EDN（清单字段 `contract`，`templates/` 下）→ 存 `savedQueries` → `publish_graph apply:true`。EDN 里自己的 workspace id、graph id（`:ownership` 里也有）全部换成目标图的 | `settings.<组件>.graph`（Studio 里的图名）；图和它的 Source 每个环境先由人建好 |
+| `oma-agent` | 用 Deployer 保存的 Agent 包定义（清单字段 `package`，`templates/` 下的 JSON，`{{system}}` 是 bundle 里的提示词，其余 `{{…}}` 取这个环境的 settings）发布新修订，把绑定在应用 slot 上的 Business Agent 指向新 agent；包 id 和 agent id 记在 Deployer 里 | `settings.<组件>`：`model`、图的 MCP 地址等 |
+| `db-migration` | 执行器在数据库容器里用 psql 执行：`install` 只在空库执行一次，`migrations` 按文件名顺序执行还没执行过的；每个脚本和它在 `deployer.migrations` 的记录在同一个事务里 | 无 |
+| `manual` | 人逐项勾选 | 无 |
+
+这个环境的组件设置写在 `environment.json` 的 `apps.<应用>.settings.<组件 id>` 里（例子见 [examples/uat.environment.json](examples/uat.environment.json)）。Logbook 用的模板：[templates/logbook.graph.edn](templates/logbook.graph.edn)（由 Logbook 的 `graph/gen_graph.py` 生成，id 已换成占位）、[templates/logbook-assistant.oma.json](templates/logbook-assistant.oma.json)（来自 Logbook 的 `agents/publish-oma.py`）；带这两个字段的 Logbook 清单在 [examples/logbook.manifest.json](examples/logbook.manifest.json)。清单格式新增的两个可选字段（`studio-graph.contract`、`oma-agent.package`）已加进 [schema/](schema/deploy-manifest-v1.schema.json)。
+
+### 契约核对（§6.4）
+
+计划时读这个版本 tag 上的 `release.json` / `package.json`，与这个环境里其他应用的版本（最近一次部署的，或 `environment.json` 里的）各自的 `provides` / `requires` 对照，两个方向都查：这个版本要求的有人提供，别的应用要求的这个版本仍然满足。不满足时拒绝（`deploy/contract`），写明哪两个应用、哪条契约；读不到、或没有登记提供者时只提示。支持 `^1.3`、`~1.3`、`>=1.2`、`1.5`、`1`、`*`。
+
+### 测试与验证（2026-10-30）
+
+- `npm test`：59 个（新增：解包与 SHA256SUMS、契约范围与双向核对、执行顺序、占位符；Logbook 形状的应用对着假的 GitHub / Workbench / Studio / OMA：计划的各步、执行器请求、Deployer 各步、人工步骤、制品、失败撤回、缺配置的提示）。执行器 20 个（新增：从 bundle 取文件、拒绝链接、迁移只执行一次且带记录、拒绝越界的迁移）。
+- **WSL 端到端：Logbook 0.7.8 一次部署**。发布包用 Logbook 仓库的文件按 Release 包的布局打成（另加一条测试迁移），PostgreSQL 和 PostgREST 是真的容器，GitHub、Workbench、Studio、OMA 是替身：
+  - 计划 7 步：db、迁移、api（执行器）→ 图、应用包、助手（Deployer）→ 首次安装（人）；
+  - PostgreSQL 按 Logbook 的 `pkg/db` 初始化（35 张表），迁移执行并记录，PostgREST 起来；Studio 收到换好 id 的 EDN 和 15 条 saved queries 并发布；Workbench 装上 0.7.8，slot 绑定到 "Logbook Assistant"；OMA 发布新 agent，Business Agent 指向它；停在首次安装，勾选两项后成功，部署记录带 bundle 的 digest；
+  - 再部署一次：迁移不再执行，OMA 新修订，Business Agent 指向新 agent；
+  - OMA 发布失败：Workbench 切回、Business Agent 不变，Studio 写明未撤回；
+  - Workbench 版本太旧（提供 `workbench-app 1.2`）：计划拒绝，写明 `logbook 0.7.8 要求 workbench-app ^1.3`。
+  - 端到端发现并修了：`SHA256SUMS` 列出自己时核对失败；Studio 没撤回却显示"已撤回"。另外发现 Windows 检出的 Logbook 文件是 CRLF，`10-roles.sh` 在 bash 下出错：Release 包必须用 LF 的文件打（端到端里先转换）。
+
+### 还没做
+
+- 真实的 Workbench、Studio、OMA 都只用替身验证过；Logbook 的 GitHub Release 附件（`logbook-0.7.8.tar.gz`）是否存在、布局是否和这里一致，要在真实环境确认。
+- 首次安装里人做的部分照旧是人做：建 Studio 图和 Source、令牌、Business Agent、插件条目、数据导入。
+- Studio 图的撤回（发布回旧版本）。
+- 新版本时由 AI 在沙箱里重新生成 EDN（阶段 6 / 7）。
+
+## 由清单生成 compose（§7.3，D11）
+
+```sh
+node bin/gen-compose.ts <清单目录> <环境设置.json> <输出目录>
+npm test
+```
+
+- 清单：格式草案在 open-atlas-docs 的 `docs/proposals/deploy-manifest-v1.md`，四份初始清单在同目录 `deploy-manifests/`。
+- 环境设置：[examples/uat.environment.json](examples/uat.environment.json)。包括项目名、端口绑定地址、登记的镜像仓库，以及每个应用部署的版本和本环境的覆盖值（宿主机端口、数据目录）。
+- 生成结果：[examples/uat/](examples/uat/)。
+
+### 服务器目录
+
+```
+/webapp/data/open-atlas/
+├─ compose.yaml              # 只有 include，每个应用一项，带 env_file
+├─ studio.env, workbench.env, dossier.env, logbook.env
+├─ studio/
+│  ├─ compose.yaml           # 生成的片段
+│  ├─ data/                  # 数据目录（清单 volumes.path，相对应用目录）
+│  └─ files/                 # 当前版本的发布文件（清单 volumes.file，只读挂载）
+└─ …
+```
+
+### 生成规则
+
+| 项 | 规则 |
+|---|---|
+| 镜像 | 公共镜像照清单写；公司镜像 = 登记的仓库前缀 / 镜像名 : 部署的版本 |
+| 重启、日志 | 一律 `restart: unless-stopped`，日志 `local` 驱动，50 MB × 3 |
+| 标签 | `org.open-atlas.app` / `component` / `version`，Deployer 读实际状态时用 |
+| 端口 | 只发布清单里有宿主机端口的，绑定到环境的 `bindIp`；环境可按容器端口覆盖 |
+| 数据目录 | `./<path>`，相对应用目录；环境可按容器路径覆盖成绝对路径 |
+| 发布文件 | `./files/<file>`，只读 |
+| env | 根文件 `include` 的 `env_file` 提供片段里 `${KEY}` 的取值；`envFile: true` 的服务另把整份文件传给容器 |
+| 依赖 | 同一应用里的 `compose-service` 依赖：对方有健康检查等 `service_healthy`，没有等 `service_started` |
+| 健康检查 | `image` 用镜像自带的；命令形式生成 `healthcheck`（10s 间隔、5s 超时、30 次） |
+| 附加字段 | 清单的 `compose` 深合并进生成的服务 |
+| 冲突 | 服务名、宿主机端口在所有应用之间唯一，冲突时拒绝生成 |
+
+### 校验结果（2026-10-30，WSL Ubuntu 26.04，Docker 29.9.2，Compose 5.6.1）
+
+用 `examples/uat/` 加占位 env 文件跑 `docker compose config`：
+
+- 通过：10 个服务、10 个镜像全部解析。
+- 每个片段的相对路径解析到自己的应用目录（如 `logbook/data/pg`、`dossier/files/deploy/Caddyfile`），端口都绑定在 `127.0.0.1`。
+- `${KEY}` 只从本应用的 env 文件取值：从 `logbook.env` 删掉 `JWT_SECRET`、放进 `dossier.env`，Logbook 拿到的是空值，不会串用 Dossier 的。
+- 缺 env 文件时直接报错；**缺某个变量只警告并取空字符串**。所以部署前 Deployer 要自己检查片段引用的每个 `${KEY}` 都在 env 文件里，缺了就拒绝（§7.2 的 env 校验做这件事）。
+
+### 还没做
+
+- **跨应用的启动顺序**：比如 Workbench 依赖 Studio 的数据面，compose 表达不了。阶段 2 每次只部署一个应用，顺序由人决定；多个应用一起部署时由计划排序。
+
+（数据目录属主已在阶段 2 由执行器处理：新建的目录按镜像的 `USER` 设属主。）

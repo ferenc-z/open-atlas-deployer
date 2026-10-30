@@ -1,0 +1,32 @@
+{
+  "name": "uat",
+  "project": "open-atlas",
+  "bindIp": "127.0.0.1",
+  "registries": {
+    "ghcr": "ghcr.io/gaojie197710-tech",
+    "harbor": "harbor.example.com/open-atlas"
+  },
+  "apps": {
+    "studio": {
+      "version": "2.8.0"
+    },
+    "workbench": {
+      "version": "1.23.1"
+    },
+    "dossier": {
+      "version": "2.17.0"
+    },
+    "logbook": {
+      "version": "0.7.8",
+      "settings": {
+        "graph": {
+          "graph": "<workspace>/logbook"
+        },
+        "assistant": {
+          "model": "<OMA Model Card 的模型名>",
+          "graphMcpUrl": "https://host.docker.internal:9632/mcp/<graph-id>"
+        }
+      }
+    }
+  }
+}

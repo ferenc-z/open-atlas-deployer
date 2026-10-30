@@ -1,0 +1,122 @@
+{
+  "v": 1,
+  "app": "logbook",
+  "appliesFrom": "0.7.8",
+  "release": {
+    "repo": "gaojie197710-tech/open-atlas-logbook",
+    "tag": "v{version}",
+    "manifest": "package.json"
+  },
+  "bundle": {
+    "kind": "release-asset",
+    "repo": "gaojie197710-tech/open-atlas-logbook",
+    "asset": "logbook-{version}.tar.gz"
+  },
+  "components": [
+    {
+      "id": "db",
+      "type": "compose-service",
+      "service": "logbook-db",
+      "source": {
+        "kind": "public-registry",
+        "image": "postgres:16.4"
+      },
+      "volumes": [
+        {
+          "target": "/var/lib/postgresql/data",
+          "path": "data/pg"
+        },
+        {
+          "target": "/docker-entrypoint-initdb.d",
+          "file": "pkg/db"
+        }
+      ],
+      "environment": {
+        "POSTGRES_PASSWORD": "${PG_SUPERUSER_PASSWORD}",
+        "POSTGRES_DB": "logbook",
+        "AUTHENTICATOR_PASSWORD": "${AUTHENTICATOR_PASSWORD}",
+        "LOGBOOK_ADMIN_EMAIL": "${LOGBOOK_ADMIN_EMAIL}",
+        "LOGBOOK_ADMIN_NAME": "${LOGBOOK_ADMIN_NAME}"
+      },
+      "health": [
+        "CMD-SHELL",
+        "pg_isready -U postgres -d logbook"
+      ]
+    },
+    {
+      "id": "api",
+      "type": "compose-service",
+      "service": "logbook-api",
+      "dependsOn": [
+        "db"
+      ],
+      "source": {
+        "kind": "public-registry",
+        "image": "postgrest/postgrest:v12.2.3"
+      },
+      "ports": [
+        {
+          "container": 3000,
+          "host": 3030
+        }
+      ],
+      "environment": {
+        "PGRST_DB_URI": "postgres://authenticator:${AUTHENTICATOR_PASSWORD}@logbook-db:5432/logbook",
+        "PGRST_DB_SCHEMAS": "api",
+        "PGRST_JWT_SECRET": "${JWT_SECRET}",
+        "PGRST_OPENAPI_SERVER_PROXY_URI": "http://127.0.0.1:3030",
+        "PGRST_LOG_LEVEL": "info"
+      },
+      "health": "none"
+    },
+    {
+      "id": "graph",
+      "type": "studio-graph",
+      "dir": "graph",
+      "savedQueries": "graph/saved-queries.json",
+      "dependsOn": [
+        "api"
+      ],
+      "contract": "logbook.graph.edn"
+    },
+    {
+      "id": "ui",
+      "type": "workbench-app",
+      "dependsOn": [
+        "api"
+      ]
+    },
+    {
+      "id": "assistant",
+      "type": "oma-agent",
+      "file": "agents/logbook-assistant.md",
+      "bind": "logbook",
+      "dependsOn": [
+        "ui",
+        "graph"
+      ],
+      "package": "logbook-assistant.oma.json"
+    },
+    {
+      "id": "first-install",
+      "type": "manual",
+      "dependsOn": [
+        "assistant"
+      ],
+      "when": "install",
+      "steps": [
+        "Import the data export (data/import-data.sh), as in INSTALL-0.7.7.md.",
+        "Grant Logbook to the Relay users with workbench/grant-relay-users.py, then check the Groups in Workbench."
+      ]
+    }
+  ],
+  "env": {
+    "file": "logbook.env",
+    "schema": ".env.example",
+    "secrets": [
+      "PG_SUPERUSER_PASSWORD",
+      "AUTHENTICATOR_PASSWORD",
+      "JWT_SECRET"
+    ]
+  }
+}

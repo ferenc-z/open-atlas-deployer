@@ -1,0 +1,2619 @@
+{:contract {:contract/family "atlas-semantic"
+   :contract/version "2.0.0"}
+ :workspace {:workspace/id "replaced-at-deploy-workspace"}
+ :graph {:graph/id "replaced-at-deploy-graph"
+   :graph/label "Atlas Logbook"
+   :graph/exposure :restricted
+   :graph/entities ["open-atlas.caller" "logbook.me" "logbook.domain" "logbook.product" "logbook.update" "logbook.question" "logbook.card" "logbook.overview" "logbook.product_page" "logbook.member" "logbook.roster" "logbook.fix" "logbook.brief" "logbook.share" "logbook.ask" "logbook.mail_plan" "logbook.mail_log" "logbook.weekly" "logbook.command"]
+   :graph/resolvers ["my_scope" "my_domains" "domains_all" "my_products" "products_all" "my_timeline" "timeline_all" "my_questions" "questions_all" "my_cards" "cards_all" "my_overview" "overview_all" "my_product" "product_all" "my_weekly_list" "weekly_list_all" "my_mail_plan" "my_report_mails" "my_brief" "brief_all" "my_share_links" "my_open_asks" "my_members" "my_rosters" "my_fixes"]
+   :graph/operations ["logbook.command/post_update" "logbook.command/undo_update" "logbook.command/propose" "logbook.command/confirm_card" "logbook.command/ask_question" "logbook.command/answer_question" "logbook.command/draft_weekly" "logbook.command/freeze_weekly" "logbook.command/log_mail" "logbook.command/admin_member" "logbook.command/save_brief" "logbook.command/create_share" "logbook.command/open_share" "logbook.command/admin_fix" "logbook.command/import_roster"]
+   :graph/terms []
+   :graph/dependencies []
+   :graph/usage-guide {:guide/purpose "The BSIC Kolkata AI and automation portfolio: products by domain, stages, HC (fact = released, target = confirmed, forecast = potential), the IT and business status lights, owners, timeline updates, questions Q1 …, cards (proposed changes) and weekly reports."
+     :guide/limitations ["Every read is limited to the caller's domains (row security); someone not registered sees nothing." "Never mix the three HC kinds: released is fact, confirmed is target, potential is forecast and must be labelled so." "Writes go through logbook.command operations, run by the Workbench page as the signed-in person after they confirm a card."]}}
+ :vocabulary {:entities {"open-atlas.caller" {:entity/label "Caller"
+       :entity/description "The signed-in person the platform vouches for. Never supplied by a request."
+       :entity/identity [:open-atlas.caller/email]
+       :entity/attributes [:open-atlas.caller/email]}
+     "logbook.me" {:entity/label "Me"
+       :entity/description "Who the caller is, their roles and the domains they can see."
+       :entity/identity [:logbook.me/email]
+       :entity/attributes [:logbook.me/email :logbook.me/display_name :logbook.me/roles :logbook.me/all_domains :logbook.me/domains :logbook.me/language]}
+     "logbook.domain" {:entity/label "Domain"
+       :entity/description "A business domain (Sales, Vendor Solution, Procurement) and its HC target."
+       :entity/identity [:logbook.domain/code]
+       :entity/attributes [:logbook.domain/code :logbook.domain/name :logbook.domain/name_zh :logbook.domain/sort :logbook.domain/target_hc :logbook.domain/target_due :logbook.domain/mine :logbook.domain/all]
+       :entity/kind :reference}
+     "logbook.product" {:entity/label "Product"
+       :entity/description "An AI / automation product in the KOL portfolio, with stage, HC (fact / target / forecast), the two sides' status and owners."
+       :entity/identity [:logbook.product/code]
+       :entity/attributes [:logbook.product/code :logbook.product/name :logbook.product/domain :logbook.product/stage :logbook.product/priority :logbook.product/risk :logbook.product/type :logbook.product/baseline_hc :logbook.product/potential_hc :logbook.product/confirmed_hc :logbook.product/released_hc :logbook.product/it_rag :logbook.product/it_headline :logbook.product/business_rag :logbook.product/business_headline :logbook.product/it_owners :logbook.product/business_owners :logbook.product/last_update_at :logbook.product/close_outcome :logbook.product/merged_into :logbook.product/mine :logbook.product/all]
+       :entity/kind :master}
+     "logbook.update" {:entity/label "Timeline update"
+       :entity/description "One progress update on a product, from the IT side, the business side or the assistant."
+       :entity/identity [:logbook.update/id]
+       :entity/attributes [:logbook.update/id :logbook.update/side :logbook.update/body :logbook.update/source :logbook.update/via_assistant :logbook.update/created_at :logbook.update/created_by :logbook.update/undone_at :logbook.update/of_product :logbook.update/all]
+       :entity/kind :event}
+     "logbook.question" {:entity/label "Question"
+       :entity/description "A question between IT and the business, numbered Q1 … across the portfolio."
+       :entity/identity [:logbook.question/code]
+       :entity/attributes [:logbook.question/code :logbook.question/product :logbook.question/domain :logbook.question/body :logbook.question/asked_by :logbook.question/assignee_email :logbook.question/assignee_name :logbook.question/status :logbook.question/answer :logbook.question/answered_by :logbook.question/answered_at :logbook.question/created_at :logbook.question/mine :logbook.question/all]
+       :entity/kind :transaction}
+     "logbook.card" {:entity/label "Card"
+       :entity/description "A proposed change waiting for (or past) confirmation."
+       :entity/identity [:logbook.card/id]
+       :entity/attributes [:logbook.card/id :logbook.card/kind :logbook.card/product :logbook.card/domain :logbook.card/payload :logbook.card/preview :logbook.card/proposed_by :logbook.card/proposed_via :logbook.card/needs :logbook.card/status :logbook.card/confirmed_sides :logbook.card/my_sides :logbook.card/created_at :logbook.card/applied_at :logbook.card/mine :logbook.card/all]
+       :entity/kind :transaction}
+     "logbook.overview" {:entity/label "Overview"
+       :entity/description "The portfolio at a glance for the caller's domains (or one domain): HC funnel, stage mix, what to decide, recent updates."
+       :entity/identity [:logbook.overview/scope_domain]
+       :entity/attributes [:logbook.overview/scope_domain :logbook.overview/kol_total :logbook.overview/kol_as_of :logbook.overview/covered_hc :logbook.overview/confirmed_hc :logbook.overview/released_hc :logbook.overview/target_hc :logbook.overview/target_due :logbook.overview/products_active :logbook.overview/products_closed :logbook.overview/stages :logbook.overview/mismatch_count :logbook.overview/stale_count :logbook.overview/no_it_owner_count :logbook.overview/open_questions :logbook.overview/open_risks :logbook.overview/pending_cards :logbook.overview/to_decide :logbook.overview/recent_updates :logbook.overview/mine :logbook.overview/all]
+       :entity/kind :event}
+     "logbook.product_page" {:entity/label "Product page"
+       :entity/description "Everything about one product: the four sections, both status lights, HC (fact / target / forecast), owners, phases, milestones, issues, questions, latest references."
+       :entity/identity [:logbook.product_page/code]
+       :entity/attributes [:logbook.product_page/code :logbook.product_page/name :logbook.product_page/domain :logbook.product_page/stage :logbook.product_page/priority :logbook.product_page/risk :logbook.product_page/type :logbook.product_page/volume_text :logbook.product_page/baseline_hc :logbook.product_page/potential_hc :logbook.product_page/confirmed_hc :logbook.product_page/released_hc :logbook.product_page/unit_minutes :logbook.product_page/it_estimated_cost :logbook.product_page/problem :logbook.product_page/approach :logbook.product_page/solution :logbook.product_page/progress_text :logbook.product_page/it_rag :logbook.product_page/it_headline :logbook.product_page/it_as_of :logbook.product_page/business_rag :logbook.product_page/business_headline :logbook.product_page/business_as_of :logbook.product_page/owners :logbook.product_page/phases :logbook.product_page/milestones :logbook.product_page/issues :logbook.product_page/questions :logbook.product_page/refs :logbook.product_page/closed :logbook.product_page/last_update_at :logbook.product_page/of_code :logbook.product_page/all]
+       :entity/kind :master}
+     "logbook.member" {:entity/label "Member"
+       :entity/description "A registered Logbook member with roles and domains (admin only)."
+       :entity/identity [:logbook.member/email]
+       :entity/attributes [:logbook.member/email :logbook.member/display_name :logbook.member/roles :logbook.member/domains :logbook.member/language :logbook.member/active :logbook.member/owns :logbook.member/created_by :logbook.member/updated_at :logbook.member/mine]
+       :entity/kind :master}
+     "logbook.roster" {:entity/label "Roster snapshot"
+       :entity/description "One imported roster (admin only)."
+       :entity/identity [:logbook.roster/id]
+       :entity/attributes [:logbook.roster/id :logbook.roster/taken_on :logbook.roster/source_file :logbook.roster/row_count :logbook.roster/created_at :logbook.roster/created_by :logbook.roster/mine]
+       :entity/kind :event}
+     "logbook.fix" {:entity/label "Admin change"
+       :entity/description "An admin correction, member change or roster import, with before / after (admin only)."
+       :entity/identity [:logbook.fix/request_id]
+       :entity/attributes [:logbook.fix/request_id :logbook.fix/actor_email :logbook.fix/result :logbook.fix/created_at :logbook.fix/mine]
+       :entity/kind :event}
+     "logbook.brief" {:entity/label "Brief"
+       :entity/description "The newest AI brief of the week for a scope and language; every sentence cites a product and update."
+       :entity/identity [:logbook.brief/id]
+       :entity/attributes [:logbook.brief/id :logbook.brief/domain :logbook.brief/language :logbook.brief/body :logbook.brief/created_at :logbook.brief/created_by :logbook.brief/mine :logbook.brief/all]
+       :entity/kind :event}
+     "logbook.share" {:entity/label "Share link"
+       :entity/description "A live read-only share link (coordinators only)."
+       :entity/identity [:logbook.share/id]
+       :entity/attributes [:logbook.share/id :logbook.share/token :logbook.share/domain :logbook.share/note :logbook.share/expires_at :logbook.share/created_at :logbook.share/created_by :logbook.share/mine]}
+     "logbook.ask" {:entity/label "Question asked of me"
+       :entity/description "An open question waiting for the caller's answer."
+       :entity/identity [:logbook.ask/code]
+       :entity/attributes [:logbook.ask/code :logbook.ask/product :logbook.ask/product_name :logbook.ask/body :logbook.ask/asked_by :logbook.ask/created_at :logbook.ask/mine]
+       :entity/kind :transaction}
+     "logbook.mail_plan" {:entity/label "Mail recipient"
+       :entity/description "A registered member and the weekly-report version they receive (admin only)."
+       :entity/identity [:logbook.mail_plan/email]
+       :entity/attributes [:logbook.mail_plan/email :logbook.mail_plan/display_name :logbook.mail_plan/language :logbook.mail_plan/version :logbook.mail_plan/mine]}
+     "logbook.mail_log" {:entity/label "Mail batch"
+       :entity/description "One batch of weekly-report mail (at most 20 recipients) and its result (admin only)."
+       :entity/identity [:logbook.mail_log/id]
+       :entity/attributes [:logbook.mail_log/id :logbook.mail_log/report_id :logbook.mail_log/domain :logbook.mail_log/language :logbook.mail_log/recipients :logbook.mail_log/state :logbook.mail_log/message_id :logbook.mail_log/created_at :logbook.mail_log/created_by :logbook.mail_log/of_week]
+       :entity/kind :event}
+     "logbook.weekly" {:entity/label "Weekly report"
+       :entity/description "A weekly report per week, domain and language; frozen reports never change."
+       :entity/identity [:logbook.weekly/id]
+       :entity/attributes [:logbook.weekly/id :logbook.weekly/week_of :logbook.weekly/week :logbook.weekly/domain :logbook.weekly/language :logbook.weekly/status :logbook.weekly/frozen_at :logbook.weekly/frozen_by :logbook.weekly/body_json :logbook.weekly/updated_at :logbook.weekly/mine :logbook.weekly/all]
+       :entity/kind :event}
+     "logbook.command" {:entity/label "Logbook command"
+       :entity/description "A write sent to the Logbook API."
+       :entity/identity [:logbook.command/request_id]
+       :entity/attributes [:logbook.command/request_id :logbook.command/payload :logbook.command/result]}}
+   :attributes {:open-atlas.caller/email {:attribute/label "Vouched caller email"
+       :attribute/type :string
+       :attribute/nullable? false}
+     :logbook.me/email {:attribute/label "Email"
+       :attribute/type :string
+       :attribute/nullable? false}
+     :logbook.me/display_name {:attribute/label "Name"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.me/roles {:attribute/label "Roles"
+       :attribute/type :json
+       :attribute/nullable? true
+       :attribute/description "Any of admin, it_coordinator, business_coordinator, it_pm, business_owner, viewer."}
+     :logbook.me/all_domains {:attribute/label "Sees every domain"
+       :attribute/type :boolean
+       :attribute/nullable? true}
+     :logbook.me/domains {:attribute/label "Domains"
+       :attribute/type :json
+       :attribute/nullable? true
+       :attribute/description "Domain codes the caller can see."}
+     :logbook.me/language {:attribute/label "Language"
+       :attribute/type :string
+       :attribute/nullable? true
+       :attribute/description "zh or en."}
+     :logbook.domain/code {:attribute/label "Domain code"
+       :attribute/type :string
+       :attribute/nullable? false
+       :attribute/description "sales, vendor_solution, procurement …"}
+     :logbook.domain/name {:attribute/label "Domain"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.domain/name_zh {:attribute/label "Domain (Chinese)"
+       :attribute/type :string
+       :attribute/nullable? true
+       :attribute/description "Empty when the English name is used in both languages."}
+     :logbook.domain/sort {:attribute/label "Sort"
+       :attribute/type :integer
+       :attribute/nullable? true}
+     :logbook.domain/target_hc {:attribute/label "Target HC"
+       :attribute/type :decimal
+       :attribute/nullable? true
+       :attribute/description "TARGET: HC the domain has committed to release."}
+     :logbook.domain/target_due {:attribute/label "Target due"
+       :attribute/type :date
+       :attribute/nullable? true}
+     :logbook.product/code {:attribute/label "Product code"
+       :attribute/type :string
+       :attribute/nullable? false
+       :attribute/description "Short code, e.g. po, q2c, pmq."}
+     :logbook.product/name {:attribute/label "Product"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.product/domain {:attribute/label "Domain code"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.product/stage {:attribute/label "Stage"
+       :attribute/type :string
+       :attribute/nullable? true
+       :attribute/description "idea, assessment, build, pilot, live or closed."}
+     :logbook.product/priority {:attribute/label "Priority"
+       :attribute/type :string
+       :attribute/nullable? true
+       :attribute/description "p1, p2, p3."}
+     :logbook.product/risk {:attribute/label "Risk"
+       :attribute/type :string
+       :attribute/nullable? true
+       :attribute/description "high, medium, low."}
+     :logbook.product/type {:attribute/label "Type"
+       :attribute/type :string
+       :attribute/nullable? true
+       :attribute/description "RPA, AI, Document AI, Hybrid …"}
+     :logbook.product/baseline_hc {:attribute/label "Baseline HC"
+       :attribute/type :decimal
+       :attribute/nullable? true
+       :attribute/description "TARGET basis: HC in scope of the product."}
+     :logbook.product/potential_hc {:attribute/label "Potential HC"
+       :attribute/type :decimal
+       :attribute/nullable? true
+       :attribute/description "FORECAST: HC the product could release (estimate)."}
+     :logbook.product/confirmed_hc {:attribute/label "Confirmed HC"
+       :attribute/type :decimal
+       :attribute/nullable? true
+       :attribute/description "TARGET: HC the business confirmed can be automated (latest)."}
+     :logbook.product/released_hc {:attribute/label "Released HC"
+       :attribute/type :decimal
+       :attribute/nullable? true
+       :attribute/description "FACT: HC already released, cumulative (latest)."}
+     :logbook.product/it_rag {:attribute/label "Delivery status"
+       :attribute/type :string
+       :attribute/nullable? true
+       :attribute/description "IT side light. g green, y amber, r red, n not set."}
+     :logbook.product/it_headline {:attribute/label "Delivery headline"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.product/business_rag {:attribute/label "Business status"
+       :attribute/type :string
+       :attribute/nullable? true
+       :attribute/description "Business side light. g green, y amber, r red, n not set."}
+     :logbook.product/business_headline {:attribute/label "Business headline"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.product/it_owners {:attribute/label "IT owners"
+       :attribute/type :json
+       :attribute/nullable? true
+       :attribute/description "Names, lead first."}
+     :logbook.product/business_owners {:attribute/label "Business owners"
+       :attribute/type :json
+       :attribute/nullable? true
+       :attribute/description "Names, lead first."}
+     :logbook.product/last_update_at {:attribute/label "Last update"
+       :attribute/type :datetime
+       :attribute/nullable? true
+       :attribute/description "Newest timeline update not undone."}
+     :logbook.product/close_outcome {:attribute/label "Close outcome"
+       :attribute/type :string
+       :attribute/nullable? true
+       :attribute/description "delivered, merged or cancelled; empty while open."}
+     :logbook.product/merged_into {:attribute/label "Merged into"
+       :attribute/type :string
+       :attribute/nullable? true
+       :attribute/description "Product code."}
+     :logbook.update/id {:attribute/label "Update ID"
+       :attribute/type :string
+       :attribute/nullable? false}
+     :logbook.update/side {:attribute/label "Side"
+       :attribute/type :string
+       :attribute/nullable? true
+       :attribute/description "it, business or ai."}
+     :logbook.update/body {:attribute/label "Update"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.update/source {:attribute/label "Source"
+       :attribute/type :string
+       :attribute/nullable? true
+       :attribute/description "chat, notes, manual or migrated."}
+     :logbook.update/via_assistant {:attribute/label "Via assistant"
+       :attribute/type :boolean
+       :attribute/nullable? true}
+     :logbook.update/created_at {:attribute/label "When"
+       :attribute/type :datetime
+       :attribute/nullable? true}
+     :logbook.update/created_by {:attribute/label "By"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.update/undone_at {:attribute/label "Undone"
+       :attribute/type :datetime
+       :attribute/nullable? true
+       :attribute/description "Set when undone; ignore undone updates."}
+     :logbook.question/code {:attribute/label "Question"
+       :attribute/type :string
+       :attribute/nullable? false
+       :attribute/description "Q1, Q2 … (global numbering)."}
+     :logbook.question/product {:attribute/label "Product code"
+       :attribute/type :string
+       :attribute/nullable? true
+       :attribute/description "Empty = whole portfolio."}
+     :logbook.question/domain {:attribute/label "Domain code"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.question/body {:attribute/label "Question text"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.question/asked_by {:attribute/label "Asked by"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.question/assignee_email {:attribute/label "Asked of (email)"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.question/assignee_name {:attribute/label "Asked of"
+       :attribute/type :string
+       :attribute/nullable? true
+       :attribute/description "Name, when the email is not known."}
+     :logbook.question/status {:attribute/label "Status"
+       :attribute/type :string
+       :attribute/nullable? true
+       :attribute/description "open, answered or closed."}
+     :logbook.question/answer {:attribute/label "Answer"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.question/answered_by {:attribute/label "Answered by"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.question/answered_at {:attribute/label "Answered"
+       :attribute/type :datetime
+       :attribute/nullable? true}
+     :logbook.question/created_at {:attribute/label "Asked"
+       :attribute/type :datetime
+       :attribute/nullable? true}
+     :logbook.card/id {:attribute/label "Card ID"
+       :attribute/type :string
+       :attribute/nullable? false}
+     :logbook.card/kind {:attribute/label "Kind"
+       :attribute/type :string
+       :attribute/nullable? true
+       :attribute/description "set_status_it, set_status_business, set_stage, set_phase, set_owner, set_unit_minutes, hc_confirmed, hc_release, close_product, reopen_product, add_product, import_roster."}
+     :logbook.card/product {:attribute/label "Product code"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.card/domain {:attribute/label "Domain code"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.card/payload {:attribute/label "Changes"
+       :attribute/type :json
+       :attribute/nullable? true}
+     :logbook.card/preview {:attribute/label "Preview"
+       :attribute/type :json
+       :attribute/nullable? true
+       :attribute/description "before → after; current = the value in the database when proposed."}
+     :logbook.card/proposed_by {:attribute/label "Proposed by"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.card/proposed_via {:attribute/label "Via"
+       :attribute/type :string
+       :attribute/nullable? true
+       :attribute/description "assistant or page."}
+     :logbook.card/needs {:attribute/label "Needs"
+       :attribute/type :string
+       :attribute/nullable? true
+       :attribute/description "admin, both_sides (one IT + one business), side_it or side_business."}
+     :logbook.card/status {:attribute/label "Status"
+       :attribute/type :string
+       :attribute/nullable? true
+       :attribute/description "pending, applied, rejected or withdrawn."}
+     :logbook.card/confirmed_sides {:attribute/label "Confirmed sides"
+       :attribute/type :json
+       :attribute/nullable? true}
+     :logbook.card/my_sides {:attribute/label "Caller's sides"
+       :attribute/type :json
+       :attribute/nullable? true
+       :attribute/description "Sides the caller can confirm for: admin, it, business."}
+     :logbook.card/created_at {:attribute/label "Proposed"
+       :attribute/type :datetime
+       :attribute/nullable? true}
+     :logbook.card/applied_at {:attribute/label "Applied"
+       :attribute/type :datetime
+       :attribute/nullable? true}
+     :logbook.overview/scope_domain {:attribute/label "Scope"
+       :attribute/type :string
+       :attribute/nullable? false
+       :attribute/description "all, or the domain code asked for."}
+     :logbook.overview/kol_total {:attribute/label "KOL headcount"
+       :attribute/type :integer
+       :attribute/nullable? true
+       :attribute/description "FACT: rows of the latest roster snapshot."}
+     :logbook.overview/kol_as_of {:attribute/label "Roster date"
+       :attribute/type :date
+       :attribute/nullable? true}
+     :logbook.overview/covered_hc {:attribute/label "Covered HC"
+       :attribute/type :decimal
+       :attribute/nullable? true
+       :attribute/description "Baseline HC of open and delivered products (merged / cancelled left out): the scope products cover."}
+     :logbook.overview/confirmed_hc {:attribute/label "Confirmed HC"
+       :attribute/type :decimal
+       :attribute/nullable? true
+       :attribute/description "TARGET: HC the business confirmed can be automated."}
+     :logbook.overview/released_hc {:attribute/label "Released HC"
+       :attribute/type :decimal
+       :attribute/nullable? true
+       :attribute/description "FACT: HC already released."}
+     :logbook.overview/target_hc {:attribute/label "Domain target HC"
+       :attribute/type :decimal
+       :attribute/nullable? true
+       :attribute/description "TARGET committed for the domain(s)."}
+     :logbook.overview/target_due {:attribute/label "Target due"
+       :attribute/type :date
+       :attribute/nullable? true}
+     :logbook.overview/products_active {:attribute/label "Active products"
+       :attribute/type :integer
+       :attribute/nullable? true}
+     :logbook.overview/products_closed {:attribute/label "Closed products"
+       :attribute/type :integer
+       :attribute/nullable? true}
+     :logbook.overview/stages {:attribute/label "Stage mix"
+       :attribute/type :json
+       :attribute/nullable? true
+       :attribute/description "{stage: count} of active products."}
+     :logbook.overview/mismatch_count {:attribute/label "Status mismatches"
+       :attribute/type :integer
+       :attribute/nullable? true
+       :attribute/description "Active products whose IT and business lights differ."}
+     :logbook.overview/stale_count {:attribute/label "Stale products"
+       :attribute/type :integer
+       :attribute/nullable? true
+       :attribute/description "Active products with no update for 14 days."}
+     :logbook.overview/no_it_owner_count {:attribute/label "Without IT owner"
+       :attribute/type :integer
+       :attribute/nullable? true}
+     :logbook.overview/open_questions {:attribute/label "Open questions"
+       :attribute/type :integer
+       :attribute/nullable? true}
+     :logbook.overview/open_risks {:attribute/label "Open issues"
+       :attribute/type :integer
+       :attribute/nullable? true}
+     :logbook.overview/pending_cards {:attribute/label "Pending cards"
+       :attribute/type :integer
+       :attribute/nullable? true}
+     :logbook.overview/to_decide {:attribute/label "To decide"
+       :attribute/type :json
+       :attribute/nullable? true
+       :attribute/description "Mismatches, open decisions / risks and two-sided cards: [{kind, product, name, text}]."}
+     :logbook.overview/recent_updates {:attribute/label "Recent updates"
+       :attribute/type :json
+       :attribute/nullable? true
+       :attribute/description "Newest 10 updates: [{product, name, side, body, at, by}]."}
+     :logbook.product_page/code {:attribute/label "Product code"
+       :attribute/type :string
+       :attribute/nullable? false}
+     :logbook.product_page/name {:attribute/label "Product"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.product_page/domain {:attribute/label "Domain code"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.product_page/stage {:attribute/label "Stage"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.product_page/priority {:attribute/label "Priority"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.product_page/risk {:attribute/label "Risk"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.product_page/type {:attribute/label "Type"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.product_page/volume_text {:attribute/label "Volume"
+       :attribute/type :string
+       :attribute/nullable? true
+       :attribute/description "As the business reports it."}
+     :logbook.product_page/baseline_hc {:attribute/label "Baseline HC"
+       :attribute/type :decimal
+       :attribute/nullable? true
+       :attribute/description "TARGET basis."}
+     :logbook.product_page/potential_hc {:attribute/label "Potential HC"
+       :attribute/type :decimal
+       :attribute/nullable? true
+       :attribute/description "FORECAST."}
+     :logbook.product_page/confirmed_hc {:attribute/label "Confirmed HC"
+       :attribute/type :decimal
+       :attribute/nullable? true
+       :attribute/description "TARGET."}
+     :logbook.product_page/released_hc {:attribute/label "Released HC"
+       :attribute/type :decimal
+       :attribute/nullable? true
+       :attribute/description "FACT, cumulative."}
+     :logbook.product_page/unit_minutes {:attribute/label "Minutes per item"
+       :attribute/type :decimal
+       :attribute/nullable? true
+       :attribute/description "Confirmed by the IT PM."}
+     :logbook.product_page/it_estimated_cost {:attribute/label "IT estimated cost"
+       :attribute/type :decimal
+       :attribute/nullable? true}
+     :logbook.product_page/problem {:attribute/label "Problem"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.product_page/approach {:attribute/label "Approach"
+       :attribute/type :string
+       :attribute/nullable? true
+       :attribute/description "IT's thinking / decision."}
+     :logbook.product_page/solution {:attribute/label "Solution"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.product_page/progress_text {:attribute/label "Progress"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.product_page/it_rag {:attribute/label "Delivery status"
+       :attribute/type :string
+       :attribute/nullable? true
+       :attribute/description "g green, y amber, r red, n not set."}
+     :logbook.product_page/it_headline {:attribute/label "Delivery headline"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.product_page/it_as_of {:attribute/label "Delivery status as of"
+       :attribute/type :datetime
+       :attribute/nullable? true}
+     :logbook.product_page/business_rag {:attribute/label "Business status"
+       :attribute/type :string
+       :attribute/nullable? true
+       :attribute/description "g green, y amber, r red, n not set."}
+     :logbook.product_page/business_headline {:attribute/label "Business headline"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.product_page/business_as_of {:attribute/label "Business status as of"
+       :attribute/type :datetime
+       :attribute/nullable? true}
+     :logbook.product_page/owners {:attribute/label "Owners"
+       :attribute/type :json
+       :attribute/nullable? true
+       :attribute/description "[{name, email, side it|business, lead}]; an owner without email cannot confirm yet."}
+     :logbook.product_page/phases {:attribute/label "Phase targets"
+       :attribute/type :json
+       :attribute/nullable? true
+       :attribute/description "[{seq, name, target_hc, budget, spent, eta, status}]."}
+     :logbook.product_page/milestones {:attribute/label "Milestones"
+       :attribute/type :json
+       :attribute/nullable? true
+       :attribute/description "[{date, label, kind target (business) | suggested (ours)}]."}
+     :logbook.product_page/issues {:attribute/label "Issues"
+       :attribute/type :json
+       :attribute/nullable? true
+       :attribute/description "[{kind risk|issue|decision, body, severity, status}]."}
+     :logbook.product_page/questions {:attribute/label "Questions"
+       :attribute/type :json
+       :attribute/nullable? true
+       :attribute/description "[{code, body, status, asked_of, answer, answered_at}]."}
+     :logbook.product_page/refs {:attribute/label "References"
+       :attribute/type :json
+       :attribute/nullable? true
+       :attribute/description "Latest 5: [{title, kind, url, by, at, tags}]."}
+     :logbook.product_page/closed {:attribute/label "Close"
+       :attribute/type :json
+       :attribute/nullable? true
+       :attribute/description "{outcome, merged_into, closed_on, summary}; empty while open."}
+     :logbook.product_page/last_update_at {:attribute/label "Last update"
+       :attribute/type :datetime
+       :attribute/nullable? true}
+     :logbook.member/email {:attribute/label "Email"
+       :attribute/type :string
+       :attribute/nullable? false}
+     :logbook.member/display_name {:attribute/label "Name"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.member/roles {:attribute/label "Roles"
+       :attribute/type :json
+       :attribute/nullable? true}
+     :logbook.member/domains {:attribute/label "Domains"
+       :attribute/type :json
+       :attribute/nullable? true}
+     :logbook.member/language {:attribute/label "Language"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.member/active {:attribute/label "Active"
+       :attribute/type :boolean
+       :attribute/nullable? true}
+     :logbook.member/owns {:attribute/label "Owner of"
+       :attribute/type :json
+       :attribute/nullable? true
+       :attribute/description "product:side, e.g. po:it."}
+     :logbook.member/created_by {:attribute/label "Added by"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.member/updated_at {:attribute/label "Last changed"
+       :attribute/type :datetime
+       :attribute/nullable? true}
+     :logbook.roster/id {:attribute/label "Snapshot ID"
+       :attribute/type :string
+       :attribute/nullable? false}
+     :logbook.roster/taken_on {:attribute/label "Taken on"
+       :attribute/type :date
+       :attribute/nullable? true}
+     :logbook.roster/source_file {:attribute/label "File"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.roster/row_count {:attribute/label "Rows"
+       :attribute/type :integer
+       :attribute/nullable? true}
+     :logbook.roster/created_at {:attribute/label "Imported"
+       :attribute/type :datetime
+       :attribute/nullable? true}
+     :logbook.roster/created_by {:attribute/label "Imported by"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.fix/request_id {:attribute/label "Request"
+       :attribute/type :string
+       :attribute/nullable? false}
+     :logbook.fix/actor_email {:attribute/label "By"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.fix/result {:attribute/label "Change"
+       :attribute/type :json
+       :attribute/nullable? true
+       :attribute/description "before / after / reason."}
+     :logbook.fix/created_at {:attribute/label "When"
+       :attribute/type :datetime
+       :attribute/nullable? true}
+     :logbook.brief/id {:attribute/label "Brief ID"
+       :attribute/type :string
+       :attribute/nullable? false}
+     :logbook.brief/domain {:attribute/label "Domain code"
+       :attribute/type :string
+       :attribute/nullable? true
+       :attribute/description "Empty = every domain."}
+     :logbook.brief/language {:attribute/label "Language"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.brief/body {:attribute/label "Brief"
+       :attribute/type :json
+       :attribute/nullable? true
+       :attribute/description "{sentences: [{text, product, at}]}: each sentence with the product and update date it comes from."}
+     :logbook.brief/created_at {:attribute/label "Written"
+       :attribute/type :datetime
+       :attribute/nullable? true}
+     :logbook.brief/created_by {:attribute/label "Saved by"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.share/id {:attribute/label "Link ID"
+       :attribute/type :string
+       :attribute/nullable? false}
+     :logbook.share/token {:attribute/label "Token"
+       :attribute/type :string
+       :attribute/nullable? true
+       :attribute/description "Goes in the link: /apps/logbook/?share=<token>."}
+     :logbook.share/domain {:attribute/label "Domain code"
+       :attribute/type :string
+       :attribute/nullable? true
+       :attribute/description "Empty = every domain."}
+     :logbook.share/note {:attribute/label "Note"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.share/expires_at {:attribute/label "Expires"
+       :attribute/type :datetime
+       :attribute/nullable? true}
+     :logbook.share/created_at {:attribute/label "Made"
+       :attribute/type :datetime
+       :attribute/nullable? true}
+     :logbook.share/created_by {:attribute/label "Made by"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.ask/code {:attribute/label "Question"
+       :attribute/type :string
+       :attribute/nullable? false}
+     :logbook.ask/product {:attribute/label "Product code"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.ask/product_name {:attribute/label "Product"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.ask/body {:attribute/label "Question text"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.ask/asked_by {:attribute/label "Asked by"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.ask/created_at {:attribute/label "Asked"
+       :attribute/type :datetime
+       :attribute/nullable? true}
+     :logbook.mail_plan/email {:attribute/label "Email"
+       :attribute/type :string
+       :attribute/nullable? false}
+     :logbook.mail_plan/display_name {:attribute/label "Name"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.mail_plan/language {:attribute/label "Language"
+       :attribute/type :string
+       :attribute/nullable? true
+       :attribute/description "zh or en."}
+     :logbook.mail_plan/version {:attribute/label "Version"
+       :attribute/type :string
+       :attribute/nullable? true
+       :attribute/description "all, or the domain code of the version this member receives."}
+     :logbook.mail_log/id {:attribute/label "Batch ID"
+       :attribute/type :string
+       :attribute/nullable? false}
+     :logbook.mail_log/report_id {:attribute/label "Report ID"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.mail_log/domain {:attribute/label "Domain code"
+       :attribute/type :string
+       :attribute/nullable? true
+       :attribute/description "Empty = all-domain version."}
+     :logbook.mail_log/language {:attribute/label "Language"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.mail_log/recipients {:attribute/label "Recipients"
+       :attribute/type :json
+       :attribute/nullable? true}
+     :logbook.mail_log/state {:attribute/label "State"
+       :attribute/type :string
+       :attribute/nullable? true
+       :attribute/description "queued, sent or failed."}
+     :logbook.mail_log/message_id {:attribute/label "Message ID"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.mail_log/created_at {:attribute/label "Sent"
+       :attribute/type :datetime
+       :attribute/nullable? true}
+     :logbook.mail_log/created_by {:attribute/label "Sent by"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.weekly/id {:attribute/label "Report ID"
+       :attribute/type :string
+       :attribute/nullable? false}
+     :logbook.weekly/week_of {:attribute/label "Week of"
+       :attribute/type :date
+       :attribute/nullable? true
+       :attribute/description "Monday of the week."}
+     :logbook.weekly/week {:attribute/label "Week"
+       :attribute/type :string
+       :attribute/nullable? true
+       :attribute/description "ISO week, e.g. 2026-W43."}
+     :logbook.weekly/domain {:attribute/label "Domain code"
+       :attribute/type :string
+       :attribute/nullable? true
+       :attribute/description "Empty = every domain."}
+     :logbook.weekly/language {:attribute/label "Language"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.weekly/status {:attribute/label "Status"
+       :attribute/type :string
+       :attribute/nullable? true
+       :attribute/description "draft or frozen."}
+     :logbook.weekly/frozen_at {:attribute/label "Frozen"
+       :attribute/type :datetime
+       :attribute/nullable? true}
+     :logbook.weekly/frozen_by {:attribute/label "Frozen by"
+       :attribute/type :string
+       :attribute/nullable? true}
+     :logbook.weekly/body_json {:attribute/label "Report"
+       :attribute/type :json
+       :attribute/nullable? true
+       :attribute/description "The report: headline, summary, changes, decisions, open questions, risks, per-domain sections, and the HC snapshot (hc) taken when drafted."}
+     :logbook.weekly/updated_at {:attribute/label "Last saved"
+       :attribute/type :datetime
+       :attribute/nullable? true}
+     :logbook.domain/mine {:attribute/label "My domains"
+       :attribute/type :ref
+       :attribute/nullable? true
+       :attribute/target "logbook.domain"
+       :attribute/cardinality :many}
+     :logbook.product/mine {:attribute/label "My products"
+       :attribute/type :ref
+       :attribute/nullable? true
+       :attribute/target "logbook.product"
+       :attribute/cardinality :many}
+     :logbook.update/of_product {:attribute/label "One product's timeline"
+       :attribute/type :ref
+       :attribute/nullable? true
+       :attribute/target "logbook.update"
+       :attribute/cardinality :many}
+     :logbook.question/mine {:attribute/label "My questions"
+       :attribute/type :ref
+       :attribute/nullable? true
+       :attribute/target "logbook.question"
+       :attribute/cardinality :many}
+     :logbook.card/mine {:attribute/label "My cards"
+       :attribute/type :ref
+       :attribute/nullable? true
+       :attribute/target "logbook.card"
+       :attribute/cardinality :many}
+     :logbook.weekly/mine {:attribute/label "Weekly reports"
+       :attribute/type :ref
+       :attribute/nullable? true
+       :attribute/target "logbook.weekly"
+       :attribute/cardinality :many}
+     :logbook.overview/mine {:attribute/label "My overview"
+       :attribute/type :ref
+       :attribute/nullable? true
+       :attribute/target "logbook.overview"
+       :attribute/cardinality :many}
+     :logbook.product_page/of_code {:attribute/label "One product's page"
+       :attribute/type :ref
+       :attribute/nullable? true
+       :attribute/target "logbook.product_page"
+       :attribute/cardinality :many}
+     :logbook.mail_plan/mine {:attribute/label "Weekly mail plan"
+       :attribute/type :ref
+       :attribute/nullable? true
+       :attribute/target "logbook.mail_plan"
+       :attribute/cardinality :many}
+     :logbook.mail_log/of_week {:attribute/label "Mail batches of a week"
+       :attribute/type :ref
+       :attribute/nullable? true
+       :attribute/target "logbook.mail_log"
+       :attribute/cardinality :many}
+     :logbook.brief/mine {:attribute/label "Latest brief"
+       :attribute/type :ref
+       :attribute/nullable? true
+       :attribute/target "logbook.brief"
+       :attribute/cardinality :many}
+     :logbook.share/mine {:attribute/label "Share links"
+       :attribute/type :ref
+       :attribute/nullable? true
+       :attribute/target "logbook.share"
+       :attribute/cardinality :many}
+     :logbook.ask/mine {:attribute/label "Asked of me"
+       :attribute/type :ref
+       :attribute/nullable? true
+       :attribute/target "logbook.ask"
+       :attribute/cardinality :many}
+     :logbook.member/mine {:attribute/label "Members"
+       :attribute/type :ref
+       :attribute/nullable? true
+       :attribute/target "logbook.member"
+       :attribute/cardinality :many}
+     :logbook.roster/mine {:attribute/label "Roster snapshots"
+       :attribute/type :ref
+       :attribute/nullable? true
+       :attribute/target "logbook.roster"
+       :attribute/cardinality :many}
+     :logbook.fix/mine {:attribute/label "Admin changes"
+       :attribute/type :ref
+       :attribute/nullable? true
+       :attribute/target "logbook.fix"
+       :attribute/cardinality :many}
+     :logbook.command/request_id {:attribute/label "Request ID"
+       :attribute/type :string
+       :attribute/nullable? false
+       :attribute/description "logbook-<ts>-<rand>, fresh per intended write. Resending it returns the first answer."}
+     :logbook.command/payload {:attribute/label "Payload"
+       :attribute/type :json
+       :attribute/nullable? false}
+     :logbook.command/result {:attribute/label "Result"
+       :attribute/type :json
+       :attribute/nullable? true
+       :attribute/description "What the API answered."}
+     :logbook.domain/all {:attribute/label "All · My domains"
+       :attribute/type :ref
+       :attribute/nullable? true
+       :attribute/description "Every domain, for the Logbook Assistant (read only). The app uses the caller-scoped list."
+       :attribute/target "logbook.domain"
+       :attribute/cardinality :many}
+     :logbook.product/all {:attribute/label "All · My products"
+       :attribute/type :ref
+       :attribute/nullable? true
+       :attribute/description "Every domain, for the Logbook Assistant (read only). The app uses the caller-scoped list."
+       :attribute/target "logbook.product"
+       :attribute/cardinality :many}
+     :logbook.update/all {:attribute/label "All · Product timeline"
+       :attribute/type :ref
+       :attribute/nullable? true
+       :attribute/description "Every domain, for the Logbook Assistant (read only). The app uses the caller-scoped list."
+       :attribute/target "logbook.update"
+       :attribute/cardinality :many}
+     :logbook.question/all {:attribute/label "All · My questions"
+       :attribute/type :ref
+       :attribute/nullable? true
+       :attribute/description "Every domain, for the Logbook Assistant (read only). The app uses the caller-scoped list."
+       :attribute/target "logbook.question"
+       :attribute/cardinality :many}
+     :logbook.card/all {:attribute/label "All · My cards"
+       :attribute/type :ref
+       :attribute/nullable? true
+       :attribute/description "Every domain, for the Logbook Assistant (read only). The app uses the caller-scoped list."
+       :attribute/target "logbook.card"
+       :attribute/cardinality :many}
+     :logbook.overview/all {:attribute/label "All · My overview"
+       :attribute/type :ref
+       :attribute/nullable? true
+       :attribute/description "Every domain, for the Logbook Assistant (read only). The app uses the caller-scoped list."
+       :attribute/target "logbook.overview"
+       :attribute/cardinality :many}
+     :logbook.product_page/all {:attribute/label "All · Product page"
+       :attribute/type :ref
+       :attribute/nullable? true
+       :attribute/description "Every domain, for the Logbook Assistant (read only). The app uses the caller-scoped list."
+       :attribute/target "logbook.product_page"
+       :attribute/cardinality :many}
+     :logbook.weekly/all {:attribute/label "All · Weekly reports"
+       :attribute/type :ref
+       :attribute/nullable? true
+       :attribute/description "Every domain, for the Logbook Assistant (read only). The app uses the caller-scoped list."
+       :attribute/target "logbook.weekly"
+       :attribute/cardinality :many}
+     :logbook.brief/all {:attribute/label "All · Latest brief"
+       :attribute/type :ref
+       :attribute/nullable? true
+       :attribute/description "Every domain, for the Logbook Assistant (read only). The app uses the caller-scoped list."
+       :attribute/target "logbook.brief"
+       :attribute/cardinality :many}}
+   :terms {}
+   :units {}
+   :aliases []
+   :references []
+   :equivalences []}
+ :execution {:resolvers {"my_scope" {:label "Who am I"
+       :description "The caller's name, roles, visible domains and language. Empty for someone not registered in Logbook."
+       :effect :read
+       :input [:open-atlas.caller/email]
+       :result/cardinality :one
+       :output [:logbook.me/email :logbook.me/display_name :logbook.me/roles :logbook.me/all_domains :logbook.me/domains :logbook.me/language]
+       :row-security {:attribute :open-atlas.caller/email}}
+     "my_domains" {:label "My domains"
+       :description "Domains the caller can see, with the latest HC target and due date."
+       :effect :read
+       :input [:open-atlas.caller/email]
+       :result/cardinality :many
+       :collection {:ordering :source-defined
+         :paging :none
+         :completeness :not-guaranteed
+         :bounds {:max-items 2000
+           :max-response-bytes 4194304
+           :timeout-ms 30000}}
+       :output [{:logbook.domain/mine [:logbook.domain/code :logbook.domain/name :logbook.domain/name_zh :logbook.domain/sort :logbook.domain/target_hc :logbook.domain/target_due]}]
+       :row-security {:attribute :open-atlas.caller/email}}
+     "domains_all" {:label "All · My domains"
+       :description "EVERY DOMAIN (assistant view, read only). Domains the caller can see, with the latest HC target and due date."
+       :effect :read
+       :input []
+       :result/cardinality :many
+       :collection {:ordering :source-defined
+         :paging :none
+         :completeness :not-guaranteed
+         :bounds {:max-items 2000
+           :max-response-bytes 4194304
+           :timeout-ms 30000}}
+       :output [{:logbook.domain/all [:logbook.domain/code :logbook.domain/name :logbook.domain/name_zh :logbook.domain/sort :logbook.domain/target_hc :logbook.domain/target_due]}]
+       :curated? true}
+     "my_products" {:label "My products"
+       :description "Products in the caller's domains: stage, priority, HC (released = fact, confirmed = target, potential = forecast), both sides' status lights and owners. Start here for progress, mismatch, missing-owner and stale questions."
+       :effect :read
+       :input [:open-atlas.caller/email]
+       :result/cardinality :many
+       :collection {:ordering :source-defined
+         :paging :none
+         :completeness :not-guaranteed
+         :bounds {:max-items 2000
+           :max-response-bytes 4194304
+           :timeout-ms 30000}}
+       :output [{:logbook.product/mine [:logbook.product/code :logbook.product/name :logbook.product/domain :logbook.product/stage :logbook.product/priority :logbook.product/risk :logbook.product/type :logbook.product/baseline_hc :logbook.product/potential_hc :logbook.product/confirmed_hc :logbook.product/released_hc :logbook.product/it_rag :logbook.product/it_headline :logbook.product/business_rag :logbook.product/business_headline :logbook.product/it_owners :logbook.product/business_owners :logbook.product/last_update_at :logbook.product/close_outcome :logbook.product/merged_into]}]
+       :row-security {:attribute :open-atlas.caller/email}
+       :params {:domain {:type :string
+           :description "Domain code: sales, vendor_solution or procurement. Omit for every domain the caller sees."}
+         :status {:type :string
+           :description "active (default), closed or all."}
+         :owner {:type :string
+           :description "none = no IT owner, none_business = no business owner, or an owner's email."}
+         :stale_days {:type :integer
+           :description "Only products with no update for this many days."}
+         :mismatch {:type :boolean
+           :description "true = only products whose IT and business lights differ."}}}
+     "products_all" {:label "All · My products"
+       :description "EVERY DOMAIN (assistant view, read only). Products in the caller's domains: stage, priority, HC (released = fact, confirmed = target, potential = forecast), both sides' status lights and owners. Start here for progress, mismatch, missing-owner and stale questions."
+       :effect :read
+       :input []
+       :result/cardinality :many
+       :collection {:ordering :source-defined
+         :paging :none
+         :completeness :not-guaranteed
+         :bounds {:max-items 2000
+           :max-response-bytes 4194304
+           :timeout-ms 30000}}
+       :output [{:logbook.product/all [:logbook.product/code :logbook.product/name :logbook.product/domain :logbook.product/stage :logbook.product/priority :logbook.product/risk :logbook.product/type :logbook.product/baseline_hc :logbook.product/potential_hc :logbook.product/confirmed_hc :logbook.product/released_hc :logbook.product/it_rag :logbook.product/it_headline :logbook.product/business_rag :logbook.product/business_headline :logbook.product/it_owners :logbook.product/business_owners :logbook.product/last_update_at :logbook.product/close_outcome :logbook.product/merged_into]}]
+       :curated? true
+       :params {:domain {:type :string
+           :description "Domain code: sales, vendor_solution or procurement. Omit for every domain the caller sees."}
+         :status {:type :string
+           :description "active (default), closed or all."}
+         :owner {:type :string
+           :description "none = no IT owner, none_business = no business owner, or an owner's email."}
+         :stale_days {:type :integer
+           :description "Only products with no update for this many days."}
+         :mismatch {:type :boolean
+           :description "true = only products whose IT and business lights differ."}}}
+     "my_timeline" {:label "Product timeline"
+       :description "One product's updates, newest first. Skip rows with undone_at."
+       :effect :read
+       :input [:open-atlas.caller/email]
+       :result/cardinality :many
+       :collection {:ordering :source-defined
+         :paging :none
+         :completeness :not-guaranteed
+         :bounds {:max-items 2000
+           :max-response-bytes 4194304
+           :timeout-ms 30000}}
+       :output [{:logbook.update/of_product [:logbook.update/id :logbook.update/side :logbook.update/body :logbook.update/source :logbook.update/via_assistant :logbook.update/created_at :logbook.update/created_by :logbook.update/undone_at]}]
+       :row-security {:attribute :open-atlas.caller/email}
+       :params {:code {:type :string
+           :description "Product code."
+           :required? true}
+         :side {:type :string
+           :description "it, business or ai."}}}
+     "timeline_all" {:label "All · Product timeline"
+       :description "EVERY DOMAIN (assistant view, read only). One product's updates, newest first. Skip rows with undone_at."
+       :effect :read
+       :input []
+       :result/cardinality :many
+       :collection {:ordering :source-defined
+         :paging :none
+         :completeness :not-guaranteed
+         :bounds {:max-items 2000
+           :max-response-bytes 4194304
+           :timeout-ms 30000}}
+       :output [{:logbook.update/all [:logbook.update/id :logbook.update/side :logbook.update/body :logbook.update/source :logbook.update/via_assistant :logbook.update/created_at :logbook.update/created_by :logbook.update/undone_at]}]
+       :curated? true
+       :params {:code {:type :string
+           :description "Product code."
+           :required? true}
+         :side {:type :string
+           :description "it, business or ai."}}}
+     "my_questions" {:label "My questions"
+       :description "Questions (Q1 …) visible to the caller, with who asked, who must answer and the answer."
+       :effect :read
+       :input [:open-atlas.caller/email]
+       :result/cardinality :many
+       :collection {:ordering :source-defined
+         :paging :none
+         :completeness :not-guaranteed
+         :bounds {:max-items 2000
+           :max-response-bytes 4194304
+           :timeout-ms 30000}}
+       :output [{:logbook.question/mine [:logbook.question/code :logbook.question/product :logbook.question/domain :logbook.question/body :logbook.question/asked_by :logbook.question/assignee_email :logbook.question/assignee_name :logbook.question/status :logbook.question/answer :logbook.question/answered_by :logbook.question/answered_at :logbook.question/created_at]}]
+       :row-security {:attribute :open-atlas.caller/email}
+       :params {:domain {:type :string
+           :description "Domain code: sales, vendor_solution or procurement. Omit for every domain the caller sees."}
+         :status {:type :string
+           :description "open, answered or closed."}
+         :assignee {:type :string
+           :description "Email of the person asked."}}}
+     "questions_all" {:label "All · My questions"
+       :description "EVERY DOMAIN (assistant view, read only). Questions (Q1 …) visible to the caller, with who asked, who must answer and the answer."
+       :effect :read
+       :input []
+       :result/cardinality :many
+       :collection {:ordering :source-defined
+         :paging :none
+         :completeness :not-guaranteed
+         :bounds {:max-items 2000
+           :max-response-bytes 4194304
+           :timeout-ms 30000}}
+       :output [{:logbook.question/all [:logbook.question/code :logbook.question/product :logbook.question/domain :logbook.question/body :logbook.question/asked_by :logbook.question/assignee_email :logbook.question/assignee_name :logbook.question/status :logbook.question/answer :logbook.question/answered_by :logbook.question/answered_at :logbook.question/created_at]}]
+       :curated? true
+       :params {:domain {:type :string
+           :description "Domain code: sales, vendor_solution or procurement. Omit for every domain the caller sees."}
+         :status {:type :string
+           :description "open, answered or closed."}
+         :assignee {:type :string
+           :description "Email of the person asked."}}}
+     "my_cards" {:label "My cards"
+       :description "Proposed changes visible to the caller. needs_me=true: pending cards the caller can still confirm."
+       :effect :read
+       :input [:open-atlas.caller/email]
+       :result/cardinality :many
+       :collection {:ordering :source-defined
+         :paging :none
+         :completeness :not-guaranteed
+         :bounds {:max-items 2000
+           :max-response-bytes 4194304
+           :timeout-ms 30000}}
+       :output [{:logbook.card/mine [:logbook.card/id :logbook.card/kind :logbook.card/product :logbook.card/domain :logbook.card/payload :logbook.card/preview :logbook.card/proposed_by :logbook.card/proposed_via :logbook.card/needs :logbook.card/status :logbook.card/confirmed_sides :logbook.card/my_sides :logbook.card/created_at :logbook.card/applied_at]}]
+       :row-security {:attribute :open-atlas.caller/email}
+       :params {:status {:type :string
+           :description "pending (default), applied, rejected, withdrawn or all."}
+         :needs_me {:type :boolean
+           :description "Only cards waiting for the caller."}}}
+     "cards_all" {:label "All · My cards"
+       :description "EVERY DOMAIN (assistant view, read only). Proposed changes visible to the caller. needs_me=true: pending cards the caller can still confirm."
+       :effect :read
+       :input []
+       :result/cardinality :many
+       :collection {:ordering :source-defined
+         :paging :none
+         :completeness :not-guaranteed
+         :bounds {:max-items 2000
+           :max-response-bytes 4194304
+           :timeout-ms 30000}}
+       :output [{:logbook.card/all [:logbook.card/id :logbook.card/kind :logbook.card/product :logbook.card/domain :logbook.card/payload :logbook.card/preview :logbook.card/proposed_by :logbook.card/proposed_via :logbook.card/needs :logbook.card/status :logbook.card/confirmed_sides :logbook.card/my_sides :logbook.card/created_at :logbook.card/applied_at]}]
+       :curated? true
+       :params {:status {:type :string
+           :description "pending (default), applied, rejected, withdrawn or all."}
+         :needs_me {:type :boolean
+           :description "Only cards waiting for the caller."}}}
+     "my_overview" {:label "My overview"
+       :description "One row: the HC funnel (KOL headcount → covered → confirmed (target) → released (fact)), domain target, stage mix, counts of mismatches, stale products, missing IT owners, open questions and issues, what to decide, and the newest updates. Start here for 'how is the programme / Sales doing'."
+       :effect :read
+       :input [:open-atlas.caller/email]
+       :result/cardinality :many
+       :collection {:ordering :source-defined
+         :paging :none
+         :completeness :not-guaranteed
+         :bounds {:max-items 1
+           :max-response-bytes 4194304
+           :timeout-ms 30000}}
+       :output [{:logbook.overview/mine [:logbook.overview/scope_domain :logbook.overview/kol_total :logbook.overview/kol_as_of :logbook.overview/covered_hc :logbook.overview/confirmed_hc :logbook.overview/released_hc :logbook.overview/target_hc :logbook.overview/target_due :logbook.overview/products_active :logbook.overview/products_closed :logbook.overview/stages :logbook.overview/mismatch_count :logbook.overview/stale_count :logbook.overview/no_it_owner_count :logbook.overview/open_questions :logbook.overview/open_risks :logbook.overview/pending_cards :logbook.overview/to_decide :logbook.overview/recent_updates]}]
+       :row-security {:attribute :open-atlas.caller/email}
+       :params {:domain {:type :string
+           :description "Domain code: sales, vendor_solution or procurement. Omit for every domain the caller sees."}}}
+     "overview_all" {:label "All · My overview"
+       :description "EVERY DOMAIN (assistant view, read only). One row: the HC funnel (KOL headcount → covered → confirmed (target) → released (fact)), domain target, stage mix, counts of mismatches, stale products, missing IT owners, open questions and issues, what to decide, and the newest updates. Start here for 'how is the programme / Sales doing'."
+       :effect :read
+       :input []
+       :result/cardinality :many
+       :collection {:ordering :source-defined
+         :paging :none
+         :completeness :not-guaranteed
+         :bounds {:max-items 1
+           :max-response-bytes 4194304
+           :timeout-ms 30000}}
+       :output [{:logbook.overview/all [:logbook.overview/scope_domain :logbook.overview/kol_total :logbook.overview/kol_as_of :logbook.overview/covered_hc :logbook.overview/confirmed_hc :logbook.overview/released_hc :logbook.overview/target_hc :logbook.overview/target_due :logbook.overview/products_active :logbook.overview/products_closed :logbook.overview/stages :logbook.overview/mismatch_count :logbook.overview/stale_count :logbook.overview/no_it_owner_count :logbook.overview/open_questions :logbook.overview/open_risks :logbook.overview/pending_cards :logbook.overview/to_decide :logbook.overview/recent_updates]}]
+       :curated? true
+       :params {:domain {:type :string
+           :description "Domain code: sales, vendor_solution or procurement. Omit for every domain the caller sees."}}}
+     "my_product" {:label "Product page"
+       :description "One product by code: problem / approach / solution / progress, both status lights with headlines and dates, HC fact / target / forecast, owners (with or without email), phase targets, milestones, issues, questions and the latest 5 references. Use for any question about one product."
+       :effect :read
+       :input [:open-atlas.caller/email]
+       :result/cardinality :many
+       :collection {:ordering :source-defined
+         :paging :none
+         :completeness :not-guaranteed
+         :bounds {:max-items 1
+           :max-response-bytes 4194304
+           :timeout-ms 30000}}
+       :output [{:logbook.product_page/of_code [:logbook.product_page/code :logbook.product_page/name :logbook.product_page/domain :logbook.product_page/stage :logbook.product_page/priority :logbook.product_page/risk :logbook.product_page/type :logbook.product_page/volume_text :logbook.product_page/baseline_hc :logbook.product_page/potential_hc :logbook.product_page/confirmed_hc :logbook.product_page/released_hc :logbook.product_page/unit_minutes :logbook.product_page/it_estimated_cost :logbook.product_page/problem :logbook.product_page/approach :logbook.product_page/solution :logbook.product_page/progress_text :logbook.product_page/it_rag :logbook.product_page/it_headline :logbook.product_page/it_as_of :logbook.product_page/business_rag :logbook.product_page/business_headline :logbook.product_page/business_as_of :logbook.product_page/owners :logbook.product_page/phases :logbook.product_page/milestones :logbook.product_page/issues :logbook.product_page/questions :logbook.product_page/refs :logbook.product_page/closed :logbook.product_page/last_update_at]}]
+       :row-security {:attribute :open-atlas.caller/email}
+       :params {:product {:type :string
+           :description "Product code (po, q2c, pmq, triage, order, emailai, mdt …)."
+           :required? true}}}
+     "product_all" {:label "All · Product page"
+       :description "EVERY DOMAIN (assistant view, read only). One product by code: problem / approach / solution / progress, both status lights with headlines and dates, HC fact / target / forecast, owners (with or without email), phase targets, milestones, issues, questions and the latest 5 references. Use for any question about one product."
+       :effect :read
+       :input []
+       :result/cardinality :many
+       :collection {:ordering :source-defined
+         :paging :none
+         :completeness :not-guaranteed
+         :bounds {:max-items 1
+           :max-response-bytes 4194304
+           :timeout-ms 30000}}
+       :output [{:logbook.product_page/all [:logbook.product_page/code :logbook.product_page/name :logbook.product_page/domain :logbook.product_page/stage :logbook.product_page/priority :logbook.product_page/risk :logbook.product_page/type :logbook.product_page/volume_text :logbook.product_page/baseline_hc :logbook.product_page/potential_hc :logbook.product_page/confirmed_hc :logbook.product_page/released_hc :logbook.product_page/unit_minutes :logbook.product_page/it_estimated_cost :logbook.product_page/problem :logbook.product_page/approach :logbook.product_page/solution :logbook.product_page/progress_text :logbook.product_page/it_rag :logbook.product_page/it_headline :logbook.product_page/it_as_of :logbook.product_page/business_rag :logbook.product_page/business_headline :logbook.product_page/business_as_of :logbook.product_page/owners :logbook.product_page/phases :logbook.product_page/milestones :logbook.product_page/issues :logbook.product_page/questions :logbook.product_page/refs :logbook.product_page/closed :logbook.product_page/last_update_at]}]
+       :curated? true
+       :params {:product {:type :string
+           :description "Product code (po, q2c, pmq, triage, order, emailai, mdt …)."
+           :required? true}}}
+     "my_weekly_list" {:label "Weekly reports"
+       :description "Weekly report history, newest first; status draft or frozen."
+       :effect :read
+       :input [:open-atlas.caller/email]
+       :result/cardinality :many
+       :collection {:ordering :source-defined
+         :paging :none
+         :completeness :not-guaranteed
+         :bounds {:max-items 2000
+           :max-response-bytes 4194304
+           :timeout-ms 30000}}
+       :output [{:logbook.weekly/mine [:logbook.weekly/id :logbook.weekly/week_of :logbook.weekly/week :logbook.weekly/domain :logbook.weekly/language :logbook.weekly/status :logbook.weekly/frozen_at :logbook.weekly/frozen_by :logbook.weekly/body_json :logbook.weekly/updated_at]}]
+       :row-security {:attribute :open-atlas.caller/email}
+       :params {:domain {:type :string
+           :description "Domain code: sales, vendor_solution or procurement. Omit for every domain the caller sees."}}}
+     "weekly_list_all" {:label "All · Weekly reports"
+       :description "EVERY DOMAIN (assistant view, read only). Weekly report history, newest first; status draft or frozen."
+       :effect :read
+       :input []
+       :result/cardinality :many
+       :collection {:ordering :source-defined
+         :paging :none
+         :completeness :not-guaranteed
+         :bounds {:max-items 2000
+           :max-response-bytes 4194304
+           :timeout-ms 30000}}
+       :output [{:logbook.weekly/all [:logbook.weekly/id :logbook.weekly/week_of :logbook.weekly/week :logbook.weekly/domain :logbook.weekly/language :logbook.weekly/status :logbook.weekly/frozen_at :logbook.weekly/frozen_by :logbook.weekly/body_json :logbook.weekly/updated_at]}]
+       :curated? true
+       :params {:domain {:type :string
+           :description "Domain code: sales, vendor_solution or procurement. Omit for every domain the caller sees."}}}
+     "my_mail_plan" {:label "Weekly mail plan"
+       :description "Every active member and the weekly-report version (all or one domain) and language they receive. Admin only."
+       :effect :read
+       :input [:open-atlas.caller/email]
+       :result/cardinality :many
+       :collection {:ordering :source-defined
+         :paging :none
+         :completeness :not-guaranteed
+         :bounds {:max-items 2000
+           :max-response-bytes 4194304
+           :timeout-ms 30000}}
+       :output [{:logbook.mail_plan/mine [:logbook.mail_plan/email :logbook.mail_plan/display_name :logbook.mail_plan/language :logbook.mail_plan/version]}]
+       :row-security {:attribute :open-atlas.caller/email}}
+     "my_report_mails" {:label "Mail batches of a week"
+       :description "Logged weekly-report mail batches of one week. Admin only."
+       :effect :read
+       :input [:open-atlas.caller/email]
+       :result/cardinality :many
+       :collection {:ordering :source-defined
+         :paging :none
+         :completeness :not-guaranteed
+         :bounds {:max-items 2000
+           :max-response-bytes 4194304
+           :timeout-ms 30000}}
+       :output [{:logbook.mail_log/of_week [:logbook.mail_log/id :logbook.mail_log/report_id :logbook.mail_log/domain :logbook.mail_log/language :logbook.mail_log/recipients :logbook.mail_log/state :logbook.mail_log/message_id :logbook.mail_log/created_at :logbook.mail_log/created_by]}]
+       :row-security {:attribute :open-atlas.caller/email}
+       :params {:week_of {:type :string
+           :description "Monday of the week, YYYY-MM-DD."
+           :required? true}}}
+     "my_brief" {:label "Latest brief"
+       :description "The newest saved brief for a domain (or all) and language."
+       :effect :read
+       :input [:open-atlas.caller/email]
+       :result/cardinality :many
+       :collection {:ordering :source-defined
+         :paging :none
+         :completeness :not-guaranteed
+         :bounds {:max-items 1
+           :max-response-bytes 4194304
+           :timeout-ms 30000}}
+       :output [{:logbook.brief/mine [:logbook.brief/id :logbook.brief/domain :logbook.brief/language :logbook.brief/body :logbook.brief/created_at :logbook.brief/created_by]}]
+       :row-security {:attribute :open-atlas.caller/email}
+       :params {:domain {:type :string
+           :description "Domain code: sales, vendor_solution or procurement. Omit for every domain the caller sees."}
+         :language {:type :string
+           :description "zh or en."}}}
+     "brief_all" {:label "All · Latest brief"
+       :description "EVERY DOMAIN (assistant view, read only). The newest saved brief for a domain (or all) and language."
+       :effect :read
+       :input []
+       :result/cardinality :many
+       :collection {:ordering :source-defined
+         :paging :none
+         :completeness :not-guaranteed
+         :bounds {:max-items 1
+           :max-response-bytes 4194304
+           :timeout-ms 30000}}
+       :output [{:logbook.brief/all [:logbook.brief/id :logbook.brief/domain :logbook.brief/language :logbook.brief/body :logbook.brief/created_at :logbook.brief/created_by]}]
+       :curated? true
+       :params {:domain {:type :string
+           :description "Domain code: sales, vendor_solution or procurement. Omit for every domain the caller sees."}
+         :language {:type :string
+           :description "zh or en."}}}
+     "my_share_links" {:label "Share links"
+       :description "Live read-only share links. Coordinators only."
+       :effect :read
+       :input [:open-atlas.caller/email]
+       :result/cardinality :many
+       :collection {:ordering :source-defined
+         :paging :none
+         :completeness :not-guaranteed
+         :bounds {:max-items 2000
+           :max-response-bytes 4194304
+           :timeout-ms 30000}}
+       :output [{:logbook.share/mine [:logbook.share/id :logbook.share/token :logbook.share/domain :logbook.share/note :logbook.share/expires_at :logbook.share/created_at :logbook.share/created_by]}]
+       :row-security {:attribute :open-atlas.caller/email}}
+     "my_open_asks" {:label "Asked of me"
+       :description "Open questions waiting for the caller's answer."
+       :effect :read
+       :input [:open-atlas.caller/email]
+       :result/cardinality :many
+       :collection {:ordering :source-defined
+         :paging :none
+         :completeness :not-guaranteed
+         :bounds {:max-items 2000
+           :max-response-bytes 4194304
+           :timeout-ms 30000}}
+       :output [{:logbook.ask/mine [:logbook.ask/code :logbook.ask/product :logbook.ask/product_name :logbook.ask/body :logbook.ask/asked_by :logbook.ask/created_at]}]
+       :row-security {:attribute :open-atlas.caller/email}}
+     "my_members" {:label "Members"
+       :description "Registered members (admin only)."
+       :effect :read
+       :input [:open-atlas.caller/email]
+       :result/cardinality :many
+       :collection {:ordering :source-defined
+         :paging :none
+         :completeness :not-guaranteed
+         :bounds {:max-items 2000
+           :max-response-bytes 4194304
+           :timeout-ms 30000}}
+       :output [{:logbook.member/mine [:logbook.member/email :logbook.member/display_name :logbook.member/roles :logbook.member/domains :logbook.member/language :logbook.member/active :logbook.member/owns :logbook.member/created_by :logbook.member/updated_at]}]
+       :row-security {:attribute :open-atlas.caller/email}}
+     "my_rosters" {:label "Roster snapshots"
+       :description "Imported rosters (admin only)."
+       :effect :read
+       :input [:open-atlas.caller/email]
+       :result/cardinality :many
+       :collection {:ordering :source-defined
+         :paging :none
+         :completeness :not-guaranteed
+         :bounds {:max-items 2000
+           :max-response-bytes 4194304
+           :timeout-ms 30000}}
+       :output [{:logbook.roster/mine [:logbook.roster/id :logbook.roster/taken_on :logbook.roster/source_file :logbook.roster/row_count :logbook.roster/created_at :logbook.roster/created_by]}]
+       :row-security {:attribute :open-atlas.caller/email}}
+     "my_fixes" {:label "Admin changes"
+       :description "The latest 100 admin corrections, member changes and roster imports (admin only)."
+       :effect :read
+       :input [:open-atlas.caller/email]
+       :result/cardinality :many
+       :collection {:ordering :source-defined
+         :paging :none
+         :completeness :not-guaranteed
+         :bounds {:max-items 2000
+           :max-response-bytes 4194304
+           :timeout-ms 30000}}
+       :output [{:logbook.fix/mine [:logbook.fix/request_id :logbook.fix/actor_email :logbook.fix/result :logbook.fix/created_at]}]
+       :row-security {:attribute :open-atlas.caller/email}}}
+   :operations {"logbook.command/post_update" {:label "Post update"
+       :description "Add a timeline update. payload {\"code\"?, \"side\"? it|business|ai, \"body\", \"source\"? chat|notes|manual, \"via_assistant\"?}."
+       :effect :write
+       :input [:logbook.command/request_id :open-atlas.caller/email :logbook.command/payload]
+       :output [:logbook.command/result]
+       :result/cardinality :one
+       :idempotency :request-key}
+     "logbook.command/undo_update" {:label "Undo update"
+       :description "Undo your own update within 24 hours. payload {\"update_id\"}."
+       :effect :write
+       :input [:logbook.command/request_id :open-atlas.caller/email :logbook.command/payload]
+       :output [:logbook.command/result]
+       :result/cardinality :one
+       :idempotency :request-key}
+     "logbook.command/propose" {:label "Propose change"
+       :description "Make a card (set_owner changes: {\"side\", \"name\", \"email\"?, \"is_lead\"?}). payload {\"kind\", \"code\" (not for add_product), \"changes\", \"preview\"?, \"via\"? assistant|page}. Applies at once when the caller may; otherwise waits for confirmation."
+       :effect :write
+       :input [:logbook.command/request_id :open-atlas.caller/email :logbook.command/payload]
+       :output [:logbook.command/result]
+       :result/cardinality :one
+       :idempotency :request-key}
+     "logbook.command/confirm_card" {:label "Confirm or reject card"
+       :description "payload {\"card_id\", \"decision\" confirm|reject, \"note\" (required to reject)}."
+       :effect :write
+       :input [:logbook.command/request_id :open-atlas.caller/email :logbook.command/payload]
+       :output [:logbook.command/result]
+       :result/cardinality :one
+       :idempotency :request-key}
+     "logbook.command/ask_question" {:label "Ask question"
+       :description "payload {\"code\"?, \"body\", \"assignee\"?}."
+       :effect :write
+       :input [:logbook.command/request_id :open-atlas.caller/email :logbook.command/payload]
+       :output [:logbook.command/result]
+       :result/cardinality :one
+       :idempotency :request-key}
+     "logbook.command/answer_question" {:label "Answer question"
+       :description "The person asked, or an admin. payload {\"question_code\", \"answer\"}."
+       :effect :write
+       :input [:logbook.command/request_id :open-atlas.caller/email :logbook.command/payload]
+       :output [:logbook.command/result]
+       :result/cardinality :one
+       :idempotency :request-key}
+     "logbook.command/draft_weekly" {:label "Save weekly draft"
+       :description "Coordinator or admin. payload {\"week_of\", \"domain\"?, \"language\", \"body_json\"}."
+       :effect :write
+       :input [:logbook.command/request_id :open-atlas.caller/email :logbook.command/payload]
+       :output [:logbook.command/result]
+       :result/cardinality :one
+       :idempotency :request-key}
+     "logbook.command/freeze_weekly" {:label "Freeze weekly report"
+       :description "Admin. payload {\"report_id\"}. Frozen reports never change."
+       :effect :write
+       :input [:logbook.command/request_id :open-atlas.caller/email :logbook.command/payload]
+       :output [:logbook.command/result]
+       :result/cardinality :one
+       :idempotency :request-key}
+     "logbook.command/log_mail" {:label "Log mail batch"
+       :description "Admin. payload {\"report_id\", \"recipients\" (≤ 20), \"state\" queued|sent|failed, \"message_id\"?}."
+       :effect :write
+       :input [:logbook.command/request_id :open-atlas.caller/email :logbook.command/payload]
+       :output [:logbook.command/result]
+       :result/cardinality :one
+       :idempotency :request-key}
+     "logbook.command/admin_member" {:label "Manage member"
+       :description "Admin. payload {\"email\", \"display_name\"?, \"roles\"?, \"domains\"?, \"language\"?, \"active\"?}."
+       :effect :write
+       :input [:logbook.command/request_id :open-atlas.caller/email :logbook.command/payload]
+       :output [:logbook.command/result]
+       :result/cardinality :one
+       :idempotency :request-key}
+     "logbook.command/save_brief" {:label "Save brief"
+       :description "Any member who can write. payload {\"domain\"?, \"language\", \"body\": {\"sentences\": [{\"text\", \"product\"?, \"at\"?}]}}."
+       :effect :write
+       :input [:logbook.command/request_id :open-atlas.caller/email :logbook.command/payload]
+       :output [:logbook.command/result]
+       :result/cardinality :one
+       :idempotency :request-key}
+     "logbook.command/create_share" {:label "Make share link"
+       :description "Coordinator or admin. payload {\"domain\"?, \"days\"? (1–365, default 90), \"note\"?}."
+       :effect :write
+       :input [:logbook.command/request_id :open-atlas.caller/email :logbook.command/payload]
+       :output [:logbook.command/result]
+       :result/cardinality :one
+       :idempotency :request-key}
+     "logbook.command/open_share" {:label "Open share link"
+       :description "Anyone signed in: becomes a viewer of the link's scope (a member keeps their roles). payload {\"token\"}."
+       :effect :write
+       :input [:logbook.command/request_id :open-atlas.caller/email :logbook.command/payload]
+       :output [:logbook.command/result]
+       :result/cardinality :one
+       :idempotency :request-key}
+     "logbook.command/admin_fix" {:label "Correct a product field"
+       :description "Admin. payload {\"code\", \"field\", \"value\", \"reason\"}; the receipt keeps before and after."
+       :effect :write
+       :input [:logbook.command/request_id :open-atlas.caller/email :logbook.command/payload]
+       :output [:logbook.command/result]
+       :result/cardinality :one
+       :idempotency :request-key}
+     "logbook.command/import_roster" {:label "Import roster"
+       :description "Admin. payload {\"source_file\", \"taken_on\"?, \"rows\"}. Makes an import_roster card with the preview; confirm it to apply."
+       :effect :write
+       :input [:logbook.command/request_id :open-atlas.caller/email :logbook.command/payload]
+       :output [:logbook.command/result]
+       :result/cardinality :one
+       :idempotency :request-key}}
+   :sources {"logbook-pgrst-api" {:source/kind "api"
+       :source/effects #{:read :write}}}
+   :bindings {"my_scope-api" {:binding/for [:resolver "my_scope"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :read
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/my_scope"
+         :json_body {"caller_email" "{open-atlas.caller/email}"}
+         :field_mapping {:logbook.me/email "$.email"
+           :logbook.me/display_name "$.display_name"
+           :logbook.me/roles "$.roles"
+           :logbook.me/all_domains "$.all_domains"
+           :logbook.me/domains "$.domains"
+           :logbook.me/language "$.language"}}
+       :binding/input-map {:open-atlas.caller/email "open-atlas.caller/email"}
+       :binding/output-map {:logbook.me/email "logbook.me/email"
+         :logbook.me/display_name "logbook.me/display_name"
+         :logbook.me/roles "logbook.me/roles"
+         :logbook.me/all_domains "logbook.me/all_domains"
+         :logbook.me/domains "logbook.me/domains"
+         :logbook.me/language "logbook.me/language"}}
+     "my_domains-api" {:binding/for [:resolver "my_domains"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :read
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/my_domains"
+         :json_body {"caller_email" "{open-atlas.caller/email}"}
+         :data_path "$"
+         :result-root :logbook.domain/mine
+         :field_mapping {:logbook.domain/code "$.code"
+           :logbook.domain/name "$.name"
+           :logbook.domain/name_zh "$.name_zh"
+           :logbook.domain/sort "$.sort"
+           :logbook.domain/target_hc "$.target_hc"
+           :logbook.domain/target_due "$.target_due"}}
+       :binding/input-map {:open-atlas.caller/email "open-atlas.caller/email"}
+       :binding/output-map {:logbook.domain/mine "logbook.domain/mine"
+         :logbook.domain/code "logbook.domain/code"
+         :logbook.domain/name "logbook.domain/name"
+         :logbook.domain/name_zh "logbook.domain/name_zh"
+         :logbook.domain/sort "logbook.domain/sort"
+         :logbook.domain/target_hc "logbook.domain/target_hc"
+         :logbook.domain/target_due "logbook.domain/target_due"}}
+     "domains_all-api" {:binding/for [:resolver "domains_all"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :read
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/my_domains"
+         :json_body {"caller_email" "logbook-agent@service.local"}
+         :data_path "$"
+         :result-root :logbook.domain/all
+         :field_mapping {:logbook.domain/code "$.code"
+           :logbook.domain/name "$.name"
+           :logbook.domain/name_zh "$.name_zh"
+           :logbook.domain/sort "$.sort"
+           :logbook.domain/target_hc "$.target_hc"
+           :logbook.domain/target_due "$.target_due"}}
+       :binding/input-map {}
+       :binding/output-map {:logbook.domain/all "logbook.domain/all"
+         :logbook.domain/code "logbook.domain/code"
+         :logbook.domain/name "logbook.domain/name"
+         :logbook.domain/name_zh "logbook.domain/name_zh"
+         :logbook.domain/sort "logbook.domain/sort"
+         :logbook.domain/target_hc "logbook.domain/target_hc"
+         :logbook.domain/target_due "logbook.domain/target_due"}}
+     "my_products-api" {:binding/for [:resolver "my_products"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :read
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/my_products"
+         :json_body {"caller_email" "{open-atlas.caller/email}"
+           "domain" "{?domain}"
+           "status" "{?status}"
+           "owner" "{?owner}"
+           "stale_days" "{?stale_days}"
+           "mismatch" "{?mismatch}"}
+         :data_path "$"
+         :result-root :logbook.product/mine
+         :field_mapping {:logbook.product/code "$.code"
+           :logbook.product/name "$.name"
+           :logbook.product/domain "$.domain"
+           :logbook.product/stage "$.stage"
+           :logbook.product/priority "$.priority"
+           :logbook.product/risk "$.risk"
+           :logbook.product/type "$.type"
+           :logbook.product/baseline_hc "$.baseline_hc"
+           :logbook.product/potential_hc "$.potential_hc"
+           :logbook.product/confirmed_hc "$.confirmed_hc"
+           :logbook.product/released_hc "$.released_hc"
+           :logbook.product/it_rag "$.it_rag"
+           :logbook.product/it_headline "$.it_headline"
+           :logbook.product/business_rag "$.business_rag"
+           :logbook.product/business_headline "$.business_headline"
+           :logbook.product/it_owners "$.it_owners"
+           :logbook.product/business_owners "$.business_owners"
+           :logbook.product/last_update_at "$.last_update_at"
+           :logbook.product/close_outcome "$.close_outcome"
+           :logbook.product/merged_into "$.merged_into"}}
+       :binding/input-map {:open-atlas.caller/email "open-atlas.caller/email"}
+       :binding/output-map {:logbook.product/mine "logbook.product/mine"
+         :logbook.product/code "logbook.product/code"
+         :logbook.product/name "logbook.product/name"
+         :logbook.product/domain "logbook.product/domain"
+         :logbook.product/stage "logbook.product/stage"
+         :logbook.product/priority "logbook.product/priority"
+         :logbook.product/risk "logbook.product/risk"
+         :logbook.product/type "logbook.product/type"
+         :logbook.product/baseline_hc "logbook.product/baseline_hc"
+         :logbook.product/potential_hc "logbook.product/potential_hc"
+         :logbook.product/confirmed_hc "logbook.product/confirmed_hc"
+         :logbook.product/released_hc "logbook.product/released_hc"
+         :logbook.product/it_rag "logbook.product/it_rag"
+         :logbook.product/it_headline "logbook.product/it_headline"
+         :logbook.product/business_rag "logbook.product/business_rag"
+         :logbook.product/business_headline "logbook.product/business_headline"
+         :logbook.product/it_owners "logbook.product/it_owners"
+         :logbook.product/business_owners "logbook.product/business_owners"
+         :logbook.product/last_update_at "logbook.product/last_update_at"
+         :logbook.product/close_outcome "logbook.product/close_outcome"
+         :logbook.product/merged_into "logbook.product/merged_into"}
+       :binding/parameter-map {:domain "domain"
+         :status "status"
+         :owner "owner"
+         :stale_days "stale_days"
+         :mismatch "mismatch"}}
+     "products_all-api" {:binding/for [:resolver "products_all"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :read
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/my_products"
+         :json_body {"caller_email" "logbook-agent@service.local"
+           "domain" "{?domain}"
+           "status" "{?status}"
+           "owner" "{?owner}"
+           "stale_days" "{?stale_days}"
+           "mismatch" "{?mismatch}"}
+         :data_path "$"
+         :result-root :logbook.product/all
+         :field_mapping {:logbook.product/code "$.code"
+           :logbook.product/name "$.name"
+           :logbook.product/domain "$.domain"
+           :logbook.product/stage "$.stage"
+           :logbook.product/priority "$.priority"
+           :logbook.product/risk "$.risk"
+           :logbook.product/type "$.type"
+           :logbook.product/baseline_hc "$.baseline_hc"
+           :logbook.product/potential_hc "$.potential_hc"
+           :logbook.product/confirmed_hc "$.confirmed_hc"
+           :logbook.product/released_hc "$.released_hc"
+           :logbook.product/it_rag "$.it_rag"
+           :logbook.product/it_headline "$.it_headline"
+           :logbook.product/business_rag "$.business_rag"
+           :logbook.product/business_headline "$.business_headline"
+           :logbook.product/it_owners "$.it_owners"
+           :logbook.product/business_owners "$.business_owners"
+           :logbook.product/last_update_at "$.last_update_at"
+           :logbook.product/close_outcome "$.close_outcome"
+           :logbook.product/merged_into "$.merged_into"}}
+       :binding/input-map {}
+       :binding/output-map {:logbook.product/all "logbook.product/all"
+         :logbook.product/code "logbook.product/code"
+         :logbook.product/name "logbook.product/name"
+         :logbook.product/domain "logbook.product/domain"
+         :logbook.product/stage "logbook.product/stage"
+         :logbook.product/priority "logbook.product/priority"
+         :logbook.product/risk "logbook.product/risk"
+         :logbook.product/type "logbook.product/type"
+         :logbook.product/baseline_hc "logbook.product/baseline_hc"
+         :logbook.product/potential_hc "logbook.product/potential_hc"
+         :logbook.product/confirmed_hc "logbook.product/confirmed_hc"
+         :logbook.product/released_hc "logbook.product/released_hc"
+         :logbook.product/it_rag "logbook.product/it_rag"
+         :logbook.product/it_headline "logbook.product/it_headline"
+         :logbook.product/business_rag "logbook.product/business_rag"
+         :logbook.product/business_headline "logbook.product/business_headline"
+         :logbook.product/it_owners "logbook.product/it_owners"
+         :logbook.product/business_owners "logbook.product/business_owners"
+         :logbook.product/last_update_at "logbook.product/last_update_at"
+         :logbook.product/close_outcome "logbook.product/close_outcome"
+         :logbook.product/merged_into "logbook.product/merged_into"}
+       :binding/parameter-map {:domain "domain"
+         :status "status"
+         :owner "owner"
+         :stale_days "stale_days"
+         :mismatch "mismatch"}}
+     "my_timeline-api" {:binding/for [:resolver "my_timeline"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :read
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/my_timeline"
+         :json_body {"caller_email" "{open-atlas.caller/email}"
+           "code" "{?code}"
+           "side" "{?side}"}
+         :data_path "$"
+         :result-root :logbook.update/of_product
+         :field_mapping {:logbook.update/id "$.id"
+           :logbook.update/side "$.side"
+           :logbook.update/body "$.body"
+           :logbook.update/source "$.source"
+           :logbook.update/via_assistant "$.via_assistant"
+           :logbook.update/created_at "$.created_at"
+           :logbook.update/created_by "$.created_by"
+           :logbook.update/undone_at "$.undone_at"}}
+       :binding/input-map {:open-atlas.caller/email "open-atlas.caller/email"}
+       :binding/output-map {:logbook.update/of_product "logbook.update/of_product"
+         :logbook.update/id "logbook.update/id"
+         :logbook.update/side "logbook.update/side"
+         :logbook.update/body "logbook.update/body"
+         :logbook.update/source "logbook.update/source"
+         :logbook.update/via_assistant "logbook.update/via_assistant"
+         :logbook.update/created_at "logbook.update/created_at"
+         :logbook.update/created_by "logbook.update/created_by"
+         :logbook.update/undone_at "logbook.update/undone_at"}
+       :binding/parameter-map {:code "code"
+         :side "side"}}
+     "timeline_all-api" {:binding/for [:resolver "timeline_all"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :read
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/my_timeline"
+         :json_body {"caller_email" "logbook-agent@service.local"
+           "code" "{?code}"
+           "side" "{?side}"}
+         :data_path "$"
+         :result-root :logbook.update/all
+         :field_mapping {:logbook.update/id "$.id"
+           :logbook.update/side "$.side"
+           :logbook.update/body "$.body"
+           :logbook.update/source "$.source"
+           :logbook.update/via_assistant "$.via_assistant"
+           :logbook.update/created_at "$.created_at"
+           :logbook.update/created_by "$.created_by"
+           :logbook.update/undone_at "$.undone_at"}}
+       :binding/input-map {}
+       :binding/output-map {:logbook.update/all "logbook.update/all"
+         :logbook.update/id "logbook.update/id"
+         :logbook.update/side "logbook.update/side"
+         :logbook.update/body "logbook.update/body"
+         :logbook.update/source "logbook.update/source"
+         :logbook.update/via_assistant "logbook.update/via_assistant"
+         :logbook.update/created_at "logbook.update/created_at"
+         :logbook.update/created_by "logbook.update/created_by"
+         :logbook.update/undone_at "logbook.update/undone_at"}
+       :binding/parameter-map {:code "code"
+         :side "side"}}
+     "my_questions-api" {:binding/for [:resolver "my_questions"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :read
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/my_questions"
+         :json_body {"caller_email" "{open-atlas.caller/email}"
+           "domain" "{?domain}"
+           "status" "{?status}"
+           "assignee" "{?assignee}"}
+         :data_path "$"
+         :result-root :logbook.question/mine
+         :field_mapping {:logbook.question/code "$.code"
+           :logbook.question/product "$.product"
+           :logbook.question/domain "$.domain"
+           :logbook.question/body "$.body"
+           :logbook.question/asked_by "$.asked_by"
+           :logbook.question/assignee_email "$.assignee_email"
+           :logbook.question/assignee_name "$.assignee_name"
+           :logbook.question/status "$.status"
+           :logbook.question/answer "$.answer"
+           :logbook.question/answered_by "$.answered_by"
+           :logbook.question/answered_at "$.answered_at"
+           :logbook.question/created_at "$.created_at"}}
+       :binding/input-map {:open-atlas.caller/email "open-atlas.caller/email"}
+       :binding/output-map {:logbook.question/mine "logbook.question/mine"
+         :logbook.question/code "logbook.question/code"
+         :logbook.question/product "logbook.question/product"
+         :logbook.question/domain "logbook.question/domain"
+         :logbook.question/body "logbook.question/body"
+         :logbook.question/asked_by "logbook.question/asked_by"
+         :logbook.question/assignee_email "logbook.question/assignee_email"
+         :logbook.question/assignee_name "logbook.question/assignee_name"
+         :logbook.question/status "logbook.question/status"
+         :logbook.question/answer "logbook.question/answer"
+         :logbook.question/answered_by "logbook.question/answered_by"
+         :logbook.question/answered_at "logbook.question/answered_at"
+         :logbook.question/created_at "logbook.question/created_at"}
+       :binding/parameter-map {:domain "domain"
+         :status "status"
+         :assignee "assignee"}}
+     "questions_all-api" {:binding/for [:resolver "questions_all"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :read
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/my_questions"
+         :json_body {"caller_email" "logbook-agent@service.local"
+           "domain" "{?domain}"
+           "status" "{?status}"
+           "assignee" "{?assignee}"}
+         :data_path "$"
+         :result-root :logbook.question/all
+         :field_mapping {:logbook.question/code "$.code"
+           :logbook.question/product "$.product"
+           :logbook.question/domain "$.domain"
+           :logbook.question/body "$.body"
+           :logbook.question/asked_by "$.asked_by"
+           :logbook.question/assignee_email "$.assignee_email"
+           :logbook.question/assignee_name "$.assignee_name"
+           :logbook.question/status "$.status"
+           :logbook.question/answer "$.answer"
+           :logbook.question/answered_by "$.answered_by"
+           :logbook.question/answered_at "$.answered_at"
+           :logbook.question/created_at "$.created_at"}}
+       :binding/input-map {}
+       :binding/output-map {:logbook.question/all "logbook.question/all"
+         :logbook.question/code "logbook.question/code"
+         :logbook.question/product "logbook.question/product"
+         :logbook.question/domain "logbook.question/domain"
+         :logbook.question/body "logbook.question/body"
+         :logbook.question/asked_by "logbook.question/asked_by"
+         :logbook.question/assignee_email "logbook.question/assignee_email"
+         :logbook.question/assignee_name "logbook.question/assignee_name"
+         :logbook.question/status "logbook.question/status"
+         :logbook.question/answer "logbook.question/answer"
+         :logbook.question/answered_by "logbook.question/answered_by"
+         :logbook.question/answered_at "logbook.question/answered_at"
+         :logbook.question/created_at "logbook.question/created_at"}
+       :binding/parameter-map {:domain "domain"
+         :status "status"
+         :assignee "assignee"}}
+     "my_cards-api" {:binding/for [:resolver "my_cards"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :read
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/my_cards"
+         :json_body {"caller_email" "{open-atlas.caller/email}"
+           "status" "{?status}"
+           "needs_me" "{?needs_me}"}
+         :data_path "$"
+         :result-root :logbook.card/mine
+         :field_mapping {:logbook.card/id "$.id"
+           :logbook.card/kind "$.kind"
+           :logbook.card/product "$.product"
+           :logbook.card/domain "$.domain"
+           :logbook.card/payload "$.payload"
+           :logbook.card/preview "$.preview"
+           :logbook.card/proposed_by "$.proposed_by"
+           :logbook.card/proposed_via "$.proposed_via"
+           :logbook.card/needs "$.needs"
+           :logbook.card/status "$.status"
+           :logbook.card/confirmed_sides "$.confirmed_sides"
+           :logbook.card/my_sides "$.my_sides"
+           :logbook.card/created_at "$.created_at"
+           :logbook.card/applied_at "$.applied_at"}}
+       :binding/input-map {:open-atlas.caller/email "open-atlas.caller/email"}
+       :binding/output-map {:logbook.card/mine "logbook.card/mine"
+         :logbook.card/id "logbook.card/id"
+         :logbook.card/kind "logbook.card/kind"
+         :logbook.card/product "logbook.card/product"
+         :logbook.card/domain "logbook.card/domain"
+         :logbook.card/payload "logbook.card/payload"
+         :logbook.card/preview "logbook.card/preview"
+         :logbook.card/proposed_by "logbook.card/proposed_by"
+         :logbook.card/proposed_via "logbook.card/proposed_via"
+         :logbook.card/needs "logbook.card/needs"
+         :logbook.card/status "logbook.card/status"
+         :logbook.card/confirmed_sides "logbook.card/confirmed_sides"
+         :logbook.card/my_sides "logbook.card/my_sides"
+         :logbook.card/created_at "logbook.card/created_at"
+         :logbook.card/applied_at "logbook.card/applied_at"}
+       :binding/parameter-map {:status "status"
+         :needs_me "needs_me"}}
+     "cards_all-api" {:binding/for [:resolver "cards_all"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :read
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/my_cards"
+         :json_body {"caller_email" "logbook-agent@service.local"
+           "status" "{?status}"
+           "needs_me" "{?needs_me}"}
+         :data_path "$"
+         :result-root :logbook.card/all
+         :field_mapping {:logbook.card/id "$.id"
+           :logbook.card/kind "$.kind"
+           :logbook.card/product "$.product"
+           :logbook.card/domain "$.domain"
+           :logbook.card/payload "$.payload"
+           :logbook.card/preview "$.preview"
+           :logbook.card/proposed_by "$.proposed_by"
+           :logbook.card/proposed_via "$.proposed_via"
+           :logbook.card/needs "$.needs"
+           :logbook.card/status "$.status"
+           :logbook.card/confirmed_sides "$.confirmed_sides"
+           :logbook.card/my_sides "$.my_sides"
+           :logbook.card/created_at "$.created_at"
+           :logbook.card/applied_at "$.applied_at"}}
+       :binding/input-map {}
+       :binding/output-map {:logbook.card/all "logbook.card/all"
+         :logbook.card/id "logbook.card/id"
+         :logbook.card/kind "logbook.card/kind"
+         :logbook.card/product "logbook.card/product"
+         :logbook.card/domain "logbook.card/domain"
+         :logbook.card/payload "logbook.card/payload"
+         :logbook.card/preview "logbook.card/preview"
+         :logbook.card/proposed_by "logbook.card/proposed_by"
+         :logbook.card/proposed_via "logbook.card/proposed_via"
+         :logbook.card/needs "logbook.card/needs"
+         :logbook.card/status "logbook.card/status"
+         :logbook.card/confirmed_sides "logbook.card/confirmed_sides"
+         :logbook.card/my_sides "logbook.card/my_sides"
+         :logbook.card/created_at "logbook.card/created_at"
+         :logbook.card/applied_at "logbook.card/applied_at"}
+       :binding/parameter-map {:status "status"
+         :needs_me "needs_me"}}
+     "my_overview-api" {:binding/for [:resolver "my_overview"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :read
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/my_overview"
+         :json_body {"caller_email" "{open-atlas.caller/email}"
+           "domain" "{?domain}"}
+         :data_path "$"
+         :result-root :logbook.overview/mine
+         :field_mapping {:logbook.overview/scope_domain "$.scope_domain"
+           :logbook.overview/kol_total "$.kol_total"
+           :logbook.overview/kol_as_of "$.kol_as_of"
+           :logbook.overview/covered_hc "$.covered_hc"
+           :logbook.overview/confirmed_hc "$.confirmed_hc"
+           :logbook.overview/released_hc "$.released_hc"
+           :logbook.overview/target_hc "$.target_hc"
+           :logbook.overview/target_due "$.target_due"
+           :logbook.overview/products_active "$.products_active"
+           :logbook.overview/products_closed "$.products_closed"
+           :logbook.overview/stages "$.stages"
+           :logbook.overview/mismatch_count "$.mismatch_count"
+           :logbook.overview/stale_count "$.stale_count"
+           :logbook.overview/no_it_owner_count "$.no_it_owner_count"
+           :logbook.overview/open_questions "$.open_questions"
+           :logbook.overview/open_risks "$.open_risks"
+           :logbook.overview/pending_cards "$.pending_cards"
+           :logbook.overview/to_decide "$.to_decide"
+           :logbook.overview/recent_updates "$.recent_updates"}}
+       :binding/input-map {:open-atlas.caller/email "open-atlas.caller/email"}
+       :binding/output-map {:logbook.overview/mine "logbook.overview/mine"
+         :logbook.overview/scope_domain "logbook.overview/scope_domain"
+         :logbook.overview/kol_total "logbook.overview/kol_total"
+         :logbook.overview/kol_as_of "logbook.overview/kol_as_of"
+         :logbook.overview/covered_hc "logbook.overview/covered_hc"
+         :logbook.overview/confirmed_hc "logbook.overview/confirmed_hc"
+         :logbook.overview/released_hc "logbook.overview/released_hc"
+         :logbook.overview/target_hc "logbook.overview/target_hc"
+         :logbook.overview/target_due "logbook.overview/target_due"
+         :logbook.overview/products_active "logbook.overview/products_active"
+         :logbook.overview/products_closed "logbook.overview/products_closed"
+         :logbook.overview/stages "logbook.overview/stages"
+         :logbook.overview/mismatch_count "logbook.overview/mismatch_count"
+         :logbook.overview/stale_count "logbook.overview/stale_count"
+         :logbook.overview/no_it_owner_count "logbook.overview/no_it_owner_count"
+         :logbook.overview/open_questions "logbook.overview/open_questions"
+         :logbook.overview/open_risks "logbook.overview/open_risks"
+         :logbook.overview/pending_cards "logbook.overview/pending_cards"
+         :logbook.overview/to_decide "logbook.overview/to_decide"
+         :logbook.overview/recent_updates "logbook.overview/recent_updates"}
+       :binding/parameter-map {:domain "domain"}}
+     "overview_all-api" {:binding/for [:resolver "overview_all"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :read
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/my_overview"
+         :json_body {"caller_email" "logbook-agent@service.local"
+           "domain" "{?domain}"}
+         :data_path "$"
+         :result-root :logbook.overview/all
+         :field_mapping {:logbook.overview/scope_domain "$.scope_domain"
+           :logbook.overview/kol_total "$.kol_total"
+           :logbook.overview/kol_as_of "$.kol_as_of"
+           :logbook.overview/covered_hc "$.covered_hc"
+           :logbook.overview/confirmed_hc "$.confirmed_hc"
+           :logbook.overview/released_hc "$.released_hc"
+           :logbook.overview/target_hc "$.target_hc"
+           :logbook.overview/target_due "$.target_due"
+           :logbook.overview/products_active "$.products_active"
+           :logbook.overview/products_closed "$.products_closed"
+           :logbook.overview/stages "$.stages"
+           :logbook.overview/mismatch_count "$.mismatch_count"
+           :logbook.overview/stale_count "$.stale_count"
+           :logbook.overview/no_it_owner_count "$.no_it_owner_count"
+           :logbook.overview/open_questions "$.open_questions"
+           :logbook.overview/open_risks "$.open_risks"
+           :logbook.overview/pending_cards "$.pending_cards"
+           :logbook.overview/to_decide "$.to_decide"
+           :logbook.overview/recent_updates "$.recent_updates"}}
+       :binding/input-map {}
+       :binding/output-map {:logbook.overview/all "logbook.overview/all"
+         :logbook.overview/scope_domain "logbook.overview/scope_domain"
+         :logbook.overview/kol_total "logbook.overview/kol_total"
+         :logbook.overview/kol_as_of "logbook.overview/kol_as_of"
+         :logbook.overview/covered_hc "logbook.overview/covered_hc"
+         :logbook.overview/confirmed_hc "logbook.overview/confirmed_hc"
+         :logbook.overview/released_hc "logbook.overview/released_hc"
+         :logbook.overview/target_hc "logbook.overview/target_hc"
+         :logbook.overview/target_due "logbook.overview/target_due"
+         :logbook.overview/products_active "logbook.overview/products_active"
+         :logbook.overview/products_closed "logbook.overview/products_closed"
+         :logbook.overview/stages "logbook.overview/stages"
+         :logbook.overview/mismatch_count "logbook.overview/mismatch_count"
+         :logbook.overview/stale_count "logbook.overview/stale_count"
+         :logbook.overview/no_it_owner_count "logbook.overview/no_it_owner_count"
+         :logbook.overview/open_questions "logbook.overview/open_questions"
+         :logbook.overview/open_risks "logbook.overview/open_risks"
+         :logbook.overview/pending_cards "logbook.overview/pending_cards"
+         :logbook.overview/to_decide "logbook.overview/to_decide"
+         :logbook.overview/recent_updates "logbook.overview/recent_updates"}
+       :binding/parameter-map {:domain "domain"}}
+     "my_product-api" {:binding/for [:resolver "my_product"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :read
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/my_product"
+         :json_body {"caller_email" "{open-atlas.caller/email}"
+           "product" "{?product}"}
+         :data_path "$"
+         :result-root :logbook.product_page/of_code
+         :field_mapping {:logbook.product_page/code "$.code"
+           :logbook.product_page/name "$.name"
+           :logbook.product_page/domain "$.domain"
+           :logbook.product_page/stage "$.stage"
+           :logbook.product_page/priority "$.priority"
+           :logbook.product_page/risk "$.risk"
+           :logbook.product_page/type "$.type"
+           :logbook.product_page/volume_text "$.volume_text"
+           :logbook.product_page/baseline_hc "$.baseline_hc"
+           :logbook.product_page/potential_hc "$.potential_hc"
+           :logbook.product_page/confirmed_hc "$.confirmed_hc"
+           :logbook.product_page/released_hc "$.released_hc"
+           :logbook.product_page/unit_minutes "$.unit_minutes"
+           :logbook.product_page/it_estimated_cost "$.it_estimated_cost"
+           :logbook.product_page/problem "$.problem"
+           :logbook.product_page/approach "$.approach"
+           :logbook.product_page/solution "$.solution"
+           :logbook.product_page/progress_text "$.progress_text"
+           :logbook.product_page/it_rag "$.it_rag"
+           :logbook.product_page/it_headline "$.it_headline"
+           :logbook.product_page/it_as_of "$.it_as_of"
+           :logbook.product_page/business_rag "$.business_rag"
+           :logbook.product_page/business_headline "$.business_headline"
+           :logbook.product_page/business_as_of "$.business_as_of"
+           :logbook.product_page/owners "$.owners"
+           :logbook.product_page/phases "$.phases"
+           :logbook.product_page/milestones "$.milestones"
+           :logbook.product_page/issues "$.issues"
+           :logbook.product_page/questions "$.questions"
+           :logbook.product_page/refs "$.refs"
+           :logbook.product_page/closed "$.closed"
+           :logbook.product_page/last_update_at "$.last_update_at"}}
+       :binding/input-map {:open-atlas.caller/email "open-atlas.caller/email"}
+       :binding/output-map {:logbook.product_page/of_code "logbook.product_page/of_code"
+         :logbook.product_page/code "logbook.product_page/code"
+         :logbook.product_page/name "logbook.product_page/name"
+         :logbook.product_page/domain "logbook.product_page/domain"
+         :logbook.product_page/stage "logbook.product_page/stage"
+         :logbook.product_page/priority "logbook.product_page/priority"
+         :logbook.product_page/risk "logbook.product_page/risk"
+         :logbook.product_page/type "logbook.product_page/type"
+         :logbook.product_page/volume_text "logbook.product_page/volume_text"
+         :logbook.product_page/baseline_hc "logbook.product_page/baseline_hc"
+         :logbook.product_page/potential_hc "logbook.product_page/potential_hc"
+         :logbook.product_page/confirmed_hc "logbook.product_page/confirmed_hc"
+         :logbook.product_page/released_hc "logbook.product_page/released_hc"
+         :logbook.product_page/unit_minutes "logbook.product_page/unit_minutes"
+         :logbook.product_page/it_estimated_cost "logbook.product_page/it_estimated_cost"
+         :logbook.product_page/problem "logbook.product_page/problem"
+         :logbook.product_page/approach "logbook.product_page/approach"
+         :logbook.product_page/solution "logbook.product_page/solution"
+         :logbook.product_page/progress_text "logbook.product_page/progress_text"
+         :logbook.product_page/it_rag "logbook.product_page/it_rag"
+         :logbook.product_page/it_headline "logbook.product_page/it_headline"
+         :logbook.product_page/it_as_of "logbook.product_page/it_as_of"
+         :logbook.product_page/business_rag "logbook.product_page/business_rag"
+         :logbook.product_page/business_headline "logbook.product_page/business_headline"
+         :logbook.product_page/business_as_of "logbook.product_page/business_as_of"
+         :logbook.product_page/owners "logbook.product_page/owners"
+         :logbook.product_page/phases "logbook.product_page/phases"
+         :logbook.product_page/milestones "logbook.product_page/milestones"
+         :logbook.product_page/issues "logbook.product_page/issues"
+         :logbook.product_page/questions "logbook.product_page/questions"
+         :logbook.product_page/refs "logbook.product_page/refs"
+         :logbook.product_page/closed "logbook.product_page/closed"
+         :logbook.product_page/last_update_at "logbook.product_page/last_update_at"}
+       :binding/parameter-map {:product "product"}}
+     "product_all-api" {:binding/for [:resolver "product_all"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :read
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/my_product"
+         :json_body {"caller_email" "logbook-agent@service.local"
+           "product" "{?product}"}
+         :data_path "$"
+         :result-root :logbook.product_page/all
+         :field_mapping {:logbook.product_page/code "$.code"
+           :logbook.product_page/name "$.name"
+           :logbook.product_page/domain "$.domain"
+           :logbook.product_page/stage "$.stage"
+           :logbook.product_page/priority "$.priority"
+           :logbook.product_page/risk "$.risk"
+           :logbook.product_page/type "$.type"
+           :logbook.product_page/volume_text "$.volume_text"
+           :logbook.product_page/baseline_hc "$.baseline_hc"
+           :logbook.product_page/potential_hc "$.potential_hc"
+           :logbook.product_page/confirmed_hc "$.confirmed_hc"
+           :logbook.product_page/released_hc "$.released_hc"
+           :logbook.product_page/unit_minutes "$.unit_minutes"
+           :logbook.product_page/it_estimated_cost "$.it_estimated_cost"
+           :logbook.product_page/problem "$.problem"
+           :logbook.product_page/approach "$.approach"
+           :logbook.product_page/solution "$.solution"
+           :logbook.product_page/progress_text "$.progress_text"
+           :logbook.product_page/it_rag "$.it_rag"
+           :logbook.product_page/it_headline "$.it_headline"
+           :logbook.product_page/it_as_of "$.it_as_of"
+           :logbook.product_page/business_rag "$.business_rag"
+           :logbook.product_page/business_headline "$.business_headline"
+           :logbook.product_page/business_as_of "$.business_as_of"
+           :logbook.product_page/owners "$.owners"
+           :logbook.product_page/phases "$.phases"
+           :logbook.product_page/milestones "$.milestones"
+           :logbook.product_page/issues "$.issues"
+           :logbook.product_page/questions "$.questions"
+           :logbook.product_page/refs "$.refs"
+           :logbook.product_page/closed "$.closed"
+           :logbook.product_page/last_update_at "$.last_update_at"}}
+       :binding/input-map {}
+       :binding/output-map {:logbook.product_page/all "logbook.product_page/all"
+         :logbook.product_page/code "logbook.product_page/code"
+         :logbook.product_page/name "logbook.product_page/name"
+         :logbook.product_page/domain "logbook.product_page/domain"
+         :logbook.product_page/stage "logbook.product_page/stage"
+         :logbook.product_page/priority "logbook.product_page/priority"
+         :logbook.product_page/risk "logbook.product_page/risk"
+         :logbook.product_page/type "logbook.product_page/type"
+         :logbook.product_page/volume_text "logbook.product_page/volume_text"
+         :logbook.product_page/baseline_hc "logbook.product_page/baseline_hc"
+         :logbook.product_page/potential_hc "logbook.product_page/potential_hc"
+         :logbook.product_page/confirmed_hc "logbook.product_page/confirmed_hc"
+         :logbook.product_page/released_hc "logbook.product_page/released_hc"
+         :logbook.product_page/unit_minutes "logbook.product_page/unit_minutes"
+         :logbook.product_page/it_estimated_cost "logbook.product_page/it_estimated_cost"
+         :logbook.product_page/problem "logbook.product_page/problem"
+         :logbook.product_page/approach "logbook.product_page/approach"
+         :logbook.product_page/solution "logbook.product_page/solution"
+         :logbook.product_page/progress_text "logbook.product_page/progress_text"
+         :logbook.product_page/it_rag "logbook.product_page/it_rag"
+         :logbook.product_page/it_headline "logbook.product_page/it_headline"
+         :logbook.product_page/it_as_of "logbook.product_page/it_as_of"
+         :logbook.product_page/business_rag "logbook.product_page/business_rag"
+         :logbook.product_page/business_headline "logbook.product_page/business_headline"
+         :logbook.product_page/business_as_of "logbook.product_page/business_as_of"
+         :logbook.product_page/owners "logbook.product_page/owners"
+         :logbook.product_page/phases "logbook.product_page/phases"
+         :logbook.product_page/milestones "logbook.product_page/milestones"
+         :logbook.product_page/issues "logbook.product_page/issues"
+         :logbook.product_page/questions "logbook.product_page/questions"
+         :logbook.product_page/refs "logbook.product_page/refs"
+         :logbook.product_page/closed "logbook.product_page/closed"
+         :logbook.product_page/last_update_at "logbook.product_page/last_update_at"}
+       :binding/parameter-map {:product "product"}}
+     "my_weekly_list-api" {:binding/for [:resolver "my_weekly_list"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :read
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/my_weekly_list"
+         :json_body {"caller_email" "{open-atlas.caller/email}"
+           "domain" "{?domain}"}
+         :data_path "$"
+         :result-root :logbook.weekly/mine
+         :field_mapping {:logbook.weekly/id "$.id"
+           :logbook.weekly/week_of "$.week_of"
+           :logbook.weekly/week "$.week"
+           :logbook.weekly/domain "$.domain"
+           :logbook.weekly/language "$.language"
+           :logbook.weekly/status "$.status"
+           :logbook.weekly/frozen_at "$.frozen_at"
+           :logbook.weekly/frozen_by "$.frozen_by"
+           :logbook.weekly/body_json "$.body_json"
+           :logbook.weekly/updated_at "$.updated_at"}}
+       :binding/input-map {:open-atlas.caller/email "open-atlas.caller/email"}
+       :binding/output-map {:logbook.weekly/mine "logbook.weekly/mine"
+         :logbook.weekly/id "logbook.weekly/id"
+         :logbook.weekly/week_of "logbook.weekly/week_of"
+         :logbook.weekly/week "logbook.weekly/week"
+         :logbook.weekly/domain "logbook.weekly/domain"
+         :logbook.weekly/language "logbook.weekly/language"
+         :logbook.weekly/status "logbook.weekly/status"
+         :logbook.weekly/frozen_at "logbook.weekly/frozen_at"
+         :logbook.weekly/frozen_by "logbook.weekly/frozen_by"
+         :logbook.weekly/body_json "logbook.weekly/body_json"
+         :logbook.weekly/updated_at "logbook.weekly/updated_at"}
+       :binding/parameter-map {:domain "domain"}}
+     "weekly_list_all-api" {:binding/for [:resolver "weekly_list_all"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :read
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/my_weekly_list"
+         :json_body {"caller_email" "logbook-agent@service.local"
+           "domain" "{?domain}"}
+         :data_path "$"
+         :result-root :logbook.weekly/all
+         :field_mapping {:logbook.weekly/id "$.id"
+           :logbook.weekly/week_of "$.week_of"
+           :logbook.weekly/week "$.week"
+           :logbook.weekly/domain "$.domain"
+           :logbook.weekly/language "$.language"
+           :logbook.weekly/status "$.status"
+           :logbook.weekly/frozen_at "$.frozen_at"
+           :logbook.weekly/frozen_by "$.frozen_by"
+           :logbook.weekly/body_json "$.body_json"
+           :logbook.weekly/updated_at "$.updated_at"}}
+       :binding/input-map {}
+       :binding/output-map {:logbook.weekly/all "logbook.weekly/all"
+         :logbook.weekly/id "logbook.weekly/id"
+         :logbook.weekly/week_of "logbook.weekly/week_of"
+         :logbook.weekly/week "logbook.weekly/week"
+         :logbook.weekly/domain "logbook.weekly/domain"
+         :logbook.weekly/language "logbook.weekly/language"
+         :logbook.weekly/status "logbook.weekly/status"
+         :logbook.weekly/frozen_at "logbook.weekly/frozen_at"
+         :logbook.weekly/frozen_by "logbook.weekly/frozen_by"
+         :logbook.weekly/body_json "logbook.weekly/body_json"
+         :logbook.weekly/updated_at "logbook.weekly/updated_at"}
+       :binding/parameter-map {:domain "domain"}}
+     "my_mail_plan-api" {:binding/for [:resolver "my_mail_plan"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :read
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/my_mail_plan"
+         :json_body {"caller_email" "{open-atlas.caller/email}"}
+         :data_path "$"
+         :result-root :logbook.mail_plan/mine
+         :field_mapping {:logbook.mail_plan/email "$.email"
+           :logbook.mail_plan/display_name "$.display_name"
+           :logbook.mail_plan/language "$.language"
+           :logbook.mail_plan/version "$.version"}}
+       :binding/input-map {:open-atlas.caller/email "open-atlas.caller/email"}
+       :binding/output-map {:logbook.mail_plan/mine "logbook.mail_plan/mine"
+         :logbook.mail_plan/email "logbook.mail_plan/email"
+         :logbook.mail_plan/display_name "logbook.mail_plan/display_name"
+         :logbook.mail_plan/language "logbook.mail_plan/language"
+         :logbook.mail_plan/version "logbook.mail_plan/version"}}
+     "my_report_mails-api" {:binding/for [:resolver "my_report_mails"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :read
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/my_report_mails"
+         :json_body {"caller_email" "{open-atlas.caller/email}"
+           "week_of" "{?week_of}"}
+         :data_path "$"
+         :result-root :logbook.mail_log/of_week
+         :field_mapping {:logbook.mail_log/id "$.id"
+           :logbook.mail_log/report_id "$.report_id"
+           :logbook.mail_log/domain "$.domain"
+           :logbook.mail_log/language "$.language"
+           :logbook.mail_log/recipients "$.recipients"
+           :logbook.mail_log/state "$.state"
+           :logbook.mail_log/message_id "$.message_id"
+           :logbook.mail_log/created_at "$.created_at"
+           :logbook.mail_log/created_by "$.created_by"}}
+       :binding/input-map {:open-atlas.caller/email "open-atlas.caller/email"}
+       :binding/output-map {:logbook.mail_log/of_week "logbook.mail_log/of_week"
+         :logbook.mail_log/id "logbook.mail_log/id"
+         :logbook.mail_log/report_id "logbook.mail_log/report_id"
+         :logbook.mail_log/domain "logbook.mail_log/domain"
+         :logbook.mail_log/language "logbook.mail_log/language"
+         :logbook.mail_log/recipients "logbook.mail_log/recipients"
+         :logbook.mail_log/state "logbook.mail_log/state"
+         :logbook.mail_log/message_id "logbook.mail_log/message_id"
+         :logbook.mail_log/created_at "logbook.mail_log/created_at"
+         :logbook.mail_log/created_by "logbook.mail_log/created_by"}
+       :binding/parameter-map {:week_of "week_of"}}
+     "my_brief-api" {:binding/for [:resolver "my_brief"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :read
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/my_brief"
+         :json_body {"caller_email" "{open-atlas.caller/email}"
+           "domain" "{?domain}"
+           "language" "{?language}"}
+         :data_path "$"
+         :result-root :logbook.brief/mine
+         :field_mapping {:logbook.brief/id "$.id"
+           :logbook.brief/domain "$.domain"
+           :logbook.brief/language "$.language"
+           :logbook.brief/body "$.body"
+           :logbook.brief/created_at "$.created_at"
+           :logbook.brief/created_by "$.created_by"}}
+       :binding/input-map {:open-atlas.caller/email "open-atlas.caller/email"}
+       :binding/output-map {:logbook.brief/mine "logbook.brief/mine"
+         :logbook.brief/id "logbook.brief/id"
+         :logbook.brief/domain "logbook.brief/domain"
+         :logbook.brief/language "logbook.brief/language"
+         :logbook.brief/body "logbook.brief/body"
+         :logbook.brief/created_at "logbook.brief/created_at"
+         :logbook.brief/created_by "logbook.brief/created_by"}
+       :binding/parameter-map {:domain "domain"
+         :language "language"}}
+     "brief_all-api" {:binding/for [:resolver "brief_all"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :read
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/my_brief"
+         :json_body {"caller_email" "logbook-agent@service.local"
+           "domain" "{?domain}"
+           "language" "{?language}"}
+         :data_path "$"
+         :result-root :logbook.brief/all
+         :field_mapping {:logbook.brief/id "$.id"
+           :logbook.brief/domain "$.domain"
+           :logbook.brief/language "$.language"
+           :logbook.brief/body "$.body"
+           :logbook.brief/created_at "$.created_at"
+           :logbook.brief/created_by "$.created_by"}}
+       :binding/input-map {}
+       :binding/output-map {:logbook.brief/all "logbook.brief/all"
+         :logbook.brief/id "logbook.brief/id"
+         :logbook.brief/domain "logbook.brief/domain"
+         :logbook.brief/language "logbook.brief/language"
+         :logbook.brief/body "logbook.brief/body"
+         :logbook.brief/created_at "logbook.brief/created_at"
+         :logbook.brief/created_by "logbook.brief/created_by"}
+       :binding/parameter-map {:domain "domain"
+         :language "language"}}
+     "my_share_links-api" {:binding/for [:resolver "my_share_links"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :read
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/my_share_links"
+         :json_body {"caller_email" "{open-atlas.caller/email}"}
+         :data_path "$"
+         :result-root :logbook.share/mine
+         :field_mapping {:logbook.share/id "$.id"
+           :logbook.share/token "$.token"
+           :logbook.share/domain "$.domain"
+           :logbook.share/note "$.note"
+           :logbook.share/expires_at "$.expires_at"
+           :logbook.share/created_at "$.created_at"
+           :logbook.share/created_by "$.created_by"}}
+       :binding/input-map {:open-atlas.caller/email "open-atlas.caller/email"}
+       :binding/output-map {:logbook.share/mine "logbook.share/mine"
+         :logbook.share/id "logbook.share/id"
+         :logbook.share/token "logbook.share/token"
+         :logbook.share/domain "logbook.share/domain"
+         :logbook.share/note "logbook.share/note"
+         :logbook.share/expires_at "logbook.share/expires_at"
+         :logbook.share/created_at "logbook.share/created_at"
+         :logbook.share/created_by "logbook.share/created_by"}}
+     "my_open_asks-api" {:binding/for [:resolver "my_open_asks"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :read
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/my_open_asks"
+         :json_body {"caller_email" "{open-atlas.caller/email}"}
+         :data_path "$"
+         :result-root :logbook.ask/mine
+         :field_mapping {:logbook.ask/code "$.code"
+           :logbook.ask/product "$.product"
+           :logbook.ask/product_name "$.product_name"
+           :logbook.ask/body "$.body"
+           :logbook.ask/asked_by "$.asked_by"
+           :logbook.ask/created_at "$.created_at"}}
+       :binding/input-map {:open-atlas.caller/email "open-atlas.caller/email"}
+       :binding/output-map {:logbook.ask/mine "logbook.ask/mine"
+         :logbook.ask/code "logbook.ask/code"
+         :logbook.ask/product "logbook.ask/product"
+         :logbook.ask/product_name "logbook.ask/product_name"
+         :logbook.ask/body "logbook.ask/body"
+         :logbook.ask/asked_by "logbook.ask/asked_by"
+         :logbook.ask/created_at "logbook.ask/created_at"}}
+     "my_members-api" {:binding/for [:resolver "my_members"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :read
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/my_members"
+         :json_body {"caller_email" "{open-atlas.caller/email}"}
+         :data_path "$"
+         :result-root :logbook.member/mine
+         :field_mapping {:logbook.member/email "$.email"
+           :logbook.member/display_name "$.display_name"
+           :logbook.member/roles "$.roles"
+           :logbook.member/domains "$.domains"
+           :logbook.member/language "$.language"
+           :logbook.member/active "$.active"
+           :logbook.member/owns "$.owns"
+           :logbook.member/created_by "$.created_by"
+           :logbook.member/updated_at "$.updated_at"}}
+       :binding/input-map {:open-atlas.caller/email "open-atlas.caller/email"}
+       :binding/output-map {:logbook.member/mine "logbook.member/mine"
+         :logbook.member/email "logbook.member/email"
+         :logbook.member/display_name "logbook.member/display_name"
+         :logbook.member/roles "logbook.member/roles"
+         :logbook.member/domains "logbook.member/domains"
+         :logbook.member/language "logbook.member/language"
+         :logbook.member/active "logbook.member/active"
+         :logbook.member/owns "logbook.member/owns"
+         :logbook.member/created_by "logbook.member/created_by"
+         :logbook.member/updated_at "logbook.member/updated_at"}}
+     "my_rosters-api" {:binding/for [:resolver "my_rosters"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :read
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/my_rosters"
+         :json_body {"caller_email" "{open-atlas.caller/email}"}
+         :data_path "$"
+         :result-root :logbook.roster/mine
+         :field_mapping {:logbook.roster/id "$.id"
+           :logbook.roster/taken_on "$.taken_on"
+           :logbook.roster/source_file "$.source_file"
+           :logbook.roster/row_count "$.row_count"
+           :logbook.roster/created_at "$.created_at"
+           :logbook.roster/created_by "$.created_by"}}
+       :binding/input-map {:open-atlas.caller/email "open-atlas.caller/email"}
+       :binding/output-map {:logbook.roster/mine "logbook.roster/mine"
+         :logbook.roster/id "logbook.roster/id"
+         :logbook.roster/taken_on "logbook.roster/taken_on"
+         :logbook.roster/source_file "logbook.roster/source_file"
+         :logbook.roster/row_count "logbook.roster/row_count"
+         :logbook.roster/created_at "logbook.roster/created_at"
+         :logbook.roster/created_by "logbook.roster/created_by"}}
+     "my_fixes-api" {:binding/for [:resolver "my_fixes"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :read
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/my_fixes"
+         :json_body {"caller_email" "{open-atlas.caller/email}"}
+         :data_path "$"
+         :result-root :logbook.fix/mine
+         :field_mapping {:logbook.fix/request_id "$.request_id"
+           :logbook.fix/actor_email "$.actor_email"
+           :logbook.fix/result "$.result"
+           :logbook.fix/created_at "$.created_at"}}
+       :binding/input-map {:open-atlas.caller/email "open-atlas.caller/email"}
+       :binding/output-map {:logbook.fix/mine "logbook.fix/mine"
+         :logbook.fix/request_id "logbook.fix/request_id"
+         :logbook.fix/actor_email "logbook.fix/actor_email"
+         :logbook.fix/result "logbook.fix/result"
+         :logbook.fix/created_at "logbook.fix/created_at"}}
+     "post_update-api" {:binding/for [:operation "logbook.command/post_update"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :write
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/cmd_post_update"
+         :json_body {"request_id" "{logbook.command/request_id}"
+           "caller_email" "{open-atlas.caller/email}"
+           "payload" "{logbook.command/payload}"}
+         :field_mapping {:logbook.command/result "$"}}
+       :binding/input-map {:logbook.command/request_id "logbook.command/request_id"
+         :open-atlas.caller/email "open-atlas.caller/email"
+         :logbook.command/payload "logbook.command/payload"}
+       :binding/output-map {:logbook.command/result "logbook.command/result"}}
+     "undo_update-api" {:binding/for [:operation "logbook.command/undo_update"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :write
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/cmd_undo_update"
+         :json_body {"request_id" "{logbook.command/request_id}"
+           "caller_email" "{open-atlas.caller/email}"
+           "payload" "{logbook.command/payload}"}
+         :field_mapping {:logbook.command/result "$"}}
+       :binding/input-map {:logbook.command/request_id "logbook.command/request_id"
+         :open-atlas.caller/email "open-atlas.caller/email"
+         :logbook.command/payload "logbook.command/payload"}
+       :binding/output-map {:logbook.command/result "logbook.command/result"}}
+     "propose-api" {:binding/for [:operation "logbook.command/propose"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :write
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/cmd_propose"
+         :json_body {"request_id" "{logbook.command/request_id}"
+           "caller_email" "{open-atlas.caller/email}"
+           "payload" "{logbook.command/payload}"}
+         :field_mapping {:logbook.command/result "$"}}
+       :binding/input-map {:logbook.command/request_id "logbook.command/request_id"
+         :open-atlas.caller/email "open-atlas.caller/email"
+         :logbook.command/payload "logbook.command/payload"}
+       :binding/output-map {:logbook.command/result "logbook.command/result"}}
+     "confirm_card-api" {:binding/for [:operation "logbook.command/confirm_card"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :write
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/cmd_confirm_card"
+         :json_body {"request_id" "{logbook.command/request_id}"
+           "caller_email" "{open-atlas.caller/email}"
+           "payload" "{logbook.command/payload}"}
+         :field_mapping {:logbook.command/result "$"}}
+       :binding/input-map {:logbook.command/request_id "logbook.command/request_id"
+         :open-atlas.caller/email "open-atlas.caller/email"
+         :logbook.command/payload "logbook.command/payload"}
+       :binding/output-map {:logbook.command/result "logbook.command/result"}}
+     "ask_question-api" {:binding/for [:operation "logbook.command/ask_question"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :write
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/cmd_ask_question"
+         :json_body {"request_id" "{logbook.command/request_id}"
+           "caller_email" "{open-atlas.caller/email}"
+           "payload" "{logbook.command/payload}"}
+         :field_mapping {:logbook.command/result "$"}}
+       :binding/input-map {:logbook.command/request_id "logbook.command/request_id"
+         :open-atlas.caller/email "open-atlas.caller/email"
+         :logbook.command/payload "logbook.command/payload"}
+       :binding/output-map {:logbook.command/result "logbook.command/result"}}
+     "answer_question-api" {:binding/for [:operation "logbook.command/answer_question"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :write
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/cmd_answer_question"
+         :json_body {"request_id" "{logbook.command/request_id}"
+           "caller_email" "{open-atlas.caller/email}"
+           "payload" "{logbook.command/payload}"}
+         :field_mapping {:logbook.command/result "$"}}
+       :binding/input-map {:logbook.command/request_id "logbook.command/request_id"
+         :open-atlas.caller/email "open-atlas.caller/email"
+         :logbook.command/payload "logbook.command/payload"}
+       :binding/output-map {:logbook.command/result "logbook.command/result"}}
+     "draft_weekly-api" {:binding/for [:operation "logbook.command/draft_weekly"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :write
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/cmd_draft_weekly"
+         :json_body {"request_id" "{logbook.command/request_id}"
+           "caller_email" "{open-atlas.caller/email}"
+           "payload" "{logbook.command/payload}"}
+         :field_mapping {:logbook.command/result "$"}}
+       :binding/input-map {:logbook.command/request_id "logbook.command/request_id"
+         :open-atlas.caller/email "open-atlas.caller/email"
+         :logbook.command/payload "logbook.command/payload"}
+       :binding/output-map {:logbook.command/result "logbook.command/result"}}
+     "freeze_weekly-api" {:binding/for [:operation "logbook.command/freeze_weekly"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :write
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/cmd_freeze_weekly"
+         :json_body {"request_id" "{logbook.command/request_id}"
+           "caller_email" "{open-atlas.caller/email}"
+           "payload" "{logbook.command/payload}"}
+         :field_mapping {:logbook.command/result "$"}}
+       :binding/input-map {:logbook.command/request_id "logbook.command/request_id"
+         :open-atlas.caller/email "open-atlas.caller/email"
+         :logbook.command/payload "logbook.command/payload"}
+       :binding/output-map {:logbook.command/result "logbook.command/result"}}
+     "log_mail-api" {:binding/for [:operation "logbook.command/log_mail"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :write
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/cmd_log_mail"
+         :json_body {"request_id" "{logbook.command/request_id}"
+           "caller_email" "{open-atlas.caller/email}"
+           "payload" "{logbook.command/payload}"}
+         :field_mapping {:logbook.command/result "$"}}
+       :binding/input-map {:logbook.command/request_id "logbook.command/request_id"
+         :open-atlas.caller/email "open-atlas.caller/email"
+         :logbook.command/payload "logbook.command/payload"}
+       :binding/output-map {:logbook.command/result "logbook.command/result"}}
+     "admin_member-api" {:binding/for [:operation "logbook.command/admin_member"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :write
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/cmd_admin_member"
+         :json_body {"request_id" "{logbook.command/request_id}"
+           "caller_email" "{open-atlas.caller/email}"
+           "payload" "{logbook.command/payload}"}
+         :field_mapping {:logbook.command/result "$"}}
+       :binding/input-map {:logbook.command/request_id "logbook.command/request_id"
+         :open-atlas.caller/email "open-atlas.caller/email"
+         :logbook.command/payload "logbook.command/payload"}
+       :binding/output-map {:logbook.command/result "logbook.command/result"}}
+     "save_brief-api" {:binding/for [:operation "logbook.command/save_brief"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :write
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/cmd_save_brief"
+         :json_body {"request_id" "{logbook.command/request_id}"
+           "caller_email" "{open-atlas.caller/email}"
+           "payload" "{logbook.command/payload}"}
+         :field_mapping {:logbook.command/result "$"}}
+       :binding/input-map {:logbook.command/request_id "logbook.command/request_id"
+         :open-atlas.caller/email "open-atlas.caller/email"
+         :logbook.command/payload "logbook.command/payload"}
+       :binding/output-map {:logbook.command/result "logbook.command/result"}}
+     "create_share-api" {:binding/for [:operation "logbook.command/create_share"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :write
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/cmd_create_share"
+         :json_body {"request_id" "{logbook.command/request_id}"
+           "caller_email" "{open-atlas.caller/email}"
+           "payload" "{logbook.command/payload}"}
+         :field_mapping {:logbook.command/result "$"}}
+       :binding/input-map {:logbook.command/request_id "logbook.command/request_id"
+         :open-atlas.caller/email "open-atlas.caller/email"
+         :logbook.command/payload "logbook.command/payload"}
+       :binding/output-map {:logbook.command/result "logbook.command/result"}}
+     "open_share-api" {:binding/for [:operation "logbook.command/open_share"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :write
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/cmd_open_share"
+         :json_body {"request_id" "{logbook.command/request_id}"
+           "caller_email" "{open-atlas.caller/email}"
+           "payload" "{logbook.command/payload}"}
+         :field_mapping {:logbook.command/result "$"}}
+       :binding/input-map {:logbook.command/request_id "logbook.command/request_id"
+         :open-atlas.caller/email "open-atlas.caller/email"
+         :logbook.command/payload "logbook.command/payload"}
+       :binding/output-map {:logbook.command/result "logbook.command/result"}}
+     "admin_fix-api" {:binding/for [:operation "logbook.command/admin_fix"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :write
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/cmd_admin_fix"
+         :json_body {"request_id" "{logbook.command/request_id}"
+           "caller_email" "{open-atlas.caller/email}"
+           "payload" "{logbook.command/payload}"}
+         :field_mapping {:logbook.command/result "$"}}
+       :binding/input-map {:logbook.command/request_id "logbook.command/request_id"
+         :open-atlas.caller/email "open-atlas.caller/email"
+         :logbook.command/payload "logbook.command/payload"}
+       :binding/output-map {:logbook.command/result "logbook.command/result"}}
+     "import_roster-api" {:binding/for [:operation "logbook.command/import_roster"]
+       :binding/source "logbook-pgrst-api"
+       :binding/effect :write
+       :binding/implementation {:method "POST"
+         :endpoint "/rpc/cmd_import_roster"
+         :json_body {"request_id" "{logbook.command/request_id}"
+           "caller_email" "{open-atlas.caller/email}"
+           "payload" "{logbook.command/payload}"}
+         :field_mapping {:logbook.command/result "$"}}
+       :binding/input-map {:logbook.command/request_id "logbook.command/request_id"
+         :open-atlas.caller/email "open-atlas.caller/email"
+         :logbook.command/payload "logbook.command/payload"}
+       :binding/output-map {:logbook.command/result "logbook.command/result"}}}
+   :selection {[:resolver "my_scope"] "my_scope-api"
+     [:resolver "my_domains"] "my_domains-api"
+     [:resolver "domains_all"] "domains_all-api"
+     [:resolver "my_products"] "my_products-api"
+     [:resolver "products_all"] "products_all-api"
+     [:resolver "my_timeline"] "my_timeline-api"
+     [:resolver "timeline_all"] "timeline_all-api"
+     [:resolver "my_questions"] "my_questions-api"
+     [:resolver "questions_all"] "questions_all-api"
+     [:resolver "my_cards"] "my_cards-api"
+     [:resolver "cards_all"] "cards_all-api"
+     [:resolver "my_overview"] "my_overview-api"
+     [:resolver "overview_all"] "overview_all-api"
+     [:resolver "my_product"] "my_product-api"
+     [:resolver "product_all"] "product_all-api"
+     [:resolver "my_weekly_list"] "my_weekly_list-api"
+     [:resolver "weekly_list_all"] "weekly_list_all-api"
+     [:resolver "my_mail_plan"] "my_mail_plan-api"
+     [:resolver "my_report_mails"] "my_report_mails-api"
+     [:resolver "my_brief"] "my_brief-api"
+     [:resolver "brief_all"] "brief_all-api"
+     [:resolver "my_share_links"] "my_share_links-api"
+     [:resolver "my_open_asks"] "my_open_asks-api"
+     [:resolver "my_members"] "my_members-api"
+     [:resolver "my_rosters"] "my_rosters-api"
+     [:resolver "my_fixes"] "my_fixes-api"
+     [:operation "logbook.command/post_update"] "post_update-api"
+     [:operation "logbook.command/undo_update"] "undo_update-api"
+     [:operation "logbook.command/propose"] "propose-api"
+     [:operation "logbook.command/confirm_card"] "confirm_card-api"
+     [:operation "logbook.command/ask_question"] "ask_question-api"
+     [:operation "logbook.command/answer_question"] "answer_question-api"
+     [:operation "logbook.command/draft_weekly"] "draft_weekly-api"
+     [:operation "logbook.command/freeze_weekly"] "freeze_weekly-api"
+     [:operation "logbook.command/log_mail"] "log_mail-api"
+     [:operation "logbook.command/admin_member"] "admin_member-api"
+     [:operation "logbook.command/save_brief"] "save_brief-api"
+     [:operation "logbook.command/create_share"] "create_share-api"
+     [:operation "logbook.command/open_share"] "open_share-api"
+     [:operation "logbook.command/admin_fix"] "admin_fix-api"
+     [:operation "logbook.command/import_roster"] "import_roster-api"}
+   :metrics {}}
+ :ownership {:entities {"open-atlas.caller" "replaced-at-deploy-graph"
+     "logbook.me" "replaced-at-deploy-graph"
+     "logbook.domain" "replaced-at-deploy-graph"
+     "logbook.product" "replaced-at-deploy-graph"
+     "logbook.update" "replaced-at-deploy-graph"
+     "logbook.question" "replaced-at-deploy-graph"
+     "logbook.card" "replaced-at-deploy-graph"
+     "logbook.overview" "replaced-at-deploy-graph"
+     "logbook.product_page" "replaced-at-deploy-graph"
+     "logbook.member" "replaced-at-deploy-graph"
+     "logbook.roster" "replaced-at-deploy-graph"
+     "logbook.fix" "replaced-at-deploy-graph"
+     "logbook.brief" "replaced-at-deploy-graph"
+     "logbook.share" "replaced-at-deploy-graph"
+     "logbook.ask" "replaced-at-deploy-graph"
+     "logbook.mail_plan" "replaced-at-deploy-graph"
+     "logbook.mail_log" "replaced-at-deploy-graph"
+     "logbook.weekly" "replaced-at-deploy-graph"
+     "logbook.command" "replaced-at-deploy-graph"}
+   :resolvers {"my_scope" "replaced-at-deploy-graph"
+     "my_domains" "replaced-at-deploy-graph"
+     "domains_all" "replaced-at-deploy-graph"
+     "my_products" "replaced-at-deploy-graph"
+     "products_all" "replaced-at-deploy-graph"
+     "my_timeline" "replaced-at-deploy-graph"
+     "timeline_all" "replaced-at-deploy-graph"
+     "my_questions" "replaced-at-deploy-graph"
+     "questions_all" "replaced-at-deploy-graph"
+     "my_cards" "replaced-at-deploy-graph"
+     "cards_all" "replaced-at-deploy-graph"
+     "my_overview" "replaced-at-deploy-graph"
+     "overview_all" "replaced-at-deploy-graph"
+     "my_product" "replaced-at-deploy-graph"
+     "product_all" "replaced-at-deploy-graph"
+     "my_weekly_list" "replaced-at-deploy-graph"
+     "weekly_list_all" "replaced-at-deploy-graph"
+     "my_mail_plan" "replaced-at-deploy-graph"
+     "my_report_mails" "replaced-at-deploy-graph"
+     "my_brief" "replaced-at-deploy-graph"
+     "brief_all" "replaced-at-deploy-graph"
+     "my_share_links" "replaced-at-deploy-graph"
+     "my_open_asks" "replaced-at-deploy-graph"
+     "my_members" "replaced-at-deploy-graph"
+     "my_rosters" "replaced-at-deploy-graph"
+     "my_fixes" "replaced-at-deploy-graph"}
+   :operations {"logbook.command/post_update" "replaced-at-deploy-graph"
+     "logbook.command/undo_update" "replaced-at-deploy-graph"
+     "logbook.command/propose" "replaced-at-deploy-graph"
+     "logbook.command/confirm_card" "replaced-at-deploy-graph"
+     "logbook.command/ask_question" "replaced-at-deploy-graph"
+     "logbook.command/answer_question" "replaced-at-deploy-graph"
+     "logbook.command/draft_weekly" "replaced-at-deploy-graph"
+     "logbook.command/freeze_weekly" "replaced-at-deploy-graph"
+     "logbook.command/log_mail" "replaced-at-deploy-graph"
+     "logbook.command/admin_member" "replaced-at-deploy-graph"
+     "logbook.command/save_brief" "replaced-at-deploy-graph"
+     "logbook.command/create_share" "replaced-at-deploy-graph"
+     "logbook.command/open_share" "replaced-at-deploy-graph"
+     "logbook.command/admin_fix" "replaced-at-deploy-graph"
+     "logbook.command/import_roster" "replaced-at-deploy-graph"}
+   :terms {}}
+ :publication {:release/version "0.1.0"
+   :source/revision 0
+   :required-capabilities #{:artifact/embedded-closure-v1 :connector/api :deployment/source-slot-v1 :execution/params-v2 :execution/row-security-v2 :graph/single-owner-v1 :operation/write-v1 :query/source-collection-v1 :semantic/core-v1}}}

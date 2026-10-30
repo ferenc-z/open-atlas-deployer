@@ -1,0 +1,162 @@
+// Stand-ins for the services phase 5 talks to: GitHub (a release with its bundle, release manifests), Workbench's
+// Administration API, Studio's and OMA's Builder MCPs. One fetch function, routed by host; every call is recorded.
+
+import { createHash } from "node:crypto";
+import { gzipSync } from "node:zlib";
+import { readTarGz, stripTop } from "../src/server/tar.ts";
+
+/** A .tar.gz of these files under one top directory, as release scripts make them. */
+export function tarGz(files: Record<string, string>, top = "pkg"): Buffer {
+  const blocks: Buffer[] = [];
+  for (const [name, content] of Object.entries(files)) {
+    const body = Buffer.from(content);
+    const header = Buffer.alloc(512);
+    header.write(`${top}/${name}`, 0, 100);
+    header.write("0000644\0", 100);
+    header.write("0000000\0", 108);
+    header.write("0000000\0", 116);
+    header.write(`${body.length.toString(8).padStart(11, "0")}\0`, 124);
+    header.write("00000000000\0", 136);
+    header.write("        ", 148);
+    header.write("0", 156);
+    header.write("ustar\0", 257);
+    header.write("00", 263);
+    let sum = 0;
+    for (const b of header) sum += b;
+    header.write(`${sum.toString(8).padStart(6, "0")}\0 `, 148);
+    blocks.push(header, body, Buffer.alloc((512 - (body.length % 512)) % 512));
+  }
+  blocks.push(Buffer.alloc(1024));
+  return gzipSync(Buffer.concat(blocks));
+}
+
+export const sha256 = (b: Buffer | string) => createHash("sha256").update(b).digest("hex");
+
+export interface FakeState {
+  calls: string[];
+  /** GitHub: release assets by "repo@tag/asset", release manifests by "repo@tag". */
+  assets: Record<string, Buffer>;
+  manifests: Record<string, { provides?: Record<string, string>; requires?: Record<string, string> }>;
+  workbench: {
+    apps: { id: string; version: string; previousVersion?: string; agentSlots?: Record<string, { name?: string; businessAgentId: string | null }> }[];
+    agents: { id: string; name: string; agentId: string; enabled: boolean }[];
+    key: string;
+  };
+  studio: { draft: string; revision: number; uploaded?: string; queries: string[]; published: number; graph: string };
+  oma: { packages: number; revision: number; agents: string[]; failPublish?: boolean };
+}
+
+export function fakeState(): FakeState {
+  return {
+    calls: [],
+    assets: {},
+    manifests: {},
+    workbench: { apps: [], agents: [], key: "wbk_test" },
+    studio: { graph: "acme/book", draft: '{:contract {:contract/family "atlas-semantic"}\n :workspace {:workspace/id "ws-uat"}\n :graph {:graph/id "g-uat" :graph/label "Book"}}', revision: 3, queries: [], published: 0 },
+    oma: { packages: 0, revision: 0, agents: [] },
+  };
+}
+
+async function mcp(request: Request, tool: (name: string, args: Record<string, any>) => unknown): Promise<Response> {
+  const message = await request.json() as { id?: number; method: string; params?: { name: string; arguments: Record<string, any> } };
+  if (message.id === undefined) return new Response(null, { status: 202 });
+  if (message.method === "initialize") return Response.json({ jsonrpc: "2.0", id: message.id, result: { protocolVersion: "2025-03-26", capabilities: {} } }, { headers: { "mcp-session-id": "s1" } });
+  try {
+    const out = tool(message.params!.name, message.params!.arguments);
+    return Response.json({ jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: JSON.stringify(out) }] } });
+  } catch (error) {
+    return Response.json({ jsonrpc: "2.0", id: message.id, result: { isError: true, content: [{ type: "text", text: (error as Error).message }] } });
+  }
+}
+
+export function fakeServices(s: FakeState): typeof fetch {
+  return (async (input: URL | string | Request, init?: RequestInit) => {
+    const request = input instanceof Request ? input : new Request(String(input), init);
+    const url = new URL(request.url);
+    const call = `${request.method} ${url.host}${url.pathname}`;
+    s.calls.push(call);
+    if (url.host === "api.github.test") {
+      let m = /^\/repos\/([^/]+\/[^/]+)\/releases\/tags\/(.+)$/.exec(url.pathname);
+      if (m) {
+        const assets = Object.keys(s.assets).filter((k) => k.startsWith(`${m![1]}@${decodeURIComponent(m![2]!)}/`));
+        if (!assets.length) return new Response("{}", { status: 404 });
+        return Response.json({ assets: assets.map((k) => ({ name: k.split("/").at(-1), url: `https://api.github.test/assets/${encodeURIComponent(k)}` })) });
+      }
+      m = /^\/assets\/(.+)$/.exec(url.pathname);
+      if (m) return new Response(new Uint8Array(s.assets[decodeURIComponent(m[1]!)]!));
+      m = /^\/repos\/([^/]+\/[^/]+)\/contents\/(.+)$/.exec(url.pathname);
+      if (m) {
+        const doc = s.manifests[`${m[1]}@${url.searchParams.get("ref")}`];
+        return doc ? new Response(JSON.stringify(doc)) : new Response("{}", { status: 404 });
+      }
+    }
+    if (url.host === "workbench:8090") {
+      if (request.headers.get("authorization") !== `Bearer ${s.workbench.key}`) return Response.json({ finding: { code: "auth/admin-token-invalid" } }, { status: 401 });
+      const wb = s.workbench;
+      if (url.pathname === "/api/workbench/admin/apps" && request.method === "GET") return Response.json({ apps: wb.apps });
+      if (url.pathname === "/api/workbench/admin/apps/upload") {
+        const file = (await request.formData()).get("package") as File;
+        const files = stripTop(readTarGz(Buffer.from(await file.arrayBuffer())));
+        const app = JSON.parse(files.get("app/app.json")!.toString()) as { id: string; version: string; agentSlots?: Record<string, { name: string }> };
+        const existing = wb.apps.find((a) => a.id === app.id);
+        if (existing) { existing.previousVersion = existing.version; existing.version = app.version; }
+        // As Workbench does: a new app's slots bind by name to the one enabled Business Agent of that name.
+        const bound: Record<string, string> = {};
+        if (!existing) {
+          wb.apps.push({ id: app.id, version: app.version, agentSlots: Object.fromEntries(Object.entries(app.agentSlots ?? {}).map(([k, v]) => {
+            const match = wb.agents.filter((a) => a.enabled && a.name === v.name);
+            if (match.length === 1) bound[k] = match[0]!.id;
+            return [k, { name: v.name, businessAgentId: bound[k] ?? null }];
+          })) });
+        }
+        return Response.json({ app: { id: app.id, version: app.version }, bound }, { status: 201 });
+      }
+      let m = /^\/api\/workbench\/admin\/apps\/([^/]+)\/switch-version$/.exec(url.pathname);
+      if (m) {
+        const a = wb.apps.find((x) => x.id === m![1])!;
+        [a.version, a.previousVersion] = [a.previousVersion!, a.version];
+        return Response.json({ version: a.version });
+      }
+      if (url.pathname === "/api/workbench/admin/business-agents") return Response.json({ agents: wb.agents });
+      m = /^\/api\/workbench\/admin\/business-agents\/([^/]+)$/.exec(url.pathname);
+      if (m && request.method === "PATCH") {
+        const body = await request.json() as { agentId: string };
+        wb.agents.find((a) => a.id === m![1])!.agentId = body.agentId;
+        return Response.json({ agent: wb.agents.find((a) => a.id === m![1]) });
+      }
+    }
+    if (url.host === "studio.test") {
+      if (request.headers.get("authorization") !== "Bearer oaw_v1.test") return new Response("no", { status: 401 });
+      return mcp(request, (name, args) => {
+        s.calls.push(`studio ${name}`);
+        if (args.graph !== s.studio.graph) throw new Error(`no graph ${args.graph}`);
+        if (name === "get_graph") return { text: s.studio.uploaded ?? s.studio.draft, revision: s.studio.revision };
+        if (name === "upload_graph") {
+          if (args.expected_revision !== s.studio.revision) throw new Error("revision conflict");
+          s.studio.uploaded = args.text; s.studio.revision++;
+          return { revision: s.studio.revision };
+        }
+        if (name === "save_saved_query") { s.studio.queries.push(args.name); return { saved: args.name }; }
+        if (name === "publish_graph") { s.studio.published++; return { version: s.studio.published }; }
+        throw new Error(`unknown tool ${name}`);
+      });
+    }
+    if (url.host === "oma.test") {
+      if (request.headers.get("authorization") !== "Bearer omab_test") return new Response("no", { status: 401 });
+      return mcp(request, (name, args) => {
+        s.calls.push(`oma ${name}`);
+        if (name === "create_package_draft") { s.oma.packages++; return { id: `pkg_${s.oma.packages}` }; }
+        if (name === "update_package_manifest") { s.oma.revision++; (s as any).lastManifest = args; return { revision: s.oma.revision }; }
+        if (name === "validate_package") return { valid: true };
+        if (name === "publish_package") {
+          if (s.oma.failPublish) throw new Error("model not available");
+          const id = `agent_${s.oma.agents.length + 1}`;
+          s.oma.agents.push(id);
+          return { revision: s.oma.revision, agents: [{ agent_id: id }] };
+        }
+        throw new Error(`unknown tool ${name}`);
+      });
+    }
+    return new Response("unexpected", { status: 599 });
+  }) as typeof fetch;
+}
