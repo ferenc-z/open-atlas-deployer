@@ -1,0 +1,2 @@
+# Scripts run on Linux hosts (the executor, install, launch): keep LF even in a Windows checkout.
+* text=auto eol=lf
