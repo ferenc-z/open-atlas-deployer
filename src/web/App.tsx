@@ -5,8 +5,9 @@ import { DeployPanel, History, JobPanel, JobState, KIND } from "./Deploy.tsx";
 import { EnvPage } from "./Env.tsx";
 import { Artifacts } from "./Artifacts.tsx";
 import { AssistantPanel, KeysPage } from "./Assistant.tsx";
+import { OnboardingPage } from "./Onboarding.tsx";
 
-type Tab = "status" | "history" | "artifacts" | "env" | "registry" | "keys" | "audit";
+type Tab = "status" | "history" | "artifacts" | "env" | "registry" | "onboarding" | "keys" | "audit";
 type Panel = { kind: "deploy"; app: string; initial?: { version: string; pinFrom?: string } } | { kind: "job"; id: string } | undefined;
 
 const VERDICT: Record<string, { label: string; tone: string }> = {
@@ -56,6 +57,7 @@ export function App() {
         {tab === "history" && <History onBack={(j) => { setPanel({ kind: "deploy", app: j.app, initial: { version: j.version, pinFrom: j.id } }); setTab("status"); }} />}
         {tab === "env" && <EnvPage />}
         {tab === "registry" && <Registry principal={p} />}
+        {tab === "onboarding" && <OnboardingPage canStart={p.permissions.includes("deploy-uat") && p.via === "workbench"} isAdmin={p.permissions.includes("admin")} onJob={(id) => { setPanel({ kind: "job", id }); setTab("status"); }} />}
         {tab === "keys" && <KeysPage isAdmin={p.permissions.includes("admin")} />}
         {tab === "audit" && p.permissions.includes("admin") && <Audit />}
       </main>
@@ -64,7 +66,7 @@ export function App() {
 }
 
 function Header({ principal, environment, tab, setTab, onSignedOut, assistant, toggleAssistant }: { principal: Principal; environment?: string; tab: Tab; setTab: (t: Tab) => void; onSignedOut: () => void; assistant: boolean; toggleAssistant: () => void }) {
-  const tabs: [Tab, string][] = [["status", "状态"], ["history", "部署记录"], ["artifacts", "制品"], ["env", "环境变量"], ["registry", "应用注册表"], ["keys", "API key"], ...(principal.permissions.includes("admin") ? [["audit", "审计"] as [Tab, string]] : [])];
+  const tabs: [Tab, string][] = [["status", "状态"], ["history", "部署记录"], ["artifacts", "制品"], ["env", "环境变量"], ["registry", "应用注册表"], ["onboarding", "接入评估"], ["keys", "API key"], ...(principal.permissions.includes("admin") ? [["audit", "审计"] as [Tab, string]] : [])];
   return (
     <header>
       <div className="brand">Open Atlas Deployer{environment && <span className="env">{environment.toUpperCase()}</span>}</div>

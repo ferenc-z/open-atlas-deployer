@@ -13,17 +13,33 @@ interface Property { type: "string" | "integer" | "boolean" | "array" | "object"
 export interface Tool {
   name: string;
   description: string;
-  /** Read-only tools are the only ones a service key sees; the others change something (destructiveHint). */
+  /** Read-only tools are the only ones a service key sees, besides draft tools; the others change something (destructiveHint). */
   readOnly: boolean;
+  /** Writes only an assessment's draft (§10.5.6): the service key sees it, and the route checks the task token. */
+  draft?: boolean;
   properties: Record<string, Property>;
   required?: string[];
-  request: (a: Record<string, unknown>) => { method: "GET" | "POST" | "PUT"; path: string; query?: Record<string, unknown>; body?: unknown };
+  request: (a: Record<string, unknown>) => { method: "GET" | "POST" | "PUT"; path: string; query?: Record<string, unknown>; body?: unknown; headers?: Record<string, string> };
 }
 
 const s = (description: string): Property => ({ type: "string", description });
 const n = (description: string): Property => ({ type: "integer", description });
 const enc = (v: unknown) => encodeURIComponent(String(v));
 const APP = s("The app id, as list_apps names it.");
+const ASSESSMENT = s("The assessment id (asm_…).");
+
+/** A draft tool: one draft operation, with the task token, a reason and a request_id. */
+function draft(name: string, operation: string, description: string, properties: Record<string, Property>, required: string[]): Tool {
+  return {
+    name, readOnly: false, draft: true, description: `${description} Writes only the draft of the assessment the task token belongs to; needs reason.`,
+    properties: { id: ASSESSMENT, ...properties, reason: s("Why this setting (recorded with the change)."), task_token: s("The task token from the assessment's first message."), request_id: REQUEST_ID },
+    required: ["id", ...required, "reason", "task_token", "request_id"],
+    request: (a) => {
+      const { id, task_token: token, ...body } = a;
+      return { method: "POST", path: `/api/assessments/${enc(id)}/draft/${operation}`, body, headers: { "x-task-token": String(token) } };
+    },
+  };
+}
 const REQUEST_ID = s("Any string unique to this command; send the same one again to retry without doing it twice.");
 
 export const TOOLS: Tool[] = [
@@ -39,6 +55,20 @@ export const TOOLS: Tool[] = [
   { name: "plan_env", readOnly: true, description: "What writing an env revision to the server would change: keys, services restarted, findings. Changes nothing.", properties: { app: APP, revision: n("Optional revision; the newest by default.") }, required: ["app"], request: (a) => ({ method: "POST", path: `/api/apps/${enc(a.app)}/env/plan`, body: a.revision === undefined ? {} : { revision: a.revision } }) },
   { name: "compare_env_with_uat", readOnly: true, description: "PROD only: UAT's env fingerprint for the app (values for plain keys, a keyed hash for secrets) to compare with get_env_fingerprint.", properties: { app: APP }, required: ["app"], request: (a) => ({ method: "GET", path: `/api/apps/${enc(a.app)}/env/peer-fingerprint` }) },
   { name: "get_env_fingerprint", readOnly: true, description: "This environment's env fingerprint for the app (secrets as a keyed hash, never their value).", properties: { app: APP }, required: ["app"], request: (a) => ({ method: "GET", path: `/api/apps/${enc(a.app)}/env/fingerprint` }) },
+  // Assessments (§10.5.6): the Onboarding Assessor reads these and writes only its own draft, with the task token.
+  { name: "onboarding_draft", readOnly: true, description: "An assessment: its draft (the manifest being built, env keys), every change with who and why, the scanned facts, findings of the last validation, report.", properties: { id: ASSESSMENT }, required: ["id"], request: (a) => ({ method: "GET", path: `/api/assessments/${enc(a.id)}` }) },
+  { name: "environment_facts", readOnly: true, description: "Ports, service names and data paths this environment already uses, per app; no env values.", properties: {}, request: () => ({ method: "GET", path: "/api/environment-facts" }) },
+  { name: "validate_draft", readOnly: true, description: "Runs every program check on the draft (schema, conflicts with other apps, compose generation, forbidden fields, release tag) and returns the findings; none means it may be trial-deployed.", properties: { id: ASSESSMENT }, required: ["id"], request: (a) => ({ method: "POST", path: `/api/assessments/${enc(a.id)}/validate`, body: {} }) },
+  draft("draft_app", "app", "The app's id, name and release: app, name, applies_from, release_repo (owner/name), tag_pattern (e.g. v{version}), release_manifest (release.json or package.json), optional bundle_asset (e.g. my-{version}.tar.gz) and bundle_repo.", { app: s("The app id (lowercase)."), name: s("Display name."), applies_from: s("Version the manifest applies from."), release_repo: s("owner/name of the release repository."), tag_pattern: s("Tag pattern with {version}."), release_manifest: s("release.json or package.json."), bundle_asset: s("Optional Release asset with {version}."), bundle_repo: s("Optional, defaults to release_repo.") }, ["app"]),
+  draft("draft_component", "component", "Add or change a component: component (id), type (compose-service, workbench-app, oma-agent, db-migration, studio-graph, manual), depends_on.", { component: s("Component id."), type: s("Component type."), depends_on: { type: "array", items: { type: "string" }, description: "Optional component ids it waits for." } }, ["component", "type"]),
+  draft("remove_draft_component", "remove-component", "Remove a component from the draft.", { component: s("Component id.") }, ["component"]),
+  draft("draft_source", "source", "A component's one source (§5.1): {kind: public-registry, image: name:fixed-tag} or {kind: company-registry, registry, image, build?}.", { component: s("Component id."), source: { type: "object", description: "The source object." } }, ["component", "source"]),
+  draft("draft_runtime", "runtime", "A component's runtime settings, the ones the Deployer generates compose from: service, ports [{container, host?}], volumes [{target, path | file}], health (image, none or a test array), command, environment {KEY: value or ${KEY}}, envFile; for other types their fields (dir, savedQueries, file, bind, steps, when, target, migrations, …).", { component: s("Component id."), service: s("Optional compose service name (unique across apps)."), ports: { type: "array", items: { type: "object" }, description: "Optional." }, volumes: { type: "array", items: { type: "object" }, description: "Optional." }, health: { type: "array", items: { type: "string" }, description: "Optional test array; or use command for image / none via draft_compose_extra." }, command: { type: "array", items: { type: "string" }, description: "Optional." }, environment: { type: "object", description: "Optional." }, envFile: { type: "boolean", description: "Optional: pass the whole env file." }, steps: { type: "array", items: { type: "string" }, description: "manual: the checklist." }, when: s("manual: install or always."), target: s("db-migration: the database component."), migrations: s("db-migration: directory."), install: s("db-migration: directory."), dir: s("studio-graph."), savedQueries: s("studio-graph."), file: s("oma-agent."), bind: s("oma-agent.") }, ["component"]),
+  draft("draft_compose_extra", "compose-extra", "Advanced: extra compose fields for a component (validated; privileged, host namespaces, build and the like are refused).", { component: s("Component id."), fields: { type: "object", description: "compose fields." } }, ["component", "fields"]),
+  draft("draft_env_key", "env-key", "An env key the app needs: key, description, secret (a secret has no default: a person fills it), default for a plain key.", { key: s("UPPER_CASE key."), description: s("What it is."), secret: { type: "boolean", description: "Whether it is a secret." }, default: s("Optional default, plain keys only.") }, ["key", "description", "secret"]),
+  draft("remove_draft_env_key", "remove-env-key", "Remove an env key from the draft.", { key: s("The key.") }, ["key"]),
+  draft("draft_report", "report", "The assessment report: level A, B, C or D (a version assessment: unchanged, or the level of the new draft) and the report (conclusion, level, components, what is missing and how, risks, what people must decide).", { level: s("A, B, C, D or unchanged."), report: s("The report, in the person's language.") }, ["level", "report"]),
+  draft("draft_issue", "issue", "Draft an issue for the Deployer's own repository: kind onboarding (what the repository's author should change) or capability (what the Deployer lacks). A person opens it.", { kind: s("onboarding or capability."), title: s("Title."), body: s("Body: source repository and version, what is missing where, the suggested change, how it would deploy then.") }, ["kind", "title", "body"]),
   { name: "deploy", readOnly: false, description: "Start a deploy (as plan_deploy plans it). Refused for a key in PROD: PROD takes a browser session.", properties: { app: APP, version: s("The version."), pin_from: s("Optional earlier successful deploy id."), request_id: REQUEST_ID }, required: ["app", "version", "request_id"], request: (a) => ({ method: "POST", path: `/api/apps/${enc(a.app)}/deploy`, body: { version: a.version, ...(a.pin_from ? { pinFrom: a.pin_from } : {}) } }) },
   { name: "build", readOnly: false, description: "Build the app's own images at a version (UAT only).", properties: { app: APP, version: s("The version."), request_id: REQUEST_ID }, required: ["app", "version", "request_id"], request: (a) => ({ method: "POST", path: `/api/apps/${enc(a.app)}/build`, body: { version: a.version } }) },
   { name: "set_env_values", readOnly: false, description: "Save a new env revision. base is the revision the change is based on (get_env); values lists every key of the new revision: {key, value} or {key, keep: true} to keep a secret unseen. Writes nothing to the server (apply_env does).", properties: { app: APP, base: n("The revision this change is based on."), values: { type: "array", items: { type: "object" }, description: "Every key of the new revision." }, note: s("Optional note."), request_id: REQUEST_ID }, required: ["app", "base", "values", "request_id"], request: (a) => ({ method: "PUT", path: `/api/apps/${enc(a.app)}/env`, body: { base: a.base, values: a.values, ...(a.note ? { note: a.note } : {}) } }) },
@@ -78,7 +108,7 @@ const text = (value: unknown, isError = false) => ({ content: [{ type: "text", t
 export async function handleMcp(message: any, ctx: McpContext): Promise<unknown> {
   const { principal, store } = ctx;
   const id = message?.id;
-  const visible = TOOLS.filter((t) => principal.via !== "service" || t.readOnly);
+  const visible = TOOLS.filter((t) => principal.via !== "service" || t.readOnly || t.draft);
   if (message?.id === undefined) return null;
   switch (message?.method) {
     case "initialize":

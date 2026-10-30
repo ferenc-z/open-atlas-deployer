@@ -28,6 +28,8 @@ import { WorkbenchAppDriver } from "../src/server/drivers/workbench-app.ts";
 import { McpClient } from "../src/server/mcp-client.ts";
 import { Keys } from "../src/server/keys.ts";
 import { Diagnoser } from "../src/server/diagnose.ts";
+import { OmaSessions } from "../src/server/oma.ts";
+import { Onboarding } from "../src/server/onboarding.ts";
 import { fakeServices, fakeState, sha256, tarGz, type FakeState } from "./fakes.ts";
 
 const SESSION = "open_atlas_workbench_session";
@@ -72,7 +74,7 @@ function setup(options: SetupOptions = {}) {
   writeFileSync(environmentFile, JSON.stringify({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", registries: {}, apps: { shop: { version: "1.2.0" } } }));
   const config: Config = {
     bind: "127.0.0.1", port: 0, basePath: "/deploy", dataDir: dir, workbenchUrl: "http://workbench:8090", workbenchPublicUrl: "/",
-    environmentFile, observeUrls: {}, secureCookies: false, webDir: join(dir, "web"), templatesDir: join(dir, "templates"), peerKeySha256: options.peerKeys ?? [], githubApi: "https://api.github.com", omaVaults: [],
+    environmentFile, observeUrls: {}, secureCookies: false, webDir: join(dir, "web"), templatesDir: join(dir, "templates"), peerKeySha256: options.peerKeys ?? [], githubApi: "https://api.github.com", omaVaults: [], omaAssessorVaults: [],
     ...(options.emergency ? { emergencyPasswordHash: hashPassword(options.emergency) } : {}),
   };
   let now = Date.parse("2026-10-30T10:00:00Z");
@@ -91,13 +93,13 @@ function setup(options: SetupOptions = {}) {
   }
   const released = options.released ?? { value: false };
   const releases = { release: async (repo: string, tag: string) => (released.value ? { released: true, detail: `${repo} 的 ${tag} 已正式发布` } : { released: false, detail: `${repo} 的 ${tag} 没有 GitHub Release` }) };
-  let phase5: { drivers: DeployDriver[]; bundles: Bundles; contracts: ContractDocs; workbench: WorkbenchAdmin } | undefined;
+  let phase5: { drivers: DeployDriver[]; bundles: Bundles; contracts: ContractDocs; workbench: WorkbenchAdmin; fetcher: typeof fetch } | undefined;
   if (options.services) {
     const f = fakeServices(options.services);
     writeFileSync(join(dir, "wb.key"), options.services.workbench.key);
     const wb = new WorkbenchAdmin("http://workbench:8090", join(dir, "wb.key"), f);
     phase5 = {
-      workbench: wb,
+      workbench: wb, fetcher: f,
       drivers: [
         new WorkbenchAppDriver(wb),
         new StudioGraphDriver(new McpClient("http://studio.test/mcp", () => ({ authorization: "Bearer oaw_v1.test" }), f), join(dir, "templates")),
@@ -113,7 +115,15 @@ function setup(options: SetupOptions = {}) {
   const schemas = new Schemas(undefined, join(dir, "templates"), (async () => new Response(example.text)) as typeof fetch);
   const env = new EnvManager(store, deployments, schemas, new SecretBox(Buffer.alloc(32, 7).toString("base64")), "shared-compare-key");
   const keys = phase5 ? new Keys(store, phase5.workbench, () => now) : undefined;
-  const app = createApp({ config, store, sessions, observer, deployments, versions, env, ...(peer ? { peer } : {}), ...(keys ? { keys } : {}) });
+  writeFileSync(join(dir, "oma.key"), "oma_test");
+  writeFileSync(join(dir, "issue.token"), "ghi_test");
+  const onboarding = phase5 ? new Onboarding({
+    store, deployments, oma: new OmaSessions({ url: "http://oma.test", keyFile: join(dir, "oma.key"), agent: "agent_assessor", environment: "env_isolated" }, phase5.fetcher),
+    githubApi: "https://api.github.test", githubTokenFile: undefined, issueRepo: "acme/deployer", issueTokenFile: join(dir, "issue.token"),
+    templatesDir: join(dir, "kept"), pageUrl: "https://wb.example/deploy/", fetcher: phase5.fetcher, now: () => now,
+  }) : undefined;
+  if (onboarding) deployments.evaluated = (a, v) => onboarding.evaluated(a, v);
+  const app = createApp({ config, store, sessions, observer, deployments, versions, env, ...(peer ? { peer } : {}), ...(keys ? { keys } : {}), ...(onboarding ? { onboarding } : {}) });
   const request = (path: string, init: RequestInit & { as?: string; cookie?: string } = {}) => {
     const headers = new Headers(init.headers);
     const cookies = [init.as ? `${SESSION}=${init.as}` : "", init.cookie ?? ""].filter(Boolean).join("; ");
@@ -797,7 +807,7 @@ test("/mcp: tools are the page's calls; a service key sees only the read-only on
   const init = await mcp(t, service, "initialize", { protocolVersion: "2025-03-26" });
   assert.equal(init.body.result.serverInfo.name, "open-atlas-deployer");
   const serviceTools = (await mcp(t, service, "tools/list")).body.result.tools as { name: string; annotations: { readOnlyHint: boolean } }[];
-  assert.ok(serviceTools.every((x) => x.annotations.readOnlyHint));
+  assert.ok(serviceTools.every((x) => x.annotations.readOnlyHint || /draft_/.test(x.name)), "read-only tools, and draft tools that need a task token");
   assert.ok(serviceTools.some((x) => x.name === "plan_deploy") && !serviceTools.some((x) => x.name === "deploy"));
   const personalTools = (await mcp(t, personal, "tools/list")).body.result.tools as { name: string }[];
   assert.ok(personalTools.some((x) => x.name === "deploy"));
@@ -857,4 +867,119 @@ test("a failed deploy is diagnosed by the Deploy Assistant through OMA, and the 
   assert.equal(view.job.diagnosis.state, "done");
   assert.equal(view.job.diagnosis.cause, "authenticator 的密码与库里不一致");
   assert.equal(view.record.diagnosis.confidence, "high");
+});
+
+// Phase 7: assessments (§10.5) and version assessments (D27).
+
+const tokenOf = (message: string) => /任务令牌[^：]*：(dtt_[\w-]+)/.exec(message)![1]!;
+let draftReq = 0;
+const agentTool = (t: ReturnType<typeof setup>, key: string, name: string, id: string, token: string, args: Record<string, unknown>) =>
+  tool(t, key, name, { id, task_token: token, request_id: `r${++draftReq}`, reason: "看了 Dockerfile 和 compose.yaml", ...args });
+
+test("an assessment: scan, the Agent fills the draft with its task token, validation, trial in UAT, registration", async () => {
+  const t = withBook();
+  t.beat();
+  t.s.tags["acme/hello"] = ["v1.0.0", "v0.9.0"];
+  t.s.releases["acme/hello"] = [{ tag_name: "v1.0.0", name: "1.0.0", draft: false, prerelease: false, published_at: "2026-10-01T00:00:00Z", assets: [] }];
+  const service = (await makeKey(t, "admin", { kind: "service", name: "assessor", days: 30 })).body.key as string;
+  assert.equal((await post(t, "/api/assessments", "viewer", { repo: "https://github.com/acme/hello" })).status, 403);
+  const started = await post(t, "/api/assessments", "uat", { repo: "https://github.com/acme/hello", version: "1.0.0" });
+  assert.equal(started.status, 201);
+  const a = (await started.json()).assessment;
+  assert.equal(a.tokenSha256, undefined, "the token is never shown");
+  assert.deepEqual(a.facts.tags, ["v1.0.0", "v0.9.0"]);
+  assert.equal(a.facts.releases[0].tag, "v1.0.0");
+  assert.ok(a.facts.environment.apps.some((x: { app: string }) => x.app === "book"));
+  const session = t.s.oma.sessions[0]!;
+  assert.deepEqual([session.body.agent, session.body.environment_id], ["agent_assessor", "env_isolated"], "the isolated Environment");
+  const token = tokenOf(session.messages[0]!);
+  assert.match(session.messages[0]!, /不执行仓库里的任何脚本/);
+
+  // The Agent configures the draft; a wrong token or another assessment's is refused.
+  assert.equal((await agentTool(t, service, "draft_app", a.id, "dtt_wrong", { app: "hello" })).value.finding.code, "assessment/token");
+  assert.equal((await tool(t, service, "draft_app", { id: a.id, task_token: token, request_id: "x1", app: "hello" })).value.finding.expected, "draft_app 缺参数 reason");
+  await agentTool(t, service, "draft_app", a.id, token, { app: "hello", name: "Hello", applies_from: "1.0.0" });
+  const early = await tool(t, service, "validate_draft", { id: a.id });
+  assert.ok(early.value.findings.some((f: { code: string }) => f.code === "draft/release" || f.code === "draft/schema"));
+  await agentTool(t, service, "draft_app", a.id, token, { app: "hello", name: "Hello", applies_from: "1.0.0", release_repo: "acme/hello", tag_pattern: "v{version}", release_manifest: "package.json" });
+  await agentTool(t, service, "draft_component", a.id, token, { component: "web", type: "compose-service" });
+  await agentTool(t, service, "draft_source", a.id, token, { component: "web", source: { kind: "public-registry", image: "nginx:latest" } });
+  await agentTool(t, service, "draft_runtime", a.id, token, { component: "web", service: "hello-web", ports: [{ container: 80, host: 18080 }], environment: { GREETING: "${GREETING}" } });
+  const forbidden = await agentTool(t, service, "draft_compose_extra", a.id, token, { component: "web", fields: { privileged: true } });
+  assert.equal(forbidden.value.finding.code, "draft/compose-forbidden");
+  await agentTool(t, service, "draft_env_key", a.id, token, { key: "GREETING", description: "greeting text", secret: false, default: "hi" });
+  assert.equal((await agentTool(t, service, "draft_env_key", a.id, token, { key: "API_TOKEN", description: "x", secret: true, default: "s3" })).value.finding.code, "draft/env-secret");
+  const latest = await tool(t, service, "validate_draft", { id: a.id });
+  assert.deepEqual(latest.value.findings.map((f: { code: string }) => f.code), ["draft/schema"]);
+  assert.match(latest.value.findings[0].expected, /latest/, "a public image needs a fixed version");
+  // A person continues on the page, with their own reason.
+  const fixed = await post(t, `/api/assessments/${a.id}/draft/source`, "uat", { component: "web", source: { kind: "public-registry", image: "nginx:1.27.0" }, reason: "固定版本号" });
+  assert.equal(fixed.status, 200);
+  assert.deepEqual((await tool(t, service, "validate_draft", { id: a.id })).value.findings, []);
+  await agentTool(t, service, "draft_report", a.id, token, { level: "B", report: "能部署：一个容器，补了 env 模板" });
+
+  t.s.oma.reply = "评估完成，B 级。";
+  const ready = await (await t.request(`/api/assessments/${a.id}`, { as: "viewer" })).json();
+  assert.equal(ready.state, "ready");
+  assert.deepEqual(ready.changes.map((c: { by: string; operation: string }) => `${c.by.startsWith("agent:") ? "agent" : c.by} ${c.operation}`).slice(-3), ["agent env-key", "u@x source", "agent report"]);
+  assert.equal(ready.manifest.env.template, "templates/hello.env.example");
+
+  // Trial in UAT by a deploy-uat person; registration by an administrator once the trial succeeded.
+  assert.equal((await post(t, `/api/assessments/${a.id}/register`, "admin", {})).status, 409, "no trial yet");
+  const trial = await (await post(t, `/api/assessments/${a.id}/trial`, "uat", {})).json();
+  assert.equal(t.store.app("hello")!.trial, a.id);
+  assert.equal(readFileSync(join(t.dir, "kept", "hello.env.example"), "utf8").includes("GREETING=hi"), true);
+  const request = JSON.parse(readFileSync(join(t.dir, "handoff", "requests", `${trial.job.id}.json`), "utf8"));
+  assert.deepEqual(request.images, [{ service: "hello-web", ref: "nginx:1.27.0", build: false }]);
+  assert.equal((await post(t, `/api/assessments/${a.id}/register`, "uat", {})).status, 403, "registration is for administrators");
+  finish(t, trial.job.id, "succeeded", { digests: { "hello-web": "sha256:h" } });
+  await t.request("/api/jobs", { as: "viewer" });
+  const registered = await (await post(t, `/api/assessments/${a.id}/register`, "admin", {})).json();
+  assert.equal(registered.state, "registered");
+  assert.equal(t.store.app("hello")!.trial, null);
+  assert.equal((await agentTool(t, service, "draft_app", a.id, token, { app: "hello" })).value.finding.code, "assessment/closed", "the token dies with the assessment");
+});
+
+test("level C drafts an issue for the Deployer's own repository; a person opens it", async () => {
+  const t = withBook();
+  const service = (await makeKey(t, "admin", { kind: "service", name: "assessor", days: 30 })).body.key as string;
+  const a = (await (await post(t, "/api/assessments", "uat", { repo: "https://github.com/acme/desktop" })).json()).assessment;
+  const token = tokenOf(t.s.oma.sessions[0]!.messages[0]!);
+  await agentTool(t, service, "draft_issue", a.id, token, { kind: "onboarding", title: "acme/desktop 缺 Dockerfile", body: "只能本地 npm start；建议加 Dockerfile 并读环境变量" });
+  await agentTool(t, service, "draft_report", a.id, token, { level: "C", report: "需要改仓库" });
+  assert.equal(t.s.issues.length, 0, "the Agent cannot open it");
+  assert.equal((await post(t, `/api/assessments/${a.id}/trial`, "uat", {})).status, 409, "C is not trial-deployed");
+  const opened = await (await post(t, `/api/assessments/${a.id}/issue`, "uat", {})).json();
+  assert.equal(opened.issue.url, "https://github.com/acme/deployer/issues/1");
+  assert.deepEqual([t.s.issues[0]!.repo, t.s.issues[0]!.labels, t.s.issues[0]!.token], ["acme/deployer", ["onboarding"], "Bearer ghi_test"]);
+  assert.match(t.s.issues[0]!.body, new RegExp(`评估 ${a.id}`));
+});
+
+test("D27: where the environment requires it, a new version deploys after its assessment is adopted", async () => {
+  const t = withBook();
+  t.beat();
+  const env = JSON.parse(readFileSync(join(t.dir, "environment.json"), "utf8"));
+  writeFileSync(join(t.dir, "environment.json"), JSON.stringify({ ...env, requireEvaluation: true }));
+  t.s.assets["acme/book@v1.1.0/book-1.1.0.tar.gz"] = t.s.assets["acme/book@v1.0.0/book-1.0.0.tar.gz"]!;
+  t.s.manifests["acme/book@v1.1.0"] = t.s.manifests["acme/book@v1.0.0"]!;
+  t.s.compares["acme/book v1.0.0...v1.1.0"] = { files: [{ filename: "src/app.ts", status: "modified" }, { filename: ".env.example", status: "modified", patch: "+NEW_FLAG=" }], commits: [{ commit: { message: "1.1.0: a new flag" } }] };
+  const blocked = await (await post(t, "/api/apps/book/plan", "uat", { version: "1.1.0" })).json();
+  assert.ok(blocked.findings.some((f: { code: string; blocking: boolean }) => f.code === "deploy/not-evaluated" && f.blocking));
+  const plain = await (await post(t, "/api/apps/book/plan", "uat", { version: "1.0.0" })).json();
+  assert.ok(!plain.findings.some((f: { code: string }) => f.code === "deploy/not-evaluated"), "the version the manifest starts at needs none");
+
+  const service = (await makeKey(t, "admin", { kind: "service", name: "assessor", days: 30 })).body.key as string;
+  const a = (await (await post(t, "/api/assessments", "uat", { app: "book", version: "1.1.0" })).json()).assessment;
+  assert.equal(a.kind, "version");
+  assert.deepEqual(a.facts.changedDeployFiles.map((f: { file: string }) => f.file), [".env.example"], "only the files that matter for the manifest");
+  assert.equal(a.draft.manifest.appliesFrom, "1.1.0", "the draft starts as the current manifest, from the new version");
+  const token = tokenOf(t.s.oma.sessions[0]!.messages[0]!);
+  await agentTool(t, service, "draft_report", a.id, token, { level: "unchanged", report: "只多了一个可选变量 NEW_FLAG，清单不用改" });
+  t.s.oma.reply = "清单不用改。";
+  await t.request(`/api/assessments/${a.id}`, { as: "viewer" });
+  assert.equal((await post(t, `/api/assessments/${a.id}/register`, "uat", {})).status, 403);
+  const adopted = await (await post(t, `/api/assessments/${a.id}/register`, "admin", {})).json();
+  assert.equal(adopted.state, "adopted");
+  const allowed = await (await post(t, "/api/apps/book/plan", "uat", { version: "1.1.0" })).json();
+  assert.ok(!allowed.findings.some((f: { code: string }) => f.code === "deploy/not-evaluated"));
 });

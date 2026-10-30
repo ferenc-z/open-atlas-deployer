@@ -111,6 +111,20 @@ export type ApiKeyView = ApiKey;
 export const keys = () => call<{ keys: ApiKey[] }>("GET", "keys");
 export const createKey = (kind: "personal" | "service", name: string, days: number) => call<{ key: string; record: ApiKey }>("POST", "keys", { kind, name, days });
 export const revokeKey = (id: string) => call<{ revoked: true }>("DELETE", `keys/${encodeURIComponent(id)}`);
+
+// Phase 7: assessments.
+import type { Assessment } from "../server/onboarding.ts";
+export type AssessmentView = Omit<Assessment, "tokenSha256"> & { manifest: Manifest };
+const asm = (id: string, rest = "") => `assessments/${encodeURIComponent(id)}${rest}`;
+export const assessments = () => call<{ assessments: AssessmentView[] }>("GET", "assessments");
+export const assessment = (id: string) => call<AssessmentView>("GET", asm(id));
+export const startAssessment = (body: { repo?: string; version?: string; app?: string }) => call<{ assessment: AssessmentView }>("POST", "assessments", body);
+export const changeDraft = (id: string, operation: string, body: Record<string, unknown>) => call<AssessmentView>("POST", asm(id, `/draft/${operation}`), body);
+export const validateDraft = (id: string) => call<{ findings: Assessment["findings"] }>("POST", asm(id, "/validate"));
+export const trialAssessment = (id: string) => call<{ assessment: AssessmentView; job: Job }>("POST", asm(id, "/trial"), {});
+export const registerAssessment = (id: string) => call<AssessmentView>("POST", asm(id, "/register"));
+export const closeAssessment = (id: string) => call<AssessmentView>("POST", asm(id, "/close"));
+export const openIssue = (id: string) => call<AssessmentView>("POST", asm(id, "/issue"));
 export const planWithOverride = (id: string, version: string, reason: string) => call<Plan>("POST", `apps/${encodeURIComponent(id)}/plan`, { version, override: { reason } });
 export const deployWithOverride = (id: string, version: string, acknowledgeManual: boolean, reason: string) =>
   call<{ job: Job }>("POST", `apps/${encodeURIComponent(id)}/deploy`, { version, acknowledgeManual, override: { reason } });

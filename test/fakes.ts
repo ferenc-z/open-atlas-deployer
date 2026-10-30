@@ -37,6 +37,11 @@ export interface FakeState {
   /** GitHub: release assets by "repo@tag/asset", release manifests by "repo@tag". */
   assets: Record<string, Buffer>;
   manifests: Record<string, { provides?: Record<string, string>; requires?: Record<string, string> }>;
+  /** GitHub: tags and releases by repo, compares by "repo base...head", issues opened. */
+  tags: Record<string, string[]>;
+  releases: Record<string, { tag_name: string; name: string; draft: boolean; prerelease: boolean; published_at: string; body?: string; assets: { name: string }[] }[]>;
+  compares: Record<string, { files: { filename: string; status: string; patch?: string }[]; commits: { commit: { message: string } }[] }>;
+  issues: { repo: string; title: string; body: string; labels: string[]; token: string | null }[];
   workbench: {
     apps: { id: string; version: string; previousVersion?: string; agentSlots?: Record<string, { name?: string; businessAgentId: string | null }> }[];
     agents: { id: string; name: string; agentId: string; enabled: boolean }[];
@@ -55,6 +60,10 @@ export function fakeState(): FakeState {
     calls: [],
     assets: {},
     manifests: {},
+    tags: {},
+    releases: {},
+    compares: {},
+    issues: [],
     workbench: { apps: [], agents: [], key: "wbk_test",
       users: [{ email: "u@x", displayName: "U", enabled: true, isAdmin: false, roleIds: ["r_uat"] }, { email: "p@x", enabled: true, isAdmin: false, roleIds: ["r_prod"] }, { email: "a@x", enabled: true, isAdmin: true, roleIds: [] }],
       roles: [{ id: "r_uat", name: "deploy-uat", enabled: true }, { id: "r_prod", name: "deploy-prod", enabled: true }] },
@@ -83,10 +92,26 @@ export function fakeServices(s: FakeState): typeof fetch {
     s.calls.push(call);
     if (url.host === "api.github.test") {
       let m = /^\/repos\/([^/]+\/[^/]+)\/releases\/tags\/(.+)$/.exec(url.pathname);
+      if (m && !Object.keys(s.assets).some((k) => k.startsWith(`${m![1]}@${decodeURIComponent(m![2]!)}/`))) {
+        const r = (s.releases[m[1]!] ?? []).find((x) => x.tag_name === decodeURIComponent(m![2]!));
+        if (r) return Response.json({ ...r, assets: [] });
+      }
       if (m) {
         const assets = Object.keys(s.assets).filter((k) => k.startsWith(`${m![1]}@${decodeURIComponent(m![2]!)}/`));
         if (!assets.length) return new Response("{}", { status: 404 });
         return Response.json({ assets: assets.map((k) => ({ name: k.split("/").at(-1), url: `https://api.github.test/assets/${encodeURIComponent(k)}` })) });
+      }
+      m = /^\/repos\/([^/]+\/[^/]+)\/tags$/.exec(url.pathname);
+      if (m) return Response.json((s.tags[m[1]!] ?? []).map((name) => ({ name })));
+      m = /^\/repos\/([^/]+\/[^/]+)\/releases$/.exec(url.pathname);
+      if (m) return Response.json(s.releases[m[1]!] ?? []);
+      m = /^\/repos\/([^/]+\/[^/]+)\/compare\/(.+)$/.exec(url.pathname);
+      if (m) { const c = s.compares[`${m[1]} ${decodeURIComponent(m[2]!)}`]; return c ? Response.json(c) : new Response("{}", { status: 404 }); }
+      m = /^\/repos\/([^/]+\/[^/]+)\/issues$/.exec(url.pathname);
+      if (m && request.method === "POST") {
+        const body = await request.json() as { title: string; body: string; labels: string[] };
+        s.issues.push({ repo: m[1]!, ...body, token: request.headers.get("authorization") });
+        return Response.json({ html_url: `https://github.com/${m[1]}/issues/${s.issues.length}` }, { status: 201 });
       }
       m = /^\/assets\/(.+)$/.exec(url.pathname);
       if (m) return new Response(new Uint8Array(s.assets[decodeURIComponent(m[1]!)]!));

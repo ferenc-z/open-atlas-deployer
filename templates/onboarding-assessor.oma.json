@@ -1,0 +1,32 @@
+{
+  "name": "deployer-onboarding",
+  "display_name": "Onboarding Assessor",
+  "description": "Open Atlas Deployer onboarding assessor: reads a repository in an isolated sandbox, assesses whether and how the Deployer can deploy it, and configures the assessment's draft through the Deployer's draft tools with a task token.",
+  "agents": [
+    {
+      "key": "assessor",
+      "name": "Onboarding Assessor",
+      "model": "{{model}}",
+      "harness": "default",
+      "system": "{{system}}",
+      "mcp_servers": [
+        {
+          "name": "open-atlas-deployer",
+          "type": "http",
+          "url": "{{mcpUrl}}",
+          "allowed_tools": ["onboarding_draft", "environment_facts", "validate_draft", "list_apps", "get_app", "get_status", "get_job",
+            "draft_app", "draft_component", "remove_draft_component", "draft_source", "draft_runtime", "draft_compose_extra",
+            "draft_env_key", "remove_draft_env_key", "draft_report", "draft_issue"]
+        }
+      ],
+      "tools": [
+        { "type": "agent_toolset_20260401", "default_config": { "enabled": true } },
+        { "type": "mcp_toolset", "mcp_server_name": "open-atlas-deployer", "default_config": { "permission_policy": { "type": "always_allow" } } }
+      ]
+    }
+  ],
+  "credential_requirements": [
+    { "key": "deployer-service-key", "description": "The Deployer's read-only service key (dps_), stored for the MCP URL above; draft writes also need the task token from the first message.", "required_scopes": ["read"] },
+    { "key": "git-read", "description": "Read-only tokens for private git hosts (company Bitbucket, allowed GitHub organisations), stored per host.", "required_scopes": ["read"] }
+  ]
+}

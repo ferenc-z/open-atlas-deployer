@@ -8,7 +8,8 @@
 - 阶段 3：环境变量管理，包括加密保存、版本、校验、写入服务器、UAT / PROD 对比（见下面"阶段 3"一节）；
 - 阶段 4：制品库、晋级规则，以及 PROD 的 Deployer 用只读 key 查 UAT 的记录（见下面"阶段 4"一节）；
 - 阶段 5：其余驱动（`workbench-app`、`studio-graph`、`oma-agent`、`db-migration`、`manual`）、Release 附件（bundle）、契约核对，一个应用的全部组件一次部署（见下面"阶段 5"一节）；
-- 阶段 6：API key 与 `/mcp`、页面旁的 Deploy Assistant（Workbench 嵌入对话 + 卡片）、部署失败后经 OMA 自动诊断（见下面"阶段 6"一节）。
+- 阶段 6：API key 与 `/mcp`、页面旁的 Deploy Assistant（Workbench 嵌入对话 + 卡片）、部署失败后经 OMA 自动诊断（见下面"阶段 6"一节）；
+- 阶段 7：接入评估（给一个仓库地址）和新版本的清单评估（D27）（见下面"阶段 7"一节）。
 
 阶段 5 起，Workbench 应用包、Agent、数据库迁移、Graph、人工步骤都有驱动，Logbook 这样由几种组件组成的应用也能一次部署。
 
@@ -51,6 +52,8 @@ Node 22.18 起直接运行 `.ts`（类型剥离），服务端不需要构建；
 | `DEPLOYER_OMA_BUILDER_URL` / `DEPLOYER_OMA_BUILDER_KEY_FILE` | 无 | OMA Builder MCP 和它的 `BUILDER_MCP_API_KEY`，给 `oma-agent` |
 | `DEPLOYER_OMA_URL` / `DEPLOYER_OMA_API_KEY_FILE` | 无 | 可选：OMA 的 API 和 key，发布后归档更早的同名 agent；不设就不归档 |
 | `DEPLOYER_OMA_APPLICATION_ID` / `DEPLOYER_OMA_AGENT` / `DEPLOYER_OMA_ENVIRONMENT` / `DEPLOYER_OMA_VAULTS` | 无 | 接法 B：Deployer 自己开 OMA Session（失败诊断）用的 Application、Agent（Deploy Assistant 的 agent id）、Environment、Vault（放只读服务 key）。配了 `DEPLOYER_OMA_URL`、`DEPLOYER_OMA_API_KEY_FILE`、`DEPLOYER_OMA_AGENT` 才诊断 |
+| `DEPLOYER_OMA_ASSESSOR_AGENT` / `DEPLOYER_OMA_ASSESSOR_ENVIRONMENT` / `DEPLOYER_OMA_ASSESSOR_VAULTS` | 无 | 接入评估：Onboarding Assessor 的 agent id、**隔离的** Environment（只放行 git 站点和 Deployer MCP）、Vault（服务 key、私有仓库只读令牌）。不配就不能评估 |
+| `DEPLOYER_ISSUE_REPO` / `DEPLOYER_ISSUE_TOKEN_FILE` | 无 | 开 Issue 的 Deployer 仓库（owner/name）和 fine-grained token（只有 Issues: write） |
 | `DEPLOYER_GITHUB_API` | `https://api.github.com` | 下载 Release 附件、读 `release.json` 的 GitHub API（测试时换成替身）；执行器对应 `EXECUTOR_GITHUB_API` |
 
 ### 认人与授权（§9）
@@ -422,6 +425,46 @@ node bin/publish-assistant.ts <OMA Builder MCP 地址> <builder key 文件> <模
 
 - 真实 OMA、Workbench 上的发布与验证（O1–O4、Business Agent、Role、嵌入页、golden cases）。
 - 新版本的清单评估（D27）放到阶段 7，和接入评估共用任务令牌与草案工作区。
+
+## 阶段 7：接入评估与版本评估（§10.5，D27）
+
+页面上"接入评估"一页（`deploy-uat` 的人发起，只在 UAT）。
+
+### 流程
+
+1. **扫描**（程序）：GitHub 的 tags 和 Release、这个环境已占用的端口 / 服务名 / 数据目录。不受信任的仓库不进 Deployer 的进程。
+2. **评估**（Onboarding Assessor，OMA 的隔离 Environment）：Deployer 开 Session，第一条消息带仓库、扫描结果、评估 id 和**任务令牌**（只对这一次评估的草案有效，24 小时）。Agent 在沙箱里克隆只读，定级 A / B / C / D。页面显示进度。
+3. **配置草案**：草案是一份不生效的清单加 env 键。Agent 用 `/mcp` 的 `draft_*` 工具改（服务 key + 任务令牌，每次带 `reason`），人在页面上也能接着改（整份 JSON 加原因）。每次修改记下谁、改了什么、为什么。草案不允许特权、宿主机命名空间、`build` 等附加字段，密钥不能有默认值。
+4. **校验**（程序）：schema、和已登记应用的冲突、compose 生成、数据目录、release tag 是否存在。
+5. **试部署**（`deploy-uat` 的人）：A / B 级、校验通过后，把草案作为"试部署"应用加入注册表，写出 env 模板（数据目录 `templates/`），按正常流程在 UAT 部署。
+6. **登记**（管理员）：试部署成功后去掉试部署标记。关闭评估时，试部署中的应用从注册表移除。
+
+C 级（要改仓库）和 Deployer 缺能力时，Agent 起草 Issue；人在页面上确认后开到 **Deployer 自己的仓库**（`onboarding` / `capability` 标签），不往源仓库写任何东西。
+
+### 新版本的清单评估（D27）
+
+同一页"评估新版本"：选应用和新版本，Deployer 取两个 tag 之间部署相关文件（`.env.example`、Dockerfile、compose、`release.json` / `package.json` 等）的差异、提交标题和发布记录，草案从当前清单复制（`appliesFrom` 设为新版本）。Agent 判断"不用改"或改好草案；管理员确认沿用或采用新清单。
+
+`environment.json` 里设 `"requireEvaluation": true` 时，比清单起始版本新、又没在这里部署过的版本，要有已采用的版本评估才能部署（`deploy/not-evaluated`）。默认不要求：OMA 不可用时不影响部署。
+
+### Onboarding Assessor 的发布
+
+提示词 [agents/onboarding-assessor.md](agents/onboarding-assessor.md)，包定义 [templates/onboarding-assessor.oma.json](templates/onboarding-assessor.oma.json)（开沙箱文件工具，`allowed_tools` 是只读工具加草案工具）：
+
+```bash
+node bin/publish-assistant.ts <OMA Builder MCP 地址> <builder key 文件> <模型名> https://<域名>/deploy/mcp ./assessor-uat.json onboarding-assessor
+```
+
+### 测试与验证（2026-10-31）
+
+- `npm test`：66 个。阶段 7 新增：扫描事实、开 Session 用隔离 Environment、任务令牌（错的、别的评估的、评估结束后都拒绝）、Agent 和人交替改草案及修改记录、禁止字段与密钥默认值、校验、试部署进注册表并按正常流程部署、管理员登记；C 级 Issue 只能由人开到 Deployer 仓库；版本评估只列部署相关文件、沿用清单后放行 `requireEvaluation`。
+- 真实 OMA 上的评估还没跑过。
+
+### 还没做
+
+- 外部仓库第一次上 PROD 必须先过 UAT（§6.2 例外）：评估和登记都在 UAT 的 Deployer，PROD 的注册表不知道一个应用是不是从评估来的；目前靠 PROD 照常的晋级规则（UAT 部署成功过，或已正式发布）。
+- 镜像仓库里有哪些版本（§10.5.2 表里 Deployer 看的一项）还没查。
+- 非 GitHub 仓库（Bitbucket）只给 Agent 地址，tags 和 Release 由 Agent 在沙箱里用 git 看。
 
 ## 由清单生成 compose（§7.3，D11）
 

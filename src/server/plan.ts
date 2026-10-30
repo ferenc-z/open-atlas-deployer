@@ -94,6 +94,8 @@ export interface PlanContext {
   steps?: Record<string, StepPlan & { impact?: string }>;
   /** §6.4: this version's provides / requires against what the other apps run here. */
   contracts?: { result?: ContractResult; error?: string };
+  /** D27: whether this version's assessment was adopted (asked only when the environment requires it). */
+  evaluated?: boolean;
 }
 
 export const isProd = (env: Environment) => env.name.toLowerCase() === "prod";
@@ -130,6 +132,8 @@ export function plan(ctx: PlanContext, version: string): Plan {
     .map((c) => ({ id: c.id, steps: (c as unknown as { steps: string[] }).steps }));
   if (manual.length) note("deploy/manual", "有人工步骤：部署到这一步时暂停，逐项勾选后才继续。");
   if (fromVersion === version) note("deploy/same-version", `${version} 已经在运行，这次是重新部署。`);
+  if (env.requireEvaluation && version !== manifest.appliesFrom && ctx.evaluated === false) block("deploy/not-evaluated", `${version} 比清单的起始版本 ${manifest.appliesFrom} 新，这个环境要求先做版本评估（D27）：评估完成并由管理员确认后才能部署。`);
+  if (app.trial) note("deploy/trial", `${app.id} 是接入评估 ${app.trial} 的试部署，还没有由管理员登记。`);
   const host = manifest.components.some((c) => HOST_TYPES.has(c.type));
   if (host && !executor.online) block("deploy/executor-offline", executor.reason ?? "执行器不在线。");
   for (const c of manifest.components) {

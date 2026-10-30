@@ -16,6 +16,7 @@ import { DeployError, deploymentRecord, type Deployments } from "./deploy.ts";
 import type { EnvManager } from "./env.ts";
 import { KeyError, isKey, type Keys } from "./keys.ts";
 import { handleMcp } from "./mcp.ts";
+import { OnboardingError, type Onboarding } from "./onboarding.ts";
 import { PeerError, type Peer, type PeerStatus } from "./peer.ts";
 import { environmentStatus, readHostState, type Observer } from "./observe.ts";
 import { StoreError, type Actor, type Store } from "./store.ts";
@@ -33,6 +34,8 @@ export interface Dependencies {
   peer?: Peer;
   /** Personal and service API keys (§9.4, phase 6); without them /mcp and bearer keys are off. */
   keys?: Keys;
+  /** Assessments (§10.5, phase 7). */
+  onboarding?: Onboarding;
 }
 
 const reject = (c: Context, status: 400 | 401 | 403 | 404 | 409 | 429 | 503, code: string, message: string, details: string[] = []) =>
@@ -42,7 +45,7 @@ const actorOf = (p: Principal): Actor => ({ id: p.id, via: p.via });
 
 const TYPES: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".json": "application/json", ".ico": "image/x-icon" };
 
-export function createApp({ config, store, sessions, observer, deployments, versions, env: envVars, peer, keys }: Dependencies): Hono {
+export function createApp({ config, store, sessions, observer, deployments, versions, env: envVars, peer, keys, onboarding }: Dependencies): Hono {
   const throttle = new LoginThrottle();
   const api = new Hono();
   // /mcp calls the API in-process as the key's principal: a one-time nonce with this process's secret, never from outside.
@@ -103,12 +106,12 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     let message: unknown;
     try { message = await c.req.json(); } catch { return c.json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } }, 400); }
     const origin = new URL(c.req.url).origin;
-    const call = async (spec: { method: string; path: string; query?: Record<string, unknown>; body?: unknown }) => {
+    const call = async (spec: { method: string; path: string; query?: Record<string, unknown>; body?: unknown; headers?: Record<string, string> }) => {
       const nonce = randomBytes(12).toString("hex");
       internal.set(nonce, principal);
       const query = Object.entries(spec.query ?? {}).filter(([, v]) => v !== undefined && v !== null && v !== "").map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`).join("&");
       const res = await api.fetch(new Request(`${origin}${spec.path}${query ? `?${query}` : ""}`, {
-        method: spec.method, headers: { "x-deployer-internal": `${internalSecret}.${nonce}`, ...(spec.body !== undefined ? { "content-type": "application/json" } : {}) },
+        method: spec.method, headers: { ...(spec.headers ?? {}), "x-deployer-internal": `${internalSecret}.${nonce}`, ...(spec.body !== undefined ? { "content-type": "application/json" } : {}) },
         ...(spec.body !== undefined ? { body: JSON.stringify(spec.body) } : {}),
       }));
       internal.delete(nonce);
@@ -118,6 +121,39 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     return reply ? c.json(reply) : c.body(null, 202);
   });
   api.get("/mcp", (c) => c.json({ jsonrpc: "2.0", id: null, error: { code: -32601, message: "no event stream here; POST JSON-RPC to /mcp" } }, 405));
+
+  // Assessments (§10.5): start, follow, the draft operations (page and Agent), validation, trial, registration.
+  const assessmentError = (c: Context, error: unknown) => {
+    if (error instanceof OnboardingError) return reject(c, error.status, error.code, error.message, error.details);
+    return deployError(c, error);
+  };
+  const withOnboarding = async (c: Context, need: Permission, run: (p: Principal, o: Onboarding) => Promise<Response> | Response) => {
+    const p = await authenticate(c, need);
+    if (p instanceof Response) return p;
+    if (!onboarding) return reject(c, 404, "assessment/not-configured", "接入评估没有启用。");
+    try { return await run(p, onboarding); } catch (error) { return assessmentError(c, error); }
+  };
+  api.get("/api/environment-facts", (c) => withOnboarding(c, "view", (_p, o) => c.json(o.environmentFacts())));
+  api.get("/api/assessments", (c) => withOnboarding(c, "view", async (_p, o) => { await o.poll(); return c.json({ assessments: o.list().map((a) => o.view(a)) }); }));
+  api.post("/api/assessments", (c) => withOnboarding(c, "view", async (p, o) => {
+    const body = await c.req.json().catch(() => ({})) as { repo?: string; version?: string; app?: string };
+    const { assessment } = await o.start(p, body);
+    return c.json({ assessment: o.view(assessment) }, 201);
+  }));
+  api.get("/api/assessments/:id", (c) => withOnboarding(c, "view", async (_p, o) => { await o.poll(); return c.json(o.view(o.get(c.req.param("id")))); }));
+  api.post("/api/assessments/:id/draft/:operation", (c) => withOnboarding(c, "view", async (p, o) => {
+    const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+    return c.json(o.view(o.change(p, c.req.param("id"), c.req.param("operation"), body, c.req.header("x-task-token"))));
+  }));
+  api.post("/api/assessments/:id/validate", (c) => withOnboarding(c, "view", (p, o) => c.json({ findings: o.validate(p, c.req.param("id")) })));
+  api.post("/api/assessments/:id/trial", (c) => withOnboarding(c, "view", async (p, o) => {
+    const body = await c.req.json().catch(() => ({})) as { version?: string };
+    const r = await o.trial(p, c.req.param("id"), body.version);
+    return c.json({ assessment: o.view(r.assessment), job: r.job });
+  }));
+  api.post("/api/assessments/:id/register", (c) => withOnboarding(c, "view", (p, o) => c.json(o.view(o.register(p, c.req.param("id"))))));
+  api.post("/api/assessments/:id/close", (c) => withOnboarding(c, "view", (p, o) => c.json(o.view(o.close(p, c.req.param("id"))))));
+  api.post("/api/assessments/:id/issue", (c) => withOnboarding(c, "view", async (p, o) => c.json(o.view(await o.openIssue(p, c.req.param("id"))))));
 
   // API keys (§9.4): made and revoked on the page with a Workbench session; a key never makes a key.
   const keyError = (c: Context, error: unknown) => {

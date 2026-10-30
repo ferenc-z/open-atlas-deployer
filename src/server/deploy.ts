@@ -80,6 +80,8 @@ export class Deployments {
 
   /** The app's env file as last written to the server, decrypted (env manager), for ${KEY} in component settings. */
   envValues?: (app: string) => Record<string, string> | undefined;
+  /** D27 (phase 7): whether a version's assessment was adopted, or it already ran here. */
+  evaluated?: (app: string, version: string) => boolean;
   /** Set when OMA is configured (phase 6, D24): a failed or rolled-back deploy is diagnosed. */
   onFailure?: (job: Job) => Promise<void>;
 
@@ -248,6 +250,7 @@ export class Deployments {
       env, app, manifests: this.manifests(), deployed, principal, executor: this.handoff.executor(),
       active: this.store.activeJobs(), built: (v) => this.store.successfulBuild(appId, v), ...(pins ? { pins } : {}),
       ...(this.envState ? { envState: this.envState(appId) } : {}), ...(promotion ? { promotion } : {}), ...outside,
+      ...(env.requireEvaluation ? { evaluated: Boolean(this.evaluated?.(appId, version)) || this.store.deployRecords(appId, version).length > 0 } : {}),
     }, version);
   }
 

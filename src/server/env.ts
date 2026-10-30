@@ -4,7 +4,7 @@
 // first: which keys change and which services restart. Importing reads the file already on the server.
 
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join, normalize } from "node:path";
 import type { Manifest } from "../compose/generate.ts";
 import {
@@ -33,10 +33,14 @@ export class Schemas {
   private templatesDir: string;
   private fetcher: typeof fetch;
 
-  constructor(tokenFile: string | undefined, templatesDir: string, fetcher: typeof fetch = fetch) {
+  /** Templates the Deployer wrote for apps registered from an assessment (phase 7); looked at before templatesDir. */
+  private keptDir: string | undefined;
+
+  constructor(tokenFile: string | undefined, templatesDir: string, fetcher: typeof fetch = fetch, keptDir?: string) {
     this.tokenFile = tokenFile;
     this.templatesDir = templatesDir;
     this.fetcher = fetcher;
+    this.keptDir = keptDir;
   }
 
   async get(manifest: Manifest, version: string): Promise<Schema | { error: string }> {
@@ -44,7 +48,8 @@ export class Schemas {
     if (env?.template) {
       const rel = normalize(env.template.replace(/^templates\//, ""));
       if (rel.startsWith("..")) return { error: `模板路径 ${env.template} 不在 templates/ 里` };
-      try { return { version, source: `Deployer ${env.template}`, keys: parseExample(readFileSync(join(this.templatesDir, rel), "utf8")) }; } catch (error) { return { error: `读不到模板 ${env.template}：${(error as Error).message}` }; }
+      const dir = this.keptDir && existsSync(join(this.keptDir, rel)) ? this.keptDir : this.templatesDir;
+      try { return { version, source: `Deployer ${env.template}`, keys: parseExample(readFileSync(join(dir, rel), "utf8")) }; } catch (error) { return { error: `读不到模板 ${env.template}：${(error as Error).message}` }; }
     }
     if (!env?.schema) return { error: "清单没有 env.schema 或 env.template" };
     if (!manifest.release) return { error: "清单没有 release，取不到 .env.example" };

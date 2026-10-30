@@ -13,7 +13,8 @@ import { compareVersions } from "../manifest/version.ts";
 export interface Actor { id: string; via: "workbench" | "emergency" | "cli" | "key" | "service" }
 
 export interface ManifestRevision { appliesFrom: string; revision: number; savedAt: string; savedBy: string; note: string | null }
-export interface RegisteredApp { id: string; name: string; repo: string; addedAt: string; addedBy: string; manifests: ManifestRevision[] }
+/** trial: in UAT for a trial deploy from an assessment (§10.5.1 ⑤), not yet registered by an administrator (⑥). */
+export interface RegisteredApp { id: string; name: string; repo: string; addedAt: string; addedBy: string; manifests: ManifestRevision[]; trial: string | null }
 export interface AuditEntry { id: number; at: string; actor: string; via: string; action: string; target: string; detail: unknown }
 
 export class StoreError extends Error {
@@ -58,6 +59,9 @@ CREATE TABLE IF NOT EXISTS api_keys (
 CREATE TABLE IF NOT EXISTS mcp_requests (
   key_id TEXT NOT NULL, request_id TEXT NOT NULL, tool TEXT NOT NULL, response TEXT NOT NULL, at TEXT NOT NULL,
   PRIMARY KEY (key_id, request_id));
+CREATE TABLE IF NOT EXISTS assessments (
+  id TEXT PRIMARY KEY, kind TEXT NOT NULL, repo TEXT NOT NULL, app TEXT, version TEXT, state TEXT NOT NULL, requested_by TEXT NOT NULL,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, body TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS component_state (
   app TEXT NOT NULL, component TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, updated_at TEXT NOT NULL,
   PRIMARY KEY (app, component, key));
@@ -177,6 +181,7 @@ export class Store {
     // Columns added after phase 1; a state database from before gets them here.
     const columns = (this.db.prepare("PRAGMA table_info(jobs)").all() as Row[]).map((c) => c.name);
     for (const column of ["rollout", "diagnosis"]) if (!columns.includes(column)) this.db.exec(`ALTER TABLE jobs ADD COLUMN ${column} TEXT`);
+    if (!(this.db.prepare("PRAGMA table_info(apps)").all() as Row[]).some((c) => c.name === "trial")) this.db.exec("ALTER TABLE apps ADD COLUMN trial TEXT");
   }
 
   close() { this.db.close(); }
@@ -196,7 +201,7 @@ export class Store {
   private toApp(a: Row): RegisteredApp {
     const rows = this.db.prepare("SELECT applies_from, revision, saved_at, saved_by, note FROM manifests WHERE app = ? ORDER BY saved_at DESC, revision DESC").all(a.id) as Row[];
     const manifests = rows.map((r) => ({ appliesFrom: r.applies_from, revision: r.revision, savedAt: r.saved_at, savedBy: r.saved_by, note: r.note ?? null }));
-    return { id: a.id, name: a.name, repo: a.repo, addedAt: a.added_at, addedBy: a.added_by, manifests };
+    return { id: a.id, name: a.name, repo: a.repo, addedAt: a.added_at, addedBy: a.added_by, manifests, trial: a.trial ?? null };
   }
 
   /** The current revision of each of an app's manifests, oldest appliesFrom first. */
@@ -356,6 +361,30 @@ export class Store {
 
   runningDiagnoses(): { job: string; diagnosis: Diagnosis }[] {
     return (this.db.prepare("SELECT id, diagnosis FROM jobs WHERE diagnosis LIKE '%\"state\":\"running\"%'").all() as Row[]).map((r) => ({ job: r.id, diagnosis: JSON.parse(r.diagnosis) }));
+  }
+
+  /** Marks an app as in trial from an assessment, or (null) registered for good. */
+  setTrial(app: string, assessment: string | null, actor: Actor) {
+    this.db.prepare("UPDATE apps SET trial = ? WHERE id = ?").run(assessment, app);
+    this.insertAudit(actor, assessment ? "app.trial" : "app.register-trial", app, assessment ? { assessment } : null);
+  }
+
+  // Assessments (§10.5, phase 7): the record, its draft, facts, report and progress live in one JSON body.
+  saveAssessment<T extends { id: string; kind: string; repo: string; app: string | null; version: string | null; state: string; requestedBy: string; createdAt: string }>(a: T): T {
+    const at = this.stamp();
+    this.db.prepare(`INSERT INTO assessments (id, kind, repo, app, version, state, requested_by, created_at, updated_at, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT (id) DO UPDATE SET app = excluded.app, version = excluded.version, state = excluded.state, updated_at = excluded.updated_at, body = excluded.body`)
+      .run(a.id, a.kind, a.repo, a.app, a.version, a.state, a.requestedBy, a.createdAt, at, JSON.stringify({ ...a, updatedAt: at }));
+    return { ...a, updatedAt: at };
+  }
+
+  assessment<T>(id: string): T | undefined {
+    const r = this.db.prepare("SELECT body FROM assessments WHERE id = ?").get(id) as Row | undefined;
+    return r ? (JSON.parse(r.body) as T) : undefined;
+  }
+
+  listAssessments<T>(limit = 100): T[] {
+    return (this.db.prepare("SELECT body FROM assessments ORDER BY created_at DESC LIMIT ?").all(limit) as Row[]).map((r) => JSON.parse(r.body) as T);
   }
 
   setObservation(id: string, observation: unknown) {

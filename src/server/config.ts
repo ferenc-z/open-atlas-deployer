@@ -47,6 +47,12 @@ export interface Config {
   omaAgent?: string;
   omaEnvironment?: string;
   omaVaults: string[];
+  /** Phase 7: the Onboarding Assessor and its isolated Environment (§10.5.2), and where issues go (D23). */
+  omaAssessorAgent?: string;
+  omaAssessorEnvironment?: string;
+  omaAssessorVaults: string[];
+  issueRepo?: string;
+  issueTokenFile?: string;
   /** UAT side (§6.3): SHA-256 of the read-only keys PROD's Deployer may use on /api/peer/*. */
   peerKeySha256: string[];
   /** PROD side: UAT's Deployer as this one reaches it, and the file holding the read-only key. */
@@ -89,6 +95,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...(env.DEPLOYER_OMA_AGENT ? { omaAgent: env.DEPLOYER_OMA_AGENT } : {}),
     ...(env.DEPLOYER_OMA_ENVIRONMENT ? { omaEnvironment: env.DEPLOYER_OMA_ENVIRONMENT } : {}),
     omaVaults: (env.DEPLOYER_OMA_VAULTS ?? "").split(/[\s,]+/).filter(Boolean),
+    ...(env.DEPLOYER_OMA_ASSESSOR_AGENT ? { omaAssessorAgent: env.DEPLOYER_OMA_ASSESSOR_AGENT } : {}),
+    ...(env.DEPLOYER_OMA_ASSESSOR_ENVIRONMENT ? { omaAssessorEnvironment: env.DEPLOYER_OMA_ASSESSOR_ENVIRONMENT } : {}),
+    omaAssessorVaults: (env.DEPLOYER_OMA_ASSESSOR_VAULTS ?? "").split(/[\s,]+/).filter(Boolean),
+    ...(env.DEPLOYER_ISSUE_REPO ? { issueRepo: env.DEPLOYER_ISSUE_REPO } : {}),
+    ...(env.DEPLOYER_ISSUE_TOKEN_FILE ? { issueTokenFile: resolve(env.DEPLOYER_ISSUE_TOKEN_FILE) } : {}),
     peerKeySha256: (env.DEPLOYER_PEER_KEY_SHA256 ?? "").split(/[\s,]+/).filter(Boolean),
     ...(env.DEPLOYER_UAT_URL ? { uatUrl: env.DEPLOYER_UAT_URL } : {}),
     ...(env.DEPLOYER_UAT_KEY_FILE ? { uatKeyFile: resolve(env.DEPLOYER_UAT_KEY_FILE) } : {}),

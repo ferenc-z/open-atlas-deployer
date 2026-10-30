@@ -48,6 +48,8 @@ export interface Environment {
   bindIp: string;
   /** Registered registries (D13): name -> image prefix. */
   registries: Record<string, string>;
+  /** D27, opt-in (phase 7): a version newer than its manifest deploys only after its version assessment was adopted. */
+  requireEvaluation?: boolean;
   apps: Record<string, {
     version: string;
     /** PROD only: hours the same digest must have run in UAT before it may be promoted (§6.2, D15); 0 when absent. */
