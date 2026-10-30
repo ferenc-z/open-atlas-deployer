@@ -4,6 +4,7 @@
 
 import { DatabaseSync } from "node:sqlite";
 import type { Diagnosis } from "./diagnose.ts";
+import type { DriftItem } from "./drift.ts";
 import type { ApiKey } from "./keys.ts";
 import type { Rollout } from "./rollout.ts";
 import type { Manifest } from "../compose/generate.ts";
@@ -62,6 +63,9 @@ CREATE TABLE IF NOT EXISTS mcp_requests (
 CREATE TABLE IF NOT EXISTS assessments (
   id TEXT PRIMARY KEY, kind TEXT NOT NULL, repo TEXT NOT NULL, app TEXT, version TEXT, state TEXT NOT NULL, requested_by TEXT NOT NULL,
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL, body TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS drift (
+  key TEXT PRIMARY KEY, app TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS briefs (date TEXT PRIMARY KEY, body TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS component_state (
   app TEXT NOT NULL, component TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, updated_at TEXT NOT NULL,
   PRIMARY KEY (app, component, key));
@@ -385,6 +389,23 @@ export class Store {
 
   listAssessments<T>(limit = 100): T[] {
     return (this.db.prepare("SELECT body FROM assessments ORDER BY created_at DESC LIMIT ?").all(limit) as Row[]).map((r) => JSON.parse(r.body) as T);
+  }
+
+  // Drift (phase 8): what differs now, since when.
+  listDrift(): DriftItem[] {
+    return (this.db.prepare("SELECT * FROM drift ORDER BY first_seen").all() as Row[]).map((r) => ({ key: r.key, app: r.app, kind: r.kind, detail: r.detail, firstSeen: r.first_seen, lastSeen: r.last_seen }));
+  }
+  saveDrift(d: Pick<DriftItem, "key" | "app" | "kind" | "detail">) {
+    const at = this.stamp();
+    this.db.prepare("INSERT INTO drift (key, app, kind, detail, first_seen, last_seen) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (key) DO UPDATE SET detail = excluded.detail, last_seen = excluded.last_seen").run(d.key, d.app, d.kind, d.detail, at, at);
+  }
+  resolveDrift(key: string) { this.db.prepare("DELETE FROM drift WHERE key = ?").run(key); }
+
+  // Daily briefs (phase 8): one per day.
+  saveBrief(date: string, brief: unknown) { this.db.prepare("INSERT INTO briefs (date, body) VALUES (?, ?) ON CONFLICT (date) DO UPDATE SET body = excluded.body").run(date, JSON.stringify(brief)); }
+  latestBrief<T>(): T | undefined {
+    const r = this.db.prepare("SELECT body FROM briefs ORDER BY date DESC LIMIT 1").get() as Row | undefined;
+    return r ? (JSON.parse(r.body) as T) : undefined;
   }
 
   setObservation(id: string, observation: unknown) {

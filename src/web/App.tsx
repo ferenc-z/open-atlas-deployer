@@ -6,6 +6,7 @@ import { EnvPage } from "./Env.tsx";
 import { Artifacts } from "./Artifacts.tsx";
 import { AssistantPanel, KeysPage } from "./Assistant.tsx";
 import { OnboardingPage } from "./Onboarding.tsx";
+import { BriefCard, DriftBanner } from "./Brief.tsx";
 
 type Tab = "status" | "history" | "artifacts" | "env" | "registry" | "onboarding" | "keys" | "audit";
 type Panel = { kind: "deploy"; app: string; initial?: { version: string; pinFrom?: string } } | { kind: "job"; id: string } | undefined;
@@ -52,7 +53,7 @@ export function App() {
       {p.actAs && <div className="banner info">{p.actAs.administrator} 正在以 {p.displayName} 的身份使用 Workbench，这里的权限也按 {p.displayName} 计算。</div>}
       {assistant && <AssistantPanel workbenchUrl={me.workbenchUrl} {...(me.environment ? { environment: me.environment } : {})} page={tab} {...(panel?.kind === "deploy" ? { app: panel.app } : {})} actions={actions} onClose={() => setAssistant(false)} />}
       <main className={assistant ? "with-assistant" : ""}>
-        {tab === "status" && <Status panel={panel} setPanel={setPanel} isAdmin={p.permissions.includes("admin")} />}
+        {tab === "status" && <><DriftBanner /><BriefCard canRegenerate={p.permissions.includes("deploy-uat") || p.permissions.includes("deploy-prod")} /><Status panel={panel} setPanel={setPanel} isAdmin={p.permissions.includes("admin")} /></>}
         {tab === "artifacts" && <Artifacts />}
         {tab === "history" && <History onBack={(j) => { setPanel({ kind: "deploy", app: j.app, initial: { version: j.version, pinFrom: j.id } }); setTab("status"); }} />}
         {tab === "env" && <EnvPage />}

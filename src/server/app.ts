@@ -17,6 +17,8 @@ import type { EnvManager } from "./env.ts";
 import { KeyError, isKey, type Keys } from "./keys.ts";
 import { handleMcp } from "./mcp.ts";
 import { OnboardingError, type Onboarding } from "./onboarding.ts";
+import type { Briefs } from "./brief.ts";
+import type { Drift } from "./drift.ts";
 import { PeerError, type Peer, type PeerStatus } from "./peer.ts";
 import { environmentStatus, readHostState, type Observer } from "./observe.ts";
 import { StoreError, type Actor, type Store } from "./store.ts";
@@ -36,6 +38,9 @@ export interface Dependencies {
   keys?: Keys;
   /** Assessments (§10.5, phase 7). */
   onboarding?: Onboarding;
+  /** Phase 8: drift between what should be and what is, and the daily brief. */
+  drift?: Drift;
+  briefs?: Briefs;
 }
 
 const reject = (c: Context, status: 400 | 401 | 403 | 404 | 409 | 429 | 503, code: string, message: string, details: string[] = []) =>
@@ -45,7 +50,7 @@ const actorOf = (p: Principal): Actor => ({ id: p.id, via: p.via });
 
 const TYPES: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".json": "application/json", ".ico": "image/x-icon" };
 
-export function createApp({ config, store, sessions, observer, deployments, versions, env: envVars, peer, keys, onboarding }: Dependencies): Hono {
+export function createApp({ config, store, sessions, observer, deployments, versions, env: envVars, peer, keys, onboarding, drift, briefs }: Dependencies): Hono {
   const throttle = new LoginThrottle();
   const api = new Hono();
   // /mcp calls the API in-process as the key's principal: a one-time nonce with this process's secret, never from outside.
@@ -274,6 +279,27 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     return c.json({ ...status, ...(uat ? { peer: uat } : {}), executor: deployments.handoff.executor(), canDeploy: deployments.canDeploy(p), envEnabled: envVars.enabled, active: store.activeJobs().map((j) => ({ id: j.id, kind: j.kind, app: j.app, version: j.version, state: j.state })) });
   });
 
+  // Drift (§7.1): shown, never changed back.
+  api.get("/api/drift", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    return c.json({ drift: drift ? await drift.check() : [] });
+  });
+
+  // The daily brief (D25): only here, on the Deployer's home page.
+  api.get("/api/brief", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    return c.json({ brief: briefs?.latest() ?? null });
+  });
+  api.post("/api/brief", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    if (!briefs) return reject(c, 404, "brief/not-configured", "每日简报没有启用。");
+    if (!p.permissions.includes("deploy-uat") && !p.permissions.includes("deploy-prod")) return reject(c, 403, "auth/forbidden", "重新生成简报要在部署组里。");
+    return c.json({ brief: await briefs.generate(p.id) });
+  });
+
   api.get("/api/apps/:id/versions", async (c) => {
     const p = await authenticate(c, "view");
     if (p instanceof Response) return p;
@@ -296,10 +322,11 @@ export function createApp({ config, store, sessions, observer, deployments, vers
   api.post("/api/apps/:id/deploy", async (c) => {
     const p = await authenticate(c, "view");
     if (p instanceof Response) return p;
-    const body = await c.req.json().catch(() => ({})) as { version?: string; pinFrom?: string; acknowledgeManual?: boolean; override?: { reason?: string } };
+    const body = await c.req.json().catch(() => ({})) as { version?: string; pinFrom?: string; acknowledgeManual?: boolean; override?: { reason?: string }; notice?: { minutes?: number } };
     try {
       const job = await deployments.deploy(p, c.req.param("id"), String(body.version ?? ""), {
         ...(body.pinFrom ? { pinFrom: body.pinFrom } : {}), acknowledgeManual: body.acknowledgeManual === true,
+        ...(body.notice ? { notice: { minutes: Number(body.notice.minutes) } } : {}),
         ...(body.override ? { override: { reason: String(body.override.reason ?? "") } } : {}),
       });
       return c.json({ job });

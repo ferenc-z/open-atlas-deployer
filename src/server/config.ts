@@ -53,6 +53,8 @@ export interface Config {
   omaAssessorVaults: string[];
   issueRepo?: string;
   issueTokenFile?: string;
+  /** Phase 8: the daily brief is made after this hour (server time), default 8. */
+  briefHour: number;
   /** UAT side (§6.3): SHA-256 of the read-only keys PROD's Deployer may use on /api/peer/*. */
   peerKeySha256: string[];
   /** PROD side: UAT's Deployer as this one reaches it, and the file holding the read-only key. */
@@ -99,6 +101,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...(env.DEPLOYER_OMA_ASSESSOR_ENVIRONMENT ? { omaAssessorEnvironment: env.DEPLOYER_OMA_ASSESSOR_ENVIRONMENT } : {}),
     omaAssessorVaults: (env.DEPLOYER_OMA_ASSESSOR_VAULTS ?? "").split(/[\s,]+/).filter(Boolean),
     ...(env.DEPLOYER_ISSUE_REPO ? { issueRepo: env.DEPLOYER_ISSUE_REPO } : {}),
+    briefHour: Number(env.DEPLOYER_BRIEF_HOUR ?? 8),
     ...(env.DEPLOYER_ISSUE_TOKEN_FILE ? { issueTokenFile: resolve(env.DEPLOYER_ISSUE_TOKEN_FILE) } : {}),
     peerKeySha256: (env.DEPLOYER_PEER_KEY_SHA256 ?? "").split(/[\s,]+/).filter(Boolean),
     ...(env.DEPLOYER_UAT_URL ? { uatUrl: env.DEPLOYER_UAT_URL } : {}),

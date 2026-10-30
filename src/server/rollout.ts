@@ -30,6 +30,10 @@ export interface Rollout {
   host: "none" | "pending" | "done";
   steps: RolloutStep[];
   log: string[];
+  /** Phase 8 (§8.4): a deploy announced in Workbench starts at this time; until then nothing is sent. */
+  scheduled?: { at: string; submitted: boolean };
+  /** The Deployer set Workbench's maintenance notice for this deploy, and clears it when the deploy ends. */
+  notice?: boolean;
 }
 
 /** dependsOn order, keeping the manifest's order where it leaves a choice. */

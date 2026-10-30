@@ -44,7 +44,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 PROTOCOLS = [1]
 # Job kinds, plus what a deploy may ask for (bundle files, migrations): an older executor is not sent those.
 KINDS = ["build", "deploy", "env", "env-read", "bundle", "db-migration"]
@@ -346,6 +346,15 @@ class Executor:
         tmp.write_text(p.stdout)
         os.chmod(tmp, 0o644)
         os.replace(tmp, f)
+        # Drift (§7.1, phase 8): hashes of the compose files and env files the Deployer writes, never their content.
+        write_json(f.with_name("files.json"), {"at": now_iso(), "files": self.file_hashes()})
+
+    def file_hashes(self):
+        root, out = self.cfg["root"], {}
+        for path in [root / "compose.yaml", *sorted(root.glob("*/compose.yaml")), *sorted(root.glob("*.env"))]:
+            if path.is_file() and path.parent.name != "deployer" and (path.suffix != ".env" or ENV_FILE_RE.match(path.name)):
+                out[str(path.relative_to(root)).replace(os.sep, "/")] = hashlib.sha256(path.read_bytes()).hexdigest()
+        return out
 
     def recover(self):
         """A job left running by a previous process was interrupted: say so instead of leaving it running."""
@@ -664,6 +673,7 @@ class Executor:
         next_root.unlink(missing_ok=True)
         for d, image in data_dirs:
             self.ensure_data_dir(d, image)
+        status["result"]["fragmentSha256"] = hashlib.sha256((app_dir / "compose.yaml").read_bytes()).hexdigest()
 
         # 6. migrations first, with only the database running; then start everything, 7. verify
         problem = None

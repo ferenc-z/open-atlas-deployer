@@ -9,7 +9,8 @@
 - 阶段 4：制品库、晋级规则，以及 PROD 的 Deployer 用只读 key 查 UAT 的记录（见下面"阶段 4"一节）；
 - 阶段 5：其余驱动（`workbench-app`、`studio-graph`、`oma-agent`、`db-migration`、`manual`）、Release 附件（bundle）、契约核对，一个应用的全部组件一次部署（见下面"阶段 5"一节）；
 - 阶段 6：API key 与 `/mcp`、页面旁的 Deploy Assistant（Workbench 嵌入对话 + 卡片）、部署失败后经 OMA 自动诊断（见下面"阶段 6"一节）；
-- 阶段 7：接入评估（给一个仓库地址）和新版本的清单评估（D27）（见下面"阶段 7"一节）。
+- 阶段 7：接入评估（给一个仓库地址）和新版本的清单评估（D27）（见下面"阶段 7"一节）；
+- 阶段 8：部署前在 Workbench 通知用户（W3）、漂移检测、每日简报（见下面"阶段 8"一节）。
 
 阶段 5 起，Workbench 应用包、Agent、数据库迁移、Graph、人工步骤都有驱动，Logbook 这样由几种组件组成的应用也能一次部署。
 
@@ -54,6 +55,7 @@ Node 22.18 起直接运行 `.ts`（类型剥离），服务端不需要构建；
 | `DEPLOYER_OMA_APPLICATION_ID` / `DEPLOYER_OMA_AGENT` / `DEPLOYER_OMA_ENVIRONMENT` / `DEPLOYER_OMA_VAULTS` | 无 | 接法 B：Deployer 自己开 OMA Session（失败诊断）用的 Application、Agent（Deploy Assistant 的 agent id）、Environment、Vault（放只读服务 key）。配了 `DEPLOYER_OMA_URL`、`DEPLOYER_OMA_API_KEY_FILE`、`DEPLOYER_OMA_AGENT` 才诊断 |
 | `DEPLOYER_OMA_ASSESSOR_AGENT` / `DEPLOYER_OMA_ASSESSOR_ENVIRONMENT` / `DEPLOYER_OMA_ASSESSOR_VAULTS` | 无 | 接入评估：Onboarding Assessor 的 agent id、**隔离的** Environment（只放行 git 站点和 Deployer MCP）、Vault（服务 key、私有仓库只读令牌）。不配就不能评估 |
 | `DEPLOYER_ISSUE_REPO` / `DEPLOYER_ISSUE_TOKEN_FILE` | 无 | 开 Issue 的 Deployer 仓库（owner/name）和 fine-grained token（只有 Issues: write） |
+| `DEPLOYER_BRIEF_HOUR` | `8` | 每日简报在这个钟点之后生成（服务器时间） |
 | `DEPLOYER_GITHUB_API` | `https://api.github.com` | 下载 Release 附件、读 `release.json` 的 GitHub API（测试时换成替身）；执行器对应 `EXECUTOR_GITHUB_API` |
 
 ### 认人与授权（§9）
@@ -465,6 +467,32 @@ node bin/publish-assistant.ts <OMA Builder MCP 地址> <builder key 文件> <模
 - 外部仓库第一次上 PROD 必须先过 UAT（§6.2 例外）：评估和登记都在 UAT 的 Deployer，PROD 的注册表不知道一个应用是不是从评估来的；目前靠 PROD 照常的晋级规则（UAT 部署成功过，或已正式发布）。
 - 镜像仓库里有哪些版本（§10.5.2 表里 Deployer 看的一项）还没查。
 - 非 GitHub 仓库（Bitbucket）只给 Agent 地址，tags 和 Release 由 Agent 在沙箱里用 git 看。
+
+## 阶段 8：维护提示、漂移、每日简报（§8.4、§7.1、D25）
+
+### 部署前通知用户（W3）
+
+部署计划里有要重启的容器时，可以选"N 分钟后部署，先在 Workbench 通知用户"（5 / 10 / 15 / 30 分钟）。Deployer 用 Workbench API key 设置维护提示（Workbench 1.25 的 W3：所有登录的人在顶部看到"<应用> 将在 HH:mm 更新到 <版本>，届时约 1–2 分钟不可用"），到时间才把任务交给执行器；部署结束（成功、失败、回滚）时撤下提示。还没开始时可以取消，提示同时撤下。需要 Workbench 1.25 和 `DEPLOYER_WORKBENCH_API_KEY_FILE`。
+
+### 漂移（§7.1）
+
+每 10 分钟（和打开首页时）比较一次，只提示、不改回：
+
+- **版本**：经 Deployer 部署过的应用，容器跑的不是期望版本；
+- **compose 片段**：服务器上 `<app>/compose.yaml` 的 SHA-256 不是 Deployer 最后一次部署时写入的（执行器 0.4.0 在部署结果里记 `fragmentSha256`）；
+- **env 文件**：不是 Deployer 最后一次写入或导入的那份。
+
+执行器每 30 秒在容器列表旁写 `files.json`：它管理的 compose 文件和 env 文件的 SHA-256，从不写内容。每处差异第一次出现、消失时各记一次审计（`drift.detected` / `drift.resolved`），首页顶部列出。
+
+### 每日简报（D25）
+
+每天 `DEPLOYER_BRIEF_HOUR` 点后生成一次，只显示在首页，不推送：各应用的新版本（读不到版本列表时写明"不知道"）、PROD 里 UAT 已跑过的版本、漂移、24 小时内失败的部署（带诊断）、停在人工步骤的部署。配了 OMA（`DEPLOYER_OMA_AGENT`）时由 Deploy Assistant 写成一段话，否则直接列出事实。部署组里的人可以重新生成。
+
+### 测试与验证（2026-10-31）
+
+- `npm test`：70 个。阶段 8 新增：预定部署到时间才交给执行器、结束时撤下提示、取消预定；三种漂移的发现、只审计一次、消失时记解决；简报到点生成、AI 写完、一天一次、没有 OMA 时只列事实；简报事实的来源。执行器 21 个（新增文件哈希）。
+- 页面在浏览器里对着假 Workbench 看过：首页简报和重新生成、API key 生成、`/mcp` 用这把 key 列工具和调用、接入评估页、助手面板嵌入地址。
+- Workbench 的 W3 在本地分支 `deployer-w3-maintenance` 上，未提交（见 Workbench 的 `docs/releases/1.25.0.zh-CN.md`）。
 
 ## 由清单生成 compose（§7.3，D11）
 

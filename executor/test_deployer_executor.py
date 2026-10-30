@@ -296,6 +296,23 @@ class BundleTest(unittest.TestCase):
             self.ex.deploy(req, {"steps": [], "result": {}})
 
 
+class FileHashTest(unittest.TestCase):
+    def test_hashes_the_compose_and_env_files_it_manages(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            (root / "compose.yaml").write_text("name: x\n")
+            (root / "shop").mkdir()
+            (root / "shop" / "compose.yaml").write_text("services: {}\n")
+            (root / "shop.env").write_text("A=1\n")
+            (root / "deployer").mkdir()
+            (root / "deployer" / "compose.yaml").write_text("not ours")
+            (root / "Bad Name.env").write_text("x")
+            hashes = dx.Executor(cfg(d)).file_hashes()
+            self.assertEqual(sorted(hashes), ["compose.yaml", "shop.env", "shop/compose.yaml"])
+            self.assertEqual(hashes["shop.env"], hashlib.sha256(b"A=1\n").hexdigest())
+
+
 class FragmentTest(unittest.TestCase):
     def test_reads_service_names_from_a_generated_fragment(self):
         with tempfile.TemporaryDirectory() as d:

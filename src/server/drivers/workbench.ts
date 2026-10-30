@@ -72,6 +72,10 @@ export class WorkbenchAdmin {
     return { email: u.email, displayName: u.displayName ?? u.email, enabled: u.enabled, isAdmin: u.isAdmin, groups: (u.roleIds ?? []).flatMap((id) => (names.has(id) ? [names.get(id)!] : [])) };
   }
 
+  /** W3 (Workbench 1.25): the notice everyone signed in sees, e.g. before a deploy interrupts an app (§8.4). */
+  async setMaintenance(message: string, startsAt: number, endsAt: number) { return this.request("PUT", "/api/workbench/admin/maintenance", { message, startsAt: new Date(startsAt).toISOString(), endsAt: new Date(endsAt).toISOString() }); }
+  async clearMaintenance() { return this.request("DELETE", "/api/workbench/admin/maintenance"); }
+
   async businessAgents(): Promise<BusinessAgent[]> { return ((await this.request("GET", "/api/workbench/admin/business-agents")) as { agents: BusinessAgent[] }).agents; }
   async pointAgent(id: string, agentId: string) { return this.request("PATCH", `/api/workbench/admin/business-agents/${encodeURIComponent(id)}`, { agentId }); }
 }

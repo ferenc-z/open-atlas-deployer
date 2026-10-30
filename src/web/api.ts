@@ -112,6 +112,17 @@ export const keys = () => call<{ keys: ApiKey[] }>("GET", "keys");
 export const createKey = (kind: "personal" | "service", name: string, days: number) => call<{ key: string; record: ApiKey }>("POST", "keys", { kind, name, days });
 export const revokeKey = (id: string) => call<{ revoked: true }>("DELETE", `keys/${encodeURIComponent(id)}`);
 
+// Phase 8: drift, the daily brief, deploys announced in Workbench.
+import type { DriftItem } from "../server/drift.ts";
+import type { Brief } from "../server/brief.ts";
+export type DriftView = DriftItem;
+export type BriefView = Brief;
+export const drift = () => call<{ drift: DriftItem[] }>("GET", "drift");
+export const brief = () => call<{ brief: Brief | null }>("GET", "brief");
+export const regenerateBrief = () => call<{ brief: Brief }>("POST", "brief");
+export const deployWithNotice = (id: string, version: string, minutes: number, pinFrom?: string) =>
+  call<{ job: Job }>("POST", `apps/${encodeURIComponent(id)}/deploy`, { version, acknowledgeManual: true, notice: { minutes }, ...(pinFrom ? { pinFrom } : {}) });
+
 // Phase 7: assessments.
 import type { Assessment } from "../server/onboarding.ts";
 export type AssessmentView = Omit<Assessment, "tokenSha256"> & { manifest: Manifest };

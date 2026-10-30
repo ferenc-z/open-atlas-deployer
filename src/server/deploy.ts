@@ -80,6 +80,8 @@ export class Deployments {
 
   /** The app's env file as last written to the server, decrypted (env manager), for ${KEY} in component settings. */
   envValues?: (app: string) => Record<string, string> | undefined;
+  /** W3 (phase 8): Workbench's maintenance notice, set before a deploy that interrupts people (§8.4). */
+  maintenance?: { setMaintenance: (message: string, startsAt: number, endsAt: number) => Promise<unknown>; clearMaintenance: () => Promise<unknown> };
   /** D27 (phase 7): whether a version's assessment was adopted, or it already ran here. */
   evaluated?: (app: string, version: string) => boolean;
   /** Set when OMA is configured (phase 6, D24): a failed or rolled-back deploy is diagnosed. */
@@ -254,7 +256,7 @@ export class Deployments {
     }, version);
   }
 
-  async deploy(principal: Principal, appId: string, version: string, options: { pinFrom?: string; acknowledgeManual?: boolean; override?: { reason: string } }): Promise<Job> {
+  async deploy(principal: Principal, appId: string, version: string, options: { pinFrom?: string; acknowledgeManual?: boolean; override?: { reason: string }; notice?: { minutes: number } }): Promise<Job> {
     if (isKey(principal) && isProd(this.environment().env)) throw new DeployError(403, "auth/browser-only", "PROD 的部署只认浏览器会话，API key 只能生成计划（§9.4）。");
     const p = await this.plan(principal, appId, version, options.pinFrom, options.override);
     const blocking = p.findings.filter((f) => f.blocking);
@@ -268,8 +270,24 @@ export class Deployments {
       steps: p.steps.map((s) => ({ component: s.component, type: s.type, where: s.where, state: "pending", ...(s.checks ? { checks: s.checks.map((text) => ({ text })) } : {}) })),
       log: [],
     };
+    if (options.notice) {
+      const minutes = options.notice.minutes;
+      if (!Number.isInteger(minutes) || minutes < 1 || minutes > 60) throw new DeployError(400, "deploy/notice", "提前通知是 1 到 60 分钟。");
+      if (!host) throw new DeployError(409, "deploy/notice-needless", "这个部署不重启容器，不需要提前通知。");
+      if (!this.maintenance) throw new DeployError(409, "deploy/notice-unavailable", "没有配置 Workbench API key，发不了维护提示。");
+      const at = this.now() + minutes * 60_000;
+      const hhmm = new Date(at).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
+      try { await this.maintenance.setMaintenance(`${this.store.app(appId)?.name ?? appId} 将在 ${hhmm} 更新到 ${version}，届时约 1–2 分钟不可用`, this.now(), at + 15 * 60_000); }
+      catch (error) { throw new DeployError(409, "deploy/notice-failed", `维护提示没有发出去，部署没有开始：${(error as Error).message}`); }
+      rollout.scheduled = { at: new Date(at).toISOString(), submitted: false };
+      rollout.notice = true;
+    }
     this.store.addJob({ id, kind: "deploy", app: appId, version, environment: env.name, fromVersion: p.fromVersion, manifest: p.manifest, pinFrom: options.pinFrom ?? null, request: p.request }, actor);
     this.store.setRollout(id, rollout);
+    if (rollout.scheduled) {
+      this.store.audit(actor, "deploy.scheduled", `${appId}@${version}`, { job: id, at: rollout.scheduled.at });
+      return this.store.job(id)!;
+    }
     if (p.promotion?.basis === "override") this.store.audit(actor, "deploy.promotion-override", `${appId}@${version}`, { job: id, reason: p.promotion.reason, unmet: p.promotion.detail });
     if (host) {
       const { steps: _steps, ...request } = p.request;
@@ -307,6 +325,17 @@ export class Deployments {
   async sync(): Promise<void> {
     for (const job of this.store.activeJobs()) {
       const rollout = job.kind === "deploy" ? job.rollout : null;
+      // An announced deploy waits for its time, then goes out as any other (§8.4).
+      if (rollout?.scheduled && !rollout.scheduled.submitted) {
+        if (this.now() < Date.parse(rollout.scheduled.at)) continue;
+        rollout.scheduled.submitted = true;
+        this.store.setRollout(job.id, rollout);
+        if (rollout.host === "pending") {
+          const { steps: _steps, ...request } = job.request;
+          this.handoff.submit(job.id, { ...request, requestedBy: job.requestedBy });
+        } else await this.runner.advance(job.id);
+        continue;
+      }
       if (rollout && rollout.host !== "pending") { await this.runner.advance(job.id); continue; }
       const status = this.handoff.status(job.id);
       if (!status) continue;
@@ -338,6 +367,7 @@ export class Deployments {
     if (job.kind === "deploy" && status.state === "succeeded") await this.observe(job);
     if (this.afterJob) await this.afterJob(job, status);
     if (job.kind === "deploy" && (status.state === "failed" || status.state === "rolled-back") && this.onFailure) await this.onFailure(job);
+    if (job.rollout?.notice && this.maintenance) await this.maintenance.clearMaintenance().catch((error) => console.error(`maintenance notice of ${job.id}:`, error));
   }
 
   /** The runner ends a deploy whose last steps were the Deployer's (or people's). */
@@ -366,6 +396,14 @@ export class Deployments {
 
   async stop(principal: Principal, jobId: string): Promise<Job> {
     const job = this.checkPermission(principal, this.store.job(jobId));
+    // An announced deploy not started yet is cancelled, and its notice cleared.
+    if (job.rollout?.scheduled && !job.rollout.scheduled.submitted && FINAL_STATES.every((s) => s !== job.state)) {
+      for (const s of job.rollout.steps) s.state = "skipped";
+      this.store.setRollout(job.id, job.rollout);
+      this.store.audit({ id: principal.id, via: principal.via }, "deploy.cancel", `${job.app}@${job.version}`, { job: job.id });
+      await this.finishRollout(this.store.job(job.id)!, "failed", `预定 ${job.rollout.scheduled.at} 的部署由 ${principal.id} 取消，没有开始`);
+      return this.store.job(job.id)!;
+    }
     try { return await this.runner.stop(job.id, { id: principal.id, via: principal.via }); }
     catch (error) { if (error instanceof RolloutError) throw new DeployError(error.status, "deploy/stop", error.message); throw error; }
   }

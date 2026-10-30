@@ -48,6 +48,9 @@ export interface FakeState {
     key: string;
     users: { email: string; displayName?: string; enabled: boolean; isAdmin: boolean; roleIds: string[] }[];
     roles: { id: string; name: string; enabled: boolean }[];
+    /** W3: the maintenance notice, and every change to it. */
+    maintenance: { message: string; startsAt: string; endsAt: string } | null;
+    maintenanceLog: string[];
   };
   studio: { draft: string; revision: number; uploaded?: string; queries: string[]; published: number; graph: string };
   oma: { packages: number; revision: number; agents: string[]; failPublish?: boolean;
@@ -66,7 +69,8 @@ export function fakeState(): FakeState {
     issues: [],
     workbench: { apps: [], agents: [], key: "wbk_test",
       users: [{ email: "u@x", displayName: "U", enabled: true, isAdmin: false, roleIds: ["r_uat"] }, { email: "p@x", enabled: true, isAdmin: false, roleIds: ["r_prod"] }, { email: "a@x", enabled: true, isAdmin: true, roleIds: [] }],
-      roles: [{ id: "r_uat", name: "deploy-uat", enabled: true }, { id: "r_prod", name: "deploy-prod", enabled: true }] },
+      roles: [{ id: "r_uat", name: "deploy-uat", enabled: true }, { id: "r_prod", name: "deploy-prod", enabled: true }],
+      maintenance: null, maintenanceLog: [] },
     studio: { graph: "acme/book", draft: '{:contract {:contract/family "atlas-semantic"}\n :workspace {:workspace/id "ws-uat"}\n :graph {:graph/id "g-uat" :graph/label "Book"}}', revision: 3, queries: [], published: 0 },
     oma: { packages: 0, revision: 0, agents: [], sessions: [], reply: "" },
   };
@@ -150,6 +154,8 @@ export function fakeServices(s: FakeState): typeof fetch {
       }
       if (url.pathname === "/api/workbench/admin/business-agents") return Response.json({ agents: wb.agents });
       if (url.pathname === "/api/workbench/admin/users") return Response.json({ users: wb.users });
+      if (url.pathname === "/api/workbench/admin/maintenance" && request.method === "PUT") { wb.maintenance = await request.json() as typeof wb.maintenance; wb.maintenanceLog.push(`set ${wb.maintenance!.message}`); return Response.json({ notice: wb.maintenance }); }
+      if (url.pathname === "/api/workbench/admin/maintenance" && request.method === "DELETE") { wb.maintenance = null; wb.maintenanceLog.push("cleared"); return Response.json({ notice: null }); }
       if (url.pathname === "/api/workbench/admin/roles") return Response.json({ roles: wb.roles });
       m = /^\/api\/workbench\/admin\/business-agents\/([^/]+)$/.exec(url.pathname);
       if (m && request.method === "PATCH") {

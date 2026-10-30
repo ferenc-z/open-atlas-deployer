@@ -40,6 +40,7 @@ export function DeployPanel({ app, initial, isAdmin, onClose, onJob }: { app: st
   const [version, setVersion] = useState(initial?.version ?? "");
   const [pinFrom] = useState(initial?.pinFrom);
   const [plan, setPlan] = useState<Plan | undefined>();
+  const [notice, setNotice] = useState(0);
   const [error, setError] = useState<{ message: string; details: string[] } | undefined>();
   const [busy, setBusy] = useState(false);
   const fail = (e: api.ApiError) => { setError({ message: e.message, details: e.details ?? [] }); setBusy(false); };
@@ -57,7 +58,7 @@ export function DeployPanel({ app, initial, isAdmin, onClose, onJob }: { app: st
 
   const start = () => {
     setBusy(true);
-    (overridden ? api.deployWithOverride(app, plan!.version, true, overridden) : api.deploy(app, plan!.version, true, pinFrom)).then((r) => onJob(r.job.id), fail);
+    (overridden ? api.deployWithOverride(app, plan!.version, true, overridden) : notice ? api.deployWithNotice(app, plan!.version, notice, pinFrom) : api.deploy(app, plan!.version, true, pinFrom)).then((r) => onJob(r.job.id), fail);
   };
   const build = () => { setBusy(true); api.build(app, plan!.version).then((r) => onJob(r.jobs[0]!.id), fail); };
   const blocking = plan?.findings.filter((f) => f.blocking) ?? [];
@@ -119,7 +120,14 @@ export function DeployPanel({ app, initial, isAdmin, onClose, onJob }: { app: st
           )}
           <div className="row">
             {notBuilt && <button onClick={build} disabled={busy}>构建 {plan.version}</button>}
-            <button className="primary" onClick={start} disabled={busy || blocking.length > 0}>确认部署 {plan.version}</button>
+            {plan.steps.some((s) => s.where === "host") && !overridden && (
+              <label className="muted">
+                <select value={notice} onChange={(e) => setNotice(Number(e.target.value))}>
+                  <option value={0}>立即部署</option>{[5, 10, 15, 30].map((m) => <option key={m} value={m}>{m} 分钟后部署，先在 Workbench 通知用户</option>)}
+                </select>
+              </label>
+            )}
+            <button className="primary" onClick={start} disabled={busy || blocking.length > 0}>{notice ? `通知并在 ${notice} 分钟后部署 ${plan.version}` : `确认部署 ${plan.version}`}</button>
           </div>
         </div>
       )}
@@ -149,7 +157,8 @@ export function JobPanel({ id, onClose, onBack }: { id: string; onClose: () => v
     api.check(id, component, index, checked).then(reload, (e: Error) => setActionError(e.message));
   };
   const stopHere = () => {
-    if (!confirm("在这个人工步骤处停止部署？已完成的步骤保留，部署记为失败。")) return;
+    const scheduled = data?.job.rollout?.scheduled && !data.job.rollout.scheduled.submitted;
+    if (!confirm(scheduled ? "取消这次预定的部署？Workbench 上的维护提示会撤下。" : "在这个人工步骤处停止部署？已完成的步骤保留，部署记为失败。")) return;
     api.stopJob(id).then(reload, (e: Error) => setActionError(e.message));
   };
   useEffect(() => { logRef.current?.scrollTo(0, logRef.current.scrollHeight); }, [data?.log]);
@@ -168,7 +177,10 @@ export function JobPanel({ id, onClose, onBack }: { id: string; onClose: () => v
       </div>
       {job.message && <p className={job.state === "succeeded" ? "" : "error"}>{job.message}</p>}
       {data.promotion && <p><span className={`badge ${data.promotion.basis === "override" ? "warn" : "info"}`}>晋级依据：{BASIS[data.promotion.basis]}</span> <span className="muted">{data.promotion.basis === "override" ? `${data.promotion.by}：${data.promotion.reason}` : data.promotion.detail}</span></p>}
-      {job.state === "queued" && job.rollout?.host !== "none" && <p className="muted">等执行器领取…</p>}
+      {job.rollout?.scheduled && !job.rollout.scheduled.submitted && !FINAL.includes(job.state) && (
+        <p className="banner info">已在 Workbench 通知用户，{new Date(job.rollout.scheduled.at).toLocaleTimeString("zh-CN", { hour12: false })} 开始部署。<button className="link" onClick={stopHere}>取消这次部署</button></p>
+      )}
+      {job.state === "queued" && job.rollout?.host !== "none" && !(job.rollout?.scheduled && !job.rollout.scheduled.submitted) && <p className="muted">等执行器领取…</p>}
       {job.rollout && (
         <table className="rollout">
           <thead><tr><th>#</th><th>组件</th><th>由谁做</th><th>状态</th><th>结果</th></tr></thead>

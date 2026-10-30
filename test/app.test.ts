@@ -30,6 +30,8 @@ import { Keys } from "../src/server/keys.ts";
 import { Diagnoser } from "../src/server/diagnose.ts";
 import { OmaSessions } from "../src/server/oma.ts";
 import { Onboarding } from "../src/server/onboarding.ts";
+import { Drift } from "../src/server/drift.ts";
+import { Briefs, collectFacts, type BriefFacts } from "../src/server/brief.ts";
 import { fakeServices, fakeState, sha256, tarGz, type FakeState } from "./fakes.ts";
 
 const SESSION = "open_atlas_workbench_session";
@@ -74,7 +76,7 @@ function setup(options: SetupOptions = {}) {
   writeFileSync(environmentFile, JSON.stringify({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", registries: {}, apps: { shop: { version: "1.2.0" } } }));
   const config: Config = {
     bind: "127.0.0.1", port: 0, basePath: "/deploy", dataDir: dir, workbenchUrl: "http://workbench:8090", workbenchPublicUrl: "/",
-    environmentFile, observeUrls: {}, secureCookies: false, webDir: join(dir, "web"), templatesDir: join(dir, "templates"), peerKeySha256: options.peerKeys ?? [], githubApi: "https://api.github.com", omaVaults: [], omaAssessorVaults: [],
+    environmentFile, observeUrls: {}, secureCookies: false, webDir: join(dir, "web"), templatesDir: join(dir, "templates"), peerKeySha256: options.peerKeys ?? [], githubApi: "https://api.github.com", omaVaults: [], omaAssessorVaults: [], briefHour: 8,
     ...(options.emergency ? { emergencyPasswordHash: hashPassword(options.emergency) } : {}),
   };
   let now = Date.parse("2026-10-30T10:00:00Z");
@@ -123,6 +125,7 @@ function setup(options: SetupOptions = {}) {
     templatesDir: join(dir, "kept"), pageUrl: "https://wb.example/deploy/", fetcher: phase5.fetcher, now: () => now,
   }) : undefined;
   if (onboarding) deployments.evaluated = (a, v) => onboarding.evaluated(a, v);
+  if (phase5) deployments.maintenance = phase5.workbench;
   const app = createApp({ config, store, sessions, observer, deployments, versions, env, ...(peer ? { peer } : {}), ...(keys ? { keys } : {}), ...(onboarding ? { onboarding } : {}) });
   const request = (path: string, init: RequestInit & { as?: string; cookie?: string } = {}) => {
     const headers = new Headers(init.headers);
@@ -982,4 +985,103 @@ test("D27: where the environment requires it, a new version deploys after its as
   assert.equal(adopted.state, "adopted");
   const allowed = await (await post(t, "/api/apps/book/plan", "uat", { version: "1.1.0" })).json();
   assert.ok(!allowed.findings.some((f: { code: string }) => f.code === "deploy/not-evaluated"));
+});
+
+// Phase 8: the maintenance notice before a deploy (W3), drift, the daily brief.
+
+test("a deploy announced in Workbench waits for its time, then goes out; the notice is cleared when it ends", async () => {
+  const t = withBook();
+  t.beat();
+  const r = await post(t, "/api/apps/book/deploy", "uat", { version: "1.0.0", notice: { minutes: 10 } });
+  assert.equal(r.status, 200);
+  const { job } = await r.json();
+  assert.match(t.s.workbench.maintenance!.message, /^Book 将在 \d\d:\d\d 更新到 1\.0\.0，届时约 1–2 分钟不可用$|^book 将在/);
+  assert.equal(Date.parse(t.s.workbench.maintenance!.endsAt) - Date.parse(job.rollout.scheduled.at), 15 * 60_000);
+  await t.request("/api/jobs", { as: "viewer" });
+  assert.ok(!readdirSync(join(t.dir, "handoff")).includes("requests") || readdirSync(join(t.dir, "handoff", "requests")).length === 0, "nothing goes to the executor before the time");
+  t.advance(10 * 60_000);
+  await t.request("/api/jobs", { as: "viewer" });
+  assert.equal(readdirSync(join(t.dir, "handoff", "requests")).length, 1, "at the time it goes out");
+  finish(t, job.id, "rolled-back", { digests: {} });
+  await t.request("/api/jobs", { as: "viewer" });
+  assert.deepEqual(t.s.workbench.maintenanceLog.map((l) => l.split(" ")[0]), ["set", "cleared"]);
+
+  t.beat();
+  const secondBody = await (await post(t, "/api/apps/book/deploy", "uat", { version: "1.0.0", notice: { minutes: 5 } })).json();
+  assert.ok(secondBody.job, JSON.stringify(secondBody));
+  const second = secondBody.job;
+  const cancelled = await (await post(t, `/api/jobs/${second.id}/stop`, "uat", {})).json();
+  assert.equal(cancelled.job.state, "failed");
+  assert.match(cancelled.job.message, /取消，没有开始/);
+  assert.equal(t.s.workbench.maintenance, null, "a cancelled deploy clears its notice");
+  assert.equal((await post(t, "/api/apps/book/deploy", "uat", { version: "1.0.0", notice: { minutes: 0 } })).status, 400);
+});
+
+test("drift: a container on another version, a fragment or env file edited by hand; shown and audited, never changed back", async () => {
+  const t = withEnvApp();
+  await importFile(t, "GREETING=hi\nAPI_TOKEN=x\n");
+  const b = (await (await post(t, "/api/apps/shop/build", "uat", { version: "1.2.0" })).json()).jobs[0].id;
+  finish(t, b, "succeeded");
+  await t.request("/api/jobs", { as: "viewer" });
+  const d = (await (await post(t, "/api/apps/shop/deploy", "uat", { version: "1.2.0" })).json()).job.id;
+  finish(t, d, "succeeded", { digests: { shop: "sha256:d" }, fragmentSha256: "f1" });
+  await t.request("/api/jobs", { as: "viewer" });
+  const envSha = createHash("sha256").update("GREETING=hi\nAPI_TOKEN=x\n").digest("hex");
+  let files: Record<string, string> = { "shop/compose.yaml": "f1", "shop.env": envSha };
+  let verdict = "ok";
+  const drift = new Drift(t.store, t.deployments, () => files, async () => ({ environment: "uat", unmanaged: [],
+    apps: [{ app: "shop", name: "Shop", desired: "1.2.0", verdict, components: [{ id: "web", type: "compose-service", service: "shop", verdict, container: { name: "shop", image: "ghcr.io/acme/open-atlas-shop:1.1.0", state: "running", health: "", status: "Up", version: "1.1.0" } }] }] }) as never);
+  assert.deepEqual(await drift.check(), [], "the server matches what the Deployer wrote");
+
+  files = { "shop/compose.yaml": "edited", "shop.env": "edited" };
+  verdict = "drift";
+  const found = await drift.check();
+  assert.deepEqual(found.map((x) => x.kind).sort(), ["env", "fragment", "version"]);
+  assert.match(found.find((x) => x.kind === "version")!.detail, /期望 1\.2\.0，实际：shop 运行 1\.1\.0/);
+  assert.match(found.find((x) => x.kind === "env")!.detail, /shop\.env 与 Deployer 最后一次导入/);
+  await drift.check();
+  assert.equal(t.store.listAudit().filter((e) => e.action === "drift.detected").length, 3, "each difference audited once");
+
+  files = { "shop/compose.yaml": "f1", "shop.env": envSha };
+  verdict = "ok";
+  assert.deepEqual(await drift.check(), []);
+  assert.equal(t.store.listAudit().filter((e) => e.action === "drift.resolved").length, 3);
+});
+
+test("the daily brief: the facts once a day after its hour, written up by the Deploy Assistant when OMA is there", async () => {
+  const t = withBook();
+  const facts: BriefFacts = { environment: "uat", apps: [{ app: "book", desired: "1.0.0", verdict: "ok", newer: ["1.1.0"] }], promotable: [], drift: [], failed: [], waiting: [] };
+  let clock = Date.parse("2026-10-31T07:30:00");
+  const oma = new OmaSessions({ url: "http://oma.test", keyFile: join(t.dir, "oma.key"), agent: "agent_assistant" }, fakeServices(t.s));
+  const briefs = new Briefs(t.store, async () => facts, oma, { now: () => clock, hour: 8 });
+  await briefs.tick();
+  assert.equal(briefs.latest(), undefined, "not before its hour");
+  clock = Date.parse("2026-10-31T08:05:00");
+  await briefs.tick();
+  assert.equal(briefs.latest()!.state, "writing");
+  assert.match(t.s.oma.sessions[0]!.messages[0]!, /"newer": \[\s*"1\.1\.0"/);
+  t.s.oma.reply = "今天 UAT 一切正常；book 有新版本 1.1.0。\n建议：先评估 1.1.0。";
+  await briefs.tick();
+  assert.deepEqual([briefs.latest()!.state, briefs.latest()!.text], ["done", t.s.oma.reply]);
+  await briefs.tick();
+  assert.equal(t.s.oma.sessions.length, 1, "once a day");
+  const view = await (await t.request("/api/brief", { as: "viewer" })).json();
+  assert.equal(view.brief, null, "this test's Briefs is not the app's; the app's has none yet");
+  const plain = new Briefs(t.store, async () => facts, undefined, { now: () => clock });
+  assert.equal((await plain.generate("u@x")).state, "facts-only", "without OMA the facts are the brief");
+});
+
+test("the brief's facts come from what the Deployer already knows", async () => {
+  const t = withBook();
+  t.beat();
+  const facts = await collectFacts({
+    store: t.store, deployments: t.deployments,
+    status: async () => ({ environment: "uat", unmanaged: [], apps: [{ app: "book", name: "Book", desired: "1.0.0", verdict: "ok", components: [] }] }) as never,
+    versions: { list: async () => ({ versions: ["1.2.0", "1.1.0", "1.0.0", "0.9.0"] }) },
+    peer: async () => ({ environment: "uat", apps: { book: { version: "1.1.0", deployment: "d", deployedAt: "x", digests: {} } } }),
+    drift: async () => [{ key: "env:book", app: "book", kind: "env", detail: "book.env 被改过", firstSeen: "2026-10-30T00:00:00Z", lastSeen: "x" }],
+  });
+  assert.deepEqual(facts.apps, [{ app: "book", desired: "1.0.0", verdict: "ok", newer: ["1.2.0", "1.1.0"] }]);
+  assert.deepEqual(facts.promotable, [{ app: "book", uat: "1.1.0", here: null }]);
+  assert.equal(facts.drift[0]!.detail, "book.env 被改过");
 });

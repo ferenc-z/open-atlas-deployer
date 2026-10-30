@@ -10,6 +10,9 @@ import { Deployments } from "./deploy.ts";
 import { Diagnoser } from "./diagnose.ts";
 import { Keys } from "./keys.ts";
 import { OmaSessions } from "./oma.ts";
+import { Briefs, collectFacts } from "./brief.ts";
+import { Drift, readFileHashes } from "./drift.ts";
+import { environmentStatus, readHostState } from "./observe.ts";
 import { Onboarding } from "./onboarding.ts";
 import { OmaAgentDriver } from "./drivers/oma-agent.ts";
 import { StudioGraphDriver } from "./drivers/studio-graph.ts";
@@ -59,13 +62,23 @@ const assessor = config.omaUrl && config.omaApiKeyFile && config.omaAssessorAgen
   : undefined;
 const onboarding = new Onboarding({ store, deployments, oma: assessor, githubApi: config.githubApi, githubTokenFile: config.githubTokenFile, issueRepo: config.issueRepo, issueTokenFile: config.issueTokenFile, templatesDir: keptTemplates, pageUrl: config.workbenchPublicUrl });
 deployments.evaluated = (app, version) => onboarding.evaluated(app, version);
-const app = createApp({ config, store, sessions: new WorkbenchSessions(config.workbenchUrl), observer, deployments, versions, env, peer, onboarding, ...(keys ? { keys } : {}) });
+// Phase 8: the maintenance notice before a deploy (W3), drift, the daily brief.
+if (config.workbenchApiKeyFile) deployments.maintenance = workbench;
+const statusOf = () => environmentStatus(deployments.environment().env, store.listApps().map((a) => ({ id: a.id, name: a.name, manifests: store.manifests(a.id) })), readHostState(config.hostStateFile), observer);
+const drift = new Drift(store, deployments, () => readFileHashes(config.hostStateFile), statusOf);
+const briefWriter = config.omaUrl && config.omaApiKeyFile && config.omaAgent
+  ? new OmaSessions({ url: config.omaUrl, keyFile: config.omaApiKeyFile, agent: config.omaAgent, ...(config.omaEnvironment ? { environment: config.omaEnvironment } : {}), vaults: config.omaVaults, ...(config.omaApplicationId ? { application: config.omaApplicationId } : {}) })
+  : undefined;
+const briefs = new Briefs(store, () => collectFacts({ store, deployments, status: statusOf, versions, ...(peer.configured ? { peer: () => peer.status() } : {}), drift: () => drift.check() }), briefWriter, { hour: config.briefHour });
+const app = createApp({ config, store, sessions: new WorkbenchSessions(config.workbenchUrl), observer, deployments, versions, env, peer, onboarding, drift, briefs, ...(keys ? { keys } : {}) });
 // Job records follow the executor's status files even while nobody has the page open.
 setInterval(() => {
   deployments.sync().catch((error) => console.error("sync:", error));
   diagnoser?.poll().catch((error) => console.error("diagnose:", error));
   onboarding.poll().catch((error) => console.error("assessments:", error));
 }, 2_000).unref();
+setInterval(() => { briefs.tick().catch((error) => console.error("brief:", error)); }, 60_000).unref();
+setInterval(() => { drift.check().catch((error) => console.error("drift:", error)); }, 10 * 60_000).unref();
 
 serve({ fetch: app.fetch, hostname: config.bind, port: config.port }, (info) => {
   console.log(`Open Atlas Deployer on http://${info.address}:${info.port}${config.basePath}/ (Workbench ${config.workbenchUrl})`);

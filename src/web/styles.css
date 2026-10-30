@@ -120,6 +120,8 @@ pre.json { background: var(--surface); border: 1px solid var(--border); border-r
 .plan { display: grid; gap: 10px; }
 .findings { margin: 0; padding-left: 4px; list-style: none; display: grid; gap: 4px; }
 .checks { list-style: none; padding-left: 0; margin: 4px 0; }
+.banner ul { margin: 6px 0 0; padding-left: 18px; }
+.brief ul { margin: 0; padding-left: 18px; }
 pre.report { white-space: pre-wrap; background: var(--bg); padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); }
 p.ok { color: var(--ok, #1a7f37); }
 .checks li { margin: 2px 0; }
