@@ -37,7 +37,7 @@ export class Peer {
 
   /** GET on the other Deployer's peer API; cached for 30 seconds so a page refresh does not ask again. */
   private async get<T>(path: string): Promise<T> {
-    if (!this.url) throw new PeerError("没有配置 UAT 的 Deployer（DEPLOYER_UAT_URL）");
+    if (!this.url) throw new PeerError("No UAT Deployer is configured (DEPLOYER_UAT_URL)");
     const hit = this.cache.get(path);
     if (hit && this.now() - hit.at < 30_000) return hit.value as T;
     const key = readToken(this.keyFile);
@@ -45,10 +45,10 @@ export class Peer {
     try {
       response = await this.fetcher(`${this.url}/api/peer/${path}`, { headers: { accept: "application/json", ...(key ? { authorization: `Bearer ${key}` } : {}) }, signal: AbortSignal.timeout(5_000) });
     } catch (error) {
-      throw new PeerError(`连不上 UAT 的 Deployer：${(error as Error).message}`);
+      throw new PeerError(`Cannot reach the UAT Deployer: ${(error as Error).message}`);
     }
     const body = await response.json().catch(() => ({})) as { message?: string };
-    if (!response.ok) throw new PeerError(`UAT 的 Deployer 返回 HTTP ${response.status}${body.message ? `：${body.message}` : ""}`);
+    if (!response.ok) throw new PeerError(`The UAT Deployer returned HTTP ${response.status}${body.message ? `: ${body.message}` : ""}`);
     this.cache.set(path, { at: this.now(), value: body });
     return body as T;
   }

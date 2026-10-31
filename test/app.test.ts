@@ -83,7 +83,7 @@ function setup(options: SetupOptions = {}) {
   const store = new Store(":memory:", () => new Date(now));
   const sessions = new WorkbenchSessions(config.workbenchUrl, fetcher, () => now);
   const observer = new Observer({}, fetcher);
-  const handoff = new Handoff(join(dir, "handoff"), () => now);
+  const handoff = new Handoff(store, () => now);
   let peer: Peer | undefined;
   if (options.uat) {
     writeFileSync(join(dir, "uat.key"), options.uat.key);
@@ -94,7 +94,7 @@ function setup(options: SetupOptions = {}) {
     }) as typeof fetch, () => now);
   }
   const released = options.released ?? { value: false };
-  const releases = { release: async (repo: string, tag: string) => (released.value ? { released: true, detail: `${repo} 的 ${tag} 已正式发布` } : { released: false, detail: `${repo} 的 ${tag} 没有 GitHub Release` }) };
+  const releases = { release: async (repo: string, tag: string) => (released.value ? { released: true, detail: `${tag} of ${repo} is officially released` } : { released: false, detail: `${repo} has no GitHub Release for ${tag}` }) };
   let phase5: { drivers: DeployDriver[]; bundles: Bundles; contracts: ContractDocs; workbench: WorkbenchAdmin; fetcher: typeof fetch } | undefined;
   if (options.services) {
     const f = fakeServices(options.services);
@@ -111,7 +111,10 @@ function setup(options: SetupOptions = {}) {
       contracts: new ContractDocs(undefined, f, "https://api.github.test"),
     };
   }
-  const deployments = new Deployments(store, handoff, observer, environmentFile, { ...(peer ? { peer } : {}), releases, now: () => now, ...(phase5 ? { drivers: phase5.drivers, bundles: phase5.bundles, contracts: phase5.contracts } : {}) });
+  // D36: the check of an app's address after a deploy; tests decide whether nginx answers.
+  const reach = { ok: true, urls: [] as string[] };
+  const checkUrl = async (url: string) => { reach.urls.push(url); return reach.ok ? { url, ok: true, status: 200 } : { url, ok: false, status: 502 }; };
+  const deployments = new Deployments(store, handoff, observer, environmentFile, { ...(peer ? { peer } : {}), releases, now: () => now, checkUrl, ...(phase5 ? { drivers: phase5.drivers, bundles: phase5.bundles, contracts: phase5.contracts } : {}) });
   const versions = new Versions(undefined, (async () => Response.json([{ name: "shop-1.2.0" }, { name: "v9" }, { name: "shop-1.10.0" }])) as typeof fetch);
   const example = { text: "" };
   const schemas = new Schemas(undefined, join(dir, "templates"), (async () => new Response(example.text)) as typeof fetch);
@@ -133,9 +136,9 @@ function setup(options: SetupOptions = {}) {
     if (cookies) headers.set("cookie", cookies);
     return app.request(`/deploy${path}`, { ...init, headers });
   };
-  const beat = () => writeFileSync(join(dir, "handoff", "executor.json"), JSON.stringify({ version: "0.3.0", protocols: [1], kinds: ["build", "deploy", "env", "env-read", "bundle", "db-migration"], at: new Date(now).toISOString(), project: "open-atlas", registries: [], databaseBackup: {}, busy: null }));
-  mkdirSync(join(dir, "handoff"), { recursive: true });
-  return { app, request, store, users, workbench, dir, beat, example, released, deployments, advance: (ms: number) => { now += ms; } };
+  // D35: plays the executor of the one host ("local"), as it would call in over HTTPS.
+  const beat = () => handoff.heartbeat("local", { version: "0.5.0", protocols: [2], kinds: ["build", "deploy", "env", "env-read", "bundle", "db-migration"], at: new Date(now).toISOString(), project: "open-atlas", registries: [], databaseBackup: {}, busy: null });
+  return { app, request, store, users, workbench, dir, beat, example, released, deployments, reach, advance: (ms: number) => { now += ms; } };
 }
 
 const shop = { v: 1, app: "shop", appliesFrom: "1.0.0", release: { repo: "acme/shop", tag: "v{version}", manifest: "package.json" },
@@ -256,8 +259,7 @@ function withBuiltApp() {
 const post = (t: ReturnType<typeof setup>, path: string, as: string, body: unknown) =>
   t.request(path, { method: "POST", as, headers: { "content-type": "application/json", "x-csrf-token": `csrf-${as}` }, body: JSON.stringify(body) });
 const finish = (t: ReturnType<typeof setup>, id: string, state: string, result: Record<string, unknown> = {}) => {
-  mkdirSync(join(t.dir, "handoff", "jobs", id), { recursive: true });
-  writeFileSync(join(t.dir, "handoff", "jobs", id, "status.json"), JSON.stringify({ id, state, steps: [], result, message: state, finishedAt: "2026-10-30T10:00:00Z" }));
+  t.deployments.handoff.putStatus(id, { state, steps: [], result, message: state, finishedAt: "2026-10-30T10:00:00Z" } as never);
 };
 /** Ticks every item of the manual step a deploy waits at (phase 5), as the given user. */
 const tickAll = async (t: ReturnType<typeof setup>, id: string, as = "uat") => {
@@ -296,10 +298,10 @@ test("builds, then deploys with the exact request the executor gets", async () =
   t.beat();
   const buildResponse = await (await post(t, "/api/apps/shop/build", "uat", { version: "1.2.0" })).json();
   const buildId = buildResponse.jobs[0].id;
-  const buildRequest = JSON.parse(readFileSync(join(t.dir, "handoff", "requests", `${buildId}.json`), "utf8"));
+  const buildRequest = t.deployments.handoff.request(buildId) as any;
   assert.deepEqual(buildRequest.build, { repo: "acme/shop", tag: "shop-1.2.0", script: "build-images.sh", platform: "linux/amd64" });
   assert.equal(buildRequest.registry, "ghcr.io/acme");
-  assert.equal(buildRequest.protocol, 1);
+  assert.equal(buildRequest.protocol, 2);
   assert.equal((await post(t, "/api/apps/shop/build", "uat", { version: "1.2.0" })).status, 409, "one job per app at a time");
   finish(t, buildId, "succeeded", { digest: "sha256:b" });
   await t.request("/api/jobs", { as: "viewer" });
@@ -308,7 +310,7 @@ test("builds, then deploys with the exact request the executor gets", async () =
   assert.deepEqual(p.findings.filter((f: { blocking: boolean }) => f.blocking), []);
   assert.equal(p.changes[0].after, "ghcr.io/acme/shop:1.2.0".replace("shop:", "open-atlas-shop:"));
   const deployed = await (await post(t, "/api/apps/shop/deploy", "uat", { version: "1.2.0" })).json();
-  const request = JSON.parse(readFileSync(join(t.dir, "handoff", "requests", `${deployed.job.id}.json`), "utf8"));
+  const request = t.deployments.handoff.request(deployed.job.id) as any;
   assert.deepEqual(request.services, ["shop"]);
   assert.deepEqual(request.images, [{ service: "shop", ref: "ghcr.io/acme/open-atlas-shop:1.2.0", build: true }]);
   assert.deepEqual(request.files, { repo: "acme/shop", tag: "shop-1.2.0", paths: ["deploy/shop.conf"] });
@@ -358,9 +360,211 @@ test("going back to a deploy pins its digests, and a failed deploy leaves the ve
   assert.equal(back.manual.length, 0, "install-only manual steps are not repeated");
   assert.equal((await post(t, "/api/apps/shop/plan", "uat", { version: "1.3.0", pinFrom: d1 })).status, 400);
   const d3 = (await (await post(t, "/api/apps/shop/deploy", "uat", { version: "1.2.0", pinFrom: d1 })).json()).job.id;
-  const request = JSON.parse(readFileSync(join(t.dir, "handoff", "requests", `${d3}.json`), "utf8"));
+  const request = t.deployments.handoff.request(d3) as any;
   assert.equal(request.images[0].pin, "sha256:one");
-  assert.deepEqual(readdirSync(join(t.dir, "handoff", "requests")).length, 5);
+  assert.deepEqual(t.store.executorJobs().length, 5);
+});
+
+test("going back uses the manifest revision that deploy ran with, and going down warns about data (D31)", async () => {
+  const t = withBuiltApp();
+  t.beat();
+  const ack = { acknowledgeManual: true };
+  for (const v of ["1.2.0", "1.3.0"]) {
+    const b = (await (await post(t, "/api/apps/shop/build", "uat", { version: v })).json()).jobs[0].id;
+    finish(t, b, "succeeded");
+    await t.request("/api/jobs", { as: "viewer" });
+  }
+  const d1 = (await (await post(t, "/api/apps/shop/deploy", "uat", { version: "1.2.0", ...ack })).json()).job.id;
+  await finishDeploy(t, d1, { digests: { shop: "sha256:one" } });
+  const ran = t.store.job(d1)!.manifest;
+  const d2 = (await (await post(t, "/api/apps/shop/deploy", "uat", { version: "1.3.0", ...ack })).json()).job.id;
+  await finishDeploy(t, d2, { digests: { shop: "sha256:two" } });
+
+  // Someone edits the manifest after 1.2.0 ran: a new revision with another host port.
+  const edited = structuredClone(built);
+  edited.components[0]!.ports = [{ container: 80, host: 18081 }];
+  t.store.saveManifest(edited, { id: "t", via: "cli" });
+
+  const back = await (await post(t, "/api/apps/shop/plan", "uat", { version: "1.2.0", pinFrom: d1 })).json();
+  assert.equal(back.manifest, ran);
+  assert.match(back.fragment, /18080/);
+  assert.doesNotMatch(back.fragment, /18081/);
+  const codes = back.findings.map((f: { code: string }) => f.code);
+  assert.ok(codes.includes("deploy/pinned-manifest"));
+  assert.match(back.findings.find((f: { code: string }) => f.code === "deploy/downgrade").message, /Going back from 1\.3\.0 to 1\.2\.0\. Data written by 1\.3\.0/);
+  const fresh = await (await post(t, "/api/apps/shop/plan", "uat", { version: "1.2.0" })).json();
+  assert.match(fresh.fragment, /18081/, "a plain plan uses the current manifest");
+  assert.notEqual(fresh.manifest, ran);
+});
+
+// D35: several hosts, each with an executor calling in over HTTPS with its own token.
+
+const hosts = { app1: { address: "10.0.1.11" }, app2: { address: "10.0.1.12", bindIp: "10.0.1.12" } };
+
+test("D35: an executor calls in with its host's token, gets only its host's jobs, and reports back", async () => {
+  const t = withBuiltApp();
+  writeFileSync(join(t.dir, "environment.json"), JSON.stringify({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", hosts, registries: { ghcr: "ghcr.io/acme" }, apps: { shop: { version: "1.2.0", host: "app2" } } }));
+  const call = (path: string, token: string | undefined, init: RequestInit = {}) => t.app.request(`/deploy${path}`, { ...init, headers: { ...(token ? { authorization: `Bearer ${token}` } : {}), ...(init.body && typeof init.body === "string" && init.body.startsWith("{") ? { "content-type": "application/json" } : {}) } });
+  assert.equal((await call("/executor/v1/heartbeat", "dpe_nope", { method: "POST", body: "{}" })).status, 401);
+  assert.equal((await post(t, "/api/hosts/app9/token", "admin", {})).status, 404, "only hosts of the environment");
+  assert.equal((await post(t, "/api/hosts/app2/token", "uat", {})).status, 403, "administrators issue tokens");
+  const { token: t2 } = await (await post(t, "/api/hosts/app2/token", "admin", {})).json();
+  const { token: t1 } = await (await post(t, "/api/hosts/app1/token", "admin", {})).json();
+  assert.match(t2, /^dpe_/);
+  const beat = (token: string) => call("/executor/v1/heartbeat", token, { method: "POST", body: JSON.stringify({ version: "0.5.0", protocols: [2], kinds: ["build", "deploy", "env", "env-read"], project: "open-atlas", registries: [], databaseBackup: {}, busy: null }) });
+  assert.equal((await beat(t2)).status, 200);
+  await beat(t1);
+  const hostsView = await (await t.request("/api/hosts", { as: "viewer" })).json();
+  assert.deepEqual(hostsView.hosts.map((h: { id: string; executor: { online: boolean }; apps: string[] }) => [h.id, h.executor.online, h.apps]), [["app1", true, []], ["app2", true, ["shop"]]]);
+  assert.ok(!JSON.stringify(hostsView).includes(t2), "tokens are shown once");
+
+  const build = await (await post(t, "/api/apps/shop/build", "uat", { version: "1.2.0" })).json();
+  const id = build.jobs[0].id;
+  assert.equal((await call("/executor/v1/jobs/next", t1)).status, 204, "app1 has nothing");
+  const got = await (await call("/executor/v1/jobs/next", t2)).json();
+  assert.equal(got.job.id, id);
+  assert.equal(got.job.protocol, 2);
+  assert.equal((await call("/executor/v1/jobs/next", t2)).status, 204, "claimed once");
+  assert.equal((await call(`/executor/v1/jobs/${id}/status`, t1, { method: "PUT", body: JSON.stringify({ state: "running", steps: [], result: {} }) })).status, 404, "another host cannot touch it");
+  await call(`/executor/v1/jobs/${id}/log`, t2, { method: "POST", body: "--- build running\n" });
+  await call(`/executor/v1/jobs/${id}/status`, t2, { method: "PUT", body: JSON.stringify({ state: "succeeded", steps: [], result: { digest: "sha256:b" }, finishedAt: "2026-10-30T10:01:00Z" }) });
+  const job = await (await t.request(`/api/jobs/${id}`, { as: "viewer" })).json();
+  assert.equal(job.job.state, "succeeded");
+  assert.match(job.log, /build running/);
+
+  // A long poll wakes up as soon as a job for its host is queued.
+  const waiting = call("/executor/v1/jobs/next?wait=5", t2);
+  const deployed = await (await post(t, "/api/apps/shop/deploy", "uat", { version: "1.2.0", acknowledgeManual: true })).json();
+  const woke = await (await waiting).json();
+  assert.equal(woke.job.id, deployed.job.id);
+  assert.match(woke.job.root, /path: "shop\/compose\.yaml"/);
+  assert.match(woke.job.fragment, /"10\.0\.1\.12:18080:80"/, "ports bind where app2 says");
+
+  await call("/executor/v1/state", t2, { method: "POST", body: JSON.stringify({ containers: JSON.stringify({ Names: "open-atlas-shop-1", Image: "ghcr.io/acme/open-atlas-shop:1.2.0", State: "running", Status: "Up", Labels: "com.docker.compose.service=shop,org.open-atlas.version=1.2.0" }), files: { "shop/compose.yaml": "abc" } }) });
+  const status = await (await t.request("/api/status", { as: "viewer" })).json();
+  assert.equal(status.apps[0].components[0].container.host, "app2");
+  assert.equal(status.hostOf.shop, "app2");
+
+  await post(t, "/api/hosts/app2/revoke", "admin", {});
+  assert.equal((await beat(t2)).status, 401, "a revoked token stops working");
+  assert.ok(t.store.listAudit().some((e) => e.action === "host.token-revoked" && e.target === "app2"));
+});
+
+test("D35: each host's compose root holds only the apps placed on it", async () => {
+  const t = withBuiltApp();
+  t.store.saveManifest({ ...shop, app: "blog", components: [{ id: "web", type: "compose-service", service: "blog", source: { kind: "public-registry", image: "nginx:1.27.0" }, ports: [{ container: 80, host: 18090 }] }] }, { id: "t", via: "cli" });
+  // The registry keeps default host ports apart; an environment may put two apps on the same port on different hosts.
+  writeFileSync(join(t.dir, "environment.json"), JSON.stringify({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", hosts, registries: { ghcr: "ghcr.io/acme" }, apps: { shop: { version: "1.2.0", host: "app1" }, blog: { version: "1.0.0", host: "app2", overrides: { web: { ports: { "80": 18080 } } } } } }));
+  t.store.recordArtifact({ app: "shop", service: "shop", digest: "sha256:x", version: "1.2.0", ref: "r", origin: "build", build: null, job: "j" });
+  t.store.addJob({ id: "deploy-shop-0001", kind: "deploy", app: "shop", version: "1.2.0", environment: "uat", fromVersion: null, manifest: "shop@1.0.0#1", pinFrom: null, request: {} }, { id: "t", via: "cli" });
+  t.store.updateJob("deploy-shop-0001", { state: "succeeded", steps: [], result: {} });
+  const plan = await (await post(t, "/api/apps/blog/plan", "uat", { version: "1.0.0" })).json();
+  assert.ok(!plan.findings.some((f: { code: string }) => f.code === "deploy/conflict"), "the same host port on two hosts is no conflict");
+  assert.doesNotMatch(plan.request?.root ?? "", /shop/, "shop runs on app1");
+});
+
+// D36: one DNS name, nginx by port (optional per app), {{app:…}} references, the internal CA, the check after a deploy.
+
+const CA = "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIUWwz3v1uq6GdV8iXkWQ9+0ZJ7YJYwCgYIKoZIzj0EAwIw\nLzEtMCsGA1UEAwwkT3BlbiBBdGxhcyBEZXBsb3llciB0ZXN0IGludGVybmFsIENB\nMB4XDTI2MTAzMTAwMDAwMFoXDTM2MTAyODAwMDAwMFowLzEtMCsGA1UEAwwkT3Bl\nbiBBdGxhcyBEZXBsb3llciB0ZXN0IGludGVybmFsIENBMFkwEwYHKoZIzj0CAQYI\nKoZIzj0DAQcDQgAEXYVlv0dOQq1rHgSx6U3Qx0sG8vJzjv6k2tXy3Xh4n2xwz3Ar\nZf1tB3R2X1oG7p3vWmZ3oYfY0Y2t4b3K5w3cM6NTMFEwHQYDVR0OBBYEFF4Z9J0b\n-----END CERTIFICATE-----";
+
+function withIngress() {
+  const t = withBuiltApp();
+  t.store.saveManifest({ ...shop, app: "api", components: [{ id: "web", type: "compose-service", service: "api", source: { kind: "public-registry", image: "nginx:1.27.0" }, ports: [{ container: 8787, host: 18787 }], environment: { SHOP_URL: "{{app:shop.url}}", SHOP_ORIGIN: "{{app:shop.origin}}" } }] }, { id: "t", via: "cli" });
+  const write = (over: Record<string, unknown> = {}) => writeFileSync(join(t.dir, "environment.json"), JSON.stringify({
+    name: "uat", project: "open-atlas", bindIp: "127.0.0.1", hosts, domain: "atlas.example.internal", registries: { ghcr: "ghcr.io/acme" },
+    apps: { shop: { version: "1.2.0", host: "app1", ingress: { kind: "nginx", port: 443 } }, api: { version: "1.0.0", host: "app2", ingress: { kind: "direct" } } }, ...over,
+  }));
+  write();
+  for (const h of ["app1", "app2"]) t.deployments.handoff.heartbeat(h, { version: "0.5.0", protocols: [2], kinds: ["build", "deploy", "env", "env-read", "bundle", "db-migration"], at: "", project: "open-atlas", registries: [], databaseBackup: {}, busy: null });
+  return { t, write };
+}
+
+test("D36: addresses come from the ingress setting; references resolve where the other app runs", async () => {
+  const { t, write } = withIngress();
+  const view = await (await t.request("/api/ingress", { as: "viewer" })).json();
+  assert.deepEqual(view.endpoints.map((e: { app: string; kind: string; url?: string; upstream?: string }) => [e.app, e.kind, e.url, e.upstream]), [
+    ["api", "direct", "http://10.0.1.12:18787", undefined],
+    ["shop", "nginx", "https://atlas.example.internal/", "10.0.1.11:18080"],
+  ]);
+  const plan = await (await post(t, "/api/apps/api/plan", "uat", { version: "1.0.0" })).json();
+  assert.match(plan.fragment, /SHOP_URL: "https:\/\/atlas\.example\.internal"/);
+  assert.match(plan.fragment, /SHOP_ORIGIN: "https:\/\/atlas\.example\.internal"/);
+  assert.equal(plan.request.url, "http://10.0.1.12:18787");
+  // shop without an ingress: api's reference cannot be resolved, and the plan says so.
+  write({ apps: { shop: { version: "1.2.0", host: "app1" }, api: { version: "1.0.0", host: "app2", ingress: { kind: "direct" } } } });
+  const blocked = await (await post(t, "/api/apps/api/plan", "uat", { version: "1.0.0" })).json();
+  assert.ok(blocked.findings.some((x: { code: string; blocking: boolean; message: string }) => x.code === "deploy/app-ref" && x.blocking && /shop has no ingress/.test(x.message)));
+});
+
+test("D36: nginx gets one server per port, locations by path; revisions keep what changed", async () => {
+  const { t, write } = withIngress();
+  t.store.saveManifest({ ...shop, app: "deployer", components: [{ id: "web", type: "compose-service", service: "deployer", source: { kind: "public-registry", image: "nginx:1.27.0" }, ports: [{ container: 8095, host: 18095 }] }] }, { id: "t", via: "cli" });
+  write({ apps: { shop: { version: "1.2.0", host: "app1", ingress: { kind: "nginx", port: 443 } }, deployer: { version: "1.0.0", host: "app1", ingress: { kind: "nginx", port: 443, path: "/deploy/" } }, api: { version: "1.0.0", host: "app2", ingress: { kind: "nginx", port: 8787, maxBodySize: "500m" } } } });
+  const view = await (await t.request("/api/ingress", { as: "viewer" })).json();
+  const conf: string = view.nginx.body;
+  assert.equal((conf.match(/^server \{/gm) ?? []).length, 2);
+  assert.match(conf, /listen 443 ssl;[\s\S]*location \/deploy\/ \{\n {8}proxy_pass http:\/\/10\.0\.1\.11:18095;[\s\S]*location \/ \{\n {8}proxy_pass http:\/\/10\.0\.1\.11:18080;/, "longest path first");
+  assert.match(conf, /listen 8787 ssl;[\s\S]*client_max_body_size 500m;[\s\S]*proxy_pass http:\/\/10\.0\.1\.12:18787;/);
+  assert.match(conf, /proxy_buffering off;/);
+  assert.match(conf, /proxy_read_timeout 600s;/);
+  assert.equal(view.nginx.latest, null);
+  const shopPlan = await (await post(t, "/api/apps/shop/plan", "uat", { version: "1.2.0" })).json();
+  assert.ok(shopPlan.findings.some((x: { code: string }) => x.code === "ingress/nginx-update"), "a deploy behind nginx says the configuration is not saved");
+  assert.equal((await post(t, "/api/ingress/nginx", "viewer", {})).status, 403);
+  assert.equal((await (await post(t, "/api/ingress/nginx", "uat", { note: "first" })).json()).revision, 1);
+  assert.equal((await post(t, "/api/ingress/nginx", "uat", {})).status, 409, "nothing changed");
+  const saved = await (await post(t, "/api/apps/shop/plan", "uat", { version: "1.2.0" })).json();
+  assert.ok(!saved.findings.some((x: { code: string }) => x.code === "ingress/nginx-update"));
+  // api moves to app1: the configuration changes, and the diff shows how.
+  write({ apps: { shop: { version: "1.2.0", host: "app1", ingress: { kind: "nginx", port: 443 } }, deployer: { version: "1.0.0", host: "app1", ingress: { kind: "nginx", port: 443, path: "/deploy/" } }, api: { version: "1.0.0", host: "app1", ingress: { kind: "nginx", port: 8787, maxBodySize: "500m" } } } });
+  const moved = await (await t.request("/api/ingress", { as: "viewer" })).json();
+  assert.match(moved.nginx.diff, /^- {9}proxy_pass http:\/\/10\.0\.1\.12:18787;$/m);
+  assert.match(moved.nginx.diff, /^\+ {9}proxy_pass http:\/\/10\.0\.1\.11:18787;$/m);
+  const file = await t.request("/api/ingress/nginx/1", { as: "viewer" });
+  assert.match(file.headers.get("content-disposition") ?? "", /open-atlas-uat-nginx-r1\.conf/);
+  assert.equal(await file.text(), conf);
+});
+
+test("D36: the internal CA is set by an administrator and mounted into the containers of every deploy", async () => {
+  const { t } = withIngress();
+  assert.equal((await put(t, "/api/settings/ca", "uat", { pem: CA })).status, 403);
+  assert.equal((await put(t, "/api/settings/ca", "admin", { pem: "not a certificate" })).status, 400);
+  t.store.setSetting("ca.pem", `${CA}\n`, { id: "admin@x", via: "workbench" });
+  const plan = await (await post(t, "/api/apps/api/plan", "uat", { version: "1.0.0" })).json();
+  assert.match(plan.fragment, /NODE_EXTRA_CA_CERTS: "\/etc\/open-atlas\/ca\.pem"/);
+  assert.match(plan.fragment, /"\.\/ca\/ca\.pem:\/etc\/open-atlas\/ca\.pem:ro"/);
+  assert.equal(plan.request.ca, `${CA}\n`, "the executor writes it beside the fragment");
+  assert.equal((await put(t, "/api/settings/ca", "admin", { pem: "" })).status, 200, "an administrator removes it");
+  assert.equal(t.store.setting("ca.pem"), undefined);
+});
+
+test("D36: after a deploy the app is reached once at its address; a failure only warns; a moved address is named", async () => {
+  const { t, write } = withIngress();
+  t.reach.ok = false;
+  const b = (await (await post(t, "/api/apps/shop/build", "uat", { version: "1.2.0" })).json()).jobs[0].id;
+  finish(t, b, "succeeded");
+  await t.request("/api/jobs", { as: "viewer" });
+  const d1 = (await (await post(t, "/api/apps/shop/deploy", "uat", { version: "1.2.0", acknowledgeManual: true })).json()).job.id;
+  await finishDeploy(t, d1, { digests: { shop: "sha256:one" } });
+  const job = await (await t.request(`/api/jobs/${d1}`, { as: "viewer" })).json();
+  assert.equal(job.job.state, "succeeded", "not rolled back");
+  assert.deepEqual(job.job.observation.ingress.ok, false);
+  assert.equal(job.job.observation.ingress.status, 502);
+  assert.deepEqual(t.reach.urls, ["https://atlas.example.internal/"]);
+  assert.ok(t.store.listAudit().some((e) => e.action === "deploy.ingress-unreachable"));
+  // shop moves to another port: the plan names the move, the apps that refer to it, and the addresses kept inside apps.
+  write({ apps: { shop: { version: "1.2.0", host: "app1", ingress: { kind: "nginx", port: 8443 } }, api: { version: "1.0.0", host: "app2", ingress: { kind: "direct" } } } });
+  const moved = await (await post(t, "/api/apps/shop/plan", "uat", { version: "1.2.0" })).json();
+  const note = moved.findings.find((x: { code: string }) => x.code === "ingress/url-changed");
+  assert.match(note.message, /moves from https:\/\/atlas\.example\.internal\/ to https:\/\/atlas\.example\.internal:8443\//);
+  assert.match(note.message, /Apps that refer to it \(api\)/);
+  assert.match(note.message, /OMA Integration/);
+  assert.equal(note.blocking, false);
+  // shop moves to app2: the plan says the containers on app1 stay until someone stops them there.
+  write({ apps: { shop: { version: "1.2.0", host: "app2", ingress: { kind: "nginx", port: 443 } }, api: { version: "1.0.0", host: "app2", ingress: { kind: "direct" } } } });
+  const rehosted = await (await post(t, "/api/apps/shop/plan", "uat", { version: "1.2.0" })).json();
+  assert.match(rehosted.findings.find((x: { code: string }) => x.code === "deploy/host-changed").message, /moves from host app1 to app2[\s\S]*stop them there by hand/);
+  assert.equal(rehosted.request.machine, "app2");
 });
 
 test("PROD does not build", async () => {
@@ -390,9 +594,7 @@ const put = (t: ReturnType<typeof setup>, path: string, as: string, body: unknow
 /** Plays the executor's part of an env-read job. */
 async function importFile(t: ReturnType<typeof setup>, content: string | null) {
   const { job } = await (await post(t, "/api/apps/shop/env/import", "uat", {})).json();
-  const dir = join(t.dir, "handoff", "jobs", job.id);
-  mkdirSync(dir, { recursive: true });
-  if (content !== null) writeFileSync(join(dir, "env.content"), content);
+  if (content !== null) t.deployments.handoff.putEnvContent(job.id, content);
   const sha256 = content === null ? undefined : createHash("sha256").update(content).digest("hex");
   finish(t, job.id, "succeeded", { env: content === null ? { exists: false } : { exists: true, sha256, bytes: content.length } });
   await t.request("/api/jobs", { as: "viewer" });
@@ -441,7 +643,7 @@ test("writing goes through a plan; the request carries the file, the job record 
   const planFirst = await (await post(t, "/api/apps/shop/env/plan", "uat", {})).json();
   assert.equal(planFirst.error, "env/revision", "nothing to write before an import or an edit");
   await importFile(t, null);
-  assert.equal(t.store.appliedEnv("shop")!.meta.note, "服务器上没有 shop.env");
+  assert.equal(t.store.appliedEnv("shop")!.meta.note, "shop.env does not exist on the server");
   await put(t, "/api/apps/shop/env", "uat", { base: 1, values: [{ key: "API_TOKEN", value: "s3cret" }] });
   const p = await (await post(t, "/api/apps/shop/env/plan", "uat", { revision: 2 })).json();
   assert.deepEqual(p.findings.map((f: { code: string }) => f.code), ["env/referenced-missing", "env/write-only"]);
@@ -453,7 +655,11 @@ test("writing goes through a plan; the request carries the file, the job record 
   assert.deepEqual(ok.changes.map((c: { key: string }) => c.key), ["API_TOKEN", "GREETING"]);
   assert.equal(ok.restart, false);
   const { job } = await (await post(t, "/api/apps/shop/env/apply", "uat", { revision: 3 })).json();
-  const request = JSON.parse(readFileSync(join(t.dir, "handoff", "requests", `${job.id}.json`), "utf8"));
+  // The executor of the app's host claims it with the content; the queue keeps no copy after that.
+  let request: any;
+  while ((request = await t.deployments.handoff.next("local")) && request.id !== job.id);
+  assert.equal(request.id, job.id);
+  assert.equal((t.deployments.handoff.request(job.id) as any).content, undefined);
   assert.equal(request.content, "# Written by Open Atlas Deployer: shop env revision 3.\n# Edit it in the Deployer; changes made here are overwritten.\nAPI_TOKEN=s3cret\nGREETING='hi there'\n");
   assert.equal(request.sha256, createHash("sha256").update(request.content).digest("hex"));
   assert.deepEqual(request.services, []);
@@ -484,7 +690,7 @@ test("a deploy needs every ${KEY} its fragment uses in the server's env file, an
   assert.equal(p.restart, true);
   assert.deepEqual(p.restarts, ["shop"]);
   const { job: envJob } = await (await post(t, "/api/apps/shop/env/apply", "uat", { revision: 3 })).json();
-  const request = JSON.parse(readFileSync(join(t.dir, "handoff", "requests", `${envJob.id}.json`), "utf8"));
+  const request = t.deployments.handoff.request(envJob.id) as any;
   assert.deepEqual([request.restart, request.services], [true, ["shop"]]);
   finish(t, envJob.id, "succeeded");
   await t.request("/api/jobs", { as: "viewer" });
@@ -554,7 +760,7 @@ test("PROD deploys exactly the digests UAT ran, and says so", async () => {
   assert.equal(p.promotion.uatDeployment, uatDeploy);
   assert.equal(p.changes[0].pin, "sha256:uat1");
   const { job } = await (await post(prod, "/api/apps/shop/deploy", "prod", { version: "1.2.0", acknowledgeManual: true })).json();
-  const request = JSON.parse(readFileSync(join(prod.dir, "handoff", "requests", `${job.id}.json`), "utf8"));
+  const request = prod.deployments.handoff.request(job.id) as any;
   assert.equal(request.images[0].pin, "sha256:uat1");
   assert.equal(request.promotion.basis, "uat");
   await finishDeploy(prod, job.id, { digests: { shop: "sha256:uat1" } }, "prod");
@@ -571,15 +777,15 @@ test("PROD refuses what UAT has not run and is not released; a release or an adm
   const p = await (await post(prod, "/api/apps/shop/plan", "prod", { version: "1.3.0" })).json();
   const refusal = p.findings.find((f: { code: string }) => f.code === "deploy/not-promoted");
   assert.ok(refusal?.blocking);
-  assert.match(refusal.message, /1\.3\.0 没有在 UAT 部署成功过；acme\/shop 的 shop-1\.3\.0 没有 GitHub Release/);
+  assert.match(refusal.message, /1\.3\.0 has never deployed successfully in UAT; acme\/shop has no GitHub Release for shop-1\.3\.0/);
 
   assert.equal((await post(prod, "/api/apps/shop/plan", "prod", { version: "1.3.0", override: { reason: "hotfix" } })).status, 403, "only an administrator overrides");
   assert.equal((await post(prod, "/api/apps/shop/plan", "admin", { version: "1.3.0", override: { reason: " " } })).status, 400, "with a reason");
-  const overridden = await (await post(prod, "/api/apps/shop/plan", "admin", { version: "1.3.0", override: { reason: "紧急修复 INC-42" } })).json();
+  const overridden = await (await post(prod, "/api/apps/shop/plan", "admin", { version: "1.3.0", override: { reason: "Emergency fix INC-42" } })).json();
   assert.deepEqual(overridden.findings.filter((f: { blocking: boolean }) => f.blocking), []);
   assert.equal(overridden.promotion.basis, "override");
-  const { job } = await (await post(prod, "/api/apps/shop/deploy", "admin", { version: "1.3.0", acknowledgeManual: true, override: { reason: "紧急修复 INC-42" } })).json();
-  assert.ok(prod.store.listAudit().some((e) => e.action === "deploy.promotion-override" && (e.detail as { reason: string }).reason === "紧急修复 INC-42"));
+  const { job } = await (await post(prod, "/api/apps/shop/deploy", "admin", { version: "1.3.0", acknowledgeManual: true, override: { reason: "Emergency fix INC-42" } })).json();
+  assert.ok(prod.store.listAudit().some((e) => e.action === "deploy.promotion-override" && (e.detail as { reason: string }).reason === "Emergency fix INC-42"));
   finish(prod, job.id, "failed");
   await prod.request("/api/jobs", { as: "viewer" });
 
@@ -592,12 +798,12 @@ test("PROD refuses what UAT has not run and is not released; a release or an adm
 test("an unreachable UAT is named; the soak time counts until UAT replaced the version", async () => {
   const wrongKey = await uatAndProd({ key: "dpr_wrong" });
   const p = await (await post(wrongKey.prod, "/api/apps/shop/plan", "prod", { version: "1.2.0" })).json();
-  assert.match(p.findings.find((f: { code: string }) => f.code === "deploy/not-promoted").message, /无法确认 UAT 记录（UAT 的 Deployer 返回 HTTP 401/);
+  assert.match(p.findings.find((f: { code: string }) => f.code === "deploy/not-promoted").message, /Cannot check the UAT records \(The UAT Deployer returned HTTP 401/);
 
   const { prod } = await uatAndProd({ soakHours: 4 });
   prod.advance(2 * 3_600_000);
   const early = await (await post(prod, "/api/apps/shop/plan", "prod", { version: "1.2.0" })).json();
-  assert.match(early.findings.find((f: { code: string }) => f.code === "deploy/not-promoted").message, /只运行了 2\.0 小时，要求 4 小时/);
+  assert.match(early.findings.find((f: { code: string }) => f.code === "deploy/not-promoted").message, /ran for only 2\.0 hours; 4 hours required/);
   prod.advance(3 * 3_600_000);
   const later = await (await post(prod, "/api/apps/shop/plan", "prod", { version: "1.2.0" })).json();
   assert.equal(later.promotion.basis, "uat");
@@ -675,23 +881,23 @@ test("a plan lists every component in order, with the bundle and the contract ch
   assert.deepEqual(p.steps.map((s: { component: string; where: string }) => `${s.component}/${s.where}`), ["db/host", "migrate/host", "graph/deployer", "ui/deployer", "assistant/deployer", "first/person"]);
   const step = (id: string) => p.steps.find((s: { component: string }) => s.component === id);
   assert.equal(step("ui").before, "book 0.9.0");
-  assert.match(step("ui").after, /^book 1\.0\.0（book-1\.0\.0\.tar\.gz，sha256:/);
-  assert.equal(step("graph").before, "acme/book 草稿第 3 版");
-  assert.match(step("migrate").after, /pkg\/migrations 里还没执行过的迁移（共 1 个）/);
+  assert.match(step("ui").after, /^book 1\.0\.0 \(book-1\.0\.0\.tar\.gz, sha256:/);
+  assert.equal(step("graph").before, "acme/book draft revision 3");
+  assert.match(step("migrate").after, /Run migrations in pkg\/migrations not yet applied \(1 in total\)/);
   assert.deepEqual(step("first").checks, ["import the data export"]);
   assert.equal(p.bundle.checked, 5);
   assert.ok(p.findings.some((f: { code: string }) => f.code === "deploy/bundle-checked"));
 
   t.environment("1.2.0");
   const old = await (await post(t, "/api/apps/book/plan", "uat", { version: "1.0.0" })).json();
-  assert.deepEqual(old.findings.filter((f: { blocking: boolean }) => f.blocking).map((f: { message: string }) => f.message), ["book 1.0.0 要求 workbench-app ^1.3，workbench 1.2.0 提供的是 1.2。"]);
+  assert.deepEqual(old.findings.filter((f: { blocking: boolean }) => f.blocking).map((f: { message: string }) => f.message), ["book 1.0.0 requires workbench-app ^1.3, but workbench 1.2.0 provides 1.2."]);
 });
 
 test("a deploy runs the executor's part, then Studio, Workbench and OMA, then waits for people", async () => {
   const t = withBook();
   t.beat();
   const { job } = await (await post(t, "/api/apps/book/deploy", "uat", { version: "1.0.0" })).json();
-  const request = JSON.parse(readFileSync(join(t.dir, "handoff", "requests", `${job.id}.json`), "utf8"));
+  const request = t.deployments.handoff.request(job.id) as any;
   const digest = sha256(t.s.assets["acme/book@v1.0.0/book-1.0.0.tar.gz"]!);
   assert.deepEqual(request.files, { bundle: { repo: "acme/book", tag: "v1.0.0", asset: "book-1.0.0.tar.gz", sha256: digest }, paths: ["pkg/db", "pkg/migrations"] });
   assert.deepEqual(request.migrations, [{ component: "migrate", service: "book-db", install: null, migrations: "pkg/migrations", backup: true }]);
@@ -735,11 +941,11 @@ test("a failing Deployer step rolls back the ones before it; with no containers 
   const { job } = await (await post(t, "/api/apps/book/deploy", "uat", { version: "1.0.0" })).json();
   const done = await settle(t, job.id);
   assert.equal(done.state, "failed");
-  assert.match(done.message, /组件 assistant 失败：publish_package: model not available。已撤回：Workbench 的 book 切回 0\.9\.0/);
+  assert.match(done.message, /Component assistant failed: publish_package: model not available\. Undone: book in Workbench switched back to 0\.9\.0/);
   assert.deepEqual(done.rollout.steps.map((s: { state: string }) => s.state), ["rolled-back", "failed"]);
   assert.equal(t.s.workbench.apps[0]!.version, "0.9.0");
   assert.equal(t.s.workbench.agents[0]!.agentId, "agent_old");
-  assert.ok(!readdirSync(join(t.dir, "handoff")).includes("requests"), "nothing went to the executor");
+  assert.equal(t.store.executorJobs().length, 0, "nothing went to the executor");
 });
 
 test("missing settings and credentials block the plan and say where to set them", async () => {
@@ -750,7 +956,7 @@ test("missing settings and credentials block the plan and say where to set them"
   const p = await (await post(t, "/api/apps/book/plan", "uat", { version: "1.0.0" })).json();
   const blocking = p.findings.filter((f: { blocking: boolean }) => f.blocking).map((f: { code: string; message: string }) => `${f.code} ${f.message}`);
   assert.ok(blocking.some((m: string) => m.startsWith("studio-graph/graph") && m.includes("apps.book.settings.graph.graph")));
-  assert.ok(blocking.some((m: string) => m.startsWith("oma-agent/settings") && m.includes("{{model}}、{{mcpUrl}}")));
+  assert.ok(blocking.some((m: string) => m.startsWith("oma-agent/settings") && m.includes("{{model}}, {{mcpUrl}}")));
   assert.ok(blocking.some((m: string) => m.startsWith("workbench-app/unreachable") && m.includes("HTTP 401")));
 });
 
@@ -819,7 +1025,7 @@ test("/mcp: tools are the page's calls; a service key sees only the read-only on
   assert.equal(plan.isError, false);
   assert.equal(plan.value.steps.length, 6);
   assert.equal((await tool(t, service, "deploy", { app: "book", version: "1.0.0", request_id: "r1" })).value.finding.code, "mcp/unknown-tool", "no write tools for the service key");
-  assert.equal((await tool(t, service, "plan_deploy", { app: "book", version: "1.0.0", force: true })).value.finding.expected, "plan_deploy 没有参数 force");
+  assert.equal((await tool(t, service, "plan_deploy", { app: "book", version: "1.0.0", force: true })).value.finding.expected, "plan_deploy has no parameter force");
   assert.equal((await tool(t, service, "get_env", { app: "book" })).value.finding.code, "env/none", "a refusal is the route's own finding");
 
   // A command with request_id: the retry returns the first answer, one job only.
@@ -828,7 +1034,7 @@ test("/mcp: tools are the page's calls; a service key sees only the read-only on
   assert.equal(first.isError, false);
   assert.equal(again.value.job.id, first.value.job.id);
   assert.equal(t.store.listJobs({ kind: "deploy" }).length, 1);
-  assert.equal((await tool(t, personal, "deploy", { app: "book", version: "1.0.0" })).value.finding.expected, "deploy 缺参数 request_id");
+  assert.equal((await tool(t, personal, "deploy", { app: "book", version: "1.0.0" })).value.finding.expected, "deploy is missing parameter request_id");
   assert.ok(t.store.listAudit().some((e) => e.action === "mcp.deploy" && e.via === "key" && e.actor === "u@x"));
 });
 
@@ -864,20 +1070,20 @@ test("a failed deploy is diagnosed by the Deploy Assistant through OMA, and the 
 
   await diagnoser.poll();
   assert.equal(t.store.job(job.id)!.diagnosis!.state, "running", "no answer yet");
-  t.s.oma.reply = "看了日志。\n```json\n{\"cause\": \"authenticator 的密码与库里不一致\", \"evidence\": [\"FATAL: password authentication failed\"], \"suggestion\": \"核对 AUTHENTICATOR_PASSWORD\", \"confidence\": \"high\"}\n```";
+  t.s.oma.reply = "Read the logs.\n```json\n{\"cause\": \"the authenticator password does not match the database\", \"evidence\": [\"FATAL: password authentication failed\"], \"suggestion\": \"check AUTHENTICATOR_PASSWORD\", \"confidence\": \"high\"}\n```";
   await diagnoser.poll();
   const view = await (await t.request(`/api/jobs/${job.id}`, { as: "viewer" })).json();
   assert.equal(view.job.diagnosis.state, "done");
-  assert.equal(view.job.diagnosis.cause, "authenticator 的密码与库里不一致");
+  assert.equal(view.job.diagnosis.cause, "the authenticator password does not match the database");
   assert.equal(view.record.diagnosis.confidence, "high");
 });
 
 // Phase 7: assessments (§10.5) and version assessments (D27).
 
-const tokenOf = (message: string) => /任务令牌[^：]*：(dtt_[\w-]+)/.exec(message)![1]!;
+const tokenOf = (message: string) => /Task token[^:]*: (dtt_[\w-]+)/.exec(message)![1]!;
 let draftReq = 0;
 const agentTool = (t: ReturnType<typeof setup>, key: string, name: string, id: string, token: string, args: Record<string, unknown>) =>
-  tool(t, key, name, { id, task_token: token, request_id: `r${++draftReq}`, reason: "看了 Dockerfile 和 compose.yaml", ...args });
+  tool(t, key, name, { id, task_token: token, request_id: `r${++draftReq}`, reason: "read the Dockerfile and compose.yaml", ...args });
 
 test("an assessment: scan, the Agent fills the draft with its task token, validation, trial in UAT, registration", async () => {
   const t = withBook();
@@ -896,11 +1102,11 @@ test("an assessment: scan, the Agent fills the draft with its task token, valida
   const session = t.s.oma.sessions[0]!;
   assert.deepEqual([session.body.agent, session.body.environment_id], ["agent_assessor", "env_isolated"], "the isolated Environment");
   const token = tokenOf(session.messages[0]!);
-  assert.match(session.messages[0]!, /不执行仓库里的任何脚本/);
+  assert.match(session.messages[0]!, /Do not run any script from the repository/);
 
   // The Agent configures the draft; a wrong token or another assessment's is refused.
   assert.equal((await agentTool(t, service, "draft_app", a.id, "dtt_wrong", { app: "hello" })).value.finding.code, "assessment/token");
-  assert.equal((await tool(t, service, "draft_app", { id: a.id, task_token: token, request_id: "x1", app: "hello" })).value.finding.expected, "draft_app 缺参数 reason");
+  assert.equal((await tool(t, service, "draft_app", { id: a.id, task_token: token, request_id: "x1", app: "hello" })).value.finding.expected, "draft_app is missing parameter reason");
   await agentTool(t, service, "draft_app", a.id, token, { app: "hello", name: "Hello", applies_from: "1.0.0" });
   const early = await tool(t, service, "validate_draft", { id: a.id });
   assert.ok(early.value.findings.some((f: { code: string }) => f.code === "draft/release" || f.code === "draft/schema"));
@@ -916,12 +1122,12 @@ test("an assessment: scan, the Agent fills the draft with its task token, valida
   assert.deepEqual(latest.value.findings.map((f: { code: string }) => f.code), ["draft/schema"]);
   assert.match(latest.value.findings[0].expected, /latest/, "a public image needs a fixed version");
   // A person continues on the page, with their own reason.
-  const fixed = await post(t, `/api/assessments/${a.id}/draft/source`, "uat", { component: "web", source: { kind: "public-registry", image: "nginx:1.27.0" }, reason: "固定版本号" });
+  const fixed = await post(t, `/api/assessments/${a.id}/draft/source`, "uat", { component: "web", source: { kind: "public-registry", image: "nginx:1.27.0" }, reason: "pin the version" });
   assert.equal(fixed.status, 200);
   assert.deepEqual((await tool(t, service, "validate_draft", { id: a.id })).value.findings, []);
-  await agentTool(t, service, "draft_report", a.id, token, { level: "B", report: "能部署：一个容器，补了 env 模板" });
+  await agentTool(t, service, "draft_report", a.id, token, { level: "B", report: "Deployable: one container, env template added" });
 
-  t.s.oma.reply = "评估完成，B 级。";
+  t.s.oma.reply = "Assessment done, level B.";
   const ready = await (await t.request(`/api/assessments/${a.id}`, { as: "viewer" })).json();
   assert.equal(ready.state, "ready");
   assert.deepEqual(ready.changes.map((c: { by: string; operation: string }) => `${c.by.startsWith("agent:") ? "agent" : c.by} ${c.operation}`).slice(-3), ["agent env-key", "u@x source", "agent report"]);
@@ -932,7 +1138,7 @@ test("an assessment: scan, the Agent fills the draft with its task token, valida
   const trial = await (await post(t, `/api/assessments/${a.id}/trial`, "uat", {})).json();
   assert.equal(t.store.app("hello")!.trial, a.id);
   assert.equal(readFileSync(join(t.dir, "kept", "hello.env.example"), "utf8").includes("GREETING=hi"), true);
-  const request = JSON.parse(readFileSync(join(t.dir, "handoff", "requests", `${trial.job.id}.json`), "utf8"));
+  const request = t.deployments.handoff.request(trial.job.id) as any;
   assert.deepEqual(request.images, [{ service: "hello-web", ref: "nginx:1.27.0", build: false }]);
   assert.equal((await post(t, `/api/assessments/${a.id}/register`, "uat", {})).status, 403, "registration is for administrators");
   finish(t, trial.job.id, "succeeded", { digests: { "hello-web": "sha256:h" } });
@@ -948,14 +1154,14 @@ test("level C drafts an issue for the Deployer's own repository; a person opens 
   const service = (await makeKey(t, "admin", { kind: "service", name: "assessor", days: 30 })).body.key as string;
   const a = (await (await post(t, "/api/assessments", "uat", { repo: "https://github.com/acme/desktop" })).json()).assessment;
   const token = tokenOf(t.s.oma.sessions[0]!.messages[0]!);
-  await agentTool(t, service, "draft_issue", a.id, token, { kind: "onboarding", title: "acme/desktop 缺 Dockerfile", body: "只能本地 npm start；建议加 Dockerfile 并读环境变量" });
-  await agentTool(t, service, "draft_report", a.id, token, { level: "C", report: "需要改仓库" });
+  await agentTool(t, service, "draft_issue", a.id, token, { kind: "onboarding", title: "acme/desktop has no Dockerfile", body: "Only runs locally with npm start; suggest adding a Dockerfile and reading environment variables" });
+  await agentTool(t, service, "draft_report", a.id, token, { level: "C", report: "Needs repository changes" });
   assert.equal(t.s.issues.length, 0, "the Agent cannot open it");
   assert.equal((await post(t, `/api/assessments/${a.id}/trial`, "uat", {})).status, 409, "C is not trial-deployed");
   const opened = await (await post(t, `/api/assessments/${a.id}/issue`, "uat", {})).json();
   assert.equal(opened.issue.url, "https://github.com/acme/deployer/issues/1");
   assert.deepEqual([t.s.issues[0]!.repo, t.s.issues[0]!.labels, t.s.issues[0]!.token], ["acme/deployer", ["onboarding"], "Bearer ghi_test"]);
-  assert.match(t.s.issues[0]!.body, new RegExp(`评估 ${a.id}`));
+  assert.match(t.s.issues[0]!.body, new RegExp(`Assessment ${a.id}`));
 });
 
 test("D27: where the environment requires it, a new version deploys after its assessment is adopted", async () => {
@@ -977,14 +1183,37 @@ test("D27: where the environment requires it, a new version deploys after its as
   assert.deepEqual(a.facts.changedDeployFiles.map((f: { file: string }) => f.file), [".env.example"], "only the files that matter for the manifest");
   assert.equal(a.draft.manifest.appliesFrom, "1.1.0", "the draft starts as the current manifest, from the new version");
   const token = tokenOf(t.s.oma.sessions[0]!.messages[0]!);
-  await agentTool(t, service, "draft_report", a.id, token, { level: "unchanged", report: "只多了一个可选变量 NEW_FLAG，清单不用改" });
-  t.s.oma.reply = "清单不用改。";
+  await agentTool(t, service, "draft_report", a.id, token, { level: "unchanged", report: "Only one optional variable NEW_FLAG was added; the manifest needs no change" });
+  t.s.oma.reply = "The manifest needs no change.";
   await t.request(`/api/assessments/${a.id}`, { as: "viewer" });
   assert.equal((await post(t, `/api/assessments/${a.id}/register`, "uat", {})).status, 403);
   const adopted = await (await post(t, `/api/assessments/${a.id}/register`, "admin", {})).json();
   assert.equal(adopted.state, "adopted");
   const allowed = await (await post(t, "/api/apps/book/plan", "uat", { version: "1.1.0" })).json();
   assert.ok(!allowed.findings.some((f: { code: string }) => f.code === "deploy/not-evaluated"));
+});
+
+test("D32: an older version is assessed against the first manifest, and \"unchanged\" extends the manifest down to it", async () => {
+  const t = withBook();
+  t.beat();
+  t.s.compares["acme/book v0.9.0...v1.0.0"] = { files: [{ filename: "src/app.ts", status: "modified" }], commits: [{ commit: { message: "1.0.0: fixes" } }] };
+  const blocked = await (await post(t, "/api/apps/book/plan", "uat", { version: "0.9.0" })).json();
+  assert.match(blocked.findings[0].message, /No manifest applies to 0\.9\.0.*Assess 0\.9\.0/);
+
+  const service = (await makeKey(t, "admin", { kind: "service", name: "assessor", days: 30 })).body.key as string;
+  const a = (await (await post(t, "/api/assessments", "uat", { app: "book", version: "0.9.0" })).json()).assessment;
+  assert.deepEqual([a.facts.direction, a.facts.from, a.facts.to], ["older", "1.0.0", "0.9.0"]);
+  assert.equal(a.facts.compareError, undefined, "compared from the older tag forwards");
+  assert.match(t.s.oma.sessions[0]!.messages[0]!, /Assess the older version 0\.9\.0 of book/);
+  const token = tokenOf(t.s.oma.sessions[0]!.messages[0]!);
+  await agentTool(t, service, "draft_report", a.id, token, { level: "unchanged", report: "No deploy-related file differs" });
+  t.s.oma.reply = "The manifest works for 0.9.0.";
+  await t.request(`/api/assessments/${a.id}`, { as: "viewer" });
+  const adopted = await (await post(t, `/api/assessments/${a.id}/register`, "admin", {})).json();
+  assert.equal(adopted.state, "adopted");
+  assert.deepEqual(t.store.manifests("book").map((m) => m.appliesFrom), ["0.9.0", "1.0.0"]);
+  const allowed = await (await post(t, "/api/apps/book/plan", "uat", { version: "0.9.0" })).json();
+  assert.ok(!allowed.findings.some((f: { code: string }) => f.code === "deploy/no-manifest"));
 });
 
 // Phase 8: the maintenance notice before a deploy (W3), drift, the daily brief.
@@ -995,13 +1224,13 @@ test("a deploy announced in Workbench waits for its time, then goes out; the not
   const r = await post(t, "/api/apps/book/deploy", "uat", { version: "1.0.0", notice: { minutes: 10 } });
   assert.equal(r.status, 200);
   const { job } = await r.json();
-  assert.match(t.s.workbench.maintenance!.message, /^Book 将在 \d\d:\d\d 更新到 1\.0\.0，届时约 1–2 分钟不可用$|^book 将在/);
+  assert.match(t.s.workbench.maintenance!.message, /^Book will update to 1\.0\.0 at \d\d:\d\d and be unavailable for about 1–2 minutes$|^book will update/);
   assert.equal(Date.parse(t.s.workbench.maintenance!.endsAt) - Date.parse(job.rollout.scheduled.at), 15 * 60_000);
   await t.request("/api/jobs", { as: "viewer" });
-  assert.ok(!readdirSync(join(t.dir, "handoff")).includes("requests") || readdirSync(join(t.dir, "handoff", "requests")).length === 0, "nothing goes to the executor before the time");
+  assert.equal(t.store.executorJobs().length, 0, "nothing goes to the executor before the time");
   t.advance(10 * 60_000);
   await t.request("/api/jobs", { as: "viewer" });
-  assert.equal(readdirSync(join(t.dir, "handoff", "requests")).length, 1, "at the time it goes out");
+  assert.equal(t.store.executorJobs().length, 1, "at the time it goes out");
   finish(t, job.id, "rolled-back", { digests: {} });
   await t.request("/api/jobs", { as: "viewer" });
   assert.deepEqual(t.s.workbench.maintenanceLog.map((l) => l.split(" ")[0]), ["set", "cleared"]);
@@ -1012,7 +1241,7 @@ test("a deploy announced in Workbench waits for its time, then goes out; the not
   const second = secondBody.job;
   const cancelled = await (await post(t, `/api/jobs/${second.id}/stop`, "uat", {})).json();
   assert.equal(cancelled.job.state, "failed");
-  assert.match(cancelled.job.message, /取消，没有开始/);
+  assert.match(cancelled.job.message, /before it started/);
   assert.equal(t.s.workbench.maintenance, null, "a cancelled deploy clears its notice");
   assert.equal((await post(t, "/api/apps/book/deploy", "uat", { version: "1.0.0", notice: { minutes: 0 } })).status, 400);
 });
@@ -1037,8 +1266,8 @@ test("drift: a container on another version, a fragment or env file edited by ha
   verdict = "drift";
   const found = await drift.check();
   assert.deepEqual(found.map((x) => x.kind).sort(), ["env", "fragment", "version"]);
-  assert.match(found.find((x) => x.kind === "version")!.detail, /期望 1\.2\.0，实际：shop 运行 1\.1\.0/);
-  assert.match(found.find((x) => x.kind === "env")!.detail, /shop\.env 与 Deployer 最后一次导入/);
+  assert.match(found.find((x) => x.kind === "version")!.detail, /Expected 1\.2\.0, actual: shop runs 1\.1\.0/);
+  assert.match(found.find((x) => x.kind === "env")!.detail, /shop\.env differs from what the Deployer last imported/);
   await drift.check();
   assert.equal(t.store.listAudit().filter((e) => e.action === "drift.detected").length, 3, "each difference audited once");
 
@@ -1060,7 +1289,7 @@ test("the daily brief: the facts once a day after its hour, written up by the De
   await briefs.tick();
   assert.equal(briefs.latest()!.state, "writing");
   assert.match(t.s.oma.sessions[0]!.messages[0]!, /"newer": \[\s*"1\.1\.0"/);
-  t.s.oma.reply = "今天 UAT 一切正常；book 有新版本 1.1.0。\n建议：先评估 1.1.0。";
+  t.s.oma.reply = "All is well in UAT today; book has a new version 1.1.0.\nSuggestion: assess 1.1.0 first.";
   await briefs.tick();
   assert.deepEqual([briefs.latest()!.state, briefs.latest()!.text], ["done", t.s.oma.reply]);
   await briefs.tick();
@@ -1079,9 +1308,9 @@ test("the brief's facts come from what the Deployer already knows", async () => 
     status: async () => ({ environment: "uat", unmanaged: [], apps: [{ app: "book", name: "Book", desired: "1.0.0", verdict: "ok", components: [] }] }) as never,
     versions: { list: async () => ({ versions: ["1.2.0", "1.1.0", "1.0.0", "0.9.0"] }) },
     peer: async () => ({ environment: "uat", apps: { book: { version: "1.1.0", deployment: "d", deployedAt: "x", digests: {} } } }),
-    drift: async () => [{ key: "env:book", app: "book", kind: "env", detail: "book.env 被改过", firstSeen: "2026-10-30T00:00:00Z", lastSeen: "x" }],
+    drift: async () => [{ key: "env:book", app: "book", kind: "env", detail: "book.env was changed", firstSeen: "2026-10-30T00:00:00Z", lastSeen: "x" }],
   });
   assert.deepEqual(facts.apps, [{ app: "book", desired: "1.0.0", verdict: "ok", newer: ["1.2.0", "1.1.0"] }]);
   assert.deepEqual(facts.promotable, [{ app: "book", uat: "1.1.0", here: null }]);
-  assert.equal(facts.drift[0]!.detail, "book.env 被改过");
+  assert.equal(facts.drift[0]!.detail, "book.env was changed");
 });

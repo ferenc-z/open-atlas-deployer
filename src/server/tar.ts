@@ -10,7 +10,7 @@ const octal = (b: Buffer, start: number, length: number) => parseInt(text(b, sta
 
 export function readTarGz(bytes: Buffer): Map<string, Buffer> {
   let tar: Buffer;
-  try { tar = gunzipSync(bytes); } catch (error) { throw new TarError(`不是 gzip 压缩的 tar 包：${(error as Error).message}`); }
+  try { tar = gunzipSync(bytes); } catch (error) { throw new TarError(`Not a gzip-compressed tar archive: ${(error as Error).message}`); }
   const files = new Map<string, Buffer>();
   let offset = 0;
   let longName: string | undefined;
@@ -32,8 +32,8 @@ export function readTarGz(bytes: Buffer): Map<string, Buffer> {
     const name = (longName ?? (prefix ? `${prefix}/${text(header, 0, 100)}` : text(header, 0, 100))).replace(/^\.\//, "");
     longName = undefined;
     if (type === "5") continue;
-    if (type !== "0" && type !== "7") throw new TarError(`包里的 ${name} 不是普通文件（类型 ${type}）`);
-    if (name.startsWith("/") || name.split("/").includes("..")) throw new TarError(`包里的路径 ${name} 越出了包`);
+    if (type !== "0" && type !== "7") throw new TarError(`${name} in the archive is not a regular file (type ${type})`);
+    if (name.startsWith("/") || name.split("/").includes("..")) throw new TarError(`The path ${name} in the archive escapes the archive`);
     files.set(name, Buffer.from(body));
   }
   return files;

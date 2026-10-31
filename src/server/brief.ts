@@ -65,8 +65,8 @@ export interface Brief {
 
 export function briefPrompt(facts: BriefFacts): string {
   return [
-    `写今天 ${facts.environment.toUpperCase()} 环境的部署简报，给团队在 Deployer 首页看。只用下面的事实，不要编造；需要时可以用只读工具核对。`,
-    "格式：一句话总结；然后按需要分节：可以升级的、UAT 已跑过待上 PROD 的、环境漂移（有人手工改过服务器）、失败或等人处理的部署；每节最多 5 行，写明应用、版本、依据。没有的节不写。最后一行写一个最该先做的建议。",
+    `Write today's deploy brief for the ${facts.environment.toUpperCase()} environment, for the team to read on the Deployer home page. Use only the facts below and invent nothing; check with the read-only tools if needed.`,
+    "Format: a one-sentence summary, then sections as needed: upgrades available, versions UAT has run that are waiting for PROD, environment drift (someone changed the server by hand), deploys that failed or are waiting for a person. At most 5 lines per section, naming the app, version and evidence. Leave out empty sections. End with one line: the single thing to do first.",
     "```json",
     JSON.stringify(facts, null, 1),
     "```",
@@ -100,8 +100,8 @@ export class Briefs {
     const facts = await this.gather();
     let brief: Brief = { date: this.today(), generatedAt: new Date(this.now()).toISOString(), by, facts, state: this.oma ? "writing" : "facts-only" };
     if (this.oma) {
-      try { brief.session = await this.oma.open(`Deployer 每日简报 · ${facts.environment} · ${brief.date}`, `brief-${brief.date}`, briefPrompt(facts)); }
-      catch (error) { brief = { ...brief, state: "facts-only", message: `没能请 AI 写简报：${(error as Error).message}` }; }
+      try { brief.session = await this.oma.open(`Deployer daily brief · ${facts.environment} · ${brief.date}`, `brief-${brief.date}`, briefPrompt(facts)); }
+      catch (error) { brief = { ...brief, state: "facts-only", message: `Could not ask the AI to write the brief: ${(error as Error).message}` }; }
     }
     this.store.saveBrief(brief.date, brief);
     if (by !== "deployer") this.store.audit({ id: by, via: "workbench" }, "brief.generate", brief.date, null);
@@ -118,9 +118,9 @@ export class Briefs {
       const current = this.latest();
       if (current?.state === "writing" && current.session && this.oma) {
         const outcome = sessionOutcome(await this.oma.events(current.session));
-        if (outcome.error) this.store.saveBrief(current.date, { ...current, state: "failed", message: `OMA 会话出错：${outcome.error}` });
+        if (outcome.error) this.store.saveBrief(current.date, { ...current, state: "failed", message: `OMA session error: ${outcome.error}` });
         else if (outcome.ended && outcome.text) this.store.saveBrief(current.date, { ...current, state: "done", text: outcome.text.slice(0, 8000) });
-        else if (this.now() - Date.parse(current.generatedAt) > 15 * 60_000) this.store.saveBrief(current.date, { ...current, state: "facts-only", message: "AI 15 分钟没有写完，先显示事实" });
+        else if (this.now() - Date.parse(current.generatedAt) > 15 * 60_000) this.store.saveBrief(current.date, { ...current, state: "facts-only", message: "The AI had not finished after 15 minutes; showing the facts" });
       }
     } finally { this.busy = false; }
   }

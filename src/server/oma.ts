@@ -25,15 +25,17 @@ export class OmaSessions {
 
   private async call(method: string, path: string, body?: unknown): Promise<any> {
     const key = readToken(this.config.keyFile);
-    if (!key) throw new Error("没有 OMA API key");
+    if (!key) throw new Error("No OMA API key");
     const response = await this.fetcher(`${this.config.url.replace(/\/+$/, "")}${path}`, {
       method,
       headers: { "x-api-key": key, accept: "application/json", ...(body !== undefined ? { "content-type": "application/json" } : {}) },
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
       signal: AbortSignal.timeout(30_000),
     });
-    if (!response.ok) throw new Error(`OMA ${method} ${path.split("?")[0]} 返回 HTTP ${response.status}`);
-    return response.json();
+    if (!response.ok) throw new Error(`OMA ${method} ${path.split("?")[0]} returned HTTP ${response.status}`);
+    // Sending events answers 202 with no body.
+    const text = await response.text();
+    return text ? JSON.parse(text) : {};
   }
 
   /** Opens a session and sends its first message; returns the session id. */

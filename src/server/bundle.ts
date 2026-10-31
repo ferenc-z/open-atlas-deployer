@@ -57,7 +57,7 @@ export class Bundles {
       renameSync(`${file}.part`, file);
     }
     let files: Map<string, Buffer>;
-    try { files = stripTop(readTarGz(bytes)); } catch (error) { throw new BundleError(`${asset}：${(error as Error).message}`); }
+    try { files = stripTop(readTarGz(bytes)); } catch (error) { throw new BundleError(`${asset}: ${(error as Error).message}`); }
     const sums = files.get(checksums);
     let checked: number | null = null;
     if (sums) {
@@ -67,8 +67,8 @@ export class Bundles {
         // A checksum file that lists itself (written while it was being generated) cannot match; skip that line.
         if (!m || m[2] === checksums) continue;
         const body = files.get(m[2]!);
-        if (!body) throw new BundleError(`${asset} 的 ${checksums} 列出了 ${m[2]}，包里没有`);
-        if (createHash("sha256").update(body).digest("hex") !== m[1]) throw new BundleError(`${asset} 里的 ${m[2]} 与 ${checksums} 不符`);
+        if (!body) throw new BundleError(`${checksums} in ${asset} lists ${m[2]}, which is not in the bundle`);
+        if (createHash("sha256").update(body).digest("hex") !== m[1]) throw new BundleError(`${m[2]} in ${asset} does not match ${checksums}`);
         checked++;
       }
     }
@@ -81,20 +81,20 @@ export class Bundles {
     let release: Response;
     try {
       release = await this.fetcher(`${this.api}/repos/${repo}/releases/tags/${encodeURIComponent(tag)}`, { headers: this.headers("application/vnd.github+json"), signal: AbortSignal.timeout(10_000) });
-    } catch (error) { throw new BundleError(`连不上 GitHub：${(error as Error).message}`); }
-    if (release.status === 404) throw new BundleError(`${repo} 没有 ${tag} 的 Release${readToken(this.tokenFile) ? "" : "（私有仓库需要 DEPLOYER_GITHUB_TOKEN_FILE）"}`);
-    if (!release.ok) throw new BundleError(`GitHub 返回 HTTP ${release.status}`);
+    } catch (error) { throw new BundleError(`Cannot reach GitHub: ${(error as Error).message}`); }
+    if (release.status === 404) throw new BundleError(`${repo} has no release for ${tag}${readToken(this.tokenFile) ? "" : " (private repositories need DEPLOYER_GITHUB_TOKEN_FILE)"}`);
+    if (!release.ok) throw new BundleError(`GitHub returned HTTP ${release.status}`);
     const found = ((await release.json()) as { assets?: { name: string; url: string }[] }).assets?.find((a) => a.name === asset);
-    if (!found) throw new BundleError(`${repo} 的 ${tag} Release 没有附件 ${asset}`);
+    if (!found) throw new BundleError(`The ${tag} release of ${repo} has no asset ${asset}`);
     const response = await this.fetcher(found.url, { headers: this.headers("application/octet-stream"), signal: AbortSignal.timeout(300_000) });
-    if (!response.ok) throw new BundleError(`下载 ${asset} 失败：HTTP ${response.status}`);
+    if (!response.ok) throw new BundleError(`Downloading ${asset} failed: HTTP ${response.status}`);
     return Buffer.from(await response.arrayBuffer());
   }
 }
 
 export function bundleText(bundle: Bundle | undefined, path: string): string {
   const body = bundle?.files.get(path.replace(/^\.\//, ""));
-  if (!body) throw new BundleError(`发布包里没有 ${path}`);
+  if (!body) throw new BundleError(`The release bundle has no ${path}`);
   return body.toString("utf8");
 }
 

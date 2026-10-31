@@ -12,6 +12,34 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import deployer_executor as dx  # noqa: E402
 
 
+class FakeApi:
+    """Plays the Deployer's side of protocol 2: a queue of jobs, and what the executor sent back."""
+
+    def __init__(self):
+        self.queue, self.status, self.logs, self.env, self.beats, self.states = [], {}, {}, {}, [], []
+
+    def token(self):
+        return "dpe_test"
+
+    def heartbeat(self, beat):
+        self.beats.append(beat)
+
+    def next_job(self, wait):
+        return self.queue.pop(0) if self.queue else None
+
+    def put_status(self, job_id, status):
+        self.status[job_id] = json.loads(json.dumps(status))
+
+    def append_log(self, job_id, text):
+        self.logs[job_id] = self.logs.get(job_id, "") + text
+
+    def put_env_content(self, job_id, text):
+        self.env[job_id] = text
+
+    def report_state(self, containers, files):
+        self.states.append((containers, files))
+
+
 def cfg(root, **over):
     c = dx.config(environ={"EXECUTOR_ROOT": str(root), "EXECUTOR_REGISTRIES": "ghcr.io/acme localhost:5000",
                            "EXECUTOR_WORK": str(pathlib.Path(root) / "work")})
@@ -96,7 +124,8 @@ class RequestTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self.tmp.name)
-        self.ex = dx.Executor(cfg(self.root), out=open("/dev/null", "w") if pathlib.Path("/dev/null").exists() else sys.stderr)
+        self.api = FakeApi()
+        self.ex = dx.Executor(cfg(self.root), out=open("/dev/null", "w") if pathlib.Path("/dev/null").exists() else sys.stderr, api=self.api)
         self.ran = []
         self.ex.sh = lambda args, **kw: self.ran.append(args) or type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
@@ -104,19 +133,17 @@ class RequestTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def submit(self, request):
-        handoff = self.ex.cfg["handoff"]
-        (handoff / "requests").mkdir(parents=True, exist_ok=True)
-        dx.write_json(handoff / "requests" / f"{request['id']}.json", request)
+        self.api.queue.append(request)
         self.assertTrue(self.ex.run_once())
-        return json.loads((handoff / "jobs" / request["id"] / "status.json").read_text())
+        return self.api.status[request["id"]]
 
     def test_build_refuses_other_scripts_registries_and_names(self):
-        base = {"protocol": 1, "kind": "build", "app": "shop", "version": "1.2.0", "registry": "ghcr.io/acme", "image": "open-atlas-shop",
+        base = {"protocol": 2, "kind": "build", "app": "shop", "version": "1.2.0", "registry": "ghcr.io/acme", "image": "open-atlas-shop",
                 "build": {"repo": "acme/shop", "tag": "shop-1.2.0", "script": "build-images.sh", "platform": "linux/amd64"}}
         cases = [({"build": {**base["build"], "script": "rm -rf /"}}, "build-images.sh"),
                  ({"registry": "ghcr.io/evil"}, "not registered"),
                  ({"image": "shop"}, "names the image"),
-                 ({"protocol": 9}, "protocol 9")]
+                 ({"protocol": 1}, "protocol 1")]
         for i, (over, word) in enumerate(cases):
             status = self.submit({**base, **over, "id": f"build-job-{i:04d}"})
             self.assertEqual(status["state"], "refused")
@@ -124,7 +151,7 @@ class RequestTest(unittest.TestCase):
         self.assertEqual(self.ran[-1][:2], ["docker", "ps"], "only the state report ran")
 
     def test_deploy_refuses_a_root_for_another_project_or_a_missing_include(self):
-        base = {"protocol": 1, "kind": "deploy", "app": "shop", "version": "1.2.0", "services": ["shop"], "fragment": "services: {}",
+        base = {"protocol": 2, "kind": "deploy", "app": "shop", "version": "1.2.0", "services": ["shop"], "fragment": "services: {}",
                 "root": 'name: "open-atlas"\ninclude:\n  - path: "shop/compose.yaml"\n'}
         status = self.submit({**base, "id": "deploy-job-0001", "root": 'name: "elsewhere"\n'})
         self.assertIn("not for project", status["message"])
@@ -135,17 +162,16 @@ class RequestTest(unittest.TestCase):
 
     def env_request(self, job_id, content, **over):
         import hashlib
-        req = {"protocol": 1, "kind": "env", "id": job_id, "app": "shop", "revision": 3, "file": "shop.env",
+        req = {"protocol": 2, "kind": "env", "id": job_id, "app": "shop", "revision": 3, "file": "shop.env",
                "content": content, "sha256": hashlib.sha256(content.encode()).hexdigest(), "restart": False, "services": []}
         req.update(over)
         return req
 
-    def test_env_write_checks_the_hash_and_drops_the_content_from_the_request(self):
+    def test_env_write_checks_the_hash_and_keeps_the_content_out_of_the_log(self):
         status = self.submit(self.env_request("env-job-0001", "A=1\n", sha256="0" * 64))
         self.assertEqual(status["state"], "refused")
         self.assertIn("sha256", status["message"])
-        kept = json.loads((self.ex.cfg["handoff"] / "jobs" / "env-job-0001" / "request.json").read_text())
-        self.assertNotIn("content", kept)
+        self.assertNotIn("A=1", self.api.logs.get("env-job-0001", ""))
         self.assertFalse((self.root / "shop.env").exists())
         status = self.submit(self.env_request("env-job-0002", "A=1\n", file="../etc/passwd"))
         self.assertIn("malformed", status["message"])
@@ -158,38 +184,51 @@ class RequestTest(unittest.TestCase):
         self.assertEqual(target.read_text(), "A=1\nB='x y'\n")
         self.assertEqual(target.stat().st_mode & 0o777, 0o600)
         self.assertEqual((self.root / "shop" / ".deployer" / "env.previous").read_text(), "A=0\n")
-        self.assertNotIn("A=1", (self.ex.cfg["handoff"] / "jobs" / "env-job-0003" / "log.txt").read_text())
+        self.assertNotIn("A=1", self.api.logs.get("env-job-0003", ""))
 
     def test_env_write_with_restart_needs_a_fragment_from_the_deployer(self):
         status = self.submit(self.env_request("env-job-0004", "A=1\n", restart=True, services=["shop"]))
         self.assertEqual(status["state"], "refused")
         self.assertIn("no compose fragment", status["message"])
 
-    def test_env_read_copies_the_file_for_the_deployer_and_cleans_it_up_later(self):
-        import os
-        status = self.submit({"protocol": 1, "kind": "env-read", "id": "env-read-0001", "app": "shop", "file": "shop.env"})
+    def test_env_read_sends_the_file_to_the_deployer_and_keeps_no_copy(self):
+        status = self.submit({"protocol": 2, "kind": "env-read", "id": "env-read-0001", "app": "shop", "file": "shop.env"})
         self.assertEqual(status["result"]["env"], {"exists": False})
         (self.root / "shop.env").write_text("SECRET=s3\n")
-        status = self.submit({"protocol": 1, "kind": "env-read", "id": "env-read-0002", "app": "shop", "file": "shop.env"})
-        copy = self.ex.cfg["handoff"] / "jobs" / "env-read-0002" / "env.content"
-        self.assertEqual(copy.read_text(), "SECRET=s3\n")
-        self.assertEqual(copy.stat().st_mode & 0o777, 0o600)
+        status = self.submit({"protocol": 2, "kind": "env-read", "id": "env-read-0002", "app": "shop", "file": "shop.env"})
+        self.assertEqual(self.api.env["env-read-0002"], "SECRET=s3\n")
         self.assertEqual(status["result"]["env"]["bytes"], 10)
-        os.utime(copy, (0, 0))
-        self.ex.remove_env_copies()
-        self.assertFalse(copy.exists())
+        self.assertNotIn("SECRET", self.api.logs.get("env-read-0002", ""))
+        self.assertEqual(sorted(p.name for p in self.root.rglob("*") if p.is_file()), ["shop.env"], "no copy beside the file")
 
     def test_a_job_left_running_is_marked_interrupted(self):
-        job = self.ex.cfg["handoff"] / "jobs" / "deploy-job-0009"
-        dx.write_json(job / "status.json", {"id": job.name, "state": "running", "steps": []})
+        dx.write_json(self.ex.current_marker(), {"id": "deploy-job-0009", "state": "running", "steps": []})
         self.ex.recover()
-        self.assertEqual(json.loads((job / "status.json").read_text())["state"], "failed")
+        self.assertEqual(self.api.status["deploy-job-0009"]["state"], "failed")
+        self.assertFalse(self.ex.current_marker().exists())
+
+    def test_a_finished_job_leaves_no_marker_and_its_log_reaches_the_deployer(self):
+        self.submit({"protocol": 2, "kind": "env-read", "id": "env-read-0003", "app": "shop", "file": "shop.env"})
+        self.assertFalse(self.ex.current_marker().exists())
+        self.assertIn("--- read running", self.api.logs["env-read-0003"])
+
+    def test_heartbeat_keeps_going_during_a_long_job(self):
+        self.ex.beat_seconds = 0.02
+        beats = []
+        heartbeat = self.ex.heartbeat
+        self.ex.heartbeat = lambda busy=None: beats.append(busy) or heartbeat(busy)
+        import time
+        self.ex.env_read = lambda request, status: time.sleep(0.2) or self.ex.finish(status, "succeeded", "read")
+        status = self.submit({"protocol": 2, "kind": "env-read", "app": "shop", "id": "env-job-0001"})
+        self.assertEqual(status["state"], "succeeded")
+        self.assertGreaterEqual(beats.count("env-job-0001"), 4, "beats while the job runs, not only when it starts")
+        self.assertIsNone(self.api.beats[-1]["busy"], "the last beat says idle")
 
     def test_heartbeat_names_protocols_and_database_backups(self):
         self.ex.cfg["db"] = dx.config(environ={"EXECUTOR_DB_DUMP_DOSSIER": "docker exec db pg_dump"})["db"]
         self.ex.heartbeat()
-        beat = json.loads((self.ex.cfg["handoff"] / "executor.json").read_text())
-        self.assertEqual(beat["protocols"], [1])
+        beat = self.api.beats[-1]
+        self.assertEqual(beat["protocols"], [2])
         self.assertEqual(beat["kinds"], ["build", "deploy", "env", "env-read", "bundle", "db-migration"])
         self.assertEqual(beat["databaseBackup"], {"dossier": {"dump": True, "restore": False}})
 

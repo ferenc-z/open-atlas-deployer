@@ -37,8 +37,6 @@ Node 22.18 起直接运行 `.ts`（类型剥离），服务端不需要构建；
 | `DEPLOYER_BIND` / `DEPLOYER_PORT` | `0.0.0.0` / `8095` | |
 | `DEPLOYER_DATA` | `./data` | 状态库目录 |
 | `DEPLOYER_ENVIRONMENT_FILE` | `<data>/environment.json` | 本环境的期望状态：名称、登记的镜像仓库、每个应用的版本（格式同 [examples/uat.environment.json](examples/uat.environment.json)）；每次请求重新读 |
-| `DEPLOYER_HOST_STATE_FILE` | 无 | 执行器每 30 秒写一次的容器列表（`<root>/deployer/state/containers.jsonl`，只读挂载）；没有时状态页只显示应用自报的版本 |
-| `DEPLOYER_HANDOFF_DIR` | 无 | 与执行器共享的交接目录（`<root>/deployer/handoff`，读写挂载）；不设就只能看、不能构建和部署 |
 | `DEPLOYER_GITHUB_TOKEN_FILE` | 无 | GitHub 只读令牌，用来列出私有仓库的 tag，供选择版本 |
 | `DEPLOYER_OBSERVE_URLS` | 无 | JSON，服务名 → 地址；只在 compose 网络之外开发时用 |
 | `DEPLOYER_EMERGENCY_PASSWORD_HASH` | 无 | 紧急账号，`node bin/hash-password.ts` 从标准输入读密码生成；不设就没有紧急账号 |
@@ -56,7 +54,7 @@ Node 22.18 起直接运行 `.ts`（类型剥离），服务端不需要构建；
 | `DEPLOYER_OMA_ASSESSOR_AGENT` / `DEPLOYER_OMA_ASSESSOR_ENVIRONMENT` / `DEPLOYER_OMA_ASSESSOR_VAULTS` | 无 | 接入评估：Onboarding Assessor 的 agent id、**隔离的** Environment（只放行 git 站点和 Deployer MCP）、Vault（服务 key、私有仓库只读令牌）。不配就不能评估 |
 | `DEPLOYER_ISSUE_REPO` / `DEPLOYER_ISSUE_TOKEN_FILE` | 无 | 开 Issue 的 Deployer 仓库（owner/name）和 fine-grained token（只有 Issues: write） |
 | `DEPLOYER_BRIEF_HOUR` | `8` | 每日简报在这个钟点之后生成（服务器时间） |
-| `DEPLOYER_GITHUB_API` | `https://api.github.com` | 下载 Release 附件、读 `release.json` 的 GitHub API（测试时换成替身）；执行器对应 `EXECUTOR_GITHUB_API` |
+| `DEPLOYER_GITHUB_API` | `https://api.github.com` | Deployer 读的 GitHub API：列 tag、查 Release、下载附件、读 `release.json` 和 `.env.example`（测试或本地试用时换成替身）；执行器对应 `EXECUTOR_GITHUB_API` |
 
 ### 认人与授权（§9）
 
@@ -116,18 +114,7 @@ Deployer 容器不挂 Docker socket（§8.2），所以状态有两个来源：
 - **Deployer**（容器，没有 Docker socket，没有镜像仓库凭据）：负责计划、权限、记录、页面。它生成一个应用的 compose 片段和根文件，写成请求交给执行器。
 - **执行器**（[executor/deployer_executor.py](executor/deployer_executor.py)，宿主机 systemd 服务，root，只用 Python 3.9 标准库）：只做固定的几种任务：构建、部署，以及阶段 3 加的写 env、读 env；请求里从来不带命令。
 
-两边只通过交接目录交换文件，协议版本 1：
-
-| 文件 | 谁写 | 内容 |
-|---|---|---|
-| `requests/<id>.json` | Deployer | 一个任务 |
-| `jobs/<id>/request.json` | 执行器 | 领取请求时搬到这里 |
-| `jobs/<id>/status.json` | 执行器 | 状态、步骤、结果（digest、commit、备份文件） |
-| `jobs/<id>/log.txt` | 执行器 | 每条命令和输出。`compose config` 的输出含 env 取值，不记录 |
-| `jobs/<id>/env.content` | 执行器 | 读 env 任务取出的文件，0600，属主改成 Deployer；10 分钟后删除 |
-| `executor.json` | 执行器 | 心跳：版本、支持的协议和任务种类、登记的仓库、哪些应用配了数据库备份、正在执行什么 |
-
-心跳超过 30 秒或协议不符，页面显示执行器离线，计划里不能部署。
+两边的交接协议原来是共享目录（协议 1），2026-10-31 起改为执行器经 HTTPS 调 Deployer（协议 2，D35），见下面"多台服务器"一节。心跳超过 30 秒或协议不符，页面显示那台机器的执行器离线，放在那台机器上的应用不能构建和部署。执行器在执行任务期间也每 10 秒发一次心跳，`busy` 是正在执行的任务。
 
 ### 构建（§5.2）
 
@@ -188,7 +175,9 @@ Deployer 容器不挂 Docker socket（§8.2），所以状态有两个来源：
 
 ```sh
 sudo ./executor/install.sh          # /opt/open-atlas-deployer/executor/releases/<版本>，current 软链接，systemd 服务
-sudoedit /etc/open-atlas-deployer/executor.env   # 见 executor/executor.env.example
+sudoedit /etc/open-atlas-deployer/executor.env   # 见 executor/executor.env.example（EXECUTOR_DEPLOYER_URL、EXECUTOR_TOKEN_FILE）
+# 这台机器的执行器凭据：在 Deployer 的 Hosts 页签发（只显示一次），存进 EXECUTOR_TOKEN_FILE（600）。
+# 第一次安装、还没法登录页面时，在 Deployer 所在机器上：node bin/executor-token.ts <DEPLOYER_DATA> <机器名> <文件>
 sudo docker login ghcr.io           # 推送与拉取凭据只在宿主机 root 下
 sudo systemctl restart open-atlas-deployer-executor
 python3 /opt/open-atlas-deployer/executor/current/deployer_executor.py check
@@ -548,3 +537,47 @@ npm test
 - **跨应用的启动顺序**：比如 Workbench 依赖 Studio 的数据面，compose 表达不了。阶段 2 每次只部署一个应用，顺序由人决定；多个应用一起部署时由计划排序。
 
 （数据目录属主已在阶段 2 由执行器处理：新建的目录按镜像的 `USER` 设属主。）
+
+## 多台服务器、HTTPS 入口、环境变量页改版（D35、D36、D37，2026-10-31）
+
+设计见设计文档 §7.4 和 §7.2。
+
+### 每台机器一个执行器，执行器主动连 Deployer（D35）
+
+- `environment.json` 加 `hosts`（机器名 → `{ "address", "bindIp"?, "project"? }`），应用加 `host`（按应用放置）。不写 `hosts` 就是一台叫 `local` 的机器。
+- 交接改成 HTTPS（协议 2），Deployer 从不连服务器，服务器不开端口：
+
+| 接口（执行器 → Deployer） | 内容 |
+|---|---|
+| `GET /executor/v1/jobs/next?wait=25` | 长轮询，只领派给本机的任务；没有任务回 204 |
+| `PUT /executor/v1/jobs/<id>/status` | 状态、步骤、结果；只能改本机的任务 |
+| `POST /executor/v1/jobs/<id>/log` | 日志分段追加（只留最后 2 MB）；`compose config` 的输出不记录 |
+| `PUT /executor/v1/jobs/<id>/env-content` | 读 env 任务的文件内容，Deployer 只取一次，10 分钟后丢弃 |
+| `POST /executor/v1/heartbeat` | 版本、协议、任务种类、部署根目录、是否在忙 |
+| `POST /executor/v1/state` | 本机容器（`docker ps` JSON 行）和 Deployer 写的文件的 SHA-256 |
+
+- 凭据：`dpe_` 开头，每台机器单独签发（Hosts 页，admin、只限浏览器会话；或 `bin/executor-token.ts`），Deployer 只存哈希，可按机器吊销。写 env 的任务里的文件内容和请求分开存，执行器领走时一起删除。
+- 每台机器一个 compose 项目，根文件只含放在这台的应用；端口、服务名、数据目录的冲突按台检查（注册表仍要求各清单的默认宿主机端口不重复，环境可以按台覆盖成相同端口）。
+- 执行器（0.5.0）：Deployer 连不上时等待重试（不退出），凭据被拒才退出；正在执行的任务记在 `<EXECUTOR_WORK>/current-job.json`，重启后报为中断。共享目录方式已删除。
+- 状态页按机器显示执行器、加"主机"列；新的 Hosts 页列出每台机器的执行器、应用、上报时间和凭据，admin 在这里签发、吊销。
+- 应用换了机器：计划提示旧机器上的容器 Deployer 不会停，验证新机器后要手工 `docker compose down`，有数据目录的先拷过去。
+
+### HTTPS 入口（D36）
+
+- 一个环境一个域名（`domain`），应用的 `ingress`：`{ "kind": "nginx", "port": 8787, "path"?, "component"?, "containerPort"?, "maxBodySize"? }` 或 `{ "kind": "direct" }`，不写就是不对外。经 nginx 的地址是 `https://<domain>:<port><path>`，直连的是 `http://<机器地址>:<发布端口>`。
+- 应用之间互相引用写 `{{app:<id>.url}}` 或 `{{app:<id>.origin}}`：在清单的 `environment` 和 env 文件的值里都可以用，Deployer 生成片段、写 env 文件时换成实际地址；解析不了就拦住部署和写入。
+- nginx 由运维维护：Ingress 页生成推荐配置（每个端口一个 server，按路径分 location，长的路径在前；关缓冲、600 秒读超时、WebSocket、上传大小），存成修订（谁、何时、为什么），显示和上一修订的差异，可下载。部署走 nginx 的应用时，配置和最新修订不一致就在计划里提示。
+- 内部 CA：admin 在 Ingress 页贴 PEM 证书；之后每次部署把它写到 `<应用>/ca/ca.pem`，只读挂到容器的 `/etc/open-atlas/ca.pem`，并设 `NODE_EXTRA_CA_CERTS`（加在系统 CA 之外）；JVM 应用要在 env 文件里用 `JAVA_OPTS` 指向 truststore。应用可以在环境里写 `"ca": false` 不挂。
+- 部署成功后经对外地址访问一次（信任内部 CA）：除 502/503/504 外的回答都算通；不通只在任务页提示"已部署，入口不通"并记审计，不回滚。
+- 地址变了：计划列出引用它的应用（要重写 env、重启），并提醒存在应用自己数据库里的地址要手工改（Workbench 的 OMA Integration、OMA 里 agent 的 MCP 地址和 Vault 凭据）。
+
+### 环境变量页（D37）
+
+应用卡片（是否部署、导入与否、未写入的修订、缺几个键）；状态条写明服务器上的版本、Deployer 里的版本和下一步（先导入 / 查看计划并写入 / 编辑）；可点的数字筛选（已设置、缺少、密钥、未知或改名、可选未设）和按键名搜索；表格按"需要处理 / 已设置 / 可选未设"分组，问题标在行上；在同一张表里编辑，底部固定操作栏；历史和对比各在一个子标签里。
+
+### 测试与验证（2026-10-31）
+
+- `npm test` 78 个，执行器单元测试 23 个。新增：执行器凭据和长轮询、只领本机任务、别的机器改不了、吊销后拒绝、状态带机器名；按台生成根文件、同端口不同台不冲突；地址解析、引用解析不了时拦住；nginx 配置按端口和路径、修订和差异、下载；内部 CA 的挂载和请求；部署后复查失败只告警；地址和机器变化的提示；执行器的 HTTP 收发、中断标记、日志不含 env 内容。
+- WSL 本地试用切到协议 2：本机执行器经 HTTP 在线、上报 4 个容器，导入 oma.env 成为修订 1。再模拟第二台机器 app2（单独的根目录、compose 项目和凭据，第二个执行器进程），登记一个 busybox 测试应用放在 app2、直连入口：部署成功，根文件只含它，复查 HTTP 200；改到 local 后计划提示换机器和地址变化。验证完删除了测试应用、app2 的执行器、凭据和目录，环境配置恢复原样。
+- 没有真实的 nginx 和内部 CA 环境，nginx 配置只在测试里核对了内容，没有在真实 nginx 上 `nginx -t`。
+

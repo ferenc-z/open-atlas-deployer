@@ -14,7 +14,8 @@ import {
 import { covering } from "../manifest/version.ts";
 import type { Principal } from "./auth.ts";
 import { DeployError, type Deployments } from "./deploy.ts";
-import { newJobId } from "./handoff.ts";
+import { hostOf, newJobId } from "./handoff.ts";
+import { resolveReferences } from "./ingress.ts";
 import { isKey } from "./keys.ts";
 import { deployPermission, isProd } from "./plan.ts";
 import { fingerprint, type SecretBox } from "./secretbox.ts";
@@ -35,24 +36,26 @@ export class Schemas {
 
   /** Templates the Deployer wrote for apps registered from an assessment (phase 7); looked at before templatesDir. */
   private keptDir: string | undefined;
+  private api: string;
 
-  constructor(tokenFile: string | undefined, templatesDir: string, fetcher: typeof fetch = fetch, keptDir?: string) {
+  constructor(tokenFile: string | undefined, templatesDir: string, fetcher: typeof fetch = fetch, keptDir?: string, api = "https://api.github.com") {
     this.tokenFile = tokenFile;
     this.templatesDir = templatesDir;
     this.fetcher = fetcher;
     this.keptDir = keptDir;
+    this.api = api.replace(/\/+$/, "");
   }
 
   async get(manifest: Manifest, version: string): Promise<Schema | { error: string }> {
     const env = manifest.env;
     if (env?.template) {
       const rel = normalize(env.template.replace(/^templates\//, ""));
-      if (rel.startsWith("..")) return { error: `模板路径 ${env.template} 不在 templates/ 里` };
+      if (rel.startsWith("..")) return { error: `Template path ${env.template} is outside templates/` };
       const dir = this.keptDir && existsSync(join(this.keptDir, rel)) ? this.keptDir : this.templatesDir;
-      try { return { version, source: `Deployer ${env.template}`, keys: parseExample(readFileSync(join(dir, rel), "utf8")) }; } catch (error) { return { error: `读不到模板 ${env.template}：${(error as Error).message}` }; }
+      try { return { version, source: `Deployer ${env.template}`, keys: parseExample(readFileSync(join(dir, rel), "utf8")) }; } catch (error) { return { error: `Cannot read template ${env.template}: ${(error as Error).message}` }; }
     }
-    if (!env?.schema) return { error: "清单没有 env.schema 或 env.template" };
-    if (!manifest.release) return { error: "清单没有 release，取不到 .env.example" };
+    if (!env?.schema) return { error: "The manifest has no env.schema or env.template" };
+    if (!manifest.release) return { error: "The manifest has no release, so .env.example cannot be fetched" };
     const tag = manifest.release.tag.replaceAll("{version}", version);
     const key = `${manifest.release.repo}@${tag}:${env.schema}`;
     const hit = this.cache.get(key);
@@ -60,16 +63,16 @@ export class Schemas {
     if (hit && Date.now() - hit.at < 3600_000) return { version, source: `${manifest.release.repo} ${tag} ${env.schema}`, keys: parseExample(hit.text) };
     const token = readToken(this.tokenFile);
     try {
-      const response = await this.fetcher(`https://api.github.com/repos/${manifest.release.repo}/contents/${env.schema.split("/").map(encodeURIComponent).join("/")}?ref=${encodeURIComponent(tag)}`, {
+      const response = await this.fetcher(`${this.api}/repos/${manifest.release.repo}/contents/${env.schema.split("/").map(encodeURIComponent).join("/")}?ref=${encodeURIComponent(tag)}`, {
         headers: { accept: "application/vnd.github.raw", "user-agent": "open-atlas-deployer", ...(token ? { authorization: `Bearer ${token}` } : {}) },
         signal: AbortSignal.timeout(8_000),
       });
-      if (!response.ok) return { error: `取 ${tag} 的 ${env.schema} 时 GitHub 返回 HTTP ${response.status}${response.status === 404 && !token ? "（私有仓库需要 DEPLOYER_GITHUB_TOKEN_FILE）" : ""}` };
+      if (!response.ok) return { error: `GitHub returned HTTP ${response.status} for ${env.schema} at ${tag}${response.status === 404 && !token ? " (private repositories need DEPLOYER_GITHUB_TOKEN_FILE)" : ""}` };
       const text = await response.text();
       this.cache.set(key, { at: Date.now(), text });
       return { version, source: `${manifest.release.repo} ${tag} ${env.schema}`, keys: parseExample(text) };
     } catch (error) {
-      return { error: `连不上 GitHub：${(error as Error).message}` };
+      return { error: `Cannot reach GitHub: ${(error as Error).message}` };
     }
   }
 }
@@ -81,7 +84,7 @@ export interface EnvPlan {
   applied: number | null;
   file: string;
   changes: EnvRevision["changes"];
-  /** Services that read a changed key (§7.2: 会重启哪些服务). */
+  /** Services that read a changed key (§7.2: which services restart). */
   restarts: string[];
   /** Whether the Deployer runs this app: otherwise the file is only written, nothing restarts. */
   restart: boolean;
@@ -109,23 +112,23 @@ export class EnvManager {
   get enabled() { return Boolean(this.box); }
 
   private need(principal: Principal, what: "view" | "change" | "admin") {
-    if (!this.box) throw new DeployError(409, "env/disabled", "没有配置 DEPLOYER_CREDENTIAL_ENCRYPTION_KEY，环境变量管理没有启用。");
-    if (what === "admin" && !principal.permissions.includes("admin")) throw new DeployError(403, "env/forbidden", "只有 Workbench 管理员能查看密钥原值。");
+    if (!this.box) throw new DeployError(409, "env/disabled", "DEPLOYER_CREDENTIAL_ENCRYPTION_KEY is not configured, so environment variable management is off.");
+    if (what === "admin" && !principal.permissions.includes("admin")) throw new DeployError(403, "env/forbidden", "Only Workbench admins can see secret values.");
     if (what === "change") {
       const need = deployPermission(this.deployments.environment().env);
-      if (!principal.permissions.includes(need)) throw new DeployError(403, "env/forbidden", `修改环境变量需要在 ${need} 组里。`);
+      if (!principal.permissions.includes(need)) throw new DeployError(403, "env/forbidden", `Changing environment variables needs the ${need} group.`);
     }
   }
 
   /** The manifest for the version running here (or about to: the desired version), and the app's env settings. */
   private context(appId: string, version?: string) {
     const app = this.store.app(appId);
-    if (!app) throw new DeployError(404, "app/unknown", "注册表里没有这个应用。");
+    if (!app) throw new DeployError(404, "app/unknown", "This app is not in the registry.");
     const manifests = this.store.manifests(appId);
     const { env, deployed } = this.deployments.environment();
     const at = version ?? deployed[appId] ?? env.apps[appId]?.version ?? manifests.at(-1)?.appliesFrom;
     const manifest = (at && covering(manifests, at)) || manifests.at(-1);
-    if (!manifest?.env) throw new DeployError(404, "env/none", `${appId} 的清单没有 env 文件。`);
+    if (!manifest?.env) throw new DeployError(404, "env/none", `The ${appId} manifest has no env file.`);
     return { app, manifest, version: at ?? manifest.appliesFrom, deployed: appId in deployed, envFile: manifest.env };
   }
 
@@ -161,7 +164,7 @@ export class EnvManager {
     this.need(principal, "view");
     const { manifest, version, deployed, envFile } = this.context(appId, options.version);
     const shown = this.store.envRevision(appId, options.revision);
-    if (options.revision !== undefined && !shown) throw new DeployError(404, "env/revision", `没有第 ${options.revision} 版。`);
+    if (options.revision !== undefined && !shown) throw new DeployError(404, "env/revision", `No revision ${options.revision}.`);
     const applied = this.store.appliedEnv(appId);
     const keys = shown ? Object.keys(shown.values) : [];
     const secrets = this.secretKeys(manifest, keys);
@@ -181,10 +184,10 @@ export class EnvManager {
 
   reveal(principal: Principal, appId: string, revision: number, key: string): string {
     this.need(principal, "admin");
-    if (isKey(principal)) throw new DeployError(403, "auth/browser-only", "查看密钥原值只认浏览器会话，API key 不行（§9.4）。");
+    if (isKey(principal)) throw new DeployError(403, "auth/browser-only", "Secret values are shown only to browser sessions, not API keys (§9.4).");
     const r = this.store.envRevision(appId, revision);
     const v = r?.values[key];
-    if (!v) throw new DeployError(404, "env/key", `第 ${revision} 版没有 ${key}。`);
+    if (!v) throw new DeployError(404, "env/key", `Revision ${revision} has no ${key}.`);
     this.store.audit({ id: principal.id, via: principal.via }, "env.reveal", `${appId}#${revision}`, { key });
     return "v" in v ? v.v : this.box!.open(v.s);
   }
@@ -194,76 +197,78 @@ export class EnvManager {
     this.need(principal, "change");
     const { manifest } = this.context(appId);
     const latest = this.store.envRevision(appId);
-    if ((latest?.meta.revision ?? null) !== body.base) throw new DeployError(409, "env/conflict", `别人刚保存了第 ${latest?.meta.revision} 版，请刷新后再改。`);
+    if ((latest?.meta.revision ?? null) !== body.base) throw new DeployError(409, "env/conflict", `Someone just saved revision ${latest?.meta.revision}; reload and try again.`);
     const before = latest ? this.plain(latest.values) : {};
     const next: Record<string, string> = {};
     const errors: string[] = [];
     for (const item of body.values ?? []) {
-      if (typeof item?.key !== "string" || !KEY.test(item.key)) { errors.push(`${String(item?.key)} 不是合法的键名`); continue; }
-      if (item.key in next) { errors.push(`${item.key} 出现了两次`); continue; }
+      if (typeof item?.key !== "string" || !KEY.test(item.key)) { errors.push(`${String(item?.key)} is not a valid key name`); continue; }
+      if (item.key in next) { errors.push(`${item.key} appears twice`); continue; }
       if (item.keep) {
-        if (!(item.key in before)) { errors.push(`${item.key} 之前没有值，不能保留`); continue; }
+        if (!(item.key in before)) { errors.push(`${item.key} had no value before, so it cannot be kept`); continue; }
         next[item.key] = before[item.key]!;
       } else if (typeof item.value !== "string" || item.value.includes("\0")) {
-        errors.push(`${item.key} 的值不是文本`);
+        errors.push(`The value of ${item.key} is not text`);
       } else next[item.key] = item.value;
     }
-    if (errors.length) throw new DeployError(400, "env/invalid", "环境变量有问题。", errors);
+    if (errors.length) throw new DeployError(400, "env/invalid", "Some environment variables are invalid.", errors);
     const changes = changedKeys(before, next, this.secretKeys(manifest, [...Object.keys(before), ...Object.keys(next)]));
-    if (!changes.length) throw new DeployError(400, "env/unchanged", "没有改动。");
+    if (!changes.length) throw new DeployError(400, "env/unchanged", "Nothing changed.");
     return this.store.saveEnv(appId, this.seal(manifest, next), changes, "edit", { id: principal.id, via: principal.via }, body.note ? { note: body.note } : {});
   }
 
-  /** "回到之前的版本": a new revision with an earlier one's values. */
+  /** "Go back to this revision": a new revision with an earlier one's values. */
   revert(principal: Principal, appId: string, revision: number, base: number | null): number {
     this.need(principal, "change");
     const { manifest } = this.context(appId);
     const latest = this.store.envRevision(appId);
-    if ((latest?.meta.revision ?? null) !== base) throw new DeployError(409, "env/conflict", `别人刚保存了第 ${latest?.meta.revision} 版，请刷新后再改。`);
+    if ((latest?.meta.revision ?? null) !== base) throw new DeployError(409, "env/conflict", `Someone just saved revision ${latest?.meta.revision}; reload and try again.`);
     const target = this.store.envRevision(appId, revision);
-    if (!target) throw new DeployError(404, "env/revision", `没有第 ${revision} 版。`);
+    if (!target) throw new DeployError(404, "env/revision", `No revision ${revision}.`);
     const before = latest ? this.plain(latest.values) : {};
     const next = this.plain(target.values);
     const changes = changedKeys(before, next, this.secretKeys(manifest, [...Object.keys(before), ...Object.keys(next)]));
-    if (!changes.length) throw new DeployError(400, "env/unchanged", `第 ${revision} 版和当前版本一样。`);
-    return this.store.saveEnv(appId, this.seal(manifest, next), changes, "revert", { id: principal.id, via: principal.via }, { note: `回到第 ${revision} 版`, detail: { from: revision } });
+    if (!changes.length) throw new DeployError(400, "env/unchanged", `Revision ${revision} is the same as the current one.`);
+    return this.store.saveEnv(appId, this.seal(manifest, next), changes, "revert", { id: principal.id, via: principal.via }, { note: `Back to revision ${revision}`, detail: { from: revision } });
   }
 
   plan(principal: Principal, appId: string, revision?: number): EnvPlan {
     this.need(principal, "view");
     const { manifest, deployed, envFile } = this.context(appId);
     const target = this.store.envRevision(appId, revision);
-    if (!target) throw new DeployError(404, "env/revision", revision === undefined ? "还没有任何版本：先导入服务器上的 env 文件。" : `没有第 ${revision} 版。`);
+    if (!target) throw new DeployError(404, "env/revision", revision === undefined ? "No revisions yet: import the env file from the server first." : `No revision ${revision}.`);
     const applied = this.store.appliedEnv(appId);
     const findings: EnvPlan["findings"] = [];
     const block = (code: string, message: string) => findings.push({ code, message, blocking: true });
     const need = deployPermission(this.deployments.environment().env);
-    if (!principal.permissions.includes(need)) block("env/forbidden", `修改环境变量需要在 ${need} 组里。`);
-    if (!applied) block("env/not-imported", "服务器上的 env 文件还没导入过：先导入，写入前才能看出会覆盖什么。");
-    const executor = this.deployments.handoff.executor();
-    if (!executor.online) block("deploy/executor-offline", executor.reason ?? "执行器不在线。");
-    else if (!executor.heartbeat?.kinds?.includes("env")) block("env/executor-old", `执行器 ${executor.heartbeat?.version} 不会写 env 文件，请先升级执行器。`);
+    if (!principal.permissions.includes(need)) block("env/forbidden", `Changing environment variables needs the ${need} group.`);
+    if (!applied) block("env/not-imported", "The env file on the server has not been imported yet: import it first, so the plan can show what a write would overwrite.");
+    const executor = this.deployments.handoff.executor(hostOf(this.deployments.environment().env, appId));
+    if (!executor.online) block("deploy/executor-offline", executor.reason ?? "The executor is offline.");
+    else if (!executor.heartbeat?.kinds?.includes("env")) block("env/executor-old", `Executor ${executor.heartbeat?.version} cannot write env files; upgrade the executor first.`);
     const busy = this.store.activeJobs().find((j) => j.app === appId);
-    if (busy) block("deploy/busy", `${appId} 已有一个任务在进行（${busy.id}）。`);
+    if (busy) block("deploy/busy", `${appId} already has a job running (${busy.id}).`);
     const next = this.plain(target.values);
     const before = applied ? this.plain(applied.values) : {};
     findings.push(...checkEnv(Object.keys(next), null, referencedKeys(manifest)));
+    // D36: {{app:<id>.url}} in a value is written as that app's address in this environment.
+    for (const [key, value] of Object.entries(next)) for (const u of resolveReferences(value, (id) => this.deployments.endpointOf(id)).unresolved) block("env/app-ref", `${key} refers to an address that cannot be worked out: ${u}.`);
     const changes = changedKeys(before, next, this.secretKeys(manifest, [...Object.keys(before), ...Object.keys(next)]));
-    if (applied && !changes.length) findings.push({ code: "env/same", message: `服务器上已经是这些值（第 ${applied.meta.revision} 版），这次只是重写文件。`, blocking: false });
-    if (!deployed) findings.push({ code: "env/write-only", message: `${appId} 还没有经 Deployer 部署过：只写文件，不重启；下次部署（或手工重启）时生效。`, blocking: false });
+    if (applied && !changes.length) findings.push({ code: "env/same", message: `The server already has these values (revision ${applied.meta.revision}); this only rewrites the file.`, blocking: false });
+    if (!deployed) findings.push({ code: "env/write-only", message: `${appId} has not been deployed by the Deployer yet: the file is written without a restart and takes effect on the next deploy (or a manual restart).`, blocking: false });
     // Compose recreates a container only when its configuration changed, so an unchanged file restarts nothing.
     const restarts = deployed && changes.length ? affectedServices(manifest, changes.map((c) => c.key)) : [];
-    if (deployed && changes.length && !restarts.length) findings.push({ code: "env/no-restart", message: "没有服务读这些键：只写文件。", blocking: false });
+    if (deployed && changes.length && !restarts.length) findings.push({ code: "env/no-restart", message: "No service reads these keys: the file is written only.", blocking: false });
     return { app: appId, revision: target.meta.revision, applied: applied?.meta.revision ?? null, file: envFile.file, changes, restarts, restart: deployed, findings };
   }
 
   apply(principal: Principal, appId: string, revision: number): Job {
-    if (isKey(principal) && isProd(this.deployments.environment().env)) throw new DeployError(403, "auth/browser-only", "PROD 的写入只认浏览器会话，API key 不行（§9.4）。");
+    if (isKey(principal) && isProd(this.deployments.environment().env)) throw new DeployError(403, "auth/browser-only", "Writes to PROD accept only browser sessions, not API keys (§9.4).");
     const p = this.plan(principal, appId, revision);
     const blocking = p.findings.filter((f) => f.blocking);
-    if (blocking.length) throw new DeployError(409, "env/blocked", "计划里有阻止写入的问题。", blocking.map((f) => f.message));
+    if (blocking.length) throw new DeployError(409, "env/blocked", "The plan has problems that block the write.", blocking.map((f) => f.message));
     const { manifest } = this.context(appId);
-    const values = this.plain(this.store.envRevision(appId, revision)!.values);
+    const values = Object.fromEntries(Object.entries(this.plain(this.store.envRevision(appId, revision)!.values)).map(([k, v]) => [k, resolveReferences(v, (id) => this.deployments.endpointOf(id)).text]));
     const content = serializeEnv(values, `Written by Open Atlas Deployer: ${appId} env revision ${revision}.\nEdit it in the Deployer; changes made here are overwritten.`);
     const sha256 = createHash("sha256").update(content).digest("hex");
     const services = manifest.components.filter((c) => c.type === "compose-service" && c.service).map((c) => c.service!);
@@ -272,21 +277,21 @@ export class EnvManager {
     const { env } = this.deployments.environment();
     // The job record keeps the hash; only the request file carries the content, and the executor removes it on pickup.
     this.store.addJob({ id, kind: "env", app: appId, version: `env#${revision}`, environment: env.name, fromVersion: p.applied === null ? null : `env#${p.applied}`, manifest: null, pinFrom: null, request }, actorOf(principal));
-    this.deployments.handoff.submit(id, { ...request, content, requestedBy: principal.id });
+    this.deployments.handoff.submit(id, { ...request, content, requestedBy: principal.id }, hostOf(this.deployments.environment().env, appId));
     return this.store.job(id)!;
   }
 
   importFromServer(principal: Principal, appId: string): Job {
     this.need(principal, "change");
     const { envFile } = this.context(appId);
-    const executor = this.deployments.handoff.executor();
-    if (!executor.online) throw new DeployError(409, "deploy/executor-offline", executor.reason ?? "执行器不在线。");
-    if (!executor.heartbeat?.kinds?.includes("env-read")) throw new DeployError(409, "env/executor-old", `执行器 ${executor.heartbeat?.version} 不会读 env 文件，请先升级执行器。`);
-    if (this.store.activeJobs().some((j) => j.app === appId)) throw new DeployError(409, "deploy/busy", `${appId} 已有一个任务在进行。`);
+    const executor = this.deployments.handoff.executor(hostOf(this.deployments.environment().env, appId));
+    if (!executor.online) throw new DeployError(409, "deploy/executor-offline", executor.reason ?? "The executor is offline.");
+    if (!executor.heartbeat?.kinds?.includes("env-read")) throw new DeployError(409, "env/executor-old", `Executor ${executor.heartbeat?.version} cannot read env files; upgrade the executor first.`);
+    if (this.store.activeJobs().some((j) => j.app === appId)) throw new DeployError(409, "deploy/busy", `${appId} already has a job running.`);
     const request = { kind: "env-read", app: appId, file: envFile.file };
     const id = newJobId("env-read");
     this.store.addJob({ id, kind: "env-read", app: appId, version: "env", environment: this.deployments.environment().env.name, fromVersion: null, manifest: null, pinFrom: null, request }, actorOf(principal));
-    this.deployments.handoff.submit(id, { ...request, requestedBy: principal.id });
+    this.deployments.handoff.submit(id, { ...request, requestedBy: principal.id }, hostOf(this.deployments.environment().env, appId));
     return this.store.job(id)!;
   }
 
@@ -313,7 +318,7 @@ export class EnvManager {
       this.store.markEnvApplied(job.app, latest.meta.revision, job.id);
       return;
     }
-    const note = [found?.exists ? `从服务器的 ${job.request.file} 导入` : `服务器上没有 ${job.request.file}`, ...parsed.errors].join("；");
+    const note = [found?.exists ? `Imported from ${job.request.file} on the server` : `${job.request.file} does not exist on the server`, ...parsed.errors].join("; ");
     this.store.saveEnv(job.app, this.seal(manifest, parsed.values), changes, "import", { id: job.requestedBy, via: job.via as Actor["via"] }, { note, appliedJob: job.id });
   }
 
@@ -325,10 +330,10 @@ export class EnvManager {
 
   /** The same for the other Deployer's read-only key (§6.3). */
   fingerprintOf(appId: string) {
-    if (!this.box) throw new DeployError(409, "env/disabled", "没有配置 DEPLOYER_CREDENTIAL_ENCRYPTION_KEY，环境变量管理没有启用。");
+    if (!this.box) throw new DeployError(409, "env/disabled", "DEPLOYER_CREDENTIAL_ENCRYPTION_KEY is not configured, so environment variable management is off.");
     const { manifest, version } = this.context(appId);
     const applied = this.store.appliedEnv(appId);
-    if (!applied) throw new DeployError(404, "env/not-imported", "服务器上的 env 文件还没导入过。");
+    if (!applied) throw new DeployError(404, "env/not-imported", "The env file on the server has not been imported yet.");
     const secrets = this.secretKeys(manifest, Object.keys(applied.values));
     const plain = this.plain(applied.values);
     const keys = Object.fromEntries(Object.entries(plain).map(([k, v]) => [k, secrets.includes(k)

@@ -1,13 +1,14 @@
-// The Deployer's side of the handoff directory shared with the host executor (design §8.2, D29,
-// protocol 1): requests go in as files written to a temporary name and renamed; the executor answers
-// in jobs/<id>/status.json and log.txt, and keeps executor.json fresh as its heartbeat.
+// The Deployer's side of the executor protocol (design §7.4, D35, protocol 2). Each host runs an executor
+// that reaches the Deployer over HTTPS with its own token: it long-polls for the next job queued for its
+// host, reports the job's status and log, sends a heartbeat, and reports the host's containers and the
+// hashes of the files the Deployer writes. The Deployer never connects to a host. Protocol 1 (a shared
+// handoff directory, one host only) is gone.
 
-import { existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, closeSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { randomBytes } from "node:crypto";
-import type { ExecutorStatus } from "./store.ts";
+import { createHash, randomBytes } from "node:crypto";
+import type { Environment } from "../compose/generate.ts";
+import type { ExecutorStatus, Store } from "./store.ts";
 
-export const PROTOCOL = 1;
+export const PROTOCOL = 2;
 
 export interface Heartbeat {
   version: string;
@@ -17,70 +18,124 @@ export interface Heartbeat {
   registries: string[];
   databaseBackup: Record<string, { dump: boolean; restore: boolean }>;
   busy: string | null;
-  /** Job kinds this executor performs; executors before 0.2.0 do not say, and only build and deploy. */
+  /** Job kinds this executor performs. */
   kinds?: string[];
+  /** The deploy root on its host. */
+  root?: string;
 }
 
-export interface ExecutorInfo { online: boolean; reason?: string; heartbeat?: Heartbeat; ageSeconds?: number }
+export interface ExecutorInfo { online: boolean; host: string; reason?: string; heartbeat?: Heartbeat; ageSeconds?: number }
+
+/** Where one host's executor said its containers and managed files were. */
+export interface HostReport { host: string; containers: unknown[]; files: Record<string, string>; at: string }
 
 export function newJobId(kind: string, now = new Date()): string {
   const stamp = now.toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
   return `${kind}-${stamp}-${randomBytes(3).toString("hex")}`;
 }
 
-export class Handoff {
-  readonly dir: string | undefined;
-  private now: () => number;
+/** The hosts of an environment; one called "local" when the environment names none (a single machine). */
+export function hostIds(env: Pick<Environment, "hosts">): string[] {
+  const ids = Object.keys(env.hosts ?? {});
+  return ids.length ? ids : ["local"];
+}
 
-  constructor(dir: string | undefined, now: () => number = Date.now) {
-    this.dir = dir;
+/** The host an app runs on (D35: placed per app); the first host when the environment does not say. */
+export function hostOf(env: Pick<Environment, "hosts" | "apps">, app: string): string {
+  return env.apps[app]?.host ?? hostIds(env)[0]!;
+}
+
+export const tokenSha256 = (token: string) => createHash("sha256").update(token).digest("hex");
+
+export class Handoff {
+  private store: Store;
+  private now: () => number;
+  /** Long polls waiting for a job, by host. */
+  private waiting = new Map<string, Set<() => void>>();
+
+  constructor(store: Store, now: () => number = Date.now) {
+    this.store = store;
     this.now = now;
   }
 
-  /** Online when the heartbeat is under 30 seconds old and speaks our protocol. */
-  executor(): ExecutorInfo {
-    if (!this.dir) return { online: false, reason: "没有配置执行器（DEPLOYER_HANDOFF_DIR）" };
-    const file = join(this.dir, "executor.json");
-    if (!existsSync(file)) return { online: false, reason: "执行器还没有上报过心跳" };
-    let heartbeat: Heartbeat;
-    try { heartbeat = JSON.parse(readFileSync(file, "utf8")); } catch { return { online: false, reason: "执行器心跳文件读不出来" }; }
-    const ageSeconds = Math.round((this.now() - Date.parse(heartbeat.at)) / 1000);
-    if (ageSeconds > 30) return { online: false, reason: `执行器 ${ageSeconds} 秒没有心跳`, heartbeat, ageSeconds };
-    if (!heartbeat.protocols?.includes(PROTOCOL)) return { online: false, reason: `执行器 ${heartbeat.version} 不支持协议 ${PROTOCOL}`, heartbeat, ageSeconds };
-    return { online: true, heartbeat, ageSeconds };
+  // --- the Deployer's side ---------------------------------------------------------------------------
+
+  /** Online when the host's heartbeat is under 30 seconds old and speaks our protocol. */
+  executor(host: string): ExecutorInfo {
+    const row = this.store.executorHosts().find((h) => h.host === host);
+    if (!row?.heartbeat || !row.beatAt) return { online: false, host, reason: `The executor on ${host} has not sent a heartbeat yet` };
+    const heartbeat = row.heartbeat as Heartbeat;
+    const ageSeconds = Math.round((this.now() - Date.parse(row.beatAt)) / 1000);
+    if (ageSeconds > 30) return { online: false, host, reason: `No heartbeat from the executor on ${host} for ${ageSeconds} seconds`, heartbeat, ageSeconds };
+    if (!heartbeat.protocols?.includes(PROTOCOL)) return { online: false, host, reason: `Executor ${heartbeat.version} on ${host} does not support protocol ${PROTOCOL}`, heartbeat, ageSeconds };
+    return { online: true, host, heartbeat, ageSeconds };
   }
 
-  submit(id: string, request: Record<string, unknown>) {
-    if (!this.dir) throw new Error("no handoff directory");
-    const dir = join(this.dir, "requests");
-    mkdirSync(dir, { recursive: true });
-    const tmp = join(dir, `.${id}.tmp`);
-    // Env requests carry the file content until the executor picks them up: only the Deployer and root read it.
-    writeFileSync(tmp, JSON.stringify({ protocol: PROTOCOL, id, ...request }, null, 2), { mode: 0o600 });
-    renameSync(tmp, join(dir, `${id}.json`));
+  executors(env: Pick<Environment, "hosts">): ExecutorInfo[] {
+    return hostIds(env).map((h) => this.executor(h));
+  }
+
+  /** Queues a job for one host's executor; an env job's content is kept apart and leaves the queue on pickup. */
+  submit(id: string, request: Record<string, unknown>, host: string) {
+    const { content, ...rest } = request;
+    this.store.queueExecutorJob(id, host, { protocol: PROTOCOL, id, ...rest }, typeof content === "string" ? content : undefined);
+    for (const wake of this.waiting.get(host) ?? []) wake();
   }
 
   status(id: string): ExecutorStatus | undefined {
-    if (!this.dir) return undefined;
-    try { return JSON.parse(readFileSync(join(this.dir, "jobs", id, "status.json"), "utf8")); } catch { return undefined; }
+    return this.store.executorJob(id)?.status ?? undefined;
   }
 
-  /** The env file an env-read job copied out (0600, ours); the executor deletes it after a few minutes. */
+  /** The request as queued, without an env job's content (tests and the job page). */
+  request(id: string): Record<string, unknown> | undefined {
+    return this.store.executorJob(id)?.request;
+  }
+
+  /** The env file an env-read job sent back; handed over once. */
   envContent(id: string): string | undefined {
-    if (!this.dir) return undefined;
-    try { return readFileSync(join(this.dir, "jobs", id, "env.content"), "utf8"); } catch { return undefined; }
+    return this.store.takeExecutorEnvContent(id);
   }
 
   /** The last `bytes` of the job's log. */
   log(id: string, bytes = 64 * 1024): string {
-    if (!this.dir) return "";
-    const file = join(this.dir, "jobs", id, "log.txt");
-    if (!existsSync(file)) return "";
-    const size = statSync(file).size;
-    const start = Math.max(0, size - bytes);
-    const buffer = Buffer.alloc(size - start);
-    const fd = openSync(file, "r");
-    try { readSync(fd, buffer, 0, buffer.length, start); } finally { closeSync(fd); }
-    return (start > 0 ? "…\n" : "") + buffer.toString("utf8");
+    const text = this.store.executorJob(id)?.log ?? "";
+    return text.length > bytes ? `…\n${text.slice(-bytes)}` : text;
   }
+
+  /** What each host last reported; stale after five minutes. */
+  reports(): (HostReport & { stale: boolean })[] {
+    return this.store.executorHosts().filter((h) => h.stateAt).map((h) => ({
+      host: h.host, containers: h.containers ?? [], files: h.files ?? {}, at: h.stateAt!, stale: this.now() - Date.parse(h.stateAt!) > 5 * 60_000,
+    }));
+  }
+
+  // --- the executor's side (behind its token) ---------------------------------------------------------
+
+  heartbeat(host: string, heartbeat: Heartbeat) {
+    this.store.setHeartbeat(host, { ...heartbeat, at: new Date(this.now()).toISOString() });
+  }
+
+  /** The next job for the host, waiting up to `waitMs` for one to be queued. */
+  async next(host: string, waitMs = 0): Promise<Record<string, unknown> | undefined> {
+    const now = this.store.claimExecutorJob(host);
+    if (now || waitMs <= 0) return now;
+    await new Promise<void>((resolve) => {
+      const set = this.waiting.get(host) ?? new Set();
+      this.waiting.set(host, set);
+      const done = () => { clearTimeout(timer); set.delete(done); resolve(); };
+      const timer = setTimeout(done, waitMs);
+      set.add(done);
+    });
+    return this.store.claimExecutorJob(host);
+  }
+
+  /** Whether a job belongs to the host asking about it. */
+  owns(host: string, id: string): boolean {
+    return this.store.executorJob(id)?.host === host;
+  }
+
+  putStatus(id: string, status: ExecutorStatus) { this.store.setExecutorStatus(id, status); }
+  appendLog(id: string, text: string) { this.store.appendExecutorLog(id, text); }
+  putEnvContent(id: string, content: string) { this.store.setExecutorEnvContent(id, content); }
+  putState(host: string, containers: unknown[], files: Record<string, string>) { this.store.setHostState(host, containers, files); }
 }

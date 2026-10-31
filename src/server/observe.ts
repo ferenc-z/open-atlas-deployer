@@ -1,10 +1,9 @@
 // What each environment is running (phase 1, read-only). Two sources, neither needs the Docker
 // socket in the Deployer's container (§8.2):
-// - the host's container list, written by host/report-state.sh (`docker ps` as JSON lines);
+// - each host's container list, reported by its executor (`docker ps` as JSON lines, D35);
 // - each own-built service's /meta/contracts (its BUILD.json), asked over the compose network.
 // Compared with the environment's desired versions, that gives one status per component.
 
-import { readFileSync, statSync } from "node:fs";
 import type { Component, Environment, Manifest } from "../compose/generate.ts";
 import { covering } from "../manifest/version.ts";
 
@@ -17,6 +16,8 @@ export interface Container {
   health?: string;
   status: string;
   labels: Record<string, string>;
+  /** D35: the host it runs on. */
+  host?: string;
 }
 
 export interface HostState { at: string; stale: boolean; containers: Container[] }
@@ -43,14 +44,14 @@ export function parseDockerPs(text: string): Container[] {
   });
 }
 
-export function readHostState(file: string | undefined, now = Date.now(), staleAfterMs = 5 * 60_000): HostState | undefined {
-  if (!file) return undefined;
-  try {
-    const mtime = statSync(file).mtimeMs;
-    return { at: new Date(mtime).toISOString(), stale: now - mtime > staleAfterMs, containers: parseDockerPs(readFileSync(file, "utf8")) };
-  } catch {
-    return undefined;
-  }
+/** D35: every host's report as one list, each container naming its host; as old as the oldest report. */
+export function hostStateOf(reports: { host: string; containers: unknown[]; at: string; stale: boolean }[]): HostState | undefined {
+  if (!reports.length) return undefined;
+  return {
+    at: reports.map((r) => r.at).sort()[0]!,
+    stale: reports.some((r) => r.stale),
+    containers: reports.flatMap((r) => (r.containers as Container[]).map((c) => ({ ...c, host: r.host }))),
+  };
 }
 
 export type Observation =
@@ -116,7 +117,7 @@ export interface ComponentStatus {
   type: string;
   service?: string;
   verdict: Verdict;
-  container?: Pick<Container, "name" | "image" | "state" | "health" | "status"> & { version?: string };
+  container?: Pick<Container, "name" | "image" | "state" | "health" | "status" | "host"> & { version?: string };
   observed?: Observation;
 }
 
@@ -173,7 +174,7 @@ export async function environmentStatus(
       return {
         id: c.id, type: c.type, service: c.service,
         verdict: verdictFor(desired, container, host, observed),
-        ...(container ? { container: { name: container.name, image: container.image, state: container.state, ...(container.health ? { health: container.health } : {}), status: container.status, ...(container.labels["org.open-atlas.version"] ? { version: container.labels["org.open-atlas.version"] } : {}) } } : {}),
+        ...(container ? { container: { name: container.name, image: container.image, state: container.state, ...(container.health ? { health: container.health } : {}), status: container.status, ...(container.host ? { host: container.host } : {}), ...(container.labels["org.open-atlas.version"] ? { version: container.labels["org.open-atlas.version"] } : {}) } } : {}),
         ...(observed ? { observed } : {}),
       };
     }));

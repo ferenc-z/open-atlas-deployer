@@ -81,15 +81,15 @@ export const TOOLS: Tool[] = [
 /** Tool arguments: only the declared ones, the required ones present, of the declared type. */
 export function checkArgs(tool: Tool, args: Record<string, unknown>): string | null {
   const unknown = Object.keys(args).filter((k) => !tool.properties[k]);
-  if (unknown.length) return `${tool.name} 没有参数 ${unknown.join("、")}`;
+  if (unknown.length) return `${tool.name} has no parameter ${unknown.join(", ")}`;
   const missing = (tool.required ?? []).filter((k) => args[k] === undefined || args[k] === null || args[k] === "");
-  if (missing.length) return `${tool.name} 缺参数 ${missing.join("、")}`;
+  if (missing.length) return `${tool.name} is missing parameter ${missing.join(", ")}`;
   for (const [k, v] of Object.entries(args)) {
     const t = tool.properties[k]!.type;
     const ok = t === "integer" ? Number.isInteger(v) : t === "array" ? Array.isArray(v) : t === "object" ? typeof v === "object" && v !== null && !Array.isArray(v) : typeof v === t;
-    if (!ok) return `${tool.name} 的参数 ${k} 应为 ${t}`;
+    if (!ok) return `Parameter ${k} of ${tool.name} should be ${t}`;
   }
-  if (!tool.readOnly && (typeof args.request_id !== "string" || args.request_id.length > 100)) return `${tool.name} 的 request_id 要是 100 字以内的文字`;
+  if (!tool.readOnly && (typeof args.request_id !== "string" || args.request_id.length > 100)) return `request_id of ${tool.name} must be text of at most 100 characters`;
   return null;
 }
 

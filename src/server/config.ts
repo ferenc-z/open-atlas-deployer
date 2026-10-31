@@ -15,10 +15,6 @@ export interface Config {
   workbenchPublicUrl: string;
   /** This environment's desired state (§7.1): name, registries, each app's version. */
   environmentFile: string;
-  /** The project's containers, written by the host executor every 30 seconds. */
-  hostStateFile?: string;
-  /** Shared with the host executor (§8.2): requests in, status and logs out. Without it nothing can be deployed. */
-  handoffDir?: string;
   /** GitHub read-only token for listing a private release repo's tags. */
   githubTokenFile?: string;
   /** service -> base URL, for asking /meta/contracts outside the compose network (development). */
@@ -77,8 +73,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     workbenchUrl,
     workbenchPublicUrl: env.DEPLOYER_WORKBENCH_PUBLIC_URL ?? "/",
     environmentFile: resolve(env.DEPLOYER_ENVIRONMENT_FILE ?? join(dataDir, "environment.json")),
-    ...(env.DEPLOYER_HOST_STATE_FILE ? { hostStateFile: resolve(env.DEPLOYER_HOST_STATE_FILE) } : {}),
-    ...(env.DEPLOYER_HANDOFF_DIR ? { handoffDir: resolve(env.DEPLOYER_HANDOFF_DIR) } : {}),
     ...(env.DEPLOYER_GITHUB_TOKEN_FILE ? { githubTokenFile: resolve(env.DEPLOYER_GITHUB_TOKEN_FILE) } : {}),
     observeUrls: env.DEPLOYER_OBSERVE_URLS ? JSON.parse(env.DEPLOYER_OBSERVE_URLS) : {},
     ...(env.DEPLOYER_EMERGENCY_PASSWORD_HASH ? { emergencyPasswordHash: env.DEPLOYER_EMERGENCY_PASSWORD_HASH } : {}),

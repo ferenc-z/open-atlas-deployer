@@ -29,13 +29,13 @@ export class StudioGraphDriver implements DeployDriver {
 
   private contract(ctx: StepContext): { text: string; workspace: string; graph: string } {
     const path = ctx.component.contract as string | undefined;
-    if (!path) throw new Error(`组件 ${ctx.component.id} 没有 contract：图的定义由 Deployer 保存（templates/ 里的 EDN）`);
+    if (!path) throw new Error(`Component ${ctx.component.id} has no contract: the Deployer keeps graph definitions (EDN in templates/)`);
     const rel = normalize(path.replace(/^templates\//, ""));
-    if (rel.startsWith("..")) throw new Error(`contract ${path} 不在 templates/ 里`);
+    if (rel.startsWith("..")) throw new Error(`contract ${path} is outside templates/`);
     const text = readFileSync(join(this.templatesDir, rel), "utf8");
     const workspace = text.match(WORKSPACE)?.[2];
     const graph = text.match(GRAPH)?.[2];
-    if (!workspace || !graph) throw new Error(`${path} 里没有 :workspace/id 或 :graph/id`);
+    if (!workspace || !graph) throw new Error(`${path} has no :workspace/id or :graph/id`);
     return { text, workspace, graph };
   }
 
@@ -43,24 +43,24 @@ export class StudioGraphDriver implements DeployDriver {
     const path = ctx.component.savedQueries as string | undefined;
     if (!path) return [];
     const list = JSON.parse(bundleText(ctx.bundle, path)) as SavedQuery[];
-    if (!Array.isArray(list) || list.some((q) => !q?.name || !q.eql)) throw new Error(`${path} 不是 saved query 列表`);
+    if (!Array.isArray(list) || list.some((q) => !q?.name || !q.eql)) throw new Error(`${path} is not a list of saved queries`);
     return list;
   }
 
   async plan(ctx: StepContext) {
     const findings = [];
     const graph = ctx.settings.graph;
-    if (!graph) findings.push(block("studio-graph/graph", `environment.json 里没有 apps.${ctx.app}.settings.${ctx.component.id}.graph（这个环境的 Studio 图名）。`));
+    if (!graph) findings.push(block("studio-graph/graph", `environment.json has no apps.${ctx.app}.settings.${ctx.component.id}.graph (the Studio graph name in this environment).`));
     let queries: SavedQuery[] = [];
     try { this.contract(ctx); queries = this.queries(ctx); } catch (error) { findings.push(block("studio-graph/contract", (error as Error).message)); }
-    const after = `上传 ${ctx.component.contract ?? "—"}，存 ${queries.length} 条 saved queries，发布`;
-    if (!this.studio) return { after, findings: [...findings, block("studio-graph/token", "没有配置 Studio Builder MCP（DEPLOYER_STUDIO_BUILDER_URL、DEPLOYER_STUDIO_TOKEN_FILE）。")] };
+    const after = `Upload ${ctx.component.contract ?? "—"}, save ${queries.length} saved queries, publish`;
+    if (!this.studio) return { after, findings: [...findings, block("studio-graph/token", "The Studio Builder MCP is not configured (DEPLOYER_STUDIO_BUILDER_URL, DEPLOYER_STUDIO_TOKEN_FILE).")] };
     if (!graph) return { after, findings };
     try {
       const draft = await this.studio.call("get_graph", { graph });
-      return { before: `${graph} 草稿第 ${draft.revision ?? 0} 版`, after, findings };
+      return { before: `${graph} draft revision ${draft.revision ?? 0}`, after, findings };
     } catch (error) {
-      return { after, findings: [...findings, block("studio-graph/unreachable", `读不到 Studio 图 ${graph}：${(error as Error).message}。图要先在这个环境的 Studio 里建好。`)] };
+      return { after, findings: [...findings, block("studio-graph/unreachable", `Cannot read Studio graph ${graph}: ${(error as Error).message}. Create the graph in this environment's Studio first.`)] };
     }
   }
 
@@ -71,7 +71,7 @@ export class StudioGraphDriver implements DeployDriver {
     const current = String(draft.text ?? "");
     const ws = current.match(WORKSPACE)?.[2];
     const gid = current.match(GRAPH)?.[2];
-    if (!ws || !gid) throw new Error(`图 ${graph} 的草稿里读不到 workspace id 或 graph id`);
+    if (!ws || !gid) throw new Error(`Cannot read the workspace id or graph id from the draft of graph ${graph}`);
     const contract = this.contract(ctx);
     const text = contract.text.split(`"${contract.workspace}"`).join(`"${ws}"`).split(`"${contract.graph}"`).join(`"${gid}"`);
     const saved = await studio.call("upload_graph", { graph, text, expected_revision: Number(draft.revision ?? 0) });
@@ -82,14 +82,14 @@ export class StudioGraphDriver implements DeployDriver {
     const published = await studio.call("publish_graph", { graph, apply: true });
     const version = published?.version ?? published?.["to-version"] ?? published?.to_version ?? null;
     ctx.log(`Studio: ${graph} published${version != null ? ` as version ${version}` : ""}`);
-    return { message: `Studio 图 ${graph} 已上传、存了 ${queries.length} 条 saved queries 并发布${version != null ? `（第 ${version} 版）` : ""}`, detail: { graph, revision: saved?.revision ?? null, version } };
+    return { message: `Studio graph ${graph} uploaded, ${queries.length} saved queries saved, and published${version != null ? ` (version ${version})` : ""}`, detail: { graph, revision: saved?.revision ?? null, version } };
   }
 
   async verify(): Promise<string | null> { return null; }
 
   async rollback(_ctx: StepContext, result: StepResult): Promise<Undo> {
-    return { message: `Studio 图 ${result.detail.graph} 保持新发布的版本（需要时在 Studio 里发布回旧版本）`, undone: false };
+    return { message: `Studio graph ${result.detail.graph} keeps the newly published version (publish the old version again in Studio if needed)`, undone: false };
   }
 
-  impact(_component: Component): string { return "不中断：发布后新的查询立即生效"; }
+  impact(_component: Component): string { return "No interruption: new queries take effect once published"; }
 }

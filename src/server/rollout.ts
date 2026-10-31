@@ -120,7 +120,7 @@ export class Runner {
         if (step.state === "waiting" && step.checks?.every((c) => c.by)) {
           step.state = "succeeded";
           step.finishedAt = this.stamp();
-          step.message = `全部 ${step.checks.length} 项已确认`;
+          step.message = `All ${step.checks.length} items confirmed`;
           log(`${step.component}: every item ticked`);
           this.save(job, rollout);
           continue;
@@ -133,14 +133,14 @@ export class Runner {
       this.save(job, rollout);
       let ctx: StepContext | undefined;
       try {
-        if (!driver) throw new Error(`没有 ${step.type} 驱动`);
+        if (!driver) throw new Error(`No ${step.type} driver`);
         ctx = await this.hooks.context(job, step);
         ctx.log = (line) => log(`${step.component}: ${line}`);
         const result = await driver.apply(ctx);
         step.result = result;
         this.save(job, rollout);
         const problem = await driver.verify(ctx, result);
-        if (problem) throw new Error(`核对没通过：${problem}`);
+        if (problem) throw new Error(`Check failed: ${problem}`);
         step.state = "succeeded";
         step.message = result.message;
         step.finishedAt = this.stamp();
@@ -154,12 +154,12 @@ export class Runner {
         const undone = await this.undo(job, rollout, step, log);
         for (const s of rollout.steps) if (s.state === "pending") s.state = "skipped";
         this.save(job, rollout);
-        const host = rollout.host === "done" ? "；容器保持新版本（健康检查已通过），需要时在部署记录里回到上一版" : "";
-        await this.hooks.finish(this.store.job(job.id)!, "failed", `组件 ${step.component} 失败：${step.message}${undone.length ? `。已撤回：${undone.join("；")}` : ""}${host}`);
+        const host = rollout.host === "done" ? "; containers keep the new version (health checks passed); go back to the previous version from the deploy history if needed" : "";
+        await this.hooks.finish(this.store.job(job.id)!, "failed", `Component ${step.component} failed: ${step.message}${undone.length ? `. Undone: ${undone.join("; ")}` : ""}${host}`);
         return;
       }
     }
-    await this.hooks.finish(this.store.job(job.id)!, "succeeded", `${job.app} ${job.version} 部署完成（${rollout.steps.length} 个组件）`);
+    await this.hooks.finish(this.store.job(job.id)!, "succeeded", `${job.app} ${job.version} deployed (${rollout.steps.length} components)`);
   }
 
   /** Rolls back the Deployer steps done before (and the failed one, if it got as far as a result), newest first. */
@@ -172,11 +172,11 @@ export class Runner {
         ctx.log = (line) => log(`${s.component}: ${line}`);
         const { message, undone } = await this.hooks.drivers[s.type]!.rollback(ctx, s.result!);
         if (s !== failed && undone) s.state = "rolled-back";
-        if (s !== failed) s.message = `${s.message ?? ""}；${undone ? "已撤回" : "未撤回"}：${message}`;
+        if (s !== failed) s.message = `${s.message ?? ""}; ${undone ? "undone" : "not undone"}: ${message}`;
         out.push(message);
         log(`${s.component}: ${undone ? "rolled back" : "left as it is"}: ${message}`);
       } catch (error) {
-        out.push(`${s.component} 撤回失败（${(error as Error).message}），需要人处理`);
+        out.push(`Undoing ${s.component} failed (${(error as Error).message}); needs a person`);
         log(`${s.component}: rollback failed: ${(error as Error).message}`);
       }
     }
@@ -187,10 +187,10 @@ export class Runner {
   async check(jobId: string, component: string, index: number, checked: boolean, actor: Actor): Promise<Job> {
     const job = this.store.job(jobId);
     const step = job?.rollout?.steps.find((s) => s.component === component && s.where === "person");
-    if (!job || !step || !step.checks) throw new RolloutError(400, "这个部署没有这个人工步骤。");
-    if (step.state !== "waiting") throw new RolloutError(409, step.state === "pending" ? "还没到这个人工步骤：前面的步骤完成后才能勾选。" : "这个人工步骤已经结束。");
+    if (!job || !step || !step.checks) throw new RolloutError(400, "This deploy has no such manual step.");
+    if (step.state !== "waiting") throw new RolloutError(409, step.state === "pending" ? "This manual step has not been reached: it can be checked once the earlier steps finish." : "This manual step has ended.");
     const item = step.checks[index];
-    if (!item) throw new RolloutError(400, "没有这一项。");
+    if (!item) throw new RolloutError(400, "No such item.");
     if (checked) { item.by = actor.id; item.at = this.stamp(); } else { delete item.by; delete item.at; }
     job.rollout!.log.push(`${this.stamp()} ${component}: item ${index + 1} ${checked ? "ticked" : "unticked"} by ${actor.id}`);
     this.store.setRollout(job.id, job.rollout!);
@@ -203,14 +203,14 @@ export class Runner {
   async stop(jobId: string, actor: Actor): Promise<Job> {
     const job = this.store.job(jobId);
     const waiting = job?.rollout?.steps.find((s) => s.state === "waiting");
-    if (!job || !waiting) throw new RolloutError(409, "只能停止停在人工步骤上的部署。");
+    if (!job || !waiting) throw new RolloutError(409, "Only a deploy waiting at a manual step can be stopped.");
     waiting.state = "failed";
     waiting.finishedAt = this.stamp();
-    waiting.message = `由 ${actor.id} 停止`;
+    waiting.message = `Stopped by ${actor.id}`;
     for (const s of job.rollout!.steps) if (s.state === "pending") s.state = "skipped";
     this.store.setRollout(job.id, job.rollout!);
     this.store.audit(actor, "deploy.stop", `${job.app}@${job.version}`, { job: job.id, at: waiting.component });
-    await this.hooks.finish(this.store.job(job.id)!, "failed", `在人工步骤 ${waiting.component} 处由 ${actor.id} 停止；已完成的步骤保留`);
+    await this.hooks.finish(this.store.job(job.id)!, "failed", `Stopped by ${actor.id} at manual step ${waiting.component}; finished steps are kept`);
     return this.store.job(job.id)!;
   }
 }

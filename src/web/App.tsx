@@ -7,26 +7,28 @@ import { Artifacts } from "./Artifacts.tsx";
 import { AssistantPanel, KeysPage } from "./Assistant.tsx";
 import { OnboardingPage } from "./Onboarding.tsx";
 import { BriefCard, DriftBanner } from "./Brief.tsx";
+import { HostsPage } from "./Hosts.tsx";
+import { IngressPage } from "./Ingress.tsx";
 
-type Tab = "status" | "history" | "artifacts" | "env" | "registry" | "onboarding" | "keys" | "audit";
+type Tab = "status" | "history" | "hosts" | "env" | "registry" | "onboarding" | "ingress" | "keys" | "audit";
 type Panel = { kind: "deploy"; app: string; initial?: { version: string; pinFrom?: string } } | { kind: "job"; id: string } | undefined;
 
 const VERDICT: Record<string, { label: string; tone: string }> = {
-  ok: { label: "正常", tone: "ok" },
-  drift: { label: "版本不符", tone: "warn" },
-  starting: { label: "启动中", tone: "info" },
-  down: { label: "异常", tone: "bad" },
-  missing: { label: "没有容器", tone: "bad" },
-  unknown: { label: "未知", tone: "muted" },
+  ok: { label: "Healthy", tone: "ok" },
+  drift: { label: "Version mismatch", tone: "warn" },
+  starting: { label: "Starting", tone: "info" },
+  down: { label: "Down", tone: "bad" },
+  missing: { label: "No containers", tone: "bad" },
+  unknown: { label: "Unknown", tone: "muted" },
   "not-a-service": { label: "—", tone: "muted" },
 };
 
 const TYPE_LABEL: Record<string, string> = {
-  "compose-service": "容器", "workbench-app": "Workbench 应用包", "oma-agent": "OMA Agent",
-  "db-migration": "数据库迁移", "studio-graph": "Studio Graph", manual: "人工步骤",
+  "compose-service": "Container", "workbench-app": "Workbench app package", "oma-agent": "OMA Agent",
+  "db-migration": "Database migration", "studio-graph": "Studio Graph", manual: "Manual step",
 };
 
-const when = (iso: string) => new Date(iso).toLocaleString("zh-CN", { hour12: false });
+const when = (iso: string) => new Date(iso).toLocaleString("en-US", { hour12: false });
 
 function Badge({ verdict }: { verdict: string }) {
   const v = VERDICT[verdict] ?? { label: verdict, tone: "muted" };
@@ -38,47 +40,86 @@ export function App() {
   const [tab, setTab] = useState<Tab>("status");
   const [panel, setPanel] = useState<Panel>();
   const [assistant, setAssistant] = useState(false);
-  const actions = useMemo(() => ({ openPlan: (app: string, version: string, pinFrom?: string) => { setPanel({ kind: "deploy", app, initial: { version, ...(pinFrom ? { pinFrom } : {}) } }); setTab("status"); } }), []);
+  const [assessment, setAssessment] = useState<string | undefined>();
+  const actions =useMemo(() => ({ openPlan: (app: string, version: string, pinFrom?: string) => { setPanel({ kind: "deploy", app, initial: { version, ...(pinFrom ? { pinFrom } : {}) } }); setTab("status"); } }), []);
   const load = useCallback(() => { api.me().then(setMe, () => setMe(undefined)); }, []);
   useEffect(load, [load]);
 
-  if (!me) return <main className="center"><p className="muted">正在确认登录…</p></main>;
+  if (!me) return <main className="center"><p className="muted">Checking sign-in…</p></main>;
   if (!me.signedIn) return "forbidden" in me ? <Forbidden message={me.message} /> : <SignIn me={me} onSignedIn={load} />;
   const p = me.principal;
+  const go = (t: Tab) => { setTab(t); if (t !== "onboarding") setAssessment(undefined); };
   return (
-    <>
-      <Header principal={p} environment={me.environment} tab={tab} setTab={setTab} onSignedOut={load} assistant={assistant} toggleAssistant={() => setAssistant(!assistant)} />
-      {p.via === "emergency" && <div className="banner bad">正在使用紧急账号：Workbench 无法访问。每个操作都记入审计；Workbench 恢复后请改用 Workbench 登录。</div>}
-      {p.stale && <div className="banner warn">Workbench 暂时没有响应，正在使用最近一次确认的登录（15 分钟内有效）。</div>}
-      {p.actAs && <div className="banner info">{p.actAs.administrator} 正在以 {p.displayName} 的身份使用 Workbench，这里的权限也按 {p.displayName} 计算。</div>}
+    <div className="shell">
+      <Sidebar principal={p} environment={me.environment} tab={tab} setTab={go} onSignedOut={load} assistant={assistant} toggleAssistant={() => setAssistant(!assistant)} />
+      <div className="content">
+        {p.via === "emergency" && <div className="banner bad">Using the emergency account: Workbench is unreachable. Every action is audited; sign in with Workbench once it is back.</div>}
+        {p.stale && <div className="banner warn">Workbench is not responding; using the last confirmed sign-in (valid for 15 minutes).</div>}
+        {p.actAs && <div className="banner info">{p.actAs.administrator} is using Workbench as {p.displayName}, so permissions here are also those of {p.displayName}.</div>}
+        <main>
+          {tab === "status" && <><DriftBanner /><BriefCard canRegenerate={p.permissions.includes("deploy-uat") || p.permissions.includes("deploy-prod")} /><Status panel={panel} setPanel={setPanel} isAdmin={p.permissions.includes("admin")} onAssessment={(id) => { setPanel(undefined); setAssessment(id); setTab("onboarding"); }} /></>}
+          {tab === "history" && <HistoryPage onBack={(j) => { setPanel({ kind: "deploy", app: j.app, initial: { version: j.version, pinFrom: j.id } }); setTab("status"); }} />}
+          {tab === "hosts" && <HostsPage isAdmin={p.permissions.includes("admin") && p.via === "workbench"} />}
+          {tab === "env" && <EnvPage />}
+          {tab === "ingress" && <IngressPage />}
+          {tab === "registry" && <Registry principal={p} />}
+          {tab === "onboarding" && <OnboardingPage key={assessment ?? ""} {...(assessment ? { initialOpen: assessment } : {})} canStart={p.permissions.includes("deploy-uat") && p.via === "workbench"} isAdmin={p.permissions.includes("admin")} onJob={(id) => { setPanel({ kind: "job", id }); setTab("status"); }} />}
+          {tab === "keys" && <KeysPage isAdmin={p.permissions.includes("admin")} />}
+          {tab === "audit" && p.permissions.includes("admin") && <Audit />}
+        </main>
+      </div>
       {assistant && <AssistantPanel workbenchUrl={me.workbenchUrl} {...(me.environment ? { environment: me.environment } : {})} page={tab} {...(panel?.kind === "deploy" ? { app: panel.app } : {})} actions={actions} onClose={() => setAssistant(false)} />}
-      <main className={assistant ? "with-assistant" : ""}>
-        {tab === "status" && <><DriftBanner /><BriefCard canRegenerate={p.permissions.includes("deploy-uat") || p.permissions.includes("deploy-prod")} /><Status panel={panel} setPanel={setPanel} isAdmin={p.permissions.includes("admin")} /></>}
-        {tab === "artifacts" && <Artifacts />}
-        {tab === "history" && <History onBack={(j) => { setPanel({ kind: "deploy", app: j.app, initial: { version: j.version, pinFrom: j.id } }); setTab("status"); }} />}
-        {tab === "env" && <EnvPage />}
-        {tab === "registry" && <Registry principal={p} />}
-        {tab === "onboarding" && <OnboardingPage canStart={p.permissions.includes("deploy-uat") && p.via === "workbench"} isAdmin={p.permissions.includes("admin")} onJob={(id) => { setPanel({ kind: "job", id }); setTab("status"); }} />}
-        {tab === "keys" && <KeysPage isAdmin={p.permissions.includes("admin")} />}
-        {tab === "audit" && p.permissions.includes("admin") && <Audit />}
-      </main>
-    </>
+    </div>
   );
 }
 
-function Header({ principal, environment, tab, setTab, onSignedOut, assistant, toggleAssistant }: { principal: Principal; environment?: string; tab: Tab; setTab: (t: Tab) => void; onSignedOut: () => void; assistant: boolean; toggleAssistant: () => void }) {
-  const tabs: [Tab, string][] = [["status", "状态"], ["history", "部署记录"], ["artifacts", "制品"], ["env", "环境变量"], ["registry", "应用注册表"], ["onboarding", "接入评估"], ["keys", "API key"], ...(principal.permissions.includes("admin") ? [["audit", "审计"] as [Tab, string]] : [])];
+/** D33: navigation down the left, in three groups; on a phone it folds into a menu button. */
+function Sidebar({ principal, environment, tab, setTab, onSignedOut, assistant, toggleAssistant }: { principal: Principal; environment?: string; tab: Tab; setTab: (t: Tab) => void; onSignedOut: () => void; assistant: boolean; toggleAssistant: () => void }) {
+  const [open, setOpen] = useState(false);
+  const groups: [string, [Tab, string][]][] = [
+    ["Deploy", [["status", "Overview"], ["history", "Deploy history"], ["hosts", "Hosts"]]],
+    ["Apps", [["registry", "Apps & manifests"], ["onboarding", "Onboarding & assessments"], ["env", "Environment variables"], ["ingress", "Ingress"]]],
+    ["Admin", [["keys", "API keys"], ...(principal.permissions.includes("admin") ? [["audit", "Audit"] as [Tab, string]] : [])]],
+  ];
+  const prod = environment?.toLowerCase() === "prod";
   return (
-    <header>
-      <div className="brand">Open Atlas Deployer{environment && <span className="env">{environment.toUpperCase()}</span>}</div>
-      <nav>{tabs.map(([id, label]) => <button key={id} className={tab === id ? "active" : ""} onClick={() => setTab(id)}>{label}</button>)}</nav>
-      <div className="who">
-        <span title={principal.groups.join(", ") || "无组"}>{principal.displayName}</span>
-        <span className="muted">{principal.isAdmin ? "管理员" : principal.groups.filter((g) => g.startsWith("deploy-")).join(" · ")}</span>
-        {principal.via === "workbench" && <button className={assistant ? "active" : ""} onClick={toggleAssistant}>问助手</button>}
-        {principal.via === "emergency" && <button className="link" onClick={() => api.emergencyLogout().then(onSignedOut)}>退出</button>}
+    <aside className={`sidebar${open ? " open" : ""}`}>
+      <div className="brand">
+        <span>Open Atlas Deployer</span>
+        {environment && <span className={`env${prod ? " prod" : ""}`}>{environment.toUpperCase()}</span>}
+        <button className="menu" aria-label="Menu" aria-expanded={open} onClick={() => setOpen(!open)}>☰</button>
       </div>
-    </header>
+      <nav>
+        {groups.map(([title, items]) => (
+          <div key={title} className="group">
+            <div className="group-title">{title}</div>
+            <div className="group-items">
+              {items.map(([id, label]) => <button key={id} className={tab === id ? "active" : ""} onClick={() => { setTab(id); setOpen(false); }}>{label}</button>)}
+            </div>
+          </div>
+        ))}
+      </nav>
+      <div className="who">
+        <span title={principal.groups.join(", ") || "No groups"}>{principal.displayName}</span>
+        <span className="muted">{principal.isAdmin ? "Admin" : principal.groups.filter((g) => g.startsWith("deploy-")).join(" · ")}</span>
+        {principal.via === "workbench" && <button className={assistant ? "active" : ""} onClick={toggleAssistant}>Ask the assistant</button>}
+        {principal.via === "emergency" && <button className="link" onClick={() => api.emergencyLogout().then(onSignedOut)}>Sign out</button>}
+      </div>
+    </aside>
+  );
+}
+
+/** Deploy history and artifacts are two views of what ran here: by deploy, and by app@version + digest. */
+function HistoryPage({ onBack }: { onBack: (job: { app: string; version: string; id: string }) => void }) {
+  const [view, setView] = useState<"deploys" | "artifacts">("deploys");
+  return (
+    <>
+      <div className="subtabs">
+        <button className={view === "deploys" ? "active" : ""} onClick={() => setView("deploys")}>Deploys</button>
+        <button className={view === "artifacts" ? "active" : ""} onClick={() => setView("artifacts")}>Artifacts</button>
+      </div>
+      {view === "deploys" ? <History onBack={onBack} /> : <Artifacts />}
+    </>
   );
 }
 
@@ -95,15 +136,15 @@ function SignIn({ me, onSignedIn }: { me: Extract<Me, { emergencyAvailable: bool
       <section className="card narrow">
         <h1>Open Atlas Deployer</h1>
         {me.reason === "workbench-unavailable"
-          ? <p>Workbench 暂时无法访问，无法确认你的登录。</p>
-          : <p>Deployer 使用 Workbench 的登录。请先登录 Workbench，再回到这里。</p>}
-        <p><a className="button" href={me.workbenchUrl}>前往 Workbench 登录</a></p>
+          ? <p>Workbench is unreachable, so your sign-in cannot be confirmed.</p>
+          : <p>The Deployer uses the Workbench sign-in. Sign in to Workbench first, then come back here.</p>}
+        <p><a className="button" href={me.workbenchUrl}>Sign in with Workbench</a></p>
         {me.emergencyAvailable && (
           <form onSubmit={submit} className="emergency">
-            <h2>紧急账号</h2>
-            <p className="muted">只在 Workbench 无法访问时可用，每次使用都记入审计。</p>
-            <input type="password" autoComplete="current-password" placeholder="紧急账号密码" value={password} onChange={(e) => setPassword(e.target.value)} />
-            <button type="submit" disabled={!password}>登录</button>
+            <h2>Emergency account</h2>
+            <p className="muted">Available only while Workbench is unreachable; every use is audited.</p>
+            <input type="password" autoComplete="current-password" placeholder="Emergency account password" value={password} onChange={(e) => setPassword(e.target.value)} />
+            <button type="submit" disabled={!password}>Sign in</button>
             {error && <p className="error">{error}</p>}
           </form>
         )}
@@ -116,15 +157,15 @@ function Forbidden({ message }: { message: string }) {
   return (
     <main className="center">
       <section className="card narrow">
-        <h1>没有权限</h1>
+        <h1>No access</h1>
         <p>{message}</p>
-        <p className="muted">请 Workbench 管理员把你加入 deploy-viewer（查看）、deploy-uat 或 deploy-prod 组。</p>
+        <p className="muted">Ask a Workbench admin to add you to the deploy-viewer (view), deploy-uat or deploy-prod group.</p>
       </section>
     </main>
   );
 }
 
-function Status({ panel, setPanel, isAdmin }: { panel: Panel; setPanel: (p: Panel) => void; isAdmin: boolean }) {
+function Status({ panel, setPanel, isAdmin, onAssessment }: { panel: Panel; setPanel: (p: Panel) => void; isAdmin: boolean; onAssessment: (id: string) => void }) {
   const [data, setData] = useState<StatusView | undefined>();
   const [error, setError] = useState("");
   const [open, setOpen] = useState<Record<string, boolean>>({});
@@ -132,44 +173,49 @@ function Status({ panel, setPanel, isAdmin }: { panel: Panel; setPanel: (p: Pane
   useEffect(() => { refresh(); const t = setInterval(refresh, panel ? 5_000 : 30_000); return () => clearInterval(t); }, [refresh, panel]);
 
   if (error) return <p className="error">{error}</p>;
-  if (!data) return <p className="muted">正在读取…</p>;
+  if (!data) return <p className="muted">Loading…</p>;
   const peerApps = data.peer && "apps" in data.peer ? data.peer.apps : undefined;
   const peerName = data.peer && "environment" in data.peer ? data.peer.environment.toUpperCase() : "UAT";
   return (
     <>
       <div className="toolbar">
-        <h1>{data.environment.toUpperCase()} 正在运行</h1>
+        <h1>Running in {data.environment.toUpperCase()}</h1>
         <span className="muted">
-          {data.host ? <>容器状态 {when(data.host.at)}{data.host.stale && <span className="badge warn">已过期</span>}</> : "执行器还没有上报容器状态，只显示应用自报的版本"}
+          {data.host ? <>Container status {when(data.host.at)}{data.host.stale && <span className="badge warn">Stale</span>}</> : "The executor has not reported container status yet; showing only the versions apps report"}
         </span>
-        <button onClick={refresh}>刷新</button>
+        <button onClick={refresh}>Refresh</button>
       </div>
       <p className="executor">
-        {data.executor.online
-          ? <><span className="badge ok">执行器在线</span> <span className="muted">{data.executor.heartbeat?.version}{data.executor.heartbeat?.busy ? ` · 正在执行 ${data.executor.heartbeat.busy}` : ""}</span></>
-          : <><span className="badge bad">执行器离线</span> <span className="muted">{data.executor.reason}；可以查看，但不能构建和部署</span></>}
+        {data.executors.map((x) => (
+          <span key={x.host} className="executor-host">
+            {data.executors.length > 1 && <strong>{x.host}</strong>}
+            {x.online
+              ? <><span className="badge ok">Executor online</span> <span className="muted">{x.heartbeat?.version}{x.heartbeat?.busy ? ` · running ${x.heartbeat.busy}` : ""}</span></>
+              : <><span className="badge bad">Executor offline</span> <span className="muted">{x.reason}; apps on it can be viewed, not built or deployed</span></>}
+          </span>
+        ))}
       </p>
-      {data.peer && "error" in data.peer && <p className="banner warn">无法确认 UAT 记录：{data.peer.error}。只有已正式发布的版本、或管理员跳过晋级规则才能部署。</p>}
-      {panel?.kind === "deploy" && <DeployPanel key={`${panel.app}-${panel.initial?.version ?? ""}-${panel.initial?.pinFrom ?? ""}`} app={panel.app} isAdmin={isAdmin} {...(panel.initial ? { initial: panel.initial } : {})} onClose={() => setPanel(undefined)} onJob={(id) => setPanel({ kind: "job", id })} />}
+      {data.peer && "error" in data.peer && <p className="banner warn">Cannot check the UAT records: {data.peer.error}. Only officially released versions can be deployed, or an admin can skip the promotion rule.</p>}
+      {panel?.kind === "deploy" && <DeployPanel key={`${panel.app}-${panel.initial?.version ?? ""}-${panel.initial?.pinFrom ?? ""}`} app={panel.app} isAdmin={isAdmin} {...(panel.initial ? { initial: panel.initial } : {})} onClose={() => setPanel(undefined)} onJob={(id) => setPanel({ kind: "job", id })} onAssessment={onAssessment} />}
       {panel?.kind === "job" && <JobPanel id={panel.id} onClose={() => { setPanel(undefined); refresh(); }} />}
       <table className="status">
-        <thead><tr><th>应用</th><th>期望版本</th>{peerApps && <th>{peerName} 现在</th>}<th>清单</th><th>状态</th><th></th></tr></thead>
+        <thead><tr><th>App</th>{data.executors.length > 1 && <th>Host</th>}<th>Desired version</th>{peerApps && <th>{peerName} now</th>}<th>Manifest</th><th>Status</th><th></th></tr></thead>
         <tbody>
           {data.apps.map((a) => {
             const active = data.active.find((j) => j.app === a.app);
             return (
-              <AppRows key={a.app} app={a} {...(peerApps ? { peer: peerApps[a.app]?.version ?? null } : {})} open={!!open[a.app]} toggle={() => setOpen({ ...open, [a.app]: !open[a.app] })}
+              <AppRows key={a.app} app={a} {...(data.executors.length > 1 ? { host: data.hostOf[a.app] ?? "—" } : {})} {...(peerApps ? { peer: peerApps[a.app]?.version ?? null } : {})} open={!!open[a.app]} toggle={() => setOpen({ ...open, [a.app]: !open[a.app] })}
                 action={active
                   ? <button className="link" onClick={() => setPanel({ kind: "job", id: active.id })}><JobState state={active.state} /> {KIND[active.kind]} {active.kind.startsWith("env") ? "" : active.version}</button>
-                  : data.canDeploy ? <button onClick={() => setPanel({ kind: "deploy", app: a.app })}>部署…</button> : null} />
+                  : data.canDeploy ? <button onClick={() => setPanel({ kind: "deploy", app: a.app })}>Deploy…</button> : null} />
             );
           })}
         </tbody>
       </table>
       {data.unmanaged.length > 0 && (
         <section>
-          <h2>未纳入清单的容器</h2>
-          <table><thead><tr><th>服务</th><th>镜像</th><th>状态</th></tr></thead>
+          <h2>Containers not in any manifest</h2>
+          <table><thead><tr><th>Service</th><th>Image</th><th>Status</th></tr></thead>
             <tbody>{data.unmanaged.map((c) => <tr key={c.service}><td>{c.service}</td><td className="mono">{c.image}</td><td>{c.status}</td></tr>)}</tbody>
           </table>
         </section>
@@ -178,30 +224,31 @@ function Status({ panel, setPanel, isAdmin }: { panel: Panel; setPanel: (p: Pane
   );
 }
 
-function AppRows({ app, open, toggle, action, peer }: { app: StatusView["apps"][number]; open: boolean; toggle: () => void; action: React.ReactNode; peer?: string | null }) {
+function AppRows({ app, open, toggle, action, peer, host }: { app: StatusView["apps"][number]; open: boolean; toggle: () => void; action: React.ReactNode; peer?: string | null; host?: string }) {
   return (
     <>
       <tr className="app" onClick={toggle}>
         <td><span className="caret">{open ? "▾" : "▸"}</span>{app.name}<span className="muted"> {app.app}</span></td>
-        <td className="mono">{app.desired ?? <span className="muted">未纳入本环境</span>}</td>
-        {peer !== undefined && <td className="mono">{peer ?? <span className="muted">—</span>}{peer && app.desired && peer !== app.desired && <span className="badge info">可晋级</span>}</td>}
-        <td className="mono">{app.manifest ? `自 ${app.manifest}` : <span className="muted">无</span>}</td>
+        {host !== undefined && <td className="mono">{host}</td>}
+        <td className="mono">{app.desired ?? <span className="muted">Not in this environment</span>}</td>
+        {peer !== undefined && <td className="mono">{peer ?? <span className="muted">—</span>}{peer && app.desired && peer !== app.desired && <span className="badge info">Can promote</span>}</td>}
+        <td className="mono">{app.manifest ? `from ${app.manifest}` : <span className="muted">None</span>}</td>
         <td><Badge verdict={app.verdict} /></td>
         <td className="actions" onClick={(e) => e.stopPropagation()}>{action}</td>
       </tr>
       {open && (
-        <tr className="detail"><td colSpan={peer !== undefined ? 6 : 5}>
+        <tr className="detail"><td colSpan={5 + (peer !== undefined ? 1 : 0) + (host !== undefined ? 1 : 0)}>
           <table>
-            <thead><tr><th>组件</th><th>类型</th><th>服务</th><th>容器</th><th>标签版本</th><th>自报版本</th><th>判断</th></tr></thead>
+            <thead><tr><th>Component</th><th>Type</th><th>Service</th><th>Container</th><th>Label version</th><th>Reported version</th><th>Verdict</th></tr></thead>
             <tbody>
               {app.components.map((c) => (
                 <tr key={c.id}>
                   <td>{c.id}</td>
                   <td>{TYPE_LABEL[c.type] ?? c.type}</td>
                   <td className="mono">{c.service ?? "—"}</td>
-                  <td>{c.container ? <span title={c.container.image}>{c.container.status}</span> : c.type === "compose-service" ? <span className="muted">—</span> : <span className="muted">阶段 5 起显示</span>}</td>
+                  <td>{c.container ? <span title={c.container.image}>{c.container.status}</span> : c.type === "compose-service" ? <span className="muted">—</span> : <span className="muted">Shown from phase 5</span>}</td>
                   <td className="mono">{c.container?.version ?? "—"}</td>
-                  <td className="mono">{c.observed?.kind === "build" ? <span title={c.observed.commit}>{c.observed.version}</span> : c.observed?.kind === "no-build-info" ? <span className="muted">无 BUILD.json</span> : c.observed?.kind === "unreachable" ? <span className="muted">连不上</span> : "—"}</td>
+                  <td className="mono">{c.observed?.kind === "build" ? <span title={c.observed.commit}>{c.observed.version}</span> : c.observed?.kind === "no-build-info" ? <span className="muted">No BUILD.json</span> : c.observed?.kind === "unreachable" ? <span className="muted">Unreachable</span> : "—"}</td>
                   <td><Badge verdict={c.verdict} /></td>
                 </tr>
               ))}
@@ -223,18 +270,18 @@ function Registry({ principal }: { principal: Principal }) {
   useEffect(refresh, [refresh]);
 
   if (error) return <p className="error">{error}</p>;
-  if (!list) return <p className="muted">正在读取…</p>;
+  if (!list) return <p className="muted">Loading…</p>;
   if (selected) return <AppDetail id={selected} admin={admin} back={() => { setSelected(undefined); refresh(); }} />;
   return (
     <>
       <div className="toolbar">
-        <h1>应用注册表</h1>
-        <span className="muted">Deployer 只部署这里列出的应用（§4.4）{admin ? "" : "；只有 Workbench 管理员能修改"}</span>
-        {admin && <button onClick={() => setAdding(!adding)}>{adding ? "取消" : "登记应用"}</button>}
+        <h1>App registry</h1>
+        <span className="muted">The Deployer only deploys the apps listed here (§4.4){admin ? "" : "; only Workbench admins can change it"}</span>
+        {admin && <button onClick={() => setAdding(!adding)}>{adding ? "Cancel" : "Register an app"}</button>}
       </div>
       {adding && <ManifestForm onSaved={() => { setAdding(false); refresh(); }} />}
       <table>
-        <thead><tr><th>应用</th><th>仓库</th><th>清单</th><th>登记</th></tr></thead>
+        <thead><tr><th>App</th><th>Repository</th><th>Manifests</th><th>Registered</th></tr></thead>
         <tbody>
           {list.map((a) => {
             const ranges = [...new Set(a.manifests.map((m) => m.appliesFrom))];
@@ -242,7 +289,7 @@ function Registry({ principal }: { principal: Principal }) {
               <tr key={a.id} className="app" onClick={() => setSelected(a.id)}>
                 <td>{a.name}<span className="muted"> {a.id}</span></td>
                 <td className="mono">{a.repo}</td>
-                <td className="mono">{ranges.map((r) => `自 ${r}`).join("，")}</td>
+                <td className="mono">{ranges.map((r) => `from ${r}`).join(", ")}</td>
                 <td className="muted">{a.addedBy} · {when(a.addedAt)}</td>
               </tr>
             );
@@ -263,46 +310,46 @@ function AppDetail({ id, admin, back }: { id: string; admin: boolean; back: () =
 
   const show = (from: string, rev: number) => api.revision(id, from, rev).then((body) => setShown({ from, rev, body }), (e: Error) => setError(e.message));
   const remove = () => {
-    if (!confirm(`从注册表移除 ${id}？清单历史保留，但 Deployer 不再部署它。`)) return;
+    if (!confirm(`Remove ${id} from the registry? Its manifest history is kept, but the Deployer will no longer deploy it.`)) return;
     api.removeApp(id).then(back, (e: Error) => setError(e.message));
   };
 
   if (error) return <p className="error">{error}</p>;
-  if (!data) return <p className="muted">正在读取…</p>;
+  if (!data) return <p className="muted">Loading…</p>;
   const { app } = data;
   return (
     <>
       <div className="toolbar">
-        <button className="link" onClick={back}>← 注册表</button>
+        <button className="link" onClick={back}>← Registry</button>
         <h1>{app.name}<span className="muted"> {app.id}</span></h1>
         <span className="mono muted">{app.repo}</span>
-        {admin && <><button onClick={() => setEditing(data.manifests.at(-1) ?? null)}>新清单 / 修改</button><button className="danger" onClick={remove}>移除</button></>}
+        {admin && <><button onClick={() => setEditing(data.manifests.at(-1) ?? null)}>New manifest / edit</button><button className="danger" onClick={remove}>Remove</button></>}
       </div>
       {editing !== null && <ManifestForm initial={editing} appId={app.id} onSaved={() => { setEditing(null); refresh(); }} />}
-      <h2>当前清单</h2>
+      <h2>Current manifests</h2>
       <table>
-        <thead><tr><th>适用自</th><th>组件</th><th>env 文件</th></tr></thead>
+        <thead><tr><th>Applies from</th><th>Components</th><th>env file</th></tr></thead>
         <tbody>
           {data.manifests.map((m) => (
             <tr key={m.appliesFrom}>
               <td className="mono">{m.appliesFrom}</td>
-              <td>{m.components.map((c) => `${c.id}（${TYPE_LABEL[c.type] ?? c.type}）`).join("、")}</td>
+              <td>{m.components.map((c) => `${c.id} (${TYPE_LABEL[c.type] ?? c.type})`).join(", ")}</td>
               <td className="mono">{m.env?.file ?? "—"}</td>
             </tr>
           ))}
         </tbody>
       </table>
-      <h2>修改历史</h2>
+      <h2>Change history</h2>
       <table>
-        <thead><tr><th>适用自</th><th>版次</th><th>谁</th><th>何时</th><th>说明</th><th></th></tr></thead>
+        <thead><tr><th>Applies from</th><th>Revision</th><th>Who</th><th>When</th><th>Note</th><th></th></tr></thead>
         <tbody>
           {app.manifests.map((m) => (
             <tr key={`${m.appliesFrom}-${m.revision}`}>
               <td className="mono">{m.appliesFrom}</td><td>{m.revision}</td><td>{m.savedBy}</td><td className="muted">{when(m.savedAt)}</td>
               <td className="muted">{m.note ?? ""}</td>
               <td className="actions">
-                <button className="link" onClick={() => show(m.appliesFrom, m.revision)}>查看</button>
-                <a href={api.revisionUrl(app.id, m.appliesFrom, m.revision)}>导出 deploy.json</a>
+                <button className="link" onClick={() => show(m.appliesFrom, m.revision)}>View</button>
+                <a href={api.revisionUrl(app.id, m.appliesFrom, m.revision)}>Export deploy.json</a>
               </td>
             </tr>
           ))}
@@ -310,7 +357,7 @@ function AppDetail({ id, admin, back }: { id: string; admin: boolean; back: () =
       </table>
       {shown && (
         <section>
-          <div className="toolbar"><h2>{shown.from} 第 {shown.rev} 版</h2><button className="link" onClick={() => setShown(undefined)}>收起</button></div>
+          <div className="toolbar"><h2>{shown.from} revision {shown.rev}</h2><button className="link" onClick={() => setShown(undefined)}>Hide</button></div>
           <pre className="json">{JSON.stringify(shown.body, null, 2)}</pre>
         </section>
       )}
@@ -327,22 +374,22 @@ function ManifestForm({ initial, appId, onSaved }: { initial?: Manifest; appId?:
     e.preventDefault();
     setError(undefined);
     let manifest: { app?: string };
-    try { manifest = JSON.parse(text); } catch (err) { setError({ message: `不是合法的 JSON：${(err as Error).message}`, details: [] }); return; }
+    try { manifest = JSON.parse(text); } catch (err) { setError({ message: `Not valid JSON: ${(err as Error).message}`, details: [] }); return; }
     const id = appId ?? manifest.app;
-    if (!id) { setError({ message: "清单里没有 app。", details: [] }); return; }
+    if (!id) { setError({ message: "The manifest has no app.", details: [] }); return; }
     api.saveManifest(id, manifest, name || undefined, note || undefined).then(onSaved, (err: api.ApiError) => setError({ message: err.message, details: err.details }));
   };
   return (
     <form className="card manifest" onSubmit={submit}>
       <p className="muted">
-        {appId ? "改 appliesFrom 即从新版本起另立一份清单；不改则保存为同一区间的新版次。" : "粘贴部署清单 v1（deploy.json）。第一份清单登记应用，仓库取自 release.repo。"}
-        保存前按格式 v1 校验，并检查服务名、宿主机端口和其他应用不冲突。
+        {appId ? "Changing appliesFrom starts a separate manifest from the new version; otherwise it is saved as a new revision for the same range." : "Paste a deploy manifest v1 (deploy.json). The first manifest registers the app; the repository comes from release.repo."}
+        It is validated against format v1 before saving, and checked for conflicts in service names and host ports with other apps.
       </p>
       <textarea spellCheck={false} value={text} onChange={(e) => setText(e.target.value)} placeholder='{ "v": 1, "app": "…", "appliesFrom": "…", … }' />
       <div className="row">
-        {!appId && <input placeholder="显示名（可选）" value={name} onChange={(e) => setName(e.target.value)} />}
-        <input placeholder="修改说明（可选）" value={note} onChange={(e) => setNote(e.target.value)} />
-        <button type="submit" disabled={!text.trim()}>校验并保存</button>
+        {!appId && <input placeholder="Display name (optional)" value={name} onChange={(e) => setName(e.target.value)} />}
+        <input placeholder="Change note (optional)" value={note} onChange={(e) => setNote(e.target.value)} />
+        <button type="submit" disabled={!text.trim()}>Validate and save</button>
       </div>
       {error && <div className="error">{error.message}{error.details.length > 0 && <ul>{error.details.map((d) => <li key={d} className="mono">{d}</li>)}</ul>}</div>}
     </form>
@@ -354,13 +401,13 @@ function Audit() {
   const [error, setError] = useState("");
   useEffect(() => { api.audit().then((d) => setEntries(d.entries), (e: Error) => setError(e.message)); }, []);
   if (error) return <p className="error">{error}</p>;
-  if (!entries) return <p className="muted">正在读取…</p>;
-  const VIA: Record<string, string> = { workbench: "Workbench", emergency: "紧急账号", cli: "命令行" };
+  if (!entries) return <p className="muted">Loading…</p>;
+  const VIA: Record<string, string> = { workbench: "Workbench", emergency: "Emergency account", cli: "Command line" };
   return (
     <>
-      <div className="toolbar"><h1>审计</h1><span className="muted">最近 100 条</span></div>
+      <div className="toolbar"><h1>Audit</h1><span className="muted">Latest 100</span></div>
       <table>
-        <thead><tr><th>时间</th><th>谁</th><th>经由</th><th>操作</th><th>对象</th><th>详情</th></tr></thead>
+        <thead><tr><th>Time</th><th>Who</th><th>Via</th><th>Action</th><th>Object</th><th>Details</th></tr></thead>
         <tbody>
           {entries.map((e) => (
             <tr key={e.id} className={e.via === "emergency" ? "flag" : ""}>

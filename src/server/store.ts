@@ -69,9 +69,20 @@ CREATE TABLE IF NOT EXISTS briefs (date TEXT PRIMARY KEY, body TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS component_state (
   app TEXT NOT NULL, component TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, updated_at TEXT NOT NULL,
   PRIMARY KEY (app, component, key));
+CREATE TABLE IF NOT EXISTS executor_tokens (
+  sha256 TEXT PRIMARY KEY, host TEXT NOT NULL, prefix TEXT NOT NULL, created_at TEXT NOT NULL, created_by TEXT NOT NULL, revoked_at TEXT);
+CREATE TABLE IF NOT EXISTS executor_jobs (
+  id TEXT PRIMARY KEY, host TEXT NOT NULL, request TEXT NOT NULL, content TEXT, queued_at TEXT NOT NULL, picked_at TEXT,
+  status TEXT, log TEXT NOT NULL DEFAULT '', env_content TEXT, env_content_at TEXT);
+CREATE INDEX IF NOT EXISTS executor_jobs_host ON executor_jobs (host, picked_at, queued_at);
+CREATE TABLE IF NOT EXISTS executor_hosts (
+  host TEXT PRIMARY KEY, heartbeat TEXT, beat_at TEXT, containers TEXT, files TEXT, state_at TEXT);
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS nginx_revisions (
+  revision INTEGER PRIMARY KEY, body TEXT NOT NULL, sha256 TEXT NOT NULL, saved_at TEXT NOT NULL, saved_by TEXT NOT NULL, note TEXT);
 `;
 
-/** queued: written to the handoff directory; the rest are the executor's states. */
+/** queued: waiting for the host's executor to claim it; the rest are the executor's states. */
 export type JobState = "queued" | "running" | "succeeded" | "failed" | "rolled-back" | "refused";
 export const FINAL_STATES: JobState[] = ["succeeded", "failed", "rolled-back", "refused"];
 
@@ -138,7 +149,7 @@ export interface Job {
   fromVersion: string | null;
   /** app@appliesFrom#revision of the manifest the plan used. */
   manifest: string | null;
-  /** The deploy whose digests this one restores ("回到这一版"). */
+  /** The deploy whose digests this one restores ("go back to this version"). */
   pinFrom: string | null;
   request: Record<string, unknown>;
   status: ExecutorStatus | null;
@@ -465,7 +476,7 @@ export class Store {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
         .run(app, revision, JSON.stringify(values), JSON.stringify(changes), source, at, actor.id, actor.via, options.note ?? null,
           options.appliedJob ? at : null, options.appliedJob ?? null);
-      // Secrets appear by name only (§7.2: 已修改), as in the revision's own change list.
+      // Secrets appear by name only (§7.2: "changed"), as in the revision's own change list.
       this.insertAudit(actor, `env.${source}`, `${app}#${revision}`, { changes, ...options.detail });
       this.db.exec("COMMIT");
       return revision;
@@ -514,5 +525,113 @@ export class Store {
 
   endEmergencySession(tokenSha256: string) {
     this.db.prepare("DELETE FROM emergency_sessions WHERE token_sha256 = ?").run(tokenSha256);
+  }
+
+  // D35: executors on each host reach the Deployer over HTTPS; their jobs, heartbeats and host state live here.
+
+  addExecutorToken(host: string, sha256: string, prefix: string, actor: Actor) {
+    this.db.prepare("INSERT INTO executor_tokens (sha256, host, prefix, created_at, created_by) VALUES (?, ?, ?, ?, ?)").run(sha256, host, prefix, this.stamp(), actor.id);
+    this.audit(actor, "host.token-created", host, { prefix });
+  }
+
+  revokeExecutorTokens(host: string, actor: Actor): number {
+    const n = Number(this.db.prepare("UPDATE executor_tokens SET revoked_at = ? WHERE host = ? AND revoked_at IS NULL").run(this.stamp(), host).changes);
+    this.audit(actor, "host.token-revoked", host, { tokens: n });
+    return n;
+  }
+
+  /** The host a live executor token belongs to. */
+  executorHost(sha256: string): string | undefined {
+    return (this.db.prepare("SELECT host FROM executor_tokens WHERE sha256 = ? AND revoked_at IS NULL").get(sha256) as Row | undefined)?.host;
+  }
+
+  executorTokens(): { host: string; prefix: string; createdAt: string; createdBy: string; revokedAt: string | null }[] {
+    return (this.db.prepare("SELECT * FROM executor_tokens ORDER BY created_at").all() as Row[]).map((r) => ({ host: r.host, prefix: r.prefix, createdAt: r.created_at, createdBy: r.created_by, revokedAt: r.revoked_at ?? null }));
+  }
+
+  queueExecutorJob(id: string, host: string, request: Record<string, unknown>, content?: string) {
+    this.db.prepare("INSERT INTO executor_jobs (id, host, request, content, queued_at) VALUES (?, ?, ?, ?, ?)").run(id, host, JSON.stringify(request), content ?? null, this.stamp());
+  }
+
+  /** Claims the oldest job queued for a host; an env job's content leaves the queue with it. */
+  claimExecutorJob(host: string): Record<string, unknown> | undefined {
+    const r = this.db.prepare("SELECT id, request, content FROM executor_jobs WHERE host = ? AND picked_at IS NULL ORDER BY queued_at, rowid LIMIT 1").get(host) as Row | undefined;
+    if (!r) return undefined;
+    this.db.prepare("UPDATE executor_jobs SET picked_at = ?, content = NULL WHERE id = ?").run(this.stamp(), r.id);
+    const request = JSON.parse(r.request) as Record<string, unknown>;
+    return r.content === null ? request : { ...request, content: r.content };
+  }
+
+  executorJob(id: string): { host: string; request: Record<string, unknown>; pickedAt: string | null; status: ExecutorStatus | null; log: string } | undefined {
+    const r = this.db.prepare("SELECT host, request, picked_at, status, log FROM executor_jobs WHERE id = ?").get(id) as Row | undefined;
+    return r && { host: r.host, request: JSON.parse(r.request), pickedAt: r.picked_at ?? null, status: parse(r.status), log: r.log };
+  }
+
+  executorJobs(host?: string): { id: string; host: string; pickedAt: string | null }[] {
+    return (this.db.prepare("SELECT id, host, picked_at FROM executor_jobs WHERE (?1 IS NULL OR host = ?1) ORDER BY queued_at, rowid").all(host ?? null) as Row[]).map((r) => ({ id: r.id, host: r.host, pickedAt: r.picked_at ?? null }));
+  }
+
+  setExecutorStatus(id: string, status: ExecutorStatus) {
+    this.db.prepare("UPDATE executor_jobs SET status = ? WHERE id = ?").run(JSON.stringify(status), id);
+  }
+
+  /** Appends to a job's log, keeping its last 2 MB. */
+  appendExecutorLog(id: string, text: string) {
+    this.db.prepare("UPDATE executor_jobs SET log = substr(log || ?, -2097152) WHERE id = ?").run(text, id);
+  }
+
+  setExecutorEnvContent(id: string, content: string) {
+    this.db.prepare("UPDATE executor_jobs SET env_content = ?, env_content_at = ? WHERE id = ?").run(content, this.stamp(), id);
+  }
+
+  /** An env-read copy is for the import within seconds: it is handed over once, and dropped after 10 minutes anyway. */
+  takeExecutorEnvContent(id: string): string | undefined {
+    this.db.prepare("UPDATE executor_jobs SET env_content = NULL WHERE env_content_at < ?").run(new Date(this.now().getTime() - 600_000).toISOString());
+    const r = this.db.prepare("SELECT env_content FROM executor_jobs WHERE id = ?").get(id) as Row | undefined;
+    if (r?.env_content == null) return undefined;
+    this.db.prepare("UPDATE executor_jobs SET env_content = NULL WHERE id = ?").run(id);
+    return r.env_content;
+  }
+
+  setHeartbeat(host: string, heartbeat: unknown) {
+    this.db.prepare("INSERT INTO executor_hosts (host, heartbeat, beat_at) VALUES (?1, ?2, ?3) ON CONFLICT (host) DO UPDATE SET heartbeat = ?2, beat_at = ?3").run(host, JSON.stringify(heartbeat), this.stamp());
+  }
+
+  setHostState(host: string, containers: unknown[], files: Record<string, string>) {
+    this.db.prepare("INSERT INTO executor_hosts (host, containers, files, state_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT (host) DO UPDATE SET containers = ?2, files = ?3, state_at = ?4").run(host, JSON.stringify(containers), JSON.stringify(files), this.stamp());
+  }
+
+  executorHosts(): { host: string; heartbeat: unknown; beatAt: string | null; containers: unknown[] | null; files: Record<string, string> | null; stateAt: string | null }[] {
+    return (this.db.prepare("SELECT * FROM executor_hosts ORDER BY host").all() as Row[]).map((r) => ({ host: r.host, heartbeat: parse(r.heartbeat), beatAt: r.beat_at ?? null, containers: parse(r.containers), files: parse(r.files), stateAt: r.state_at ?? null }));
+  }
+
+  // D36: environment-wide settings an administrator keeps on the page (the internal CA certificate).
+
+  setting(key: string): string | undefined {
+    return (this.db.prepare("SELECT value FROM settings WHERE key = ?").get(key) as Row | undefined)?.value;
+  }
+
+  setSetting(key: string, value: string | null, actor: Actor) {
+    if (value === null) this.db.prepare("DELETE FROM settings WHERE key = ?").run(key);
+    else this.db.prepare("INSERT INTO settings (key, value, updated_at, updated_by) VALUES (?1, ?2, ?3, ?4) ON CONFLICT (key) DO UPDATE SET value = ?2, updated_at = ?3, updated_by = ?4").run(key, value, this.stamp(), actor.id);
+    this.audit(actor, "setting.changed", key, { cleared: value === null });
+  }
+
+  // D36: the recommended nginx configuration, kept as revisions for operations to apply.
+
+  saveNginx(body: string, sha256: string, actor: Actor, note?: string): number {
+    const next = Number((this.db.prepare("SELECT COALESCE(MAX(revision), 0) + 1 AS n FROM nginx_revisions").get() as Row).n);
+    this.db.prepare("INSERT INTO nginx_revisions (revision, body, sha256, saved_at, saved_by, note) VALUES (?, ?, ?, ?, ?, ?)").run(next, body, sha256, this.stamp(), actor.id, note ?? null);
+    this.audit(actor, "nginx.revision", String(next), { sha256, note: note ?? null });
+    return next;
+  }
+
+  nginxRevisions(): { revision: number; sha256: string; savedAt: string; savedBy: string; note: string | null }[] {
+    return (this.db.prepare("SELECT revision, sha256, saved_at, saved_by, note FROM nginx_revisions ORDER BY revision DESC").all() as Row[]).map((r) => ({ revision: r.revision, sha256: r.sha256, savedAt: r.saved_at, savedBy: r.saved_by, note: r.note ?? null }));
+  }
+
+  nginxRevision(revision?: number): { revision: number; body: string; sha256: string; savedAt: string; savedBy: string; note: string | null } | undefined {
+    const r = (revision === undefined ? this.db.prepare("SELECT * FROM nginx_revisions ORDER BY revision DESC LIMIT 1").get() : this.db.prepare("SELECT * FROM nginx_revisions WHERE revision = ?").get(revision)) as Row | undefined;
+    return r && { revision: r.revision, body: r.body, sha256: r.sha256, savedAt: r.saved_at, savedBy: r.saved_by, note: r.note ?? null };
   }
 }

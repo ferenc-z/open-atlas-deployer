@@ -32,16 +32,16 @@ export function checkContracts(app: string, version: string, doc: ContractDoc, o
   const known = others.filter((o) => o.doc);
   for (const [name, range] of Object.entries(doc.requires)) {
     const providers = known.filter((o) => o.doc!.provides[name] !== undefined);
-    if (!providers.length) { unknown.push(`${app} ${version} 要求 ${name} ${range}，这个环境里没有登记提供它的应用${others.some((o) => !o.doc) ? "（有应用的契约读不到）" : ""}`); continue; }
+    if (!providers.length) { unknown.push(`${app} ${version} requires ${name} ${range}, but no registered app in this environment provides it${others.some((o) => !o.doc) ? " (some apps' contracts could not be read)" : ""}`); continue; }
     for (const o of providers) {
-      if (!satisfies(o.doc!.provides[name]!, range)) unmet.push(`${app} ${version} 要求 ${name} ${range}，${o.app} ${o.version} 提供的是 ${o.doc!.provides[name]}`);
+      if (!satisfies(o.doc!.provides[name]!, range)) unmet.push(`${app} ${version} requires ${name} ${range}, but ${o.app} ${o.version} provides ${o.doc!.provides[name]}`);
     }
   }
   for (const o of known) {
     for (const [name, range] of Object.entries(o.doc!.requires)) {
       const provided = doc.provides[name];
       if (provided === undefined) continue;
-      if (!satisfies(provided, range)) unmet.push(`${o.app} ${o.version} 要求 ${name} ${range}，${app} ${version} 提供的是 ${provided}`);
+      if (!satisfies(provided, range)) unmet.push(`${o.app} ${o.version} requires ${name} ${range}, but ${app} ${version} provides ${provided}`);
     }
   }
   return { unmet, unknown };
@@ -71,8 +71,8 @@ export class ContractDocs {
         headers: { accept: "application/vnd.github.raw", "user-agent": "open-atlas-deployer", ...(token ? { authorization: `Bearer ${token}` } : {}) },
         signal: AbortSignal.timeout(8_000),
       });
-    } catch (error) { throw new Error(`连不上 GitHub：${(error as Error).message}`); }
-    if (!response.ok) throw new Error(`读不到 ${repo}@${tag} 的 ${path}（HTTP ${response.status}）`);
+    } catch (error) { throw new Error(`Cannot reach GitHub: ${(error as Error).message}`); }
+    if (!response.ok) throw new Error(`Cannot read ${path} of ${repo}@${tag} (HTTP ${response.status})`);
     const body = JSON.parse(await response.text()) as Partial<ContractDoc>;
     const doc = { provides: body.provides ?? {}, requires: body.requires ?? {} };
     this.cache.set(key, doc);

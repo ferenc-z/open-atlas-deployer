@@ -155,7 +155,7 @@ export function verifyPassword(password: string, stored: string): boolean {
 }
 
 export function emergencyPrincipal(csrfToken: string): Principal {
-  return { id: "emergency", displayName: "紧急管理员", via: "emergency", groups: [], isAdmin: true, permissions: permissionsFor([], true), csrfToken };
+  return { id: "emergency", displayName: "Emergency admin", via: "emergency", groups: [], isAdmin: true, permissions: permissionsFor([], true), csrfToken };
 }
 
 export function newToken(): { token: string; sha256: string } {

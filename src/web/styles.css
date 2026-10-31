@@ -45,20 +45,66 @@ a { color: var(--accent); }
 .error { color: var(--bad); }
 .error ul { margin: 6px 0 0; padding-left: 18px; }
 
-header { display: flex; align-items: center; gap: 24px; padding: 10px 24px; background: var(--surface); border-bottom: 1px solid var(--border); flex-wrap: wrap; }
-.brand { font-weight: 600; display: flex; align-items: center; gap: 8px; }
+/* D33: navigation down the left in groups; on a phone it folds into a menu button. */
+.shell { display: flex; min-height: 100vh; }
+.sidebar { position: sticky; top: 0; height: 100vh; width: 220px; flex: none; display: flex; flex-direction: column; background: var(--surface); border-right: 1px solid var(--border); padding: 14px 10px; overflow-y: auto; }
+.brand { font-weight: 600; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 0 8px 14px; }
 .env { font-size: 11px; font-weight: 600; letter-spacing: .05em; padding: 1px 6px; border-radius: 4px; background: var(--info-bg); color: var(--info); }
-nav { display: flex; gap: 4px; flex: 1; }
-nav button { background: none; border: none; padding: 6px 10px; border-radius: 6px; color: var(--muted); }
-nav button.active { background: var(--bg); color: var(--text); font-weight: 600; }
-.who { display: flex; gap: 10px; align-items: center; }
+.env.prod { background: var(--bad-bg); color: var(--bad); }
+.sidebar .menu { display: none; margin-left: auto; border: none; background: none; font-size: 18px; padding: 0 4px; }
+nav { display: flex; flex-direction: column; gap: 18px; flex: 1; }
+.group { display: flex; flex-direction: column; gap: 2px; }
+/* Level 1: the group, in the text colour and larger; level 2: its pages, indented behind a guide line. */
+.group-title { font-size: 14px; font-weight: 700; color: var(--text); padding: 0 8px 6px; }
+.group-items { display: flex; flex-direction: column; gap: 2px; margin-left: 12px; padding-left: 8px; border-left: 2px solid var(--border); }
+nav button { background: none; border: none; text-align: left; padding: 5px 10px; border-radius: 6px; color: var(--muted); font-size: 13px; }
+nav button:hover { background: var(--bg); color: var(--text); }
+nav button.active { position: relative; background: var(--info-bg); color: var(--info); font-weight: 600; }
+nav button.active::before { content: ""; position: absolute; left: -10px; top: 4px; bottom: 4px; width: 2px; background: var(--info); }
+.who { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; border-top: 1px solid var(--border); padding: 12px 8px 0; margin-top: 12px; }
+.content { flex: 1; min-width: 0; }
+.subtabs { display: inline-flex; gap: 2px; padding: 2px; margin-bottom: 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+.subtabs button { border: none; background: none; padding: 4px 14px; border-radius: 6px; color: var(--muted); }
+.subtabs button.active { background: var(--bg); color: var(--text); font-weight: 600; }
+@media (max-width: 760px) {
+  .shell { flex-direction: column; }
+  .sidebar { position: sticky; height: auto; width: 100%; padding: 10px 16px; border-right: none; border-bottom: 1px solid var(--border); z-index: 6; }
+  .brand { padding: 0; }
+  .sidebar .menu { display: block; }
+  .sidebar nav, .sidebar .who { display: none; }
+  .sidebar.open nav, .sidebar.open .who { display: flex; }
+  .sidebar.open nav { margin-top: 12px; }
+}
 
 main { padding: 20px 24px 48px; max-width: 1200px; margin: 0 auto; }
-main.with-assistant { margin-right: 440px; }
-.assistant { position: fixed; right: 0; top: 56px; bottom: 0; width: 420px; display: flex; flex-direction: column; background: var(--surface); border-left: 1px solid var(--border); z-index: 5; }
-.assistant .toolbar { padding: 8px 12px; margin: 0; }
-.assistant iframe { flex: 1; border: 0; width: 100%; }
-@media (max-width: 900px) { main.with-assistant { margin-right: 0; } .assistant { width: 100%; } }
+/* D34: the Deploy Assistant is a third column beside the page; under 1100px a drawer over it, on a phone full screen. */
+main { overflow-x: auto; }
+.assistant { position: sticky; top: 0; height: 100vh; flex: none; width: var(--assistant-width, 420px); display: flex; flex-direction: column; background: var(--surface); border-left: 1px solid var(--border); }
+.assistant .toolbar { padding: 8px 12px; margin: 0; gap: 10px; border-bottom: 1px solid var(--border); }
+.assistant .toolbar { flex-wrap: nowrap; }
+.assistant .toolbar > .muted { font-size: 12px; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.assistant iframe { flex: 1; border: 0; width: 100%; min-height: 0; }
+.assistant.dragging iframe { pointer-events: none; }
+.assistant-resizer { position: absolute; left: -3px; top: 0; bottom: 0; width: 6px; cursor: col-resize; z-index: 2; }
+.assistant-resizer:hover, .assistant.dragging .assistant-resizer { background: var(--info); opacity: .5; }
+.assistant.collapsed { width: 40px; }
+.assistant.collapsed iframe { display: none; }
+.assistant-strip { flex: 1; border: none; border-radius: 0; background: var(--surface); color: var(--muted); padding: 12px 0; display: flex; justify-content: center; }
+.assistant-strip:hover { background: var(--bg); color: var(--text); }
+.assistant-strip span { writing-mode: vertical-rl; font-weight: 600; letter-spacing: .04em; }
+.assistant.expanded { flex: 1; width: auto; }
+.shell:has(.assistant.expanded) .content { display: none; }
+.assistant-backdrop { display: none; }
+@media (max-width: 1100px) {
+  .assistant { position: fixed; right: 0; top: 0; bottom: 0; height: auto; width: min(480px, 100%); z-index: 20; box-shadow: -8px 0 24px rgba(0, 0, 0, .18); }
+  .assistant.expanded { width: min(480px, 100%); }
+  .shell:has(.assistant.expanded) .content { display: block; }
+  .assistant.collapsed { top: auto; bottom: 16px; height: auto; width: auto; border: 1px solid var(--border); border-radius: 8px 0 0 8px; box-shadow: -2px 2px 8px rgba(0, 0, 0, .15); }
+  .assistant.collapsed .assistant-strip { padding: 10px 8px; border-radius: 8px 0 0 8px; }
+  .assistant-resizer, .assistant .wide-only { display: none; }
+  .assistant-backdrop { display: block; position: fixed; inset: 0; background: rgba(0, 0, 0, .25); z-index: 19; }
+}
+@media (max-width: 760px) { .assistant:not(.collapsed) { width: 100%; } .assistant .toolbar > .muted { display: none; } }
 main.center { display: grid; place-items: center; min-height: 80vh; }
 
 .banner { padding: 8px 24px; font-size: 13px; }
@@ -114,7 +160,8 @@ pre.json { background: var(--surface); border: 1px solid var(--border); border-r
 }
 
 /* phase 2 */
-.executor { margin: -4px 0 12px; }
+.executor { margin: -4px 0 12px; display: flex; flex-wrap: wrap; gap: 6px 18px; }
+.executor-host { display: inline-flex; align-items: center; gap: 6px; }
 .panel { margin-bottom: 16px; display: grid; gap: 12px; }
 .panel h2, .panel h3 { margin: 0; }
 .plan { display: grid; gap: 10px; }
@@ -138,6 +185,8 @@ td.clip { max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-spa
 
 /* Phase 3: environment variables */
 select { font: inherit; padding: 5px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: var(--text); }
+select.versions option.running { font-weight: 600; background: var(--ok-bg); color: var(--ok); }
+select.versions option.uncovered { color: var(--muted); }
 td.value { word-break: break-all; max-width: 420px; }
 tr.absent td { background: var(--bg); }
 tr.current td { background: var(--info-bg); }
@@ -148,3 +197,36 @@ table.edit td:first-child { width: 34%; }
 
 /* Phase 4 */
 .override input { flex: 1; }
+
+/* D37: environment variables page. */
+.app-cards { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+.app-card { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; min-width: 160px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); text-align: left; }
+.app-card:hover { border-color: var(--info); }
+.app-card.selected { border-color: var(--info); box-shadow: 0 0 0 2px var(--info-bg); }
+.app-card .badge { margin-left: 0; }
+.env-status { padding: 14px 16px; margin-bottom: 12px; }
+.steps3 { display: flex; align-items: stretch; gap: 10px; flex-wrap: wrap; }
+.step3 { flex: 1; min-width: 180px; display: flex; flex-direction: column; gap: 4px; padding: 10px 12px; border-radius: 8px; background: var(--bg); border: 1px solid var(--border); }
+.step3.ok { border-color: var(--ok); }
+.step3.warn { border-color: var(--warn); background: var(--warn-bg); }
+.step3.next { background: var(--surface); }
+.step3.next button { align-self: flex-start; }
+.steps3 .arrow { align-self: center; color: var(--muted); font-size: 18px; }
+.small { font-size: 12px; }
+.env-status .row { margin-top: 8px; gap: 10px; align-items: center; }
+.env-filters { align-items: center; gap: 6px; margin: 8px 0 10px; flex-wrap: wrap; }
+.chip { border-radius: 14px; padding: 3px 10px; font-size: 12px; color: var(--muted); }
+.chip strong { color: var(--text); margin-left: 2px; }
+.chip.active { background: var(--info-bg); border-color: var(--info); color: var(--info); }
+.chip.bad strong { color: var(--bad); }
+.chip.warn strong { color: var(--warn); }
+.env-filters .search { margin-left: auto; min-width: 200px; }
+.banner.clickable { display: block; width: 100%; text-align: left; border: none; border-radius: 8px; cursor: pointer; margin-bottom: 8px; }
+table.env-values tr.group-row td { background: var(--bg); font-weight: 600; padding: 6px 12px; }
+table.env-values tr.group-row button.link { color: var(--text); font-weight: 600; }
+table.env-values td.desc { max-width: 380px; }
+.clip1 { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
+table.env-values.edit input { width: 100%; box-sizing: border-box; }
+.edit-bar { position: sticky; bottom: 0; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 10px 12px; margin-top: 10px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 -4px 12px rgba(0, 0, 0, .06); }
+.edit-bar > .muted { flex-basis: 100%; font-size: 12px; }
+.edit-bar input { flex: 1; }

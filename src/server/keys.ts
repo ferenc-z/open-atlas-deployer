@@ -45,12 +45,12 @@ export class Keys {
   }
 
   create(p: Principal, kind: KeyKind, name: string, days: number): { key: string; record: ApiKey } {
-    if (p.via !== "workbench") throw new KeyError(403, "key/browser-only", "API key 只能在页面上用 Workbench 登录生成，不能用 key 生成 key。");
-    if (kind === "service" && !p.isAdmin) throw new KeyError(403, "key/forbidden", "只有 Workbench 管理员能生成服务 key。");
-    if (kind === "personal" && !p.permissions.includes("view")) throw new KeyError(403, "key/forbidden", "不在任何 deploy 组里，不能生成 key。");
+    if (p.via !== "workbench") throw new KeyError(403, "key/browser-only", "API keys can only be created on the page while signed in with Workbench, not with another key.");
+    if (kind === "service" && !p.isAdmin) throw new KeyError(403, "key/forbidden", "Only Workbench admins can create service keys.");
+    if (kind === "personal" && !p.permissions.includes("view")) throw new KeyError(403, "key/forbidden", "You are not in any deploy group, so you cannot create a key.");
     const label = name.trim();
-    if (!label || label.length > 80) throw new KeyError(400, "key/name", "key 的名字要有 1 到 80 个字。");
-    if (!Number.isInteger(days) || days < 1 || days > 365) throw new KeyError(400, "key/expiry", "有效期是 1 到 365 天。");
+    if (!label || label.length > 80) throw new KeyError(400, "key/name", "A key name is 1 to 80 characters.");
+    if (!Number.isInteger(days) || days < 1 || days > 365) throw new KeyError(400, "key/expiry", "Expiry is 1 to 365 days.");
     const key = `${kind === "personal" ? "dpk" : "dps"}_${randomBytes(32).toString("base64url")}`;
     const id = `key_${randomBytes(8).toString("hex")}`;
     const record = this.store.addKey({ id, kind, name: label, prefix: key.slice(0, 12), sha256: sha256(key), owner: p.id, expiresAt: new Date(this.now() + days * 86_400_000).toISOString() }, { id: p.id, via: "workbench" });
@@ -63,26 +63,26 @@ export class Keys {
   }
 
   revoke(p: Principal, id: string) {
-    if (p.via !== "workbench") throw new KeyError(403, "key/browser-only", "吊销 key 要在页面上操作。");
+    if (p.via !== "workbench") throw new KeyError(403, "key/browser-only", "Keys are revoked on the page.");
     const k = this.store.listKeys().find((x) => x.id === id);
-    if (!k || (!p.isAdmin && k.owner !== p.id) || (k.kind === "service" && !p.isAdmin)) throw new KeyError(404, "key/unknown", "没有这把 key。");
+    if (!k || (!p.isAdmin && k.owner !== p.id) || (k.kind === "service" && !p.isAdmin)) throw new KeyError(404, "key/unknown", "No such key.");
     this.store.revokeKey(id, { id: p.id, via: "workbench" });
   }
 
   /** The principal behind a bearer key: a service key as is; a personal key as its owner is in Workbench right now. */
   async resolve(bearer: string): Promise<Principal> {
     const k = this.store.keyBySha(sha256(bearer));
-    if (!k || k.revokedAt) throw new KeyError(401, "key/invalid", "API key 不对或已吊销。");
-    if (Date.parse(k.expiresAt) <= this.now()) throw new KeyError(401, "key/expired", "API key 已过期。");
+    if (!k || k.revokedAt) throw new KeyError(401, "key/invalid", "The API key is wrong or revoked.");
+    if (Date.parse(k.expiresAt) <= this.now()) throw new KeyError(401, "key/expired", "The API key has expired.");
     this.store.touchKey(k.id);
     if (k.kind === "service") {
-      return { id: `service:${k.name}`, displayName: `服务 key ${k.name}`, via: "service", groups: [], isAdmin: false, permissions: ["view"], csrfToken: "", keyId: k.id };
+      return { id: `service:${k.name}`, displayName: `Service key ${k.name}`, via: "service", groups: [], isAdmin: false, permissions: ["view"], csrfToken: "", keyId: k.id };
     }
     let owner: Awaited<ReturnType<WorkbenchAdmin["person"]>>;
-    try { owner = await this.workbench.person(k.owner); } catch (error) { throw new KeyError(503, "key/workbench-unavailable", `无法向 Workbench 确认 key 的主人：${(error as Error).message}`); }
-    if (!owner?.enabled) throw new KeyError(401, "key/owner-disabled", "key 的主人在 Workbench 里已停用或不存在。");
+    try { owner = await this.workbench.person(k.owner); } catch (error) { throw new KeyError(503, "key/workbench-unavailable", `Cannot confirm the key's owner with Workbench: ${(error as Error).message}`); }
+    if (!owner?.enabled) throw new KeyError(401, "key/owner-disabled", "The key's owner is disabled or missing in Workbench.");
     const permissions = permissionsFor(owner.groups, owner.isAdmin);
-    if (!permissions.includes("view")) throw new KeyError(403, "auth/forbidden", "key 的主人已不在任何 deploy 组里。");
+    if (!permissions.includes("view")) throw new KeyError(403, "auth/forbidden", "The key's owner is no longer in any deploy group.");
     return { id: owner.email, displayName: owner.displayName || owner.email, via: "key", groups: owner.groups, isAdmin: owner.isAdmin, permissions, csrfToken: "", keyId: k.id };
   }
 }

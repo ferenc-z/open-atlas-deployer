@@ -12,7 +12,8 @@ import type { Principal } from "./auth.ts";
 import type { Bundle, Bundles } from "./bundle.ts";
 import { checkContracts, type ContractDocs, type Running } from "./contracts.ts";
 import type { DeployDriver, StepContext } from "./drivers/types.ts";
-import { Handoff, newJobId } from "./handoff.ts";
+import { Handoff, hostIds, hostOf, newJobId } from "./handoff.ts";
+import { checkUrl, endpoint, nginxConfig, references } from "./ingress.ts";
 import type { Observer } from "./observe.ts";
 import type { Peer } from "./peer.ts";
 import { buildRequests, deployPermission, isProd, manifestRef, plan, type BundleInfo, type Plan, type PlanContext, type PromotionInput } from "./plan.ts";
@@ -94,10 +95,12 @@ export class Deployments {
   private drivers: Record<string, DeployDriver>;
   readonly runner: Runner;
   private now: () => number;
+  private checkUrl: typeof checkUrl;
 
   constructor(store: Store, handoff: Handoff, observer: Observer, environmentFile: string,
-    options: { peer?: Peer; releases?: Pick<Versions, "release">; bundles?: Bundles; contracts?: ContractDocs; drivers?: DeployDriver[]; now?: () => number } = {}) {
+    options: { peer?: Peer; releases?: Pick<Versions, "release">; bundles?: Bundles; contracts?: ContractDocs; drivers?: DeployDriver[]; now?: () => number; checkUrl?: typeof checkUrl } = {}) {
     this.store = store;
+    this.checkUrl = options.checkUrl ?? checkUrl;
     this.handoff = handoff;
     this.observer = observer;
     this.environmentFile = environmentFile;
@@ -145,23 +148,23 @@ export class Deployments {
         if (record) uat.record = record;
       } catch (error) { uat.error = (error as Error).message; }
     }
-    let release = { released: false, detail: "清单没有 release，无法确认是否已发布" };
+    let release = { released: false, detail: "The manifest has no release, so release status cannot be checked" };
     const services = manifest?.components.filter((c) => c.type === "compose-service" && c.source) ?? [];
     const own = services.filter((c) => c.source!.kind === "company-registry");
     const floating = services.flatMap((c) => (c.source!.kind === "public-registry" && !pinnedTag(c.source!.image) ? [c.source!.image] : []));
-    if (floating.length) release = { released: false, detail: `公共镜像 ${floating.join("、")} 没有固定版本号` };
-    else if (!own.length) release = { released: true, detail: "只用固定版本号的公共镜像" };
+    if (floating.length) release = { released: false, detail: `Public images ${floating.join(", ")} have no fixed version` };
+    else if (!own.length) release = { released: true, detail: "Uses only public images with fixed versions" };
     else if (manifest?.release) {
-      release = this.releases ? await this.releases.release(manifest.release.repo, manifest.release.tag.replaceAll("{version}", version)) : { released: false, detail: "无法查询 GitHub Release" };
+      release = this.releases ? await this.releases.release(manifest.release.repo, manifest.release.tag.replaceAll("{version}", version)) : { released: false, detail: "Cannot query GitHub Releases" };
     }
     return { soakHours: env.apps[appId]?.uatSoakHours ?? 0, uat, release, ...(override ? { override } : {}), now: this.now() };
   }
 
   /** The release bundle a manifest names at a version (§5.1 release-asset): downloaded once, then from disk. */
   private async bundleFor(manifest: Manifest, version: string): Promise<Bundle> {
-    if (!manifest.bundle) throw new Error("清单没有 bundle");
-    if (!this.bundles) throw new Error("没有配置发布包下载");
-    if (!manifest.release) throw new Error("清单有 bundle 但没有 release，不知道用哪个 tag");
+    if (!manifest.bundle) throw new Error("The manifest has no bundle");
+    if (!this.bundles) throw new Error("Release bundle downloads are not configured");
+    if (!manifest.release) throw new Error("The manifest has a bundle but no release, so the tag is unknown");
     const tag = manifest.release.tag.replaceAll("{version}", version);
     return this.bundles.get(manifest.bundle.repo, tag, manifest.bundle.asset.replaceAll("{version}", version), manifest.bundle.checksums ?? "SHA256SUMS");
   }
@@ -179,17 +182,22 @@ export class Deployments {
 
   /** For a running deploy: the exact manifest revision its plan used. */
   private async jobStepContext(job: Job, step: RolloutStep): Promise<StepContext> {
-    const m = /^(.+)@(.+)#(\d+)$/.exec(job.manifest ?? "");
-    const manifest = m ? this.store.manifestRevision(m[1]!, m[2]!, Number(m[3])) : covering(this.store.manifests(job.app), job.version);
-    if (!manifest) throw new Error(`找不到部署用的清单 ${job.manifest}`);
+    const manifest = this.jobManifest(job);
+    if (!manifest) throw new Error(`Cannot find the manifest for the deploy: ${job.manifest}`);
     const component = manifest.components.find((c) => c.id === step.component);
-    if (!component) throw new Error(`清单里没有组件 ${step.component}`);
+    if (!component) throw new Error(`The manifest has no component ${step.component}`);
     return this.stepContext(job.app, job.version, job.fromVersion, component, manifest, this.environment().env);
   }
 
+  /** The manifest revision a job recorded (app@appliesFrom#revision); revisions are never deleted (D31). */
+  private jobManifest(job: Job): Manifest | undefined {
+    const m = /^(.+)@(.+)#(\d+)$/.exec(job.manifest ?? "");
+    return m ? this.store.manifestRevision(m[1]!, m[2]!, Number(m[3])) : covering(this.store.manifests(job.app), job.version);
+  }
+
   /** What the plan needs from outside: the bundle, the Deployer drivers' plans, the other apps' contracts. */
-  private async outside(env: Environment, appId: string, version: string, fromVersion: string | null): Promise<Pick<PlanContext, "bundle" | "steps" | "contracts">> {
-    const manifest = covering(this.store.manifests(appId), version);
+  private async outside(env: Environment, appId: string, version: string, fromVersion: string | null, pinned?: Manifest): Promise<Pick<PlanContext, "bundle" | "steps" | "contracts">> {
+    const manifest = pinned ?? covering(this.store.manifests(appId), version);
     if (!manifest) return {};
     const out: Pick<PlanContext, "bundle" | "steps" | "contracts"> = {};
     if (manifest.bundle) {
@@ -223,7 +231,7 @@ export class Deployments {
         }
         out.contracts = { result: checkContracts(appId, version, doc, others) };
         const unread = others.filter((o) => o.error);
-        if (unread.length) out.contracts.result!.unknown.push(...unread.map((o) => `读不到 ${o.app} ${o.version} 的契约（${o.error}）`));
+        if (unread.length) out.contracts.result!.unknown.push(...unread.map((o) => `Cannot read the contracts of ${o.app} ${o.version} (${o.error})`));
       } catch (error) { out.contracts = { error: (error as Error).message }; }
     }
     return out;
@@ -231,36 +239,39 @@ export class Deployments {
 
   async plan(principal: Principal, appId: string, version: string, pinFrom?: string, override?: { reason: string }): Promise<Plan> {
     const app = this.store.app(appId);
-    if (!app) throw new DeployError(404, "app/unknown", "注册表里没有这个应用。");
-    if (!/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(version)) throw new DeployError(400, "deploy/version", `${version} 不是版本号。`);
+    if (!app) throw new DeployError(404, "app/unknown", "This app is not in the registry.");
+    if (!/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(version)) throw new DeployError(400, "deploy/version", `${version} is not a version.`);
     const { env, deployed } = this.environment();
-    let pins: { from: string; digests: Record<string, string> } | undefined;
+    let pins: PlanContext["pins"];
     if (pinFrom) {
       const from = this.store.job(pinFrom);
-      if (!from || from.kind !== "deploy" || from.app !== appId || from.state !== "succeeded") throw new DeployError(400, "deploy/pin-from", "只能回到这个应用一次成功的部署。");
-      if (from.version !== version) throw new DeployError(400, "deploy/pin-version", `部署记录 ${pinFrom} 是 ${from.version}，不是 ${version}。`);
-      pins = { from: from.id, digests: from.status?.result.digests ?? {} };
+      if (!from || from.kind !== "deploy" || from.app !== appId || from.state !== "succeeded") throw new DeployError(400, "deploy/pin-from", "You can only go back to a successful deploy of this app.");
+      if (from.version !== version) throw new DeployError(400, "deploy/pin-version", `Deploy ${pinFrom} is ${from.version}, not ${version}.`);
+      // D31: going back uses the manifest revision that deploy ran with, not whatever the manifest says now.
+      const body = from.manifest ? this.jobManifest(from) : undefined;
+      pins = { from: from.id, digests: from.status?.result.digests ?? {}, ...(body ? { manifest: { body, ref: from.manifest! } } : {}) };
     }
     if (override) {
-      if (isKey(principal)) throw new DeployError(403, "auth/browser-only", "跳过晋级规则只认浏览器会话，API key 不行（§9.4）。");
-      if (!principal.permissions.includes("admin")) throw new DeployError(403, "deploy/override-forbidden", "只有 Workbench 管理员能跳过晋级规则。");
-      if (override.reason.trim().length < 4) throw new DeployError(400, "deploy/override-reason", "跳过晋级规则必须写明原因。");
+      if (isKey(principal)) throw new DeployError(403, "auth/browser-only", "Skipping the promotion rule accepts only browser sessions, not API keys (§9.4).");
+      if (!principal.permissions.includes("admin")) throw new DeployError(403, "deploy/override-forbidden", "Only Workbench admins can skip the promotion rule.");
+      if (override.reason.trim().length < 4) throw new DeployError(400, "deploy/override-reason", "Skipping the promotion rule needs a reason.");
     }
     const promotion = await this.promotionInput(env, appId, version, override ? { reason: override.reason.trim(), by: principal.id } : undefined);
-    const outside = await this.outside(env, appId, version, deployed[appId] ?? null);
+    const outside = await this.outside(env, appId, version, deployed[appId] ?? null, pins?.manifest?.body);
     return plan({
-      env, app, manifests: this.manifests(), deployed, principal, executor: this.handoff.executor(),
+      env, app, manifests: this.manifests(), deployed, principal, executor: this.handoff.executor(hostOf(env, appId)),
       active: this.store.activeJobs(), built: (v) => this.store.successfulBuild(appId, v), ...(pins ? { pins } : {}),
       ...(this.envState ? { envState: this.envState(appId) } : {}), ...(promotion ? { promotion } : {}), ...outside,
       ...(env.requireEvaluation ? { evaluated: Boolean(this.evaluated?.(appId, version)) || this.store.deployRecords(appId, version).length > 0 } : {}),
+      ...this.ingressContext(env, appId, version),
     }, version);
   }
 
   async deploy(principal: Principal, appId: string, version: string, options: { pinFrom?: string; acknowledgeManual?: boolean; override?: { reason: string }; notice?: { minutes: number } }): Promise<Job> {
-    if (isKey(principal) && isProd(this.environment().env)) throw new DeployError(403, "auth/browser-only", "PROD 的部署只认浏览器会话，API key 只能生成计划（§9.4）。");
+    if (isKey(principal) && isProd(this.environment().env)) throw new DeployError(403, "auth/browser-only", "PROD deploys accept only browser sessions; API keys can only create plans (§9.4).");
     const p = await this.plan(principal, appId, version, options.pinFrom, options.override);
     const blocking = p.findings.filter((f) => f.blocking);
-    if (blocking.length || !p.request) throw new DeployError(409, "deploy/blocked", "计划里有阻止部署的问题。", blocking.map((f) => f.message));
+    if (blocking.length || !p.request) throw new DeployError(409, "deploy/blocked", "The plan has problems that block the deploy.", blocking.map((f) => f.message));
     const { env } = this.environment();
     const id = newJobId("deploy");
     const actor: Actor = { id: principal.id, via: principal.via };
@@ -272,13 +283,13 @@ export class Deployments {
     };
     if (options.notice) {
       const minutes = options.notice.minutes;
-      if (!Number.isInteger(minutes) || minutes < 1 || minutes > 60) throw new DeployError(400, "deploy/notice", "提前通知是 1 到 60 分钟。");
-      if (!host) throw new DeployError(409, "deploy/notice-needless", "这个部署不重启容器，不需要提前通知。");
-      if (!this.maintenance) throw new DeployError(409, "deploy/notice-unavailable", "没有配置 Workbench API key，发不了维护提示。");
+      if (!Number.isInteger(minutes) || minutes < 1 || minutes > 60) throw new DeployError(400, "deploy/notice", "Advance notice is 1 to 60 minutes.");
+      if (!host) throw new DeployError(409, "deploy/notice-needless", "This deploy restarts no containers, so no advance notice is needed.");
+      if (!this.maintenance) throw new DeployError(409, "deploy/notice-unavailable", "No Workbench API key is configured, so the maintenance notice cannot be sent.");
       const at = this.now() + minutes * 60_000;
-      const hhmm = new Date(at).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
-      try { await this.maintenance.setMaintenance(`${this.store.app(appId)?.name ?? appId} 将在 ${hhmm} 更新到 ${version}，届时约 1–2 分钟不可用`, this.now(), at + 15 * 60_000); }
-      catch (error) { throw new DeployError(409, "deploy/notice-failed", `维护提示没有发出去，部署没有开始：${(error as Error).message}`); }
+      const hhmm = new Date(at).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false });
+      try { await this.maintenance.setMaintenance(`${this.store.app(appId)?.name ?? appId} will update to ${version} at ${hhmm} and be unavailable for about 1–2 minutes`, this.now(), at + 15 * 60_000); }
+      catch (error) { throw new DeployError(409, "deploy/notice-failed", `The maintenance notice was not sent, so the deploy did not start: ${(error as Error).message}`); }
       rollout.scheduled = { at: new Date(at).toISOString(), submitted: false };
       rollout.notice = true;
     }
@@ -291,7 +302,7 @@ export class Deployments {
     if (p.promotion?.basis === "override") this.store.audit(actor, "deploy.promotion-override", `${appId}@${version}`, { job: id, reason: p.promotion.reason, unmet: p.promotion.detail });
     if (host) {
       const { steps: _steps, ...request } = p.request;
-      this.handoff.submit(id, { ...request, requestedBy: principal.id });
+      this.handoff.submit(id, { ...request, requestedBy: principal.id }, hostOf(env, appId));
     } else {
       this.runner.advance(id).catch((error) => console.error(`rollout ${id}:`, error));
     }
@@ -300,22 +311,22 @@ export class Deployments {
 
   build(principal: Principal, appId: string, version: string): Job[] {
     const app = this.store.app(appId);
-    if (!app) throw new DeployError(404, "app/unknown", "注册表里没有这个应用。");
+    if (!app) throw new DeployError(404, "app/unknown", "This app is not in the registry.");
     const { env } = this.environment();
-    if (isProd(env)) throw new DeployError(409, "build/prod", "PROD 不构建：只部署 UAT 验证过或已正式发布的制品（§6.1）。");
-    if (!principal.permissions.includes("deploy-uat")) throw new DeployError(403, "build/forbidden", "构建需要在 deploy-uat 组里。");
+    if (isProd(env)) throw new DeployError(409, "build/prod", "PROD does not build: it only deploys artifacts verified in UAT or officially released (§6.1).");
+    if (!principal.permissions.includes("deploy-uat")) throw new DeployError(403, "build/forbidden", "Building needs the deploy-uat group.");
     const manifest = covering(this.store.manifests(appId), version);
-    if (!manifest) throw new DeployError(404, "build/no-manifest", `没有适用于 ${version} 的清单。`);
-    const executor = this.handoff.executor();
-    if (!executor.online) throw new DeployError(409, "build/executor-offline", executor.reason ?? "执行器不在线。");
-    if (this.store.activeJobs().some((j) => j.app === appId)) throw new DeployError(409, "build/busy", `${appId} 已有一个任务在进行。`);
+    if (!manifest) throw new DeployError(404, "build/no-manifest", `No manifest applies to ${version}.`);
+    const executor = this.handoff.executor(hostOf(env, appId));
+    if (!executor.online) throw new DeployError(409, "build/executor-offline", executor.reason ?? "The executor is offline.");
+    if (this.store.activeJobs().some((j) => j.app === appId)) throw new DeployError(409, "build/busy", `${appId} already has a job running.`);
     const requests = buildRequests(env, manifest, version);
-    if (!requests.length) throw new DeployError(400, "build/nothing", "这个应用没有要由 Deployer 构建的镜像。");
+    if (!requests.length) throw new DeployError(400, "build/nothing", "This app has no images built by the Deployer.");
     const actor: Actor = { id: principal.id, via: principal.via };
     return requests.map(({ request }) => {
       const id = newJobId("build");
       this.store.addJob({ id, kind: "build", app: appId, version, environment: env.name, fromVersion: null, manifest: manifestRef(app, manifest), pinFrom: null, request }, actor);
-      this.handoff.submit(id, { ...request, requestedBy: principal.id });
+      this.handoff.submit(id, { ...request, requestedBy: principal.id }, hostOf(env, appId));
       return this.store.job(id)!;
     });
   }
@@ -332,7 +343,7 @@ export class Deployments {
         this.store.setRollout(job.id, rollout);
         if (rollout.host === "pending") {
           const { steps: _steps, ...request } = job.request;
-          this.handoff.submit(job.id, { ...request, requestedBy: job.requestedBy });
+          this.handoff.submit(job.id, { ...request, requestedBy: job.requestedBy }, hostOf(this.environment().env, job.app));
         } else await this.runner.advance(job.id);
         continue;
       }
@@ -381,9 +392,9 @@ export class Deployments {
   }
 
   private checkPermission(principal: Principal, job: Job | undefined): Job {
-    if (!job || job.kind !== "deploy") throw new DeployError(404, "job/unknown", "没有这个部署。");
-    if (!this.canDeploy(principal)) throw new DeployError(403, "deploy/forbidden", "需要有部署这个环境的权限。");
-    if (isKey(principal) && isProd(this.environment().env)) throw new DeployError(403, "auth/browser-only", "PROD 的部署步骤只认浏览器会话（§9.4）。");
+    if (!job || job.kind !== "deploy") throw new DeployError(404, "job/unknown", "No such deploy.");
+    if (!this.canDeploy(principal)) throw new DeployError(403, "deploy/forbidden", "Needs permission to deploy to this environment.");
+    if (isKey(principal) && isProd(this.environment().env)) throw new DeployError(403, "auth/browser-only", "PROD deploy steps accept only browser sessions (§9.4).");
     return job;
   }
 
@@ -401,7 +412,7 @@ export class Deployments {
       for (const s of job.rollout.steps) s.state = "skipped";
       this.store.setRollout(job.id, job.rollout);
       this.store.audit({ id: principal.id, via: principal.via }, "deploy.cancel", `${job.app}@${job.version}`, { job: job.id });
-      await this.finishRollout(this.store.job(job.id)!, "failed", `预定 ${job.rollout.scheduled.at} 的部署由 ${principal.id} 取消，没有开始`);
+      await this.finishRollout(this.store.job(job.id)!, "failed", `The deploy scheduled for ${job.rollout.scheduled.at} was cancelled by ${principal.id} before it started`);
       return this.store.job(job.id)!;
     }
     try { return await this.runner.stop(job.id, { id: principal.id, via: principal.via }); }
@@ -431,14 +442,58 @@ export class Deployments {
   }
 
   private async observe(job: Job) {
-    const manifest = covering(this.store.manifests(job.app), job.version);
+    const manifest = this.jobManifest(job);
     const observations: Record<string, unknown> = {};
     for (const c of manifest?.components ?? []) {
       this.observer.forget(c.service ?? "");
       const o = await this.observer.observe(c);
       if (o) observations[c.service!] = o;
     }
-    this.store.setObservation(job.id, Object.keys(observations).length ? observations : { unconfirmed: "no service reports a BUILD.json" });
+    // D36: reach the app once at its address, through nginx when it has one; a failure only warns (owner 2026-10-31).
+    const url = typeof job.request.url === "string" ? job.request.url : undefined;
+    const ingress = url ? { ...(await this.checkUrl(url, this.store.setting("ca.pem"))), at: new Date(this.now()).toISOString() } : undefined;
+    this.store.setObservation(job.id, { ...(Object.keys(observations).length ? observations : { unconfirmed: "no service reports a BUILD.json" }), ...(ingress ? { ingress } : {}) });
+    if (ingress && !ingress.ok) this.store.audit({ id: "deployer", via: "cli" }, "deploy.ingress-unreachable", `${job.app}@${job.version}`, { job: job.id, url, ...(ingress.status ? { status: ingress.status } : {}), ...(ingress.error ? { error: ingress.error } : {}) });
+  }
+
+  /** D36: the recommended nginx configuration, each app at the version given (the version deployed otherwise). */
+  nginx(at: Record<string, string> = {}): ReturnType<typeof nginxConfig> {
+    const { env } = this.environment();
+    const apps = Object.fromEntries(Object.entries(env.apps).map(([id, a]) => [id, { ...a, version: at[id] ?? a.version }]));
+    return nginxConfig({ ...env, apps }, Object.fromEntries(Object.keys(apps).map((id) => [id, covering(this.store.manifests(id), apps[id]!.version)])));
+  }
+
+  /** D36: where an app is reached in this environment (at the version it is deployed). */
+  endpointOf(appId: string) {
+    const { env } = this.environment();
+    return endpoint(env, appId, covering(this.store.manifests(appId), env.apps[appId]?.version ?? ""));
+  }
+
+  /** D36: other apps whose compose environment or env file refers to this app's address. */
+  dependents(appId: string): string[] {
+    const { env } = this.environment();
+    const needle = (text: string) => references(text).some((r) => r.app === appId);
+    return Object.keys(env.apps).filter((id) => id !== appId).filter((id) => {
+      const m = covering(this.store.manifests(id), env.apps[id]!.version);
+      if (m?.components.some((c) => Object.values(c.environment ?? {}).some(needle))) return true;
+      const revision = this.store.envRevision(id);
+      return Object.values(revision?.values ?? {}).some((v) => "v" in v && needle(v.v));
+    });
+  }
+
+  private ingressContext(env: Environment, appId: string, version: string): Pick<PlanContext, "ca" | "lastUrl" | "dependents" | "nginx" | "lastHost"> {
+    const ca = this.store.setting("ca.pem");
+    const lastJob = this.store.deployedVersion(appId);
+    const last = lastJob?.request.url;
+    const lastHost = lastJob?.request.machine;
+    const latest = this.store.nginxRevision();
+    return {
+      ...(ca ? { ca } : {}),
+      ...(typeof last === "string" ? { lastUrl: last, dependents: this.dependents(appId) } : {}),
+      // Deploys from before D35 ran on the one host there was: the first.
+      ...(lastJob ? { lastHost: typeof lastHost === "string" ? lastHost : hostIds(env)[0]! } : {}),
+      ...(env.apps[appId]?.ingress?.kind === "nginx" ? { nginx: { sha256: this.nginx({ [appId]: version }).sha256, ...(latest ? { latest: { revision: latest.revision, sha256: latest.sha256 } } : {}) } } : {}),
+    };
   }
 
   canDeploy(principal: Principal): boolean {

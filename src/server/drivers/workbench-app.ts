@@ -7,9 +7,9 @@ import type { WorkbenchAdmin } from "./workbench.ts";
 
 function packageApp(ctx: StepContext): { id: string; version: string } {
   const raw = ctx.bundle?.files.get("app/app.json");
-  if (!raw) throw new Error(`发布包 ${ctx.bundle?.asset ?? ""} 里没有 app/app.json，不是 Workbench 应用包`);
+  if (!raw) throw new Error(`The release bundle ${ctx.bundle?.asset ?? ""} has no app/app.json, so it is not a Workbench app package`);
   const app = JSON.parse(raw.toString("utf8")) as { id?: string; version?: string };
-  if (!app.id || !app.version) throw new Error("app/app.json 缺 id 或 version");
+  if (!app.id || !app.version) throw new Error("app/app.json is missing id or version");
   return { id: app.id, version: app.version };
 }
 
@@ -21,17 +21,17 @@ export class WorkbenchAppDriver implements DeployDriver {
 
   async plan(ctx: StepContext) {
     const findings = [];
-    if (ctx.component.source) findings.push(block("workbench-app/source", `组件 ${ctx.component.id} 写了单独的 source；现在只支持取自清单的 bundle。`));
-    if (!ctx.bundle) return { after: "—", findings: [...findings, block("workbench-app/no-bundle", `组件 ${ctx.component.id} 的应用包取自 bundle，清单没有 bundle。`)] };
+    if (ctx.component.source) findings.push(block("workbench-app/source", `Component ${ctx.component.id} has its own source; only the manifest's bundle is supported for now.`));
+    if (!ctx.bundle) return { after: "—", findings: [...findings, block("workbench-app/no-bundle", `The app package of component ${ctx.component.id} comes from the bundle, but the manifest has no bundle.`)] };
     let pkg: { id: string; version: string };
     try { pkg = packageApp(ctx); } catch (error) { return { after: "—", findings: [...findings, block("workbench-app/package", (error as Error).message)] }; }
-    if (pkg.version !== ctx.version) findings.push(block("workbench-app/version", `应用包里的版本是 ${pkg.version}，不是 ${ctx.version}。`));
+    if (pkg.version !== ctx.version) findings.push(block("workbench-app/version", `The app package's version is ${pkg.version}, not ${ctx.version}.`));
     for (const [name, value] of Object.entries((ctx.component.settings ?? {}) as Record<string, string>)) {
       const r = resolveEnv(value, ctx.envValue);
-      if (r.missing.length) findings.push(block("workbench-app/setting", `设置 ${name} 要用 env 里的 ${r.missing.join("、")}，服务器上的 env 文件没有。`));
+      if (r.missing.length) findings.push(block("workbench-app/setting", `Setting ${name} uses ${r.missing.join(", ")} from env, which the env file on the server does not have.`));
     }
-    const after = `${pkg.id} ${pkg.version}（${ctx.bundle.asset}，${ctx.bundle.digest.slice(0, 19)}…）`;
-    if (!this.workbench.configured) return { after, findings: [...findings, block("workbench-app/key", "没有配置 Workbench API key（DEPLOYER_WORKBENCH_API_KEY_FILE），装不了应用包。")] };
+    const after = `${pkg.id} ${pkg.version} (${ctx.bundle.asset}, ${ctx.bundle.digest.slice(0, 19)}…)`;
+    if (!this.workbench.configured) return { after, findings: [...findings, block("workbench-app/key", "No Workbench API key is configured (DEPLOYER_WORKBENCH_API_KEY_FILE), so the app package cannot be installed.")] };
     try {
       const installed = (await this.workbench.apps()).find((a) => a.id === pkg.id);
       return { ...(installed ? { before: `${pkg.id} ${installed.version}` } : {}), after, findings };
@@ -52,21 +52,21 @@ export class WorkbenchAppDriver implements DeployDriver {
     }
     const bound = Object.keys(r.bound ?? {});
     return {
-      message: `Workbench 装好 ${r.app.id} ${r.app.version}${before ? `（之前 ${before.version}）` : "（第一次安装）"}${bound.length ? `，按名字绑定了 ${bound.join("、")}` : ""}`,
+      message: `Workbench installed ${r.app.id} ${r.app.version}${before ? ` (was ${before.version})` : " (first install)"}${bound.length ? `; bound ${bound.join(", ")} by name` : ""}`,
       detail: { appId: r.app.id, version: r.app.version, previous: before?.version ?? null },
     };
   }
 
   async verify(_ctx: StepContext, result: StepResult): Promise<string | null> {
     const app = (await this.workbench.apps()).find((a) => a.id === result.detail.appId);
-    return app?.version === result.detail.version ? null : `Workbench 里 ${result.detail.appId} 是 ${app?.version ?? "没有"}，应为 ${result.detail.version}`;
+    return app?.version === result.detail.version ? null : `${result.detail.appId} in Workbench is ${app?.version ?? "missing"}, expected ${result.detail.version}`;
   }
 
   async rollback(_ctx: StepContext, result: StepResult): Promise<Undo> {
-    if (!result.detail.previous) return { message: `${result.detail.appId} 是第一次安装，保留在 Workbench 里（需要时在 Workbench 管理页面删除）`, undone: false };
+    if (!result.detail.previous) return { message: `${result.detail.appId} was a first install and stays in Workbench (remove it on the Workbench admin page if needed)`, undone: false };
     const r = await this.workbench.switchVersion(String(result.detail.appId));
-    return { message: `Workbench 的 ${result.detail.appId} 切回 ${r.version}`, undone: true };
+    return { message: `${result.detail.appId} in Workbench switched back to ${r.version}`, undone: true };
   }
 
-  impact(_component: Component): string { return "不中断：应用包换好后，打开着的页面提示刷新"; }
+  impact(_component: Component): string { return "No interruption: once the package is replaced, open pages are asked to reload"; }
 }

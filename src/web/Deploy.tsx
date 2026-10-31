@@ -1,5 +1,5 @@
 // Phase 2 pages: choose a version, read the plan, build, confirm, follow the job; the deploy history
-// with "回到这一版". Phase 5: the plan lists every component in the order it runs, and a running deploy
+// with "Go back to this version". Phase 5: the plan lists every component in the order it runs, and a running deploy
 // shows those steps, with the manual ones ticked here item by item.
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -8,35 +8,35 @@ import type { Job, JobView as JobData, Plan } from "./api.ts";
 import { diffLines } from "./diff.ts";
 
 const STEP: Record<string, string> = {
-  clone: "克隆 tag", tools: "取发布工具", build: "构建并推送", "verify-build": "核对 BUILD.json",
-  files: "取发布文件", pull: "拉取镜像并固定 digest", validate: "校验片段与策略", backup: "备份数据",
-  switch: "切换", migrate: "数据库迁移", start: "启动", verify: "健康检查", cleanup: "清理", rollback: "回滚", "restore-data": "恢复数据",
-  write: "写入 env 文件", restart: "重启用到的服务", read: "读取 env 文件",
+  clone: "Clone tag", tools: "Get release tools", build: "Build and push", "verify-build": "Check BUILD.json",
+  files: "Get release files", pull: "Pull images and pin digests", validate: "Validate fragment and policy", backup: "Back up data",
+  switch: "Switch", migrate: "Database migration", start: "Start", verify: "Health check", cleanup: "Clean up", rollback: "Roll back", "restore-data": "Restore data",
+  write: "Write env file", restart: "Restart services that use it", read: "Read env file",
 };
 const STATE: Record<string, { label: string; tone: string }> = {
-  queued: { label: "排队中", tone: "muted" }, running: { label: "进行中", tone: "info" }, succeeded: { label: "成功", tone: "ok" },
-  failed: { label: "失败", tone: "bad" }, "rolled-back": { label: "已回滚", tone: "warn" }, refused: { label: "被拒绝", tone: "bad" },
-  done: { label: "完成", tone: "ok" }, pending: { label: "未开始", tone: "muted" }, waiting: { label: "等人确认", tone: "warn" },
-  skipped: { label: "跳过", tone: "muted" },
+  queued: { label: "Queued", tone: "muted" }, running: { label: "Running", tone: "info" }, succeeded: { label: "Succeeded", tone: "ok" },
+  failed: { label: "Failed", tone: "bad" }, "rolled-back": { label: "Rolled back", tone: "warn" }, refused: { label: "Refused", tone: "bad" },
+  done: { label: "Done", tone: "ok" }, pending: { label: "Not started", tone: "muted" }, waiting: { label: "Waiting for confirmation", tone: "warn" },
+  skipped: { label: "Skipped", tone: "muted" },
 };
 const TYPE: Record<string, string> = {
-  "compose-service": "容器", "db-migration": "数据库迁移", "workbench-app": "Workbench 应用包", "studio-graph": "Studio 图", "oma-agent": "OMA Agent", manual: "人工步骤",
+  "compose-service": "Container", "db-migration": "Database migration", "workbench-app": "Workbench app package", "studio-graph": "Studio graph", "oma-agent": "OMA Agent", manual: "Manual step",
 };
-const WHERE: Record<string, string> = { host: "执行器", deployer: "Deployer", person: "人" };
+const WHERE: Record<string, string> = { host: "Executor", deployer: "Deployer", person: "Person" };
 const FINAL = ["succeeded", "failed", "rolled-back", "refused"];
-export const BASIS: Record<string, string> = { uat: "UAT 部署成功过", release: "已正式发布", "prod-history": "本环境部署成功过", override: "管理员跳过" };
-export const KIND: Record<string, string> = { build: "构建", deploy: "部署", env: "写入环境变量", "env-read": "导入环境变量" };
-const when = (iso: string | null | undefined) => (iso ? new Date(iso).toLocaleString("zh-CN", { hour12: false }) : "—");
+export const BASIS: Record<string, string> = { uat: "Deployed successfully in UAT", release: "Officially released", "prod-history": "Deployed successfully here", override: "Skipped by an admin" };
+export const KIND: Record<string, string> = { build: "Build", deploy: "Deploy", env: "Write env", "env-read": "Import env" };
+const when = (iso: string | null | undefined) => (iso ? new Date(iso).toLocaleString("en-US", { hour12: false }) : "—");
 
 export function JobState({ state }: { state: string }) {
   const s = STATE[state] ?? { label: state, tone: "muted" };
   return <span className={`badge ${s.tone}`}>{s.label}</span>;
 }
 
-export function DeployPanel({ app, initial, isAdmin, onClose, onJob }: { app: string; initial?: { version: string; pinFrom?: string }; isAdmin?: boolean; onClose: () => void; onJob: (id: string) => void }) {
+export function DeployPanel({ app, initial, isAdmin, onClose, onJob, onAssessment }: { app: string; initial?: { version: string; pinFrom?: string }; isAdmin?: boolean; onClose: () => void; onJob: (id: string) => void; onAssessment: (id: string) => void }) {
   const [reason, setReason] = useState("");
   const [overridden, setOverridden] = useState<string | undefined>();
-  const [list, setList] = useState<{ versions: string[]; error?: string; built: string[]; deployed: string | null } | undefined>();
+  const [list, setList] = useState<api.VersionList | undefined>();
   const [version, setVersion] = useState(initial?.version ?? "");
   const [pinFrom] = useState(initial?.pinFrom);
   const [plan, setPlan] = useState<Plan | undefined>();
@@ -45,7 +45,8 @@ export function DeployPanel({ app, initial, isAdmin, onClose, onJob }: { app: st
   const [busy, setBusy] = useState(false);
   const fail = (e: api.ApiError) => { setError({ message: e.message, details: e.details ?? [] }); setBusy(false); };
 
-  useEffect(() => { api.versions(app).then((l) => { setList(l); if (!version) setVersion(l.versions[0] ?? ""); }, fail); }, [app]);
+  // Start on the running version so the full list opens around it; fall back to the newest tag.
+  useEffect(() => { api.versions(app).then((l) => { setList(l); if (!version) setVersion(l.deployed && l.versions.includes(l.deployed) ? l.deployed : l.versions[0] ?? ""); }, fail); }, [app]);
   const makePlan = useCallback((v = version) => {
     setError(undefined); setPlan(undefined); setOverridden(undefined);
     if (v) api.plan(app, v, pinFrom).then(setPlan, fail);
@@ -61,6 +62,9 @@ export function DeployPanel({ app, initial, isAdmin, onClose, onJob }: { app: st
     (overridden ? api.deployWithOverride(app, plan!.version, true, overridden) : notice ? api.deployWithNotice(app, plan!.version, notice, pinFrom) : api.deploy(app, plan!.version, true, pinFrom)).then((r) => onJob(r.job.id), fail);
   };
   const build = () => { setBusy(true); api.build(app, plan!.version).then((r) => onJob(r.jobs[0]!.id), fail); };
+  // D32: a version no manifest covers is assessed first; "unchanged" extends the manifest down to it.
+  const assess = () => { setBusy(true); api.startAssessment({ app, version }).then((r) => onAssessment(r.assessment.id), fail); };
+  const uncovered = Boolean(list?.uncovered.includes(version));
   const blocking = plan?.findings.filter((f) => f.blocking) ?? [];
   const notBuilt = blocking.some((f) => f.code === "deploy/not-built") && blocking.every((f) => f.code === "deploy/not-built");
   const notPromoted = blocking.some((f) => f.code === "deploy/not-promoted");
@@ -68,20 +72,34 @@ export function DeployPanel({ app, initial, isAdmin, onClose, onJob }: { app: st
   return (
     <section className="card panel">
       <div className="toolbar">
-        <h2>{pinFrom ? `回到 ${app} ${initial?.version}` : `部署 ${app}`}</h2>
-        <span className="muted">{list?.deployed ? `现在：${list.deployed}` : "还没有经 Deployer 部署过"}</span>
-        <button className="link" onClick={onClose}>关闭</button>
+        <h2>{pinFrom ? `Go back to ${app} ${initial?.version}` : `Deploy ${app}`}</h2>
+        <span className="muted">{list?.deployed ? `Now: ${list.deployed}` : "Not deployed by the Deployer yet"}</span>
+        <button className="link" onClick={onClose}>Close</button>
       </div>
       {!pinFrom && (
         <div className="row">
-          <input list={`versions-${app}`} value={version} onChange={(e) => setVersion(e.target.value.trim())} placeholder="版本，如 2.8.0" />
-          <datalist id={`versions-${app}`}>
-            {(list?.versions ?? []).map((v) => <option key={v} value={v}>{list?.built.includes(v) ? "已构建" : ""}{list?.deployed === v ? " · 运行中" : ""}</option>)}
-          </datalist>
-          <button onClick={() => makePlan()} disabled={!version}>生成计划</button>
-          {list?.error && <span className="muted">{list.error}，可以直接输入版本号</span>}
+          {list?.versions.length ? (
+            <>
+              <select value={version} onChange={(e) => { setVersion(e.target.value); setPlan(undefined); setError(undefined); }} className="versions">
+                {(list.versions.includes(version) || !version ? list.versions : [version, ...list.versions]).map((v) => (
+                  <option key={v} value={v} className={list.deployed === v ? "running" : list.uncovered.includes(v) ? "uncovered" : undefined}>
+                    {v}{list.deployed === v ? " · Running" : ""}{list.built.includes(v) ? " · Built" : ""}{list.uncovered.includes(v) ? " · No manifest" : ""}
+                  </option>
+                ))}
+              </select>
+              {list.deployed === version && <span className="badge ok">Running</span>}
+              {uncovered && <span className="badge muted">No manifest</span>}
+            </>
+          ) : (
+            <input value={version} onChange={(e) => setVersion(e.target.value.trim())} placeholder="Version, e.g. 2.8.0" />
+          )}
+          {uncovered
+            ? <button onClick={assess} disabled={busy}>Assess this version</button>
+            : <button onClick={() => makePlan()} disabled={!version}>Create plan</button>}
+          {list?.error && <span className="muted">{list.error}; you can type a version directly</span>}
         </div>
       )}
+      {!pinFrom && uncovered && <p className="muted">No manifest covers {version} yet: it is older than the first one. An assessment compares its deploy files with the manifest's version; if nothing changed, the manifest extends down to {version}, otherwise a new manifest is drafted for an admin to adopt.</p>}
       {plan && (
         <div className="plan">
           {plan.findings.length > 0 && (
@@ -89,15 +107,15 @@ export function DeployPanel({ app, initial, isAdmin, onClose, onJob }: { app: st
               {plan.findings.map((f) => <li key={f.code + f.message} className={f.blocking ? "error" : "muted"}>{f.blocking ? "✕ " : "• "}{f.message}</li>)}
             </ul>
           )}
-          {plan.promotion && <p className={plan.promotion.basis === "override" ? "error" : ""}><span className="badge info">晋级依据：{BASIS[plan.promotion.basis]}</span> {plan.promotion.basis === "override" ? `原因：${plan.promotion.reason}` : plan.promotion.detail}</p>}
+          {plan.promotion && <p className={plan.promotion.basis === "override" ? "error" : ""}><span className="badge info">Promotion basis: {BASIS[plan.promotion.basis]}</span> {plan.promotion.basis === "override" ? `Reason: ${plan.promotion.reason}` : plan.promotion.detail}</p>}
           {notPromoted && isAdmin && (
             <div className="row override">
-              <input value={reason} onChange={(e) => setReason(e.target.value)} placeholder="跳过晋级规则的原因（记入审计，部署记录上会标出）" />
-              <button className="danger" onClick={override} disabled={reason.trim().length < 4}>跳过晋级规则</button>
+              <input value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Reason for skipping the promotion rule (audited and marked on the deploy record)" />
+              <button className="danger" onClick={override} disabled={reason.trim().length < 4}>Skip the promotion rule</button>
             </div>
           )}
           <table>
-            <thead><tr><th>#</th><th>组件</th><th>由谁做</th><th>现在</th><th>部署后</th><th>影响</th></tr></thead>
+            <thead><tr><th>#</th><th>Component</th><th>Done by</th><th>Now</th><th>After deploy</th><th>Impact</th></tr></thead>
             <tbody>
               {plan.steps.map((s, i) => (
                 <tr key={s.component}>
@@ -111,23 +129,23 @@ export function DeployPanel({ app, initial, isAdmin, onClose, onJob }: { app: st
               ))}
             </tbody>
           </table>
-          <p className="muted">清单 {plan.manifest}{plan.bundle ? `；发布包 ${plan.bundle.asset}（${plan.bundle.digest.slice(0, 19)}…）` : ""}。按顺序执行：执行器的部分先拉取镜像并固定 digest、校验片段、备份数据、切换、启动、等健康检查，失败自动回到上一版；之后 Deployer 依次调用 Workbench、Studio、OMA，某一步失败就撤回它之前的这些步骤；人工步骤处暂停，逐项勾选后继续。</p>
+          <p className="muted">Manifest {plan.manifest}{plan.bundle ? `; release bundle ${plan.bundle.asset} (${plan.bundle.digest.slice(0, 19)}…)` : ""}. Runs in order: the executor first pulls images and pins digests, validates the fragment, backs up data, switches, starts and waits for health checks, going back to the previous version automatically on failure; then the Deployer calls Workbench, Studio and OMA in turn, and if a step fails, the steps before it are undone; it pauses at manual steps and continues once every item is checked.</p>
           {plan.fragment && (
             <details>
-              <summary>compose 片段的变化</summary>
+              <summary>Changes to the compose fragment</summary>
               <pre className="diff">{diffLines(plan.previousFragment ?? "", plan.fragment).map((l, i) => <div key={i} className={l.kind}>{l.kind === "add" ? "+ " : l.kind === "del" ? "- " : "  "}{l.text}</div>)}</pre>
             </details>
           )}
           <div className="row">
-            {notBuilt && <button onClick={build} disabled={busy}>构建 {plan.version}</button>}
+            {notBuilt && <button onClick={build} disabled={busy}>Build {plan.version}</button>}
             {plan.steps.some((s) => s.where === "host") && !overridden && (
               <label className="muted">
                 <select value={notice} onChange={(e) => setNotice(Number(e.target.value))}>
-                  <option value={0}>立即部署</option>{[5, 10, 15, 30].map((m) => <option key={m} value={m}>{m} 分钟后部署，先在 Workbench 通知用户</option>)}
+                  <option value={0}>Deploy now</option>{[5, 10, 15, 30].map((m) => <option key={m} value={m}>Deploy in {m} minutes, notifying Workbench users first</option>)}
                 </select>
               </label>
             )}
-            <button className="primary" onClick={start} disabled={busy || blocking.length > 0}>{notice ? `通知并在 ${notice} 分钟后部署 ${plan.version}` : `确认部署 ${plan.version}`}</button>
+            <button className="primary" onClick={start} disabled={busy || blocking.length > 0}>{notice ? `Notify and deploy ${plan.version} in ${notice} minutes` : `Confirm deploy of ${plan.version}`}</button>
           </div>
         </div>
       )}
@@ -158,32 +176,40 @@ export function JobPanel({ id, onClose, onBack }: { id: string; onClose: () => v
   };
   const stopHere = () => {
     const scheduled = data?.job.rollout?.scheduled && !data.job.rollout.scheduled.submitted;
-    if (!confirm(scheduled ? "取消这次预定的部署？Workbench 上的维护提示会撤下。" : "在这个人工步骤处停止部署？已完成的步骤保留，部署记为失败。")) return;
+    if (!confirm(scheduled ? "Cancel this scheduled deploy? The maintenance notice in Workbench will be removed." : "Stop the deploy at this manual step? Finished steps are kept and the deploy is marked failed.")) return;
     api.stopJob(id).then(reload, (e: Error) => setActionError(e.message));
   };
   useEffect(() => { logRef.current?.scrollTo(0, logRef.current.scrollHeight); }, [data?.log]);
 
   if (error) return <section className="card panel"><p className="error">{error}</p></section>;
-  if (!data) return <section className="card panel"><p className="muted">正在读取…</p></section>;
+  if (!data) return <section className="card panel"><p className="muted">Loading…</p></section>;
   const { job } = data;
   return (
     <section className="card panel">
       <div className="toolbar">
         <h2>{KIND[job.kind] ?? job.kind} {job.app} {job.kind === "env-read" ? "" : job.version}</h2>
         <JobState state={job.state} />
-        <span className="muted">{job.requestedBy} · {when(job.requestedAt)}{job.pinFrom ? ` · 回到 ${job.pinFrom}` : ""}</span>
-        {onBack && job.kind === "deploy" && job.state === "succeeded" && <button onClick={() => onBack(job)}>回到这一版</button>}
-        <button className="link" onClick={onClose}>关闭</button>
+        <span className="muted">{job.requestedBy} · {when(job.requestedAt)}{job.pinFrom ? ` · back to ${job.pinFrom}` : ""}</span>
+        {onBack && job.kind === "deploy" && job.state === "succeeded" && <button onClick={() => onBack(job)}>Go back to this version</button>}
+        <button className="link" onClick={onClose}>Close</button>
       </div>
       {job.message && <p className={job.state === "succeeded" ? "" : "error"}>{job.message}</p>}
-      {data.promotion && <p><span className={`badge ${data.promotion.basis === "override" ? "warn" : "info"}`}>晋级依据：{BASIS[data.promotion.basis]}</span> <span className="muted">{data.promotion.basis === "override" ? `${data.promotion.by}：${data.promotion.reason}` : data.promotion.detail}</span></p>}
+      {(() => {
+        // D36: the address checked once after the deploy; a failure only warns.
+        const ingress = (job.observation as { ingress?: { url: string; ok: boolean; status?: number; error?: string } } | null)?.ingress;
+        if (!ingress) return null;
+        return ingress.ok
+          ? <p className="muted">Reached at <a href={ingress.url} target="_blank" rel="noreferrer">{ingress.url}</a> (HTTP {ingress.status}).</p>
+          : <p className="banner warn">Deployed, but not reachable at its address: {ingress.url} ({ingress.status ? `HTTP ${ingress.status}` : ingress.error}). The containers are healthy, so check the nginx configuration (Ingress page) and the network; nothing was rolled back.</p>;
+      })()}
+      {data.promotion && <p><span className={`badge ${data.promotion.basis === "override" ? "warn" : "info"}`}>Promotion basis: {BASIS[data.promotion.basis]}</span> <span className="muted">{data.promotion.basis === "override" ? `${data.promotion.by}: ${data.promotion.reason}` : data.promotion.detail}</span></p>}
       {job.rollout?.scheduled && !job.rollout.scheduled.submitted && !FINAL.includes(job.state) && (
-        <p className="banner info">已在 Workbench 通知用户，{new Date(job.rollout.scheduled.at).toLocaleTimeString("zh-CN", { hour12: false })} 开始部署。<button className="link" onClick={stopHere}>取消这次部署</button></p>
+        <p className="banner info">Workbench users have been notified; the deploy starts at {new Date(job.rollout.scheduled.at).toLocaleTimeString("en-US", { hour12: false })}. <button className="link" onClick={stopHere}>Cancel this deploy</button></p>
       )}
-      {job.state === "queued" && job.rollout?.host !== "none" && !(job.rollout?.scheduled && !job.rollout.scheduled.submitted) && <p className="muted">等执行器领取…</p>}
+      {job.state === "queued" && job.rollout?.host !== "none" && !(job.rollout?.scheduled && !job.rollout.scheduled.submitted) && <p className="muted">Waiting for the executor to pick it up…</p>}
       {job.rollout && (
         <table className="rollout">
-          <thead><tr><th>#</th><th>组件</th><th>由谁做</th><th>状态</th><th>结果</th></tr></thead>
+          <thead><tr><th>#</th><th>Component</th><th>Done by</th><th>Status</th><th>Result</th></tr></thead>
           <tbody>
             {job.rollout.steps.map((s, i) => (
               <tr key={s.component}>
@@ -205,7 +231,7 @@ export function JobPanel({ id, onClose, onBack }: { id: string; onClose: () => v
                       ))}
                     </ul>
                   )}
-                  {s.state === "waiting" && <button className="link" onClick={stopHere}>在这里停止部署</button>}
+                  {s.state === "waiting" && <button className="link" onClick={stopHere}>Stop the deploy here</button>}
                 </td>
               </tr>
             ))}
@@ -220,19 +246,19 @@ export function JobPanel({ id, onClose, onBack }: { id: string; onClose: () => v
       </ol>
       {data.record && job.state !== "queued" && (
         <details>
-          <summary>部署记录（deployment-receipt 字段）</summary>
+          <summary>Deploy record (deployment-receipt fields)</summary>
           <pre className="json">{JSON.stringify(data.record, null, 2)}</pre>
         </details>
       )}
       {job.rollout?.host !== "none" && (
         <details open={!FINAL.includes(job.state) && job.rollout?.host !== "done"}>
-          <summary>执行器日志</summary>
-          <pre className="log" ref={logRef}>{data.log || "（还没有日志）"}</pre>
+          <summary>Executor log</summary>
+          <pre className="log" ref={logRef}>{data.log || "(no log yet)"}</pre>
         </details>
       )}
       {(job.rollout?.log.length ?? 0) > 0 && (
         <details open={!FINAL.includes(job.state) && job.rollout?.host !== "pending"}>
-          <summary>Deployer 步骤日志</summary>
+          <summary>Deployer step log</summary>
           <pre className="log">{job.rollout!.log.join("\n")}</pre>
         </details>
       )}
@@ -247,18 +273,18 @@ export function History({ onBack }: { onBack: (job: { app: string; version: stri
   const refresh = useCallback(() => { api.jobs().then((d) => setList(d.jobs), (e: Error) => setError(e.message)); }, []);
   useEffect(() => { refresh(); const t = setInterval(refresh, 5_000); return () => clearInterval(t); }, [refresh]);
   if (error) return <p className="error">{error}</p>;
-  if (!list) return <p className="muted">正在读取…</p>;
+  if (!list) return <p className="muted">Loading…</p>;
   return (
     <>
-      <div className="toolbar"><h1>部署记录</h1><span className="muted">构建、部署与环境变量写入，最近 50 条</span></div>
+      <div className="toolbar"><h1>Deploy history</h1><span className="muted">Builds, deploys and env writes, latest 50</span></div>
       {open && <JobPanel id={open} onClose={() => setOpen(undefined)} onBack={(j) => onBack({ app: j.app, version: j.version, id: j.id })} />}
       <table>
-        <thead><tr><th>时间</th><th>任务</th><th>应用</th><th>版本</th><th>谁</th><th>结果</th><th>说明</th></tr></thead>
+        <thead><tr><th>Time</th><th>Job</th><th>App</th><th>Version</th><th>Who</th><th>Result</th><th>Note</th></tr></thead>
         <tbody>
           {list.map((j) => (
             <tr key={j.id} className="app" onClick={() => setOpen(j.id)}>
               <td className="muted">{when(j.requestedAt)}</td>
-              <td>{j.pinFrom ? "回到旧版" : KIND[j.kind] ?? j.kind}</td>
+              <td>{j.pinFrom ? "Back to an old version" : KIND[j.kind] ?? j.kind}</td>
               <td>{j.app}</td>
               <td className="mono">{j.fromVersion && j.kind !== "build" ? `${j.fromVersion} → ` : ""}{j.kind === "env-read" ? "" : j.version}</td>
               <td>{j.requestedBy}</td>

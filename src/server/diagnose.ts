@@ -41,13 +41,13 @@ export function diagnosisPrompt(job: Job, log: string): string {
     executor_log_tail: log.split("\n").slice(-LOG_LINES).join("\n"),
   };
   return [
-    "这次部署失败或回滚了。请判断原因，只读、不改任何东西。",
-    "需要更多信息时，可以用 Deployer 的只读工具（get_job、get_status、get_app、plan_deploy、get_env）；不要猜测没有依据的原因。",
-    "最后一条回复只写一个 JSON 代码块，格式：",
+    "This deploy failed or was rolled back. Work out why; read only, change nothing.",
+    "If you need more information, use the Deployer's read-only tools (get_job, get_status, get_app, plan_deploy, get_env); do not guess causes without evidence.",
+    "Your last reply is a single JSON code block in this format:",
     "```json",
-    '{"cause": "一句话原因", "evidence": ["日志或步骤里的依据，原文摘录"], "suggestion": "建议：回到上一版 / 修改什么 / 找谁", "confidence": "high | medium | low"}',
+    '{"cause": "the cause in one sentence", "evidence": ["evidence from the logs or steps, quoted verbatim"], "suggestion": "suggestion: go back to the previous version / what to change / whom to ask", "confidence": "high | medium | low"}',
     "```",
-    "下面是这个任务的情况：",
+    "This is the job:",
     "```json",
     JSON.stringify(facts, null, 1),
     "```",
@@ -89,15 +89,17 @@ export class Diagnoser {
 
   private async oma(method: string, path: string, body?: unknown): Promise<any> {
     const key = readToken(this.config.keyFile);
-    if (!key) throw new Error("没有 OMA API key");
+    if (!key) throw new Error("No OMA API key");
     const response = await this.fetcher(`${this.config.url.replace(/\/+$/, "")}${path}`, {
       method,
       headers: { "x-api-key": key, accept: "application/json", ...(body !== undefined ? { "content-type": "application/json" } : {}) },
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
       signal: AbortSignal.timeout(30_000),
     });
-    if (!response.ok) throw new Error(`OMA ${method} ${path.split("?")[0]} 返回 HTTP ${response.status}`);
-    return response.json();
+    if (!response.ok) throw new Error(`OMA ${method} ${path.split("?")[0]} returned HTTP ${response.status}`);
+    // Sending events answers 202 with no body.
+    const text = await response.text();
+    return text ? JSON.parse(text) : {};
   }
 
   private stamp() { return new Date(this.now()).toISOString(); }
@@ -107,7 +109,7 @@ export class Diagnoser {
     const startedAt = this.stamp();
     try {
       const session = await this.oma("POST", "/v1/sessions", {
-        agent: this.config.agent, title: `Deployer 诊断 · ${job.app} ${job.version}（${job.environment}）`,
+        agent: this.config.agent, title: `Deployer diagnosis · ${job.app} ${job.version} (${job.environment})`,
         ...(this.config.environment ? { environment_id: this.config.environment } : {}),
         ...(this.config.vaults?.length ? { vault_ids: this.config.vaults } : {}),
         ...(this.config.application ? { app_id: this.config.application, correlation_id: job.id } : {}),
@@ -116,7 +118,7 @@ export class Diagnoser {
       await this.oma("POST", `/v1/sessions/${encodeURIComponent(id)}/events`, { events: [{ type: "user.message", content: [{ type: "text", text: diagnosisPrompt(job, this.log(job.id)) }] }] });
       this.store.setDiagnosis(job.id, { state: "running", session: id, startedAt });
     } catch (error) {
-      this.store.setDiagnosis(job.id, { state: "failed", startedAt, finishedAt: this.stamp(), text: `没能开始诊断：${(error as Error).message}` });
+      this.store.setDiagnosis(job.id, { state: "failed", startedAt, finishedAt: this.stamp(), text: `Could not start the diagnosis: ${(error as Error).message}` });
     }
   }
 
@@ -133,12 +135,12 @@ export class Diagnoser {
           const last = [...events].reverse().find((e) => e.type === "agent.message");
           const ended = events.some((e) => e.type === "session.status_idle" || e.type === "agent.message_stream_end") || Boolean(last);
           if (error) {
-            this.store.setDiagnosis(job, { ...diagnosis, state: "failed", finishedAt: this.stamp(), text: `OMA 会话出错：${JSON.stringify(error.error ?? error.status)}` });
+            this.store.setDiagnosis(job, { ...diagnosis, state: "failed", finishedAt: this.stamp(), text: `OMA session error: ${JSON.stringify(error.error ?? error.status)}` });
           } else if (last && ended) {
             const text = (last.content ?? []).filter((b) => b.type === "text").map((b) => b.text ?? "").join("\n");
             this.store.setDiagnosis(job, { ...diagnosis, state: "done", finishedAt: this.stamp(), ...readAnswer(text) });
           } else if (this.now() - Date.parse(diagnosis.startedAt) > TIMEOUT_MS) {
-            this.store.setDiagnosis(job, { ...diagnosis, state: "failed", finishedAt: this.stamp(), text: "诊断 10 分钟没有结果" });
+            this.store.setDiagnosis(job, { ...diagnosis, state: "failed", finishedAt: this.stamp(), text: "The diagnosis had no result after 10 minutes" });
           }
         } catch (error) {
           if (this.now() - Date.parse(diagnosis.startedAt) > TIMEOUT_MS) this.store.setDiagnosis(job, { ...diagnosis, state: "failed", finishedAt: this.stamp(), text: (error as Error).message });

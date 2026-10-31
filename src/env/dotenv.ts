@@ -23,7 +23,7 @@ export function parseEnv(text: string): ParsedEnv {
     if (!trimmed || trimmed.startsWith("#")) { i = end + 1; line++; continue; }
     const m = /^\s*(?:export\s+)?([^=\s]+)\s*=\s*/.exec(raw);
     if (!m || !KEY.test(m[1]!)) {
-      errors.push(`第 ${line} 行不是 KEY=value：${trimmed.slice(0, 60)}`);
+      errors.push(`Line ${line} is not KEY=value: ${trimmed.slice(0, 60)}`);
       i = end + 1; line++; continue;
     }
     const key = m[1]!;
@@ -46,11 +46,11 @@ export function parseEnv(text: string): ParsedEnv {
         value += ch;
         j++;
       }
-      if (!closed) errors.push(`${key} 的引号没有闭合`);
+      if (!closed) errors.push(`The quotes of ${key} are not closed`);
       values[key] = value;
       const rest = src.indexOf("\n", j) === -1 ? src.length : src.indexOf("\n", j);
       const tail = src.slice(j, rest).trim();
-      if (tail && !tail.startsWith("#")) errors.push(`${key} 的引号后面还有内容：${tail.slice(0, 40)}`);
+      if (tail && !tail.startsWith("#")) errors.push(`${key} has more text after its quotes: ${tail.slice(0, 40)}`);
       i = rest + 1; line++;
       continue;
     }
@@ -158,21 +158,21 @@ export function checkEnv(present: string[], example: ExampleKey[] | null, refere
   const findings: EnvFinding[] = [];
   const set = new Set(present);
   for (const key of referenced.required) {
-    if (!set.has(key)) findings.push({ code: "env/referenced-missing", key, blocking: true, message: `compose 片段引用了 \${${key}}，env 文件里没有。` });
+    if (!set.has(key)) findings.push({ code: "env/referenced-missing", key, blocking: true, message: `The compose fragment uses \${${key}}, which the env file does not have.` });
   }
   if (!example) return findings;
   const known = new Map(example.map((e) => [e.key, e]));
   const missing = example.filter((e) => e.required && !set.has(e.key)).map((e) => e.key);
   const unset = example.filter((e) => !set.has(e.key)).map((e) => e.key);
   for (const key of missing) {
-    if (!referenced.required.includes(key)) findings.push({ code: "env/missing", key, blocking: false, message: `.env.example 要求设置 ${key}。` });
+    if (!referenced.required.includes(key)) findings.push({ code: "env/missing", key, blocking: false, message: `.env.example requires ${key}.` });
   }
   for (const key of present) {
     if (known.has(key)) continue;
     const was = similar(key, unset);
     findings.push({
       code: was ? "env/renamed" : "env/unknown", key, blocking: false,
-      message: was ? `${key} 不在 .env.example 里，可能是改名成了 ${was}。` : `${key} 不在 .env.example 里：应用可能已经不用它了。`,
+      message: was ? `${key} is not in .env.example; it may have been renamed to ${was}.` : `${key} is not in .env.example: the app may no longer use it.`,
       ...(was ? { suggestion: was } : {}),
     });
   }

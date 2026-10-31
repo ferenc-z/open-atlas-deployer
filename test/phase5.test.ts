@@ -24,8 +24,8 @@ test("a bundle is read without its top directory and checked against its SHA256S
   assert.equal(b.checked, 2);
   assert.deepEqual([...b.files.keys()].sort(), ["SHA256SUMS", "app/app.json", "pkg/db/01.sql"]);
   assert.equal(b.digest, `sha256:${sha256(s.assets["acme/book@v1.0.0/book-1.0.0.tar.gz"]!)}`);
-  await assert.rejects(bundles.get("acme/book", "v1.0.1", "book-1.0.1.tar.gz"), /app\/app.json 与 SHA256SUMS 不符/);
-  await assert.rejects(bundles.get("acme/book", "v2.0.0", "book-2.0.0.tar.gz"), /没有 v2.0.0 的 Release/);
+  await assert.rejects(bundles.get("acme/book", "v1.0.1", "book-1.0.1.tar.gz"), /app\/app.json in book-1.0.1.tar.gz does not match SHA256SUMS/);
+  await assert.rejects(bundles.get("acme/book", "v2.0.0", "book-2.0.0.tar.gz"), /has no release for v2.0.0/);
   const calls = s.calls.length;
   await bundles.get("acme/book", "v1.0.0", "book-1.0.0.tar.gz");
   assert.equal(s.calls.length, calls, "downloaded once");
@@ -41,7 +41,7 @@ test("a bundle may not hold links or paths that climb out", () => {
   link.write("pkg/link", 0);
   link.write("00000000000\0", 124);
   link.write("2", 156);
-  assert.throws(() => readTarGz(gzipSync(Buffer.concat([link, Buffer.alloc(1024)]))), /不是普通文件/);
+  assert.throws(() => readTarGz(gzipSync(Buffer.concat([link, Buffer.alloc(1024)]))), /is not a regular file/);
   assert.deepEqual([...stripTop(new Map([["a.txt", Buffer.from("")], ["b/c", Buffer.from("")]])).keys()], ["a.txt", "b/c"], "no single top directory, nothing stripped");
 });
 
@@ -67,10 +67,10 @@ test("the contract check names both apps and the contract, both ways", () => {
   ]);
   assert.deepEqual(ok, { unmet: [], unknown: [] });
   const old = checkContracts("book", "1.0.0", book, [{ app: "workbench", version: "1.2.0", doc: { provides: { "workbench-app": "1.2" }, requires: {} } }]);
-  assert.deepEqual(old.unmet, ["book 1.0.0 要求 workbench-app ^1.3，workbench 1.2.0 提供的是 1.2"]);
-  assert.match(old.unknown[0]!, /要求 data-plane-api \^1.0，这个环境里没有登记提供它的应用/);
+  assert.deepEqual(old.unmet, ["book 1.0.0 requires workbench-app ^1.3, but workbench 1.2.0 provides 1.2"]);
+  assert.match(old.unknown[0]!, /requires data-plane-api \^1.0, but no registered app in this environment provides it/);
   const studio = checkContracts("studio", "3.0.0", { provides: { "data-plane-api": "2.0" }, requires: {} }, [{ app: "book", version: "1.0.0", doc: book }]);
-  assert.deepEqual(studio.unmet, ["book 1.0.0 要求 data-plane-api ^1.0，studio 3.0.0 提供的是 2.0"]);
+  assert.deepEqual(studio.unmet, ["book 1.0.0 requires data-plane-api ^1.0, but studio 3.0.0 provides 2.0"]);
 });
 
 test("components run in dependsOn order; executor parts cannot wait for the Deployer's", () => {

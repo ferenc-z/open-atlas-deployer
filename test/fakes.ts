@@ -192,7 +192,8 @@ export function fakeServices(s: FakeState): typeof fetch {
       if (session && request.method === "POST") {
         const body = await request.json() as { events: { content: { text: string }[] }[] };
         session.messages.push(...body.events.map((e) => e.content.map((c) => c.text).join("")));
-        return Response.json({ ok: true });
+        return new Response(null, { status: 202 }); // as OMA answers
+
       }
       if (session) return Response.json({ data: s.oma.reply ? [{ type: "user.message" }, { type: "agent.message", content: [{ type: "text", text: s.oma.reply }] }, { type: "session.status_idle" }] : [{ type: "user.message" }] });
       return new Response("{}", { status: 404 });

@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """Open Atlas Deployer host executor (design §8.2, D29).
 
-Runs on the host as a systemd service; the Deployer's container has no Docker socket and no registry
-credentials, so everything that touches Docker happens here. The two sides only exchange files in the
-handoff directory (written to a temporary name, then renamed):
+Runs on each host as a systemd service; the Deployer's container has no Docker socket and no registry
+credentials, so everything that touches Docker happens here. Protocol 2 (design §7.4, D35): the executor
+calls the Deployer over HTTPS with its host's token (dpe_, EXECUTOR_TOKEN_FILE); the Deployer never calls
+a host and the host opens no port:
 
-    handoff/requests/<id>.json   Deployer: one job (build, deploy, env, env-read), protocol 1
-    handoff/jobs/<id>/request.json   the executor claims a request by moving it here
-    handoff/jobs/<id>/status.json    executor: state, steps, result
-    handoff/jobs/<id>/log.txt        executor: every command and its output (never compose config output,
-                                     which holds env values)
-    handoff/jobs/<id>/env.content    env-read: the app's env file, 0600 and owned by the Deployer; removed after 10 minutes
-    handoff/executor.json            executor heartbeat: version, protocols, job kinds, what this host has configured
+    GET  /executor/v1/jobs/next?wait=25      the next job queued for this host (long poll; 204: none)
+    PUT  /executor/v1/jobs/<id>/status       state, steps, result
+    POST /executor/v1/jobs/<id>/log          every command and its output (never compose config output,
+                                             which holds env values)
+    PUT  /executor/v1/jobs/<id>/env-content  env-read: the app's env file, handed to the Deployer once
+    POST /executor/v1/heartbeat              version, protocols, job kinds, what this host has configured
+    POST /executor/v1/state                  the project's containers and the hashes of the files the Deployer writes
 
 It only performs a fixed set of actions. A request never carries a command: a build runs the pinned
 release tools' build-images.sh, a deploy writes a compose fragment that first passes a policy check on
@@ -40,17 +41,17 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import urllib.error
 import urllib.request
 
-VERSION = "0.4.0"
-PROTOCOLS = [1]
+VERSION = "0.5.0"
+PROTOCOLS = [2]
 # Job kinds, plus what a deploy may ask for (bundle files, migrations): an older executor is not sent those.
 KINDS = ["build", "deploy", "env", "env-read", "bundle", "db-migration"]
 ENV_FILE_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*\.env$")
 ENV_MAX_BYTES = 1024 * 1024
-ENV_COPY_SECONDS = 600
 BUILD_JSON_IN_IMAGE = "/opt/open-atlas/BUILD.json"
 APP_RE = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$")
@@ -61,6 +62,7 @@ TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
 ASSET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 COMPONENT_RE = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
+CA_RE = re.compile(r"^(-----BEGIN CERTIFICATE-----[A-Za-z0-9+/=\s]+-----END CERTIFICATE-----\s*)+$")
 # Runs psql in the database container as the image's own superuser, on its local socket; arguments follow.
 PSQL = 'exec psql -X -q -v ON_ERROR_STOP=1 -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-${POSTGRES_USER:-postgres}}" "$@"'
 MIGRATIONS_TABLE = ("CREATE SCHEMA IF NOT EXISTS deployer; CREATE TABLE IF NOT EXISTS deployer.migrations ("
@@ -116,8 +118,11 @@ def config(env_file=None, environ=None):
     return {
         "root": root,
         "project": e.get("EXECUTOR_PROJECT", "open-atlas"),
-        "handoff": pathlib.Path(e.get("EXECUTOR_HANDOFF", str(deployer / "handoff"))),
-        "state_file": pathlib.Path(e.get("EXECUTOR_STATE_FILE", str(deployer / "state" / "containers.jsonl"))),
+        # D35: where this host's executor reaches the Deployer, with the token issued for this host.
+        "deployer_url": e.get("EXECUTOR_DEPLOYER_URL", "").rstrip("/"),
+        "executor_token_file": e.get("EXECUTOR_TOKEN_FILE", ""),
+        "ca_file": e.get("EXECUTOR_CA_FILE", ""),
+        "wait_seconds": int(e.get("EXECUTOR_WAIT_SECONDS", "25")),
         "backups": pathlib.Path(e.get("EXECUTOR_BACKUPS", str(deployer / "backups"))),
         "work": pathlib.Path(e.get("EXECUTOR_WORK", "/var/lib/open-atlas-deployer-executor")),
         "registries": [r.rstrip("/") for r in e.get("EXECUTOR_REGISTRIES", "").split()],
@@ -234,12 +239,71 @@ def ports_in_use(docker_ps_lines, exclude_services, project):
 
 # --- the executor -------------------------------------------------------------------------------------
 
+class DeployerApi:
+    """The executor's calls to the Deployer (protocol 2). Tests replace it."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.context = None
+        if cfg["deployer_url"].startswith("https://") and cfg["ca_file"]:
+            import ssl
+            self.context = ssl.create_default_context(cafile=cfg["ca_file"])
+
+    def token(self):
+        f = self.cfg["executor_token_file"]
+        return pathlib.Path(f).read_text().strip() if f and pathlib.Path(f).is_file() else ""
+
+    def call(self, method, path, body=None, text=None, timeout=30):
+        if not self.cfg["deployer_url"]:
+            raise Failed("EXECUTOR_DEPLOYER_URL is not set")
+        data, headers = None, {"authorization": f"Bearer {self.token()}", "user-agent": f"open-atlas-deployer-executor/{VERSION}"}
+        if body is not None:
+            data, headers["content-type"] = json.dumps(body).encode(), "application/json"
+        elif text is not None:
+            data, headers["content-type"] = text.encode(), "text/plain; charset=utf-8"
+        req = urllib.request.Request(self.cfg["deployer_url"] + path, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout, context=self.context) as r:
+                raw = r.read()
+                return json.loads(raw) if raw and r.status != 204 else None
+        except urllib.error.HTTPError as e:
+            raise Failed(f"the Deployer answered {method} {path.split('?')[0]} with HTTP {e.code}: {e.read()[:300].decode('utf-8', 'replace')}")
+        except (urllib.error.URLError, OSError) as e:
+            raise Failed(f"cannot reach the Deployer at {self.cfg['deployer_url']}: {getattr(e, 'reason', e)}")
+
+    def heartbeat(self, beat):
+        self.call("POST", "/executor/v1/heartbeat", body=beat)
+
+    def next_job(self, wait):
+        r = self.call("GET", f"/executor/v1/jobs/next?wait={int(wait)}", timeout=wait + 30)
+        return r["job"] if r else None
+
+    def put_status(self, job_id, status):
+        self.call("PUT", f"/executor/v1/jobs/{job_id}/status", body=status)
+
+    def append_log(self, job_id, text):
+        self.call("POST", f"/executor/v1/jobs/{job_id}/log", text=text)
+
+    def put_env_content(self, job_id, text):
+        self.call("PUT", f"/executor/v1/jobs/{job_id}/env-content", text=text)
+
+    def report_state(self, containers, files):
+        self.call("POST", "/executor/v1/state", body={"containers": containers, "files": files})
+
+
 class Executor:
-    def __init__(self, cfg, out=sys.stdout):
+    def __init__(self, cfg, out=sys.stdout, api=None):
         self.cfg = cfg
         self.out = out
-        self.log_file = None
+        self.api = api or DeployerApi(cfg)
+        # The running job's id and its log lines not yet sent to the Deployer.
+        self.job_id = None
+        self.log_buffer = []
+        self.log_lock = threading.Lock()
         self.last_state = 0.0
+        self.beat_lock = threading.Lock()
+        # A job can run for minutes (a build, a health wait); the heartbeat keeps going meanwhile.
+        self.beat_seconds = 10.0
 
     # Host access. Tests replace these.
     def sh(self, args, cwd=None, env=None, check=True, timeout=None, input=None, quiet=False):
@@ -247,10 +311,9 @@ class Executor:
         if cwd:
             full_env["PWD"] = str(cwd)
         p = subprocess.run(args, cwd=cwd, env=full_env, capture_output=True, text=True, timeout=timeout, input=input)
-        if self.log_file:
+        if self.job_id:
             output = f"[output not logged]\n" if quiet else f"{p.stdout}{p.stderr}"
-            with open(self.log_file, "a") as f:
-                f.write(f"$ {' '.join(shlex.quote(a) for a in args)}\n{output}[exit {p.returncode}]\n")
+            self.log(f"$ {' '.join(shlex.quote(a) for a in args)}\n{output}[exit {p.returncode}]")
         if check and p.returncode != 0:
             raise Failed(f"{' '.join(args[:3])} failed (exit {p.returncode}): {(p.stderr or p.stdout).strip()[-600:]}")
         return p
@@ -274,9 +337,23 @@ class Executor:
         time.sleep(seconds)
 
     def log(self, text):
-        if self.log_file:
-            with open(self.log_file, "a") as f:
-                f.write(text.rstrip("\n") + "\n")
+        if self.job_id:
+            with self.log_lock:
+                self.log_buffer.append(text.rstrip("\n") + "\n")
+
+    def flush_log(self):
+        """Sends the buffered log lines; kept for the next try when the Deployer cannot be reached."""
+        with self.log_lock:
+            if not self.job_id or not self.log_buffer:
+                return
+            text, job_id = "".join(self.log_buffer), self.job_id
+            self.log_buffer = []
+        try:
+            self.api.append_log(job_id, text)
+        except Exception as e:
+            with self.log_lock:
+                self.log_buffer.insert(0, text)
+            self.say(f"cannot send the log of {job_id}: {e}")
 
     def say(self, msg):
         print(f"{now_iso()} {msg}", file=self.out, flush=True)
@@ -326,13 +403,17 @@ class Executor:
 
     def heartbeat(self, busy=None):
         db = {app: {"dump": "dump" in v, "restore": "restore" in v} for app, v in self.cfg["db"].items()}
-        write_json(self.cfg["handoff"] / "executor.json", {
-            "version": VERSION, "protocols": PROTOCOLS, "kinds": KINDS, "at": now_iso(), "pid": os.getpid(),
-            "project": self.cfg["project"], "registries": self.cfg["registries"], "databaseBackup": db, "busy": busy,
-        })
+        with self.beat_lock:
+            try:
+                self.api.heartbeat({
+                    "version": VERSION, "protocols": PROTOCOLS, "kinds": KINDS, "at": now_iso(), "pid": os.getpid(), "root": str(self.cfg["root"]),
+                    "project": self.cfg["project"], "registries": self.cfg["registries"], "databaseBackup": db, "busy": busy,
+                })
+            except Exception as e:  # the Deployer may be restarting; the next beat tries again
+                self.say(f"heartbeat failed: {e}")
 
     def report_state(self, force=False):
-        """The project's containers for the status page (what host/report-state.sh did in phase 1)."""
+        """The project's containers on this host, for the status page."""
         if not force and time.monotonic() - self.last_state < self.cfg["state_seconds"]:
             return
         self.last_state = time.monotonic()
@@ -340,14 +421,11 @@ class Executor:
                      "--format", "{{json .}}"], check=False)
         if p.returncode != 0:
             return
-        f = self.cfg["state_file"]
-        f.parent.mkdir(parents=True, exist_ok=True)
-        tmp = f.with_name(f".{f.name}.tmp")
-        tmp.write_text(p.stdout)
-        os.chmod(tmp, 0o644)
-        os.replace(tmp, f)
         # Drift (§7.1, phase 8): hashes of the compose files and env files the Deployer writes, never their content.
-        write_json(f.with_name("files.json"), {"at": now_iso(), "files": self.file_hashes()})
+        try:
+            self.api.report_state(p.stdout, self.file_hashes())
+        except Exception as e:
+            self.say(f"cannot report the host state: {e}")
 
     def file_hashes(self):
         root, out = self.cfg["root"], {}
@@ -356,46 +434,28 @@ class Executor:
                 out[str(path.relative_to(root)).replace(os.sep, "/")] = hashlib.sha256(path.read_bytes()).hexdigest()
         return out
 
+    def current_marker(self):
+        return self.cfg["work"] / "current-job.json"
+
     def recover(self):
         """A job left running by a previous process was interrupted: say so instead of leaving it running."""
-        jobs = self.cfg["handoff"] / "jobs"
-        for status_file in jobs.glob("*/status.json") if jobs.is_dir() else []:
-            status = json.loads(status_file.read_text())
-            if status.get("state") not in FINAL:
-                status.update(state="failed", finishedAt=now_iso(),
-                              message="The executor stopped while this job ran; check the app before deploying again.")
-                write_json(status_file, status)
+        marker = self.current_marker()
+        if not marker.is_file():
+            return
+        status = json.loads(marker.read_text())
+        if status.get("state") not in FINAL:
+            status.update(state="failed", finishedAt=now_iso(),
+                          message="The executor stopped while this job ran; check the app before deploying again.")
+            self.api.put_status(status["id"], status)
+        marker.unlink()
 
-    def next_request(self):
-        requests = self.cfg["handoff"] / "requests"
-        if not requests.is_dir():
-            return None
-        for f in sorted(requests.glob("*.json"), key=lambda p: p.stat().st_mtime):
-            job_id = f.stem
-            target = self.cfg["handoff"] / "jobs" / job_id
-            if not ID_RE.match(job_id) or target.exists():
-                f.rename(f.with_suffix(".rejected"))
-                continue
-            target.mkdir(parents=True)
-            os.replace(f, target / "request.json")
-            return target
-        return None
-
-    def remove_env_copies(self):
-        """An env-read copy is for the Deployer to import within seconds; it does not stay in the handoff directory."""
-        jobs = self.cfg["handoff"] / "jobs"
-        for f in jobs.glob("*/env.content") if jobs.is_dir() else []:
-            if time.time() - f.stat().st_mtime > ENV_COPY_SECONDS:
-                f.unlink(missing_ok=True)
-
-    def run_once(self):
+    def run_once(self, wait=0):
         self.heartbeat()
         self.report_state()
-        self.remove_env_copies()
-        job_dir = self.next_request()
-        if not job_dir:
+        request = self.api.next_job(wait)
+        if not request:
             return False
-        self.handle(job_dir)
+        self.handle(request)
         self.report_state(force=True)
         return True
 
@@ -406,8 +466,8 @@ class Executor:
         self.selfcheck()
         while True:
             try:
-                if not self.run_once():
-                    self.sleep(self.cfg["poll_seconds"])
+                # The long poll waits at the Deployer; a heartbeat thread keeps the host online meanwhile.
+                self.run_once(wait=self.cfg["wait_seconds"])
             except Exception as e:  # keep serving; the job itself already recorded its failure
                 self.say(f"error: {e}")
                 self.sleep(self.cfg["poll_seconds"])
@@ -415,10 +475,22 @@ class Executor:
     def selfcheck(self):
         """After an upgrade, launch.sh counts starts until this clears the marker (§8.6)."""
         self.sh(["docker", "version", "--format", "{{.Server.Version}}"])
-        for d in ("requests", "jobs"):
-            (self.cfg["handoff"] / d).mkdir(parents=True, exist_ok=True)
-        if not os.access(self.cfg["handoff"], os.W_OK):
-            raise SystemExit(f"cannot write {self.cfg['handoff']}")
+        if not self.cfg["deployer_url"] or not self.api.token():
+            raise SystemExit("EXECUTOR_DEPLOYER_URL and EXECUTOR_TOKEN_FILE (this host's dpe_ token) are required")
+        # The Deployer may be starting or restarting: wait for it rather than exit. A refused token stops here.
+        waited = 0
+        while True:
+            try:
+                self.api.heartbeat({"version": VERSION, "protocols": PROTOCOLS, "kinds": KINDS, "at": now_iso(), "pid": os.getpid(), "root": str(self.cfg["root"]),
+                                    "project": self.cfg["project"], "registries": self.cfg["registries"], "databaseBackup": {}, "busy": None})
+                break
+            except Failed as e:
+                if "HTTP 401" in str(e):
+                    raise SystemExit(f"the Deployer refused this host's token: {e}")
+                if waited % 30 == 0:
+                    self.say(f"waiting for the Deployer: {e}")
+                self.sleep(5)
+                waited += 5
         marker = self.cfg["work"] / "upgrade-pending"
         if marker.exists():
             marker.unlink()
@@ -426,21 +498,21 @@ class Executor:
 
     # --- one job --------------------------------------------------------------------------------------
 
-    def handle(self, job_dir):
-        self.log_file = job_dir / "log.txt"
-        self.log_file.touch()
-        os.chmod(self.log_file, 0o644)
-        status = {"protocol": 1, "id": job_dir.name, "state": "running", "startedAt": now_iso(), "steps": [], "result": {}}
-        self.status_file = job_dir / "status.json"
+    def handle(self, request):
+        job_id = str(request.get("id", ""))
+        if not ID_RE.match(job_id):
+            self.say(f"refused a job with the id {job_id[:80]!r}")
+            return
+        self.job_id = job_id
+        self.log_buffer = []
+        status = {"protocol": 2, "id": job_id, "state": "running", "startedAt": now_iso(), "steps": [], "result": {}}
+        done = threading.Event()
+        beating = threading.Thread(target=self.keep_beating, args=(done, job_id), daemon=True)
+        beating.start()
         try:
-            owner = (job_dir / "request.json").stat().st_uid
-            request = json.loads((job_dir / "request.json").read_text())
-            if "content" in request:
-                # The env content has been read; it does not stay on disk beside the job.
-                write_json(job_dir / "request.json", {k: v for k, v in request.items() if k != "content"}, mode=0o600)
             status.update(kind=request.get("kind"), app=request.get("app"), version=request.get("version"))
             self.write_status(status)
-            self.heartbeat(busy=job_dir.name)
+            self.heartbeat(busy=job_id)
             if request.get("protocol") not in PROTOCOLS:
                 raise Refused(f"protocol {request.get('protocol')} is not supported (this executor speaks {PROTOCOLS})")
             if request.get("kind") == "build":
@@ -450,7 +522,7 @@ class Executor:
             elif request.get("kind") == "env":
                 self.env_write(request, status)
             elif request.get("kind") == "env-read":
-                self.env_read(request, status, job_dir, owner)
+                self.env_read(request, status)
             else:
                 raise Refused(f"unknown job kind {request.get('kind')}")
         except Refused as e:
@@ -459,11 +531,32 @@ class Executor:
             if status["state"] not in FINAL:
                 self.finish(status, "failed", str(e))
         finally:
-            self.log_file = None
+            done.set()
+            beating.join()
+            self.flush_log()
+            self.job_id = None
+            self.current_marker().unlink(missing_ok=True)
             self.heartbeat()
 
+    def keep_beating(self, done, busy):
+        while not done.wait(self.beat_seconds):
+            self.heartbeat(busy=busy)
+            self.flush_log()
+
     def write_status(self, status):
-        write_json(self.status_file, status)
+        """To the Deployer, and to a local marker so a restart can say the job was interrupted."""
+        self.cfg["work"].mkdir(parents=True, exist_ok=True)
+        write_json(self.current_marker(), status, mode=0o600)
+        self.flush_log()
+        for attempt in range(5):
+            try:
+                self.api.put_status(status["id"], status)
+                return
+            except Exception as e:
+                if attempt == 4:
+                    self.say(f"cannot send the status of {status['id']}: {e}")
+                else:
+                    self.sleep(2)
 
     def step(self, status, name, state="running", message=None):
         steps = status["steps"]
@@ -581,6 +674,16 @@ class Executor:
         files = req.get("files")
         if files:
             self.fetch_files(files, files_next)
+        # D36: the internal CA the administrator configured, mounted read-only from <app>/ca/ca.pem.
+        ca = req.get("ca")
+        if ca is not None:
+            if not isinstance(ca, str) or len(ca) > 65536 or not CA_RE.match(ca.strip()):
+                raise Refused("the CA is not PEM certificates")
+            (app_dir / "ca").mkdir(exist_ok=True)
+            tmp = app_dir / "ca" / ".ca.pem.tmp"
+            tmp.write_text(ca)
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, app_dir / "ca" / "ca.pem")
 
         # 2. pull every image and pin it to its digest
         self.step(status, "pull")
@@ -789,7 +892,7 @@ class Executor:
         else:
             self.finish(status, "failed", f"{app} did not come up with the new env file ({problem}) nor with the previous one; it needs a person")
 
-    def env_read(self, req, status, job_dir, owner):
+    def env_read(self, req, status):
         app, target = self.env_target(req)
         self.step(status, "read")
         if not target.is_file():
@@ -803,10 +906,7 @@ class Executor:
             data.decode("utf-8")
         except UnicodeDecodeError:
             raise Refused(f"{target.name} is not UTF-8")
-        out = job_dir / "env.content"
-        self.write_private(out, data)
-        if os.geteuid() == 0 and owner != 0:
-            os.chown(out, owner, -1)
+        self.api.put_env_content(status["id"], data.decode("utf-8"))
         status["result"]["env"] = {"exists": True, "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
         self.finish(status, "succeeded", f"read {target.name} ({len(data)} bytes) for the Deployer to import")
 

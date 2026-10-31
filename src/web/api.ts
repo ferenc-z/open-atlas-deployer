@@ -64,11 +64,34 @@ import type { Job } from "../server/store.ts";
 import type { ExecutorInfo } from "../server/handoff.ts";
 export type { ExecutorInfo, Job, Plan };
 
-export type StatusView = EnvironmentStatus & { executor: ExecutorInfo; canDeploy: boolean; active: Pick<Job, "id" | "kind" | "app" | "version" | "state">[]; peer?: import("../server/peer.ts").PeerStatus | { error: string } };
+export type StatusView = EnvironmentStatus & { executor: ExecutorInfo; executors: ExecutorInfo[]; hostOf: Record<string, string>; canDeploy: boolean; active: Pick<Job, "id" | "kind" | "app" | "version" | "state">[]; peer?: import("../server/peer.ts").PeerStatus | { error: string } };
 export interface JobView { job: Omit<Job, "request">; request: Record<string, unknown>; log: string; record?: Record<string, unknown>; promotion?: import("../server/plan.ts").Promotion }
 
 export const statusView = () => call<StatusView>("GET", "status");
-export const versions = (id: string) => call<{ versions: string[]; error?: string; built: string[]; deployed: string | null }>("GET", `apps/${encodeURIComponent(id)}/versions`);
+
+// D35: the hosts of this environment and their executors' tokens.
+export type HostView = { id: string; address: string | null; executor: ExecutorInfo; apps: string[]; report: { at: string; stale: boolean; containers: number } | null; tokens: { prefix: string; createdAt: string; createdBy: string; revokedAt: string | null }[] };
+export const hosts = () => call<{ hosts: HostView[] }>("GET", "hosts");
+export const issueHostToken = (id: string) => call<{ host: string; token: string }>("POST", `hosts/${encodeURIComponent(id)}/token`, {});
+export const revokeHost = (id: string) => call<{ revoked: number }>("POST", `hosts/${encodeURIComponent(id)}/revoke`, {});
+
+// D36: addresses, the recommended nginx configuration and its revisions, the internal CA.
+export type IngressView = {
+  domain: string | null;
+  endpoints: { app: string; host: string; kind: string; url?: string; upstream?: string; problem?: string }[];
+  nginx: { body: string; sha256: string; problems: string[]; latest: { revision: number; sha256: string; savedAt: string; savedBy: string; note: string | null } | null; diff: string | null };
+  revisions: { revision: number; sha256: string; savedAt: string; savedBy: string; note: string | null }[];
+  ca: { subject: string; issuer: string; validTo: string; fingerprint256: string } | null;
+  canSave: boolean;
+  canSetCa: boolean;
+};
+export const ingress = () => call<IngressView>("GET", "ingress");
+export const saveNginx = (note: string) => call<{ revision: number }>("POST", "ingress/nginx", { note });
+export const nginxRevisionUrl = (revision: number) => `${BASE}api/ingress/nginx/${revision}`;
+export const setCa = (pem: string) => call<{ ca: IngressView["ca"] }>("PUT", "settings/ca", { pem });
+/** uncovered: versions no manifest covers yet, which need an assessment first (D32). */
+export type VersionList = { versions: string[]; error?: string; built: string[]; uncovered: string[]; deployed: string | null };
+export const versions = (id: string) => call<VersionList>("GET", `apps/${encodeURIComponent(id)}/versions`);
 export const plan = (id: string, version: string, pinFrom?: string) => call<Plan>("POST", `apps/${encodeURIComponent(id)}/plan`, { version, ...(pinFrom ? { pinFrom } : {}) });
 export const deploy = (id: string, version: string, acknowledgeManual: boolean, pinFrom?: string) =>
   call<{ job: Job }>("POST", `apps/${encodeURIComponent(id)}/deploy`, { version, acknowledgeManual, ...(pinFrom ? { pinFrom } : {}) });

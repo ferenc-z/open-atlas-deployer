@@ -25,8 +25,8 @@ export class McpClient {
       signal: AbortSignal.timeout(120_000),
     });
     this.session = response.headers.get("mcp-session-id") ?? this.session;
-    if (response.status === 401 || response.status === 403) throw new McpError(`${this.url} 拒绝了凭据（HTTP ${response.status}）`);
-    if (!response.ok && !(notify && response.status === 202)) throw new McpError(`${this.url} 返回 HTTP ${response.status}`);
+    if (response.status === 401 || response.status === 403) throw new McpError(`${this.url} refused the credentials (HTTP ${response.status})`);
+    if (!response.ok && !(notify && response.status === 202)) throw new McpError(`${this.url} returned HTTP ${response.status}`);
     const raw = await response.text();
     if (notify || !raw.trim()) return null;
     const text = (response.headers.get("content-type") ?? "").includes("text/event-stream")

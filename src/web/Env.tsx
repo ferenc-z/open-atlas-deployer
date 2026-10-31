@@ -1,15 +1,16 @@
-// Phase 3 page (design §7.2): one app's env file — its values (secrets masked), the checks against
-// .env.example and the compose fragment, editing as a new revision, the history with "回到这一版",
-// writing to the server as a plan, and comparing with the other environment.
+// Environment variables (design §7.2; page redesigned in D37): app cards with each app's state; a status strip that
+// says what is on the server, what the Deployer holds, and the one next step; the values grouped (needs attention,
+// set, optional and unset) with problems marked on their rows, counts that filter, a search, and editing in the same
+// table; history and the comparison with the other environment in their own tabs. Writing goes through a plan.
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import * as api from "./api.ts";
 import type { EnvEdit, EnvPlan, EnvView, Fingerprint, RegisteredApp } from "./api.ts";
 import { JobPanel } from "./Deploy.tsx";
 
-const when = (iso: string | null | undefined) => (iso ? new Date(iso).toLocaleString("zh-CN", { hour12: false }) : "—");
-const SOURCE: Record<string, string> = { edit: "编辑", import: "从服务器导入", revert: "回到旧版" };
-const CHANGE: Record<string, string> = { added: "新增", removed: "删除", changed: "修改" };
+const when = (iso: string | null | undefined) => (iso ? new Date(iso).toLocaleString("en-US", { hour12: false }) : "—");
+const SOURCE: Record<string, string> = { edit: "Edit", import: "Imported from the server", revert: "Back to an old revision" };
+const CHANGE: Record<string, string> = { added: "added", removed: "removed", changed: "changed" };
 const MASK = "••••••••";
 
 type Fail = { message: string; details: string[] };
@@ -20,31 +21,72 @@ function Failure({ error }: { error: Fail | undefined }) {
   return <div className="error">{error.message}{error.details.length > 0 && <ul>{error.details.map((d) => <li key={d}>{d}</li>)}</ul>}</div>;
 }
 
+/** One app's state in a few words, for its card. */
+function stateOf(v: EnvView): { label: string; tone: string; missing: number } {
+  const latest = v.revisions[0]?.revision ?? null;
+  const missing = v.findings.filter((f) => f.code === "env/referenced-missing").length;
+  if (latest === null || v.applied === null) return { label: "Not imported", tone: "warn", missing };
+  if (latest !== v.applied) return { label: `Revision ${latest} not written`, tone: "warn", missing };
+  return { label: `In sync · revision ${latest}`, tone: "ok", missing };
+}
+
 export function EnvPage() {
   const [apps, setApps] = useState<RegisteredApp[] | undefined>();
+  const [views, setViews] = useState<Record<string, EnvView | { error: string }>>({});
   const [app, setApp] = useState("");
   const [error, setError] = useState("");
-  useEffect(() => { api.apps().then((d) => { setApps(d.apps); setApp((a) => a || d.apps[0]?.id || ""); }, (e: Error) => setError(e.message)); }, []);
+  const loadViews = useCallback((list: RegisteredApp[]) => Promise.all(list.map((a) => api.env(a.id).then((v) => [a.id, v] as const, (e: api.ApiError) => [a.id, { error: e.status === 404 ? "No env file" : "Cannot read" }] as const)))
+    .then((pairs) => { const next = Object.fromEntries(pairs); setViews(next); return next; }), []);
+  useEffect(() => {
+    api.apps().then((d) => {
+      setApps(d.apps);
+      loadViews(d.apps).then((next) => setApp((a) => a || d.apps.find((x) => { const v = next[x.id]; return v && "deployed" in v && v.deployed; })?.id || d.apps[0]?.id || ""));
+    }, (e: Error) => setError(e.message));
+  }, [loadViews]);
   if (error) return <p className="error">{error}</p>;
-  if (!apps) return <p className="muted">正在读取…</p>;
+  if (!apps) return <p className="muted">Loading…</p>;
   return (
     <>
       <div className="toolbar">
-        <h1>环境变量</h1>
-        <select value={app} onChange={(e) => setApp(e.target.value)}>
-          {apps.map((a) => <option key={a.id} value={a.id}>{a.name}（{a.id}）</option>)}
-        </select>
-        <span className="muted">Deployer 是 env 文件唯一的维护者：在这里改，确认计划后由执行器写入服务器并重启用到的服务。</span>
+        <h1>Environment variables</h1>
+        <span className="muted">The Deployer is the only maintainer of env files: change them here, then write them to the server through a plan.</span>
       </div>
-      {app && <EnvApp key={app} app={app} />}
+      <div className="app-cards">
+        {apps.map((a) => {
+          const v = views[a.id];
+          const s = v && "revisions" in v ? stateOf(v) : undefined;
+          return (
+            <button key={a.id} className={`app-card${a.id === app ? " selected" : ""}`} onClick={() => setApp(a.id)}>
+              <strong>{a.name}</strong>
+              <span className="muted">{v && "deployed" in v ? (v.deployed ? "Deployed" : "Not deployed") : v && "error" in v ? v.error : "…"}</span>
+              {s && <span className={`badge ${s.tone}`}>{s.label}</span>}
+              {s && s.missing > 0 && <span className="badge bad">{s.missing} missing</span>}
+            </button>
+          );
+        })}
+      </div>
+      {app && <EnvApp key={app} app={app} onChanged={() => loadViews(apps)} />}
     </>
   );
 }
 
-function EnvApp({ app }: { app: string }) {
+type Row = {
+  key: string;
+  group: "attention" | "set" | "optional";
+  value?: string;
+  secret: boolean;
+  present: boolean;
+  tags: { label: string; tone: string; title?: string }[];
+  comment?: string;
+  example?: string;
+};
+
+function EnvApp({ app, onChanged }: { app: string; onChanged: () => void }) {
   const [data, setData] = useState<EnvView | undefined>();
   const [revision, setRevision] = useState<number | undefined>();
-  const [mode, setMode] = useState<"view" | "edit" | "plan" | "compare">("view");
+  const [tab, setTab] = useState<"values" | "history" | "compare">("values");
+  const [editing, setEditing] = useState(false);
+  const [planning, setPlanning] = useState(false);
   const [job, setJob] = useState<string | undefined>();
   const [revealed, setRevealed] = useState<Record<string, string>>({});
   const [error, setError] = useState<Fail | undefined>();
@@ -55,155 +97,247 @@ function EnvApp({ app }: { app: string }) {
   useEffect(() => refresh(), [refresh]);
 
   if (error && !data) return <Failure error={error} />;
-  if (!data) return <p className="muted">正在读取…</p>;
+  if (!data) return <p className="muted">Loading…</p>;
   const latest = data.revisions[0]?.revision ?? null;
   const shown = data.revision?.revision ?? null;
   const viewingOld = revision !== undefined && revision !== latest;
-  const schemaKeys = "keys" in data.schema ? data.schema.keys : [];
-  const byKey = new Map(schemaKeys.map((k) => [k.key, k]));
-  const findingFor = new Map(data.findings.map((f) => [f.key, f]));
-  const reveal = (key: string) => api.revealEnv(app, shown!, key).then((r) => setRevealed({ ...revealed, [key]: r.value }), (e: api.ApiError) => setError(toFail(e)));
   const startImport = () => api.importEnv(app).then((r) => setJob(r.job.id), (e: api.ApiError) => setError(toFail(e)));
+  const reveal = (key: string) => api.revealEnv(app, shown!, key).then((r) => setRevealed({ ...revealed, [key]: r.value }), (e: api.ApiError) => setError(toFail(e)));
   const revert = (rev: number) => {
-    if (!confirm(`以第 ${rev} 版的值另存为新版本？保存后还需要写入服务器才生效。`)) return;
-    api.revertEnv(app, rev, latest).then(() => refresh(), (e: api.ApiError) => setError(toFail(e)));
+    if (!confirm(`Save the values of revision ${rev} as a new revision? It still has to be written to the server to take effect.`)) return;
+    api.revertEnv(app, rev, latest).then(() => { refresh(); onChanged(); }, (e: api.ApiError) => setError(toFail(e)));
   };
+  const done = () => { refresh(); onChanged(); };
+
+  // The one next step (D37): import, write, or — in sync — edit.
+  const notImported = latest === null || data.applied === null;
+  const unwritten = !notImported && latest !== data.applied;
+  const next = !data.canChange || viewingOld ? null
+    : notImported ? { label: "Import from the server", hint: "The Deployer has not read the file on the server yet. Import it first, so nothing on the server is lost when you write.", run: startImport }
+    : unwritten ? { label: "Review the plan and write…", hint: `Revision ${latest} is saved but not on the server yet; writing shows which services restart first.`, run: () => setPlanning(true) }
+    : { label: "Edit", hint: "The server has the Deployer's latest revision.", run: () => { setTab("values"); setEditing(true); } };
 
   return (
     <>
-      <div className="toolbar">
-        <h2 className="mono">{data.file}</h2>
-        <span className="muted">
-          {shown === null ? "还没有任何版本" : <>第 {shown} 版{viewingOld && "（历史版本）"} · 服务器上：{data.applied === null ? "还没导入" : `第 ${data.applied} 版`}{data.applied !== null && latest !== data.applied && <span className="badge warn">有未写入的修改</span>}</>}
-          {!data.deployed && " · 还没有经 Deployer 部署过，写入只改文件"}
-        </span>
-        {viewingOld && <button className="link" onClick={() => refresh()}>回到最新版</button>}
-        {data.canChange && mode === "view" && !viewingOld && (
-          <>
-            <button onClick={startImport}>从服务器导入</button>
-            <button onClick={() => setMode("edit")}>编辑</button>
-            {shown !== null && <button className="primary" onClick={() => setMode("plan")}>写入服务器…</button>}
-          </>
-        )}
-        {mode === "view" && data.applied !== null && <button onClick={() => setMode("compare")}>与另一环境对比</button>}
-      </div>
-      {job && <JobPanel id={job} onClose={() => { setJob(undefined); refresh(); }} />}
+      <section className="card env-status">
+        <div className="steps3">
+          <div className={`step3 ${notImported ? "warn" : "ok"}`}>
+            <span className="muted">On the server</span>
+            <strong className="mono">{data.file}</strong>
+            <span>{data.applied === null ? "Not imported yet" : `Revision ${data.applied}`}</span>
+          </div>
+          <div className="arrow">→</div>
+          <div className={`step3 ${unwritten ? "warn" : notImported ? "" : "ok"}`}>
+            <span className="muted">In the Deployer</span>
+            <strong>{latest === null ? "No revisions" : `Revision ${latest}`}</strong>
+            <span>{unwritten ? "Not written to the server" : notImported ? "—" : "Same as the server"}</span>
+          </div>
+          <div className="arrow">→</div>
+          <div className="step3 next">
+            <span className="muted">Next</span>
+            {next ? <button className="primary" onClick={next.run}>{next.label}</button> : <span className="muted">{viewingOld ? "Viewing an old revision" : "View only"}</span>}
+            {next && <span className="muted small">{next.hint}</span>}
+          </div>
+        </div>
+        <div className="row small">
+          {!data.deployed && <span className="badge muted">Not deployed by the Deployer: writing only changes the file</span>}
+          {viewingOld && <><span className="badge info">Viewing revision {revision}</span><button className="link" onClick={() => refresh()}>Back to the latest</button></>}
+          {data.canChange && !viewingOld && !notImported && <button className="link" onClick={startImport}>Import again</button>}
+          {data.canChange && !viewingOld && unwritten && !editing && <button className="link" onClick={() => { setTab("values"); setEditing(true); }}>Edit</button>}
+        </div>
+      </section>
+      {job && <JobPanel id={job} onClose={() => { setJob(undefined); done(); }} />}
       <Failure error={error} />
-      {mode === "plan" && shown !== null && <PlanPanel app={app} revision={shown} onClose={() => setMode("view")} onJob={(id) => { setMode("view"); setJob(id); }} />}
-      {mode === "compare" && <Compare app={app} onClose={() => setMode("view")} />}
-      {mode === "edit"
-        ? <Editor data={data} onCancel={() => setMode("view")} onSaved={() => { setMode("view"); refresh(); }} />
-        : (
-          <>
-            <p className="muted">
-              校验依据：{"error" in data.schema ? <span className="error">{data.schema.error}</span> : <>{data.schema.source}（{data.version}）</>}
-              {data.referenced.required.length > 0 && <> · compose 片段引用 {data.referenced.required.map((k) => `\${${k}}`).join(" ")}</>}
-            </p>
-            {data.findings.length > 0 && (
-              <ul className="findings">{data.findings.map((f) => <li key={f.code + f.key} className={f.blocking ? "error" : "muted"}>{f.blocking ? "✕ " : "• "}{f.message}</li>)}</ul>
-            )}
-            <table>
-              <thead><tr><th>键</th><th>值</th><th>.env.example</th></tr></thead>
-              <tbody>
-                {data.values.map((v) => (
-                  <tr key={v.key}>
-                    <td className="mono">{v.key}{findingFor.get(v.key) && <span className="badge warn">{findingFor.get(v.key)!.code === "env/renamed" ? "可能改名" : "未知"}</span>}</td>
-                    <td className="mono value">
-                      {v.secret
-                        ? revealed[v.key] !== undefined ? revealed[v.key] : <>{MASK} <span className="badge muted">密钥</span>{data.canReveal && <button className="link" onClick={() => reveal(v.key)}>查看原值</button>}</>
-                        : v.value === "" ? <span className="muted">（空）</span> : v.value}
-                    </td>
-                    <td className="muted">{byKey.get(v.key)?.comment ?? ""}</td>
-                  </tr>
-                ))}
-                {schemaKeys.filter((k) => !data.values.some((v) => v.key === k.key)).map((k) => (
-                  <tr key={k.key} className="absent">
-                    <td className="mono">{k.key}{k.required ? <span className="badge warn">缺少</span> : <span className="badge muted">可选</span>}</td>
-                    <td className="mono muted">{k.example ? `示例：${k.example}` : "—"}</td>
-                    <td className="muted">{k.comment ?? ""}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </>
-        )}
-      <h3>版本历史</h3>
-      <table>
-        <thead><tr><th>版本</th><th>来源</th><th>谁</th><th>何时</th><th>改了哪些键</th><th>说明</th><th></th></tr></thead>
-        <tbody>
-          {data.revisions.map((r) => (
-            <tr key={r.revision} className={r.revision === shown ? "current" : ""}>
-              <td>{r.revision}{r.revision === data.applied && <span className="badge ok">服务器上</span>}</td>
-              <td>{SOURCE[r.source] ?? r.source}</td>
-              <td>{r.savedBy}</td>
-              <td className="muted">{when(r.savedAt)}</td>
-              <td className="mono">{r.changes.length ? r.changes.map((c) => `${c.key} ${c.secret && c.change === "changed" ? "已修改" : CHANGE[c.change]}`).join("，") : <span className="muted">无变化</span>}</td>
-              <td className="muted">{r.note ?? ""}</td>
-              <td className="actions">
-                {r.revision !== shown && <button className="link" onClick={() => refresh(r.revision)}>查看</button>}
-                {data.canChange && r.revision !== latest && <button className="link" onClick={() => revert(r.revision)}>回到这一版</button>}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+      {planning && shown !== null && <PlanPanel app={app} revision={latest!} onClose={() => setPlanning(false)} onJob={(id) => { setPlanning(false); setJob(id); }} />}
+      <div className="subtabs">
+        <button className={tab === "values" ? "active" : ""} onClick={() => setTab("values")}>Values</button>
+        <button className={tab === "history" ? "active" : ""} onClick={() => setTab("history")}>History ({data.revisions.length})</button>
+        {data.applied !== null && <button className={tab === "compare" ? "active" : ""} onClick={() => setTab("compare")}>Compare with the other environment</button>}
+      </div>
+      {tab === "values" && <Values data={data} editing={editing} revealed={revealed} reveal={reveal} onCancel={() => setEditing(false)} onSaved={() => { setEditing(false); done(); }} />}
+      {tab === "history" && (
+        <table>
+          <thead><tr><th>Revision</th><th>Source</th><th>Who</th><th>When</th><th>Keys changed</th><th>Note</th><th></th></tr></thead>
+          <tbody>
+            {data.revisions.map((r) => (
+              <tr key={r.revision} className={r.revision === shown ? "current" : ""}>
+                <td>{r.revision}{r.revision === data.applied && <span className="badge ok">On the server</span>}{r.revision === latest && <span className="badge info">Latest</span>}</td>
+                <td>{SOURCE[r.source] ?? r.source}</td>
+                <td>{r.savedBy}</td>
+                <td className="muted">{when(r.savedAt)}</td>
+                <td className="mono">{r.changes.length ? r.changes.map((c) => `${c.key} ${c.secret && c.change === "changed" ? "changed" : CHANGE[c.change]}`).join(", ") : <span className="muted">No changes</span>}</td>
+                <td className="muted">{r.note ?? ""}</td>
+                <td className="actions">
+                  {r.revision !== shown && <button className="link" onClick={() => { refresh(r.revision); setTab("values"); }}>View</button>}
+                  {data.canChange && r.revision !== latest && <button className="link" onClick={() => revert(r.revision)}>Go back to this revision</button>}
+                </td>
+              </tr>
+            ))}
+            {!data.revisions.length && <tr><td colSpan={7} className="muted">No revisions yet: import the file from the server first.</td></tr>}
+          </tbody>
+        </table>
+      )}
+      {tab === "compare" && <Compare app={app} onClose={() => setTab("values")} />}
     </>
   );
 }
 
-type Row = { id: number; key: string; value: string; secret: boolean; had: boolean };
+const GROUPS: { id: Row["group"]; title: string }[] = [
+  { id: "attention", title: "Needs attention" },
+  { id: "set", title: "Set" },
+  { id: "optional", title: "Optional, not set" },
+];
+type Filter = "all" | "set" | "missing" | "secret" | "unknown" | "optional";
 
-function Editor({ data, onCancel, onSaved }: { data: EnvView; onCancel: () => void; onSaved: () => void }) {
-  const initial = useMemo<Row[]>(() => data.values.map((v, i) => ({ id: i, key: v.key, value: v.value ?? "", secret: v.secret, had: true })), [data]);
-  const [rows, setRows] = useState<Row[]>(initial);
-  const [note, setNote] = useState("");
-  const [error, setError] = useState<Fail | undefined>();
-  const [nextId, setNextId] = useState(initial.length);
+function Values({ data, editing, revealed, reveal, onCancel, onSaved }: { data: EnvView; editing: boolean; revealed: Record<string, string>; reveal: (key: string) => void; onCancel: () => void; onSaved: () => void }) {
+  const [filter, setFilter] = useState<Filter>("all");
+  const [query, setQuery] = useState("");
+  const [open, setOpen] = useState<Record<string, boolean>>({});
   const schemaKeys = "keys" in data.schema ? data.schema.keys : [];
-  const missing = schemaKeys.filter((k) => !rows.some((r) => r.key === k.key));
-  const add = (key = "", value = "") => { setRows([...rows, { id: nextId, key, value, secret: data.secrets.includes(key), had: false }]); setNextId(nextId + 1); };
-  const update = (id: number, patch: Partial<Row>) => setRows(rows.map((r) => (r.id === id ? { ...r, ...patch } : r)));
-  const save = () => {
-    setError(undefined);
-    // A secret the page never saw goes back as "keep" unless someone typed a new value.
-    const values: EnvEdit[] = rows.filter((r) => r.key.trim()).map((r) => (r.secret && r.had && r.value === "" ? { key: r.key.trim(), keep: true } : { key: r.key.trim(), value: r.value }));
-    api.saveEnv(data.app, data.revision?.revision ?? null, values, note || undefined).then(onSaved, (e: api.ApiError) => setError(toFail(e)));
+  const rows = useMemo<Row[]>(() => {
+    const byKey = new Map(schemaKeys.map((k) => [k.key, k]));
+    const finding = new Map(data.findings.map((f) => [f.key, f]));
+    const used = new Set(data.referenced.required);
+    const out: Row[] = data.values.map((v) => {
+      const f = finding.get(v.key);
+      const tags: Row["tags"] = [];
+      if (f?.code === "env/renamed") tags.push({ label: "Maybe renamed", tone: "warn", title: f.message });
+      if (f?.code === "env/unknown") tags.push({ label: "Unknown", tone: "warn", title: f.message });
+      if (used.has(v.key)) tags.push({ label: "Used by containers", tone: "info" });
+      if (v.secret) tags.push({ label: "Secret", tone: "muted" });
+      return { key: v.key, group: f ? "attention" : "set", value: v.value ?? "", secret: v.secret, present: true, tags, ...(byKey.get(v.key)?.comment ? { comment: byKey.get(v.key)!.comment! } : {}) };
+    });
+    const present = new Set(data.values.map((v) => v.key));
+    const absent = [...new Set([...data.referenced.required, ...schemaKeys.map((k) => k.key)])].filter((k) => !present.has(k));
+    for (const key of absent) {
+      const k = byKey.get(key);
+      const required = used.has(key) || Boolean(k?.required);
+      const tags: Row["tags"] = [required ? { label: used.has(key) ? "Missing · containers need it" : "Missing", tone: "bad", ...(finding.get(key) ? { title: finding.get(key)!.message } : {}) } : { label: "Optional", tone: "muted" }];
+      out.push({ key, group: required ? "attention" : "optional", secret: data.secrets.includes(key), present: false, tags, ...(k?.comment ? { comment: k.comment } : {}), ...(k?.example ? { example: k.example } : {}) });
+    }
+    return out;
+  }, [data]);
+  const counts = {
+    all: rows.length,
+    set: rows.filter((r) => r.present).length,
+    missing: rows.filter((r) => !r.present && r.group === "attention").length,
+    secret: rows.filter((r) => r.present && r.secret).length,
+    unknown: rows.filter((r) => r.present && r.group === "attention").length,
+    optional: rows.filter((r) => r.group === "optional").length,
   };
+  const match = (r: Row) => (!query || r.key.toLowerCase().includes(query.toLowerCase()))
+    && (filter === "all" || (filter === "set" && r.present) || (filter === "missing" && !r.present && r.group === "attention") || (filter === "secret" && r.present && r.secret) || (filter === "unknown" && r.present && r.group === "attention") || (filter === "optional" && r.group === "optional"));
+  const containerMissing = rows.filter((r) => !r.present && r.tags.some((t) => t.label.includes("containers need")));
+
+  // Editing in the same table: values of present rows, missing rows filled in, new rows added, rows removed.
+  const [edits, setEdits] = useState<Record<string, string>>({});
+  const [removed, setRemoved] = useState<Set<string>>(new Set());
+  const [added, setAdded] = useState<{ id: number; key: string; value: string }[]>([]);
+  const [note, setNote] = useState("");
+  const [saveError, setSaveError] = useState<Fail | undefined>();
+  useEffect(() => { if (!editing) { setEdits({}); setRemoved(new Set()); setAdded([]); setNote(""); setSaveError(undefined); } }, [editing]);
+  const save = () => {
+    setSaveError(undefined);
+    const values: EnvEdit[] = [];
+    for (const v of data.values) {
+      if (removed.has(v.key)) continue;
+      const typed = edits[v.key];
+      // A secret the page never saw goes back as "keep" unless someone typed a new value.
+      if (v.secret && (typed === undefined || typed === "")) values.push({ key: v.key, keep: true });
+      else values.push({ key: v.key, value: typed ?? v.value ?? "" });
+    }
+    for (const r of rows.filter((x) => !x.present)) if (edits[r.key]) values.push({ key: r.key, value: edits[r.key]! });
+    for (const a of added) if (a.key.trim()) values.push({ key: a.key.trim(), value: a.value });
+    api.saveEnv(data.app, data.revision?.revision ?? null, values, note || undefined).then(onSaved, (e: api.ApiError) => setSaveError(toFail(e)));
+  };
+
+  const valueCell = (r: Row) => {
+    if (editing && !removed.has(r.key)) {
+      return r.secret
+        ? <input className="mono" type="password" autoComplete="new-password" value={edits[r.key] ?? ""} onChange={(e) => setEdits({ ...edits, [r.key]: e.target.value })} placeholder={r.present ? "Leave empty to keep" : "Secret"} />
+        : <input className="mono" value={edits[r.key] ?? (r.present ? r.value ?? "" : "")} onChange={(e) => setEdits({ ...edits, [r.key]: e.target.value })} placeholder={r.present ? "" : r.example ? `e.g. ${r.example}` : "Not set"} />;
+    }
+    if (!r.present) return <span className="muted">{r.example ? `e.g. ${r.example}` : "Not set"}</span>;
+    if (removed.has(r.key)) return <span className="muted">Will be removed</span>;
+    if (r.secret) return revealed[r.key] !== undefined ? revealed[r.key] : <>{MASK}{data.canReveal && <button className="link" onClick={() => reveal(r.key)}> Show</button>}</>;
+    return r.value === "" ? <span className="muted">(empty)</span> : r.value;
+  };
+  const visible = rows.filter(match);
+  const chip = (id: Filter, label: string, tone = "") => (
+    <button key={id} className={`chip${filter === id ? " active" : ""} ${tone}`} onClick={() => setFilter(filter === id ? "all" : id)}>{label} <strong>{counts[id]}</strong></button>
+  );
   return (
-    <section className="card panel">
-      <p className="muted">保存后是新的一版，还没有写入服务器。密钥留空表示不修改；要清空密钥请删除这一行。</p>
-      <table className="edit">
-        <thead><tr><th>键</th><th>值</th><th></th></tr></thead>
-        <tbody>
-          {rows.map((r) => (
-            <tr key={r.id}>
-              <td><input className="mono" value={r.key} onChange={(e) => update(r.id, { key: e.target.value, secret: r.secret || data.secrets.includes(e.target.value) })} placeholder="KEY" /></td>
-              <td>
-                {r.secret
-                  ? <input className="mono" type="password" autoComplete="new-password" value={r.value} onChange={(e) => update(r.id, { value: e.target.value })} placeholder={r.had ? "不修改则留空" : "密钥"} />
-                  : <input className="mono" value={r.value} onChange={(e) => update(r.id, { value: e.target.value })} />}
-              </td>
-              <td className="actions"><button className="link danger" onClick={() => setRows(rows.filter((x) => x.id !== r.id))}>删除</button></td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-      <div className="row">
-        <button onClick={() => add()}>添加一行</button>
-        {missing.length > 0 && (
-          <select value="" onChange={(e) => { const k = schemaKeys.find((x) => x.key === e.target.value); if (k) add(k.key, k.example); }}>
-            <option value="">从 .env.example 添加…</option>
-            {missing.map((k) => <option key={k.key} value={k.key}>{k.key}{k.required ? "（应设置）" : ""}</option>)}
-          </select>
+    <>
+      {containerMissing.length > 0 && (
+        <button className="banner bad clickable" onClick={() => setFilter("missing")}>
+          The containers need {containerMissing.length} key{containerMissing.length > 1 ? "s" : ""} that {containerMissing.length > 1 ? "are" : "is"} not set: {containerMissing.slice(0, 4).map((r) => r.key).join(", ")}{containerMissing.length > 4 ? "…" : ""}. Deploys and writes are blocked until they are set.
+        </button>
+      )}
+      <div className="row env-filters">
+        {chip("all", "All")}
+        {chip("set", "Set")}
+        {chip("missing", "Missing", "bad")}
+        {chip("secret", "Secrets")}
+        {chip("unknown", "Unknown or renamed", "warn")}
+        {chip("optional", "Optional, not set")}
+        <input className="search" value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search keys" />
+      </div>
+      <table className={`env-values${editing ? " edit" : ""}`}>
+        <thead><tr><th>Key</th><th>Value</th><th>Status</th><th>Description</th>{editing && <th></th>}</tr></thead>
+        {GROUPS.map((g) => {
+          const list = visible.filter((r) => r.group === g.id);
+          if (!list.length) return null;
+          const folded = g.id === "optional" && !open.optional && filter !== "optional" && !query;
+          return (
+            <tbody key={g.id}>
+              <tr className="group-row"><td colSpan={editing ? 5 : 4}>
+                <button className="link" onClick={() => g.id === "optional" && setOpen({ ...open, optional: !open.optional })}>{g.id === "optional" ? (folded ? "▸ " : "▾ ") : ""}{g.title} ({list.length})</button>
+              </td></tr>
+              {!folded && list.map((r) => (
+                <tr key={r.key} className={r.present ? "" : "absent"}>
+                  <td className="mono">{r.key}</td>
+                  <td className="mono value">{valueCell(r)}</td>
+                  <td>{r.tags.map((t) => <span key={t.label} className={`badge ${t.tone}`} title={t.title}>{t.label}</span>)}</td>
+                  <td className="muted desc">{r.comment ? <span className={open[r.key] ? "" : "clip1"} title={r.comment} onClick={() => setOpen({ ...open, [r.key]: !open[r.key] })}>{r.comment}</span> : ""}</td>
+                  {editing && <td className="actions">{r.present && (removed.has(r.key) ? <button className="link" onClick={() => { const n = new Set(removed); n.delete(r.key); setRemoved(n); }}>Keep</button> : <button className="link danger" onClick={() => setRemoved(new Set([...removed, r.key]))}>Remove</button>)}</td>}
+                </tr>
+              ))}
+            </tbody>
+          );
+        })}
+        {editing && (
+          <tbody>
+            {added.map((a) => (
+              <tr key={a.id}>
+                <td><input className="mono" value={a.key} onChange={(e) => setAdded(added.map((x) => (x.id === a.id ? { ...x, key: e.target.value } : x)))} placeholder="NEW_KEY" /></td>
+                <td><input className="mono" value={a.value} onChange={(e) => setAdded(added.map((x) => (x.id === a.id ? { ...x, value: e.target.value } : x)))} /></td>
+                <td><span className="badge info">New</span></td><td></td>
+                <td className="actions"><button className="link danger" onClick={() => setAdded(added.filter((x) => x.id !== a.id))}>Remove</button></td>
+              </tr>
+            ))}
+            <tr><td colSpan={5}><button className="link" onClick={() => setAdded([...added, { id: Date.now(), key: "", value: "" }])}>+ Add a key</button></td></tr>
+          </tbody>
         )}
-      </div>
-      <div className="row">
-        <input placeholder="修改说明（可选）" value={note} onChange={(e) => setNote(e.target.value)} />
-        <button onClick={onCancel}>取消</button>
-        <button className="primary" onClick={save}>保存为新版本</button>
-      </div>
-      <Failure error={error} />
-    </section>
+      </table>
+      {!visible.length && <p className="muted">No keys match.</p>}
+      <details className="small">
+        <summary>Details</summary>
+        <p className="muted">
+          Checked against: {"error" in data.schema ? <span className="error">{data.schema.error}</span> : <>{data.schema.source} ({data.version})</>}.
+          {" "}Keys the compose fragment uses: {data.referenced.required.length ? <span className="mono">{data.referenced.required.join(", ")}</span> : "none"}.
+          {" "}Values may refer to another app's address as <span className="mono">{"{{app:<id>.url}}"}</span>; it is written in when the file is written.
+        </p>
+      </details>
+      {editing && (
+        <div className="edit-bar">
+          <span className="muted">Saving creates a new revision; it is written to the server only after you review the plan. Leave a secret empty to keep it.</span>
+          <input placeholder="Change note (optional)" value={note} onChange={(e) => setNote(e.target.value)} />
+          <button onClick={onCancel}>Cancel</button>
+          <button className="primary" onClick={save}>Save as a new revision</button>
+          <Failure error={saveError} />
+        </div>
+      )}
+    </>
   );
 }
 
@@ -217,18 +351,18 @@ function PlanPanel({ app, revision, onClose, onJob }: { app: string; revision: n
   return (
     <section className="card panel">
       <div className="toolbar">
-        <h2>写入第 {revision} 版</h2>
-        <span className="muted">{plan ? `服务器上现在是${plan.applied === null ? "未导入的文件" : `第 ${plan.applied} 版`}` : ""}</span>
-        <button className="link" onClick={onClose}>关闭</button>
+        <h2>Write revision {revision}</h2>
+        <span className="muted">{plan ? `The server now has ${plan.applied === null ? "a file not yet imported" : `revision ${plan.applied}`}` : ""}</span>
+        <button className="link" onClick={onClose}>Close</button>
       </div>
       {plan && (
         <div className="plan">
           {plan.findings.length > 0 && <ul className="findings">{plan.findings.map((f) => <li key={f.code + (f.key ?? "")} className={f.blocking ? "error" : "muted"}>{f.blocking ? "✕ " : "• "}{f.message}</li>)}</ul>}
           <p>
-            {plan.changes.length ? <>改动：<span className="mono">{plan.changes.map((c) => `${c.key} ${c.secret && c.change === "changed" ? "已修改" : CHANGE[c.change]}`).join("，")}</span></> : "没有改动。"}
+            {plan.changes.length ? <>Changes: <span className="mono">{plan.changes.map((c) => `${c.key} ${c.secret && c.change === "changed" ? "changed" : CHANGE[c.change]}`).join(", ")}</span></> : "No changes."}
           </p>
-          <p>{plan.restarts.length ? <>会重启：<span className="mono">{plan.restarts.join("、")}</span>。重启期间这些服务不可用，通常几秒到一分钟；健康检查不过会自动换回原来的文件。</> : "不重启任何服务。"}</p>
-          <div className="row"><button className="primary" onClick={apply} disabled={busy || blocking.length > 0}>确认写入</button></div>
+          <p>{plan.restarts.length ? <>Restarts: <span className="mono">{plan.restarts.join(", ")}</span>. These services are unavailable while restarting, usually a few seconds to a minute; if the health check fails, the old file is put back automatically.</> : "No service restarts."}</p>
+          <div className="row"><button className="primary" onClick={apply} disabled={busy || blocking.length > 0}>Confirm write</button></div>
         </div>
       )}
       <Failure error={error} />
@@ -236,7 +370,7 @@ function PlanPanel({ app, revision, onClose, onJob }: { app: string; revision: n
   );
 }
 
-/** §7.2 并排比较: this environment's fingerprint next to the other Deployer's, fetched in PROD (§6.3) or pasted. */
+/** §7.2 side-by-side comparison: this environment's fingerprint next to the other Deployer's, fetched in PROD (§6.3) or pasted. */
 function Compare({ app, onClose }: { app: string; onClose: () => void }) {
   const [mine, setMine] = useState<Fingerprint | undefined>();
   const [text, setText] = useState("");
@@ -251,10 +385,10 @@ function Compare({ app, onClose }: { app: string; onClose: () => void }) {
   if (text.trim()) {
     try {
       other = JSON.parse(text);
-      if (other?.format !== mine?.format || other?.app !== app) parseError = `这不是 ${app} 的环境变量指纹。`;
-    } catch (e) { parseError = `不是合法的 JSON：${(e as Error).message}`; }
+      if (other?.format !== mine?.format || other?.app !== app) parseError = `This is not an environment variable fingerprint of ${app}.`;
+    } catch (e) { parseError = `Not valid JSON: ${(e as Error).message}`; }
   }
-  const cell = (v: { value?: string; secret?: string | null } | undefined) => (!v ? <span className="muted">（没有）</span> : "value" in v ? (v.value || <span className="muted">（空）</span>) : <span className="muted">{MASK}</span>);
+  const cell = (v: { value?: string; secret?: string | null } | undefined) => (!v ? <span className="muted">(none)</span> : "value" in v ? (v.value || <span className="muted">(empty)</span>) : <span className="muted">{MASK}</span>);
   const same = (a?: { value?: string; secret?: string | null }, b?: { value?: string; secret?: string | null }) => {
     if (!a || !b) return false;
     if ("value" in a || "value" in b) return a.value === b.value;
@@ -263,36 +397,36 @@ function Compare({ app, onClose }: { app: string; onClose: () => void }) {
   const keys = mine && other && !parseError ? [...new Set([...Object.keys(mine.keys), ...Object.keys(other.keys)])].sort() : [];
   return (
     <section className="card panel">
-      <div className="toolbar"><h2>与另一环境对比</h2><span className="muted">密钥只比较是否相同</span><button className="link" onClick={onClose}>关闭</button></div>
+      <div className="toolbar"><h2>Compare with the other environment</h2><span className="muted">Secrets are compared only for equality</span><button className="link" onClick={onClose}>Close</button></div>
       {mine && (
         <details>
-          <summary>本环境（{mine.environment.toUpperCase()}，第 {mine.revision} 版）的指纹：复制到另一环境的 Deployer 里粘贴</summary>
-          <div className="row"><button onClick={() => navigator.clipboard?.writeText(JSON.stringify(mine))}>复制</button></div>
+          <summary>Fingerprint of this environment ({mine.environment.toUpperCase()}, revision {mine.revision}): copy it and paste it into the other environment's Deployer</summary>
+          <div className="row"><button onClick={() => navigator.clipboard?.writeText(JSON.stringify(mine))}>Copy</button></div>
           <pre className="json">{JSON.stringify(mine, null, 2)}</pre>
         </details>
       )}
-      {fetched === "" ? <p className="muted">已从 UAT 的 Deployer 取得指纹。</p> : <>
-        {fetched && <p className="error">没能从 UAT 的 Deployer 取得指纹：{fetched}。可以手工粘贴。</p>}
-        <textarea className="mono" spellCheck={false} rows={4} value={text} onChange={(e) => setText(e.target.value)} placeholder="粘贴另一环境的指纹（那边的 环境变量 → 与另一环境对比 → 复制）" />
+      {fetched === "" ? <p className="muted">Fingerprint fetched from the UAT Deployer.</p> : <>
+        {fetched && <p className="error">Could not fetch the fingerprint from the UAT Deployer: {fetched}. You can paste it by hand.</p>}
+        <textarea className="mono" spellCheck={false} rows={4} value={text} onChange={(e) => setText(e.target.value)} placeholder="Paste the other environment's fingerprint (there: Environment variables → Compare with the other environment → Copy)" />
       </>}
       {parseError && <p className="error">{parseError}</p>}
       {keys.length > 0 && mine && other && (
         <table>
-          <thead><tr><th>键</th><th>{mine.environment.toUpperCase()}</th><th>{other.environment.toUpperCase()}</th><th></th></tr></thead>
+          <thead><tr><th>Key</th><th>{mine.environment.toUpperCase()}</th><th>{other.environment.toUpperCase()}</th><th></th></tr></thead>
           <tbody>
             {keys.map((k) => {
               const s = same(mine.keys[k], other!.keys[k]);
               return (
                 <tr key={k} className={s === false ? "differs" : ""}>
                   <td className="mono">{k}</td><td className="mono value">{cell(mine.keys[k])}</td><td className="mono value">{cell(other!.keys[k])}</td>
-                  <td>{s === true ? <span className="badge ok">相同</span> : s === false ? <span className="badge warn">不同</span> : <span className="badge muted">无法比较</span>}</td>
+                  <td>{s === true ? <span className="badge ok">Same</span> : s === false ? <span className="badge warn">Different</span> : <span className="badge muted">Cannot compare</span>}</td>
                 </tr>
               );
             })}
           </tbody>
         </table>
       )}
-      {mine && Object.values(mine.keys).some((v) => "secret" in v && v.secret === null) && <p className="muted">没有配置 DEPLOYER_COMPARE_KEY：密钥只能看出两边是否都设置了。</p>}
+      {mine && Object.values(mine.keys).some((v) => "secret" in v && v.secret === null) && <p className="muted">DEPLOYER_COMPARE_KEY is not configured: for secrets, only whether both sides set them is visible.</p>}
       <Failure error={error} />
     </section>
   );

@@ -23,7 +23,7 @@
           "graph": "<workspace>/logbook"
         },
         "assistant": {
-          "model": "<OMA Model Card 的模型名>",
+          "model": "<model name from the OMA Model Card>",
           "graphMcpUrl": "https://host.docker.internal:9632/mcp/<graph-id>"
         }
       }

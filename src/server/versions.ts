@@ -24,11 +24,13 @@ export class Versions {
   private tokenFile: string | undefined;
   private fetcher: typeof fetch;
   private now: () => number;
+  private api: string;
 
-  constructor(tokenFile: string | undefined, fetcher: typeof fetch = fetch, now: () => number = Date.now) {
+  constructor(tokenFile: string | undefined, fetcher: typeof fetch = fetch, now: () => number = Date.now, api = "https://api.github.com") {
     this.tokenFile = tokenFile;
     this.fetcher = fetcher;
     this.now = now;
+    this.api = api.replace(/\/+$/, "");
   }
 
   async list(repo: string, pattern: string): Promise<{ versions: string[]; error?: string }> {
@@ -39,17 +41,17 @@ export class Versions {
     const tags: string[] = [];
     try {
       for (let page = 1; page <= 5; page++) {
-        const response = await this.fetcher(`https://api.github.com/repos/${repo}/tags?per_page=100&page=${page}`, {
+        const response = await this.fetcher(`${this.api}/repos/${repo}/tags?per_page=100&page=${page}`, {
           headers: { accept: "application/vnd.github+json", "user-agent": "open-atlas-deployer", ...(token ? { authorization: `Bearer ${token}` } : {}) },
           signal: AbortSignal.timeout(8_000),
         });
-        if (!response.ok) return { versions: [], error: `GitHub 返回 HTTP ${response.status}${response.status === 404 && !token ? "（私有仓库需要 DEPLOYER_GITHUB_TOKEN_FILE）" : ""}` };
+        if (!response.ok) return { versions: [], error: `GitHub returned HTTP ${response.status}${response.status === 404 && !token ? " (private repositories need DEPLOYER_GITHUB_TOKEN_FILE)" : ""}` };
         const batch = (await response.json()) as { name: string }[];
         tags.push(...batch.map((t) => t.name));
         if (batch.length < 100) break;
       }
     } catch (error) {
-      return { versions: [], error: `连不上 GitHub：${(error as Error).message}` };
+      return { versions: [], error: `Cannot reach GitHub: ${(error as Error).message}` };
     }
     const versions = versionsFromTags(tags, pattern);
     this.cache.set(key, { at: this.now(), versions });
@@ -58,7 +60,7 @@ export class Versions {
 
   private releases = new Map<string, { at: number; result: { released: boolean; detail: string } }>();
 
-  /** "已正式发布" (§6.2, D14): the tag has a published GitHub Release that is neither a draft nor a prerelease. */
+  /** "Officially released" (§6.2, D14): the tag has a published GitHub Release that is neither a draft nor a prerelease. */
   async release(repo: string, tag: string): Promise<{ released: boolean; detail: string }> {
     const key = `${repo}@${tag}`;
     const hit = this.releases.get(key);
@@ -66,20 +68,20 @@ export class Versions {
     const token = readToken(this.tokenFile);
     let result: { released: boolean; detail: string };
     try {
-      const response = await this.fetcher(`https://api.github.com/repos/${repo}/releases/tags/${encodeURIComponent(tag)}`, {
+      const response = await this.fetcher(`${this.api}/repos/${repo}/releases/tags/${encodeURIComponent(tag)}`, {
         headers: { accept: "application/vnd.github+json", "user-agent": "open-atlas-deployer", ...(token ? { authorization: `Bearer ${token}` } : {}) },
         signal: AbortSignal.timeout(8_000),
       });
-      if (response.status === 404) result = { released: false, detail: `${repo} 的 ${tag} 没有 GitHub Release${token ? "" : "（私有仓库需要 DEPLOYER_GITHUB_TOKEN_FILE）"}` };
-      else if (!response.ok) return { released: false, detail: `查 ${tag} 的 Release 时 GitHub 返回 HTTP ${response.status}` };
+      if (response.status === 404) result = { released: false, detail: `${repo} has no GitHub Release for ${tag}${token ? "" : " (private repositories need DEPLOYER_GITHUB_TOKEN_FILE)"}` };
+      else if (!response.ok) return { released: false, detail: `GitHub returned HTTP ${response.status} when checking the release of ${tag}` };
       else {
         const r = (await response.json()) as { draft?: boolean; prerelease?: boolean; html_url?: string };
         result = r.draft || r.prerelease
-          ? { released: false, detail: `${repo} 的 ${tag} 是${r.draft ? "草稿" : "预发布"}，不算正式发布` }
-          : { released: true, detail: `${repo} 的 ${tag} 已正式发布${r.html_url ? `（${r.html_url}）` : ""}` };
+          ? { released: false, detail: `${tag} of ${repo} is a ${r.draft ? "draft" : "prerelease"}, not an official release` }
+          : { released: true, detail: `${tag} of ${repo} is officially released${r.html_url ? ` (${r.html_url})` : ""}` };
       }
     } catch (error) {
-      return { released: false, detail: `连不上 GitHub，无法确认 ${tag} 是否已发布：${(error as Error).message}` };
+      return { released: false, detail: `Cannot reach GitHub to check whether ${tag} is released: ${(error as Error).message}` };
     }
     this.releases.set(key, { at: this.now(), result });
     return result;

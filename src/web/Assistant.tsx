@@ -3,7 +3,7 @@
 // runs as that person, through the same calls as the buttons; only the operations declared in Workbench's
 // application entry (chat.hostOperations) are accepted, and only from Workbench's own origin.
 
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type CSSProperties, type FormEvent, type PointerEvent as ReactPointerEvent } from "react";
 import * as api from "./api.ts";
 
 export const HOST_OPERATIONS = ["plan_deploy", "plan_rollback", "build_artifact", "set_env_value"] as const;
@@ -19,39 +19,39 @@ const str = (v: unknown) => (typeof v === "string" ? v.trim() : "");
 /** One card's operation, run as the signed-in person; the outcome is what the card shows. */
 export async function runHostOperation(operation: string, payload: Payload, actions: HostActions): Promise<{ ok: boolean; outcome: string }> {
   const app = str(payload.app);
-  if (!(HOST_OPERATIONS as readonly string[]).includes(operation)) return { ok: false, outcome: `Deployer 不接受操作 ${operation}` };
-  if (!app) return { ok: false, outcome: "卡片里没有 app" };
+  if (!(HOST_OPERATIONS as readonly string[]).includes(operation)) return { ok: false, outcome: `The Deployer does not accept operation ${operation}` };
+  if (!app) return { ok: false, outcome: "The card has no app" };
   try {
     switch (operation) {
       case "plan_deploy":
       case "plan_rollback": {
         const version = str(payload.version);
-        if (!version) return { ok: false, outcome: "卡片里没有 version" };
+        if (!version) return { ok: false, outcome: "The card has no version" };
         const pinFrom = str(payload.pin_from ?? payload.pinFrom) || undefined;
-        if (operation === "plan_rollback" && !pinFrom) return { ok: false, outcome: "回到旧版要指明是哪一次部署（pin_from）" };
+        if (operation === "plan_rollback" && !pinFrom) return { ok: false, outcome: "Going back to an old version needs the deploy to go back to (pin_from)" };
         actions.openPlan(app, version, pinFrom);
-        return { ok: true, outcome: `已在页面上生成 ${app} ${version} 的计划：核对后点\"确认部署\"才会执行` };
+        return { ok: true, outcome: `Created the plan for ${app} ${version} on the page: it runs only after it is checked and \"Confirm deploy\" is clicked` };
       }
       case "build_artifact": {
         const version = str(payload.version);
-        if (!version) return { ok: false, outcome: "卡片里没有 version" };
+        if (!version) return { ok: false, outcome: "The card has no version" };
         const r = await api.build(app, version);
-        return { ok: true, outcome: `已开始构建 ${app} ${version}（${r.jobs.map((j) => j.id).join("、")}）` };
+        return { ok: true, outcome: `Started building ${app} ${version} (${r.jobs.map((j) => j.id).join(", ")})` };
       }
       case "set_env_value": {
         const key = str(payload.key);
-        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) || typeof payload.value !== "string") return { ok: false, outcome: "卡片里的 key 或 value 不对" };
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) || typeof payload.value !== "string") return { ok: false, outcome: "The key or value on the card is invalid" };
         const view = await api.env(app);
         const values: api.EnvEdit[] = view.values.filter((v) => v.key !== key).map((v) => (v.secret ? { key: v.key, keep: true } : { key: v.key, value: v.value ?? "" }));
         values.push({ key, value: payload.value });
-        const r = await api.saveEnv(app, view.revision?.revision ?? null, values, str(payload.note) || `助手卡片：设置 ${key}`);
-        return { ok: true, outcome: `${app} 的环境变量第 ${r.revision} 版已保存，还没写入服务器：到\"环境变量\"页看计划后写入` };
+        const r = await api.saveEnv(app, view.revision?.revision ?? null, values, str(payload.note) || `Assistant card: set ${key}`);
+        return { ok: true, outcome: `Revision ${r.revision} of the ${app} environment variables is saved but not yet written to the server: review the plan on the \"Environment variables\" page and write it` };
       }
     }
   } catch (error) {
     return { ok: false, outcome: (error as Error).message };
   }
-  return { ok: false, outcome: "没有处理" };
+  return { ok: false, outcome: "Not handled" };
 }
 
 export function AssistantPanel({ workbenchUrl, environment, page, app, actions, onClose }: { workbenchUrl: string; environment?: string; page: string; app?: string; actions: HostActions; onClose: () => void }) {
@@ -76,13 +76,53 @@ export function AssistantPanel({ workbenchUrl, environment, page, app, actions, 
   }, [origin, actions]);
   useEffect(() => { send({ type: "workbench-chat:context", pageContext: context }); }, [environment, page, app]);
 
+  // D34: a column beside the page, not over it. Its width can be dragged and is remembered; it can fold into a strip
+  // (the conversation stays loaded) or take the whole content area. Under 1100px it is a drawer over the page.
+  const [mode, setMode] = useState<"normal" | "collapsed" | "expanded">("normal");
+  const [width, setWidth] = useState(() => { try { return clampWidth(Number(localStorage.getItem(WIDTH_KEY)) || 420); } catch { return 420; } });
+  const [dragging, setDragging] = useState(false);
+  const drag = (e: ReactPointerEvent) => {
+    e.preventDefault();
+    setDragging(true);
+    const move = (ev: PointerEvent) => setWidth(clampWidth(window.innerWidth - ev.clientX));
+    const up = () => {
+      setDragging(false);
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      setWidth((w) => { try { localStorage.setItem(WIDTH_KEY, String(w)); } catch { /* per-viewer convenience only */ } return w; });
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  };
+
   return (
-    <aside className="assistant">
-      <div className="toolbar"><strong>Deploy Assistant</strong><span className="muted">只读；改动经卡片由你确认后执行</span><button className="link" onClick={onClose}>收起</button></div>
-      <iframe ref={frame} src={src} title="Deploy Assistant" />
-    </aside>
+    <>
+      {mode !== "collapsed" && <div className="assistant-backdrop" onClick={() => setMode("collapsed")} />}
+      <aside className={`assistant ${mode}${dragging ? " dragging" : ""}`} style={{ "--assistant-width": `${width}px` } as CSSProperties}>
+        {mode === "collapsed" ? (
+          <button className="assistant-strip" onClick={() => setMode("normal")} title="Show the Deploy Assistant" aria-label="Show the Deploy Assistant">
+            <span>Deploy Assistant</span>
+          </button>
+        ) : (
+          <>
+            {mode === "normal" && <div className="assistant-resizer" onPointerDown={drag} title="Drag to resize" aria-hidden="true" />}
+            <div className="toolbar">
+              <strong>Deploy Assistant</strong>
+              <span className="muted">Read-only; changes run through cards after you confirm them</span>
+              <button className="link" onClick={() => setMode("collapsed")} title="Fold into a strip; the conversation stays">Collapse</button>
+              <button className="link wide-only" onClick={() => setMode(mode === "expanded" ? "normal" : "expanded")}>{mode === "expanded" ? "Restore" : "Expand"}</button>
+              <button className="link" onClick={onClose}>Close</button>
+            </div>
+          </>
+        )}
+        <iframe ref={frame} src={src} title="Deploy Assistant" />
+      </aside>
+    </>
   );
 }
+
+const WIDTH_KEY = "deployer.assistant.width";
+const clampWidth = (w: number) => Math.min(720, Math.max(320, Math.round(w)));
 
 export function KeysPage({ isAdmin }: { isAdmin: boolean }) {
   const [list, setList] = useState<api.ApiKeyView[] | undefined>();
@@ -98,28 +138,28 @@ export function KeysPage({ isAdmin }: { isAdmin: boolean }) {
     setError("");
     api.createKey(kind, name, days).then((r) => { setMade(r.key); setName(""); refresh(); }, (e: Error) => setError(e.message));
   };
-  const revoke = (id: string) => { if (confirm("吊销这把 key？用它的客户端会立即失效。")) api.revokeKey(id).then(refresh, (e: Error) => setError(e.message)); };
+  const revoke = (id: string) => { if (confirm("Revoke this key? Clients using it stop working immediately.")) api.revokeKey(id).then(refresh, (e: Error) => setError(e.message)); };
   return (
     <>
-      <div className="toolbar"><h1>API key</h1><span className="muted">给 AI 客户端用（Deployer 的 /mcp）。key 能做的和你在页面上能做的一样，但 PROD 执行、跳过晋级、查看密钥原值只认浏览器会话</span></div>
+      <div className="toolbar"><h1>API keys</h1><span className="muted">For AI clients (the Deployer's /mcp). A key can do what you can do on the page, but running in PROD, skipping promotion and seeing secret values accept only browser sessions</span></div>
       <form className="card panel" onSubmit={create}>
         <div className="row">
-          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="名字，如 我的 Claude Code" />
-          <select value={days} onChange={(e) => setDays(Number(e.target.value))}>{[7, 30, 90, 365].map((d) => <option key={d} value={d}>{d} 天</option>)}</select>
-          {isAdmin && <select value={kind} onChange={(e) => setKind(e.target.value as "personal" | "service")}><option value="personal">个人 key</option><option value="service">服务 key（只读，给 OMA Vault）</option></select>}
-          <button className="primary" disabled={!name.trim()}>生成</button>
+          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Name, e.g. My Claude Code" />
+          <select value={days} onChange={(e) => setDays(Number(e.target.value))}>{[7, 30, 90, 365].map((d) => <option key={d} value={d}>{d} days</option>)}</select>
+          {isAdmin && <select value={kind} onChange={(e) => setKind(e.target.value as "personal" | "service")}><option value="personal">Personal key</option><option value="service">Service key (read-only, for OMA Vault)</option></select>}
+          <button className="primary" disabled={!name.trim()}>Create</button>
         </div>
-        {made && <div className="banner warn">只显示这一次，请现在复制：<code className="mono">{made}</code> <button type="button" className="link" onClick={() => navigator.clipboard?.writeText(made)}>复制</button></div>}
+        {made && <div className="banner warn">Shown only once; copy it now: <code className="mono">{made}</code> <button type="button" className="link" onClick={() => navigator.clipboard?.writeText(made)}>Copy</button></div>}
         {error && <p className="error">{error}</p>}
       </form>
       <table>
-        <thead><tr><th>名字</th><th>类型</th><th>前缀</th><th>主人</th><th>到期</th><th>最近使用</th><th></th></tr></thead>
+        <thead><tr><th>Name</th><th>Kind</th><th>Prefix</th><th>Owner</th><th>Expires</th><th>Last used</th><th></th></tr></thead>
         <tbody>
           {(list ?? []).map((k) => (
             <tr key={k.id} className={k.revokedAt ? "muted" : ""}>
-              <td>{k.name}</td><td>{k.kind === "service" ? "服务（只读）" : "个人"}</td><td className="mono">{k.prefix}…</td><td>{k.owner}</td>
-              <td>{new Date(k.expiresAt).toLocaleDateString("zh-CN")}</td><td>{k.lastUsedAt ? new Date(k.lastUsedAt).toLocaleString("zh-CN", { hour12: false }) : "—"}</td>
-              <td>{k.revokedAt ? "已吊销" : <button className="link" onClick={() => revoke(k.id)}>吊销</button>}</td>
+              <td>{k.name}</td><td>{k.kind === "service" ? "Service (read-only)" : "Personal"}</td><td className="mono">{k.prefix}…</td><td>{k.owner}</td>
+              <td>{new Date(k.expiresAt).toLocaleDateString("en-US")}</td><td>{k.lastUsedAt ? new Date(k.lastUsedAt).toLocaleString("en-US", { hour12: false }) : "—"}</td>
+              <td>{k.revokedAt ? "Revoked" : <button className="link" onClick={() => revoke(k.id)}>Revoke</button>}</td>
             </tr>
           ))}
         </tbody>

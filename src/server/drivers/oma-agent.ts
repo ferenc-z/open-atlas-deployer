@@ -41,14 +41,14 @@ export class OmaAgentDriver implements DeployDriver {
 
   private manifest(ctx: StepContext): { manifest: Record<string, any>; missing: string[] } {
     const path = ctx.component.package as string | undefined;
-    if (!path) throw new Error(`组件 ${ctx.component.id} 没有 package：Agent 包的定义由 Deployer 保存（templates/ 里的 JSON）`);
+    if (!path) throw new Error(`Component ${ctx.component.id} has no package: the Deployer keeps agent package definitions (JSON in templates/)`);
     const rel = normalize(path.replace(/^templates\//, ""));
-    if (rel.startsWith("..")) throw new Error(`package ${path} 不在 templates/ 里`);
+    if (rel.startsWith("..")) throw new Error(`package ${path} is outside templates/`);
     const template = JSON.parse(readFileSync(join(this.templatesDir, rel), "utf8"));
     const system = bundleText(ctx.bundle, String(ctx.component.file));
     const missing = new Set<string>();
     const manifest = fillDeep(template, { ...ctx.settings, system, app: ctx.app, version: ctx.version }, missing) as Record<string, any>;
-    if (!Array.isArray(manifest.agents) || manifest.agents.length !== 1) throw new Error(`${path} 要正好定义一个 Agent`);
+    if (!Array.isArray(manifest.agents) || manifest.agents.length !== 1) throw new Error(`${path} must define exactly one agent`);
     return { manifest, missing: [...missing] };
   }
 
@@ -65,15 +65,15 @@ export class OmaAgentDriver implements DeployDriver {
     try {
       const m = this.manifest(ctx);
       name = String(m.manifest.agents[0].name);
-      if (m.missing.length) findings.push(block("oma-agent/settings", `Agent 包要用 ${m.missing.map((x) => `{{${x}}}`).join("、")}：在 environment.json 的 apps.${ctx.app}.settings.${ctx.component.id} 里设置。`));
+      if (m.missing.length) findings.push(block("oma-agent/settings", `The agent package uses ${m.missing.map((x) => `{{${x}}}`).join(", ")}: set them in apps.${ctx.app}.settings.${ctx.component.id} in environment.json.`));
     } catch (error) { findings.push(block("oma-agent/package", (error as Error).message)); }
-    if (!this.builder) findings.push(block("oma-agent/builder", "没有配置 OMA Builder MCP（DEPLOYER_OMA_BUILDER_URL、DEPLOYER_OMA_BUILDER_KEY_FILE）。"));
-    if (!this.workbench.configured) findings.push(block("oma-agent/workbench-key", "没有配置 Workbench API key，发布后无法把 Business Agent 指向新 agent。"));
+    if (!this.builder) findings.push(block("oma-agent/builder", "The OMA Builder MCP is not configured (DEPLOYER_OMA_BUILDER_URL, DEPLOYER_OMA_BUILDER_KEY_FILE)."));
+    if (!this.workbench.configured) findings.push(block("oma-agent/workbench-key", "No Workbench API key is configured, so after publishing the Business Agent cannot be pointed at the new agent."));
     const last = ctx.state.get<string>("agentId");
-    const after = `发布 ${name} 的新修订（模型 ${ctx.settings.model ?? "—"}），Business Agent 指向新 agent`;
+    const after = `Publish a new revision of ${name} (model ${ctx.settings.model ?? "—"}) and point the Business Agent at the new agent`;
     if (this.workbench.configured) {
       try {
-        if (!(await this.bound(ctx)).length) findings.push(note("oma-agent/unbound", `Workbench 应用 ${ctx.component.bind ?? ctx.app} 的 Agent slot 还没有绑定 Business Agent：发布后要按首次安装步骤建 Business Agent 并绑定。`));
+        if (!(await this.bound(ctx)).length) findings.push(note("oma-agent/unbound", `The agent slot of Workbench app ${ctx.component.bind ?? ctx.app} has no Business Agent bound yet: after publishing, create and bind a Business Agent as in the first-install steps.`));
       } catch (error) { findings.push(block("oma-agent/unreachable", (error as Error).message)); }
     }
     return { ...(last ? { before: `agent ${last}` } : {}), after, findings };
@@ -91,10 +91,10 @@ export class OmaAgentDriver implements DeployDriver {
     }
     await builder.call("update_package_manifest", { package_id: packageId, ...manifest });
     const validation = await builder.call("validate_package", { package_id: packageId });
-    if (validation?.valid === false) throw new Error(`OMA 校验 Agent 包不通过：${JSON.stringify(validation).slice(0, 400)}`);
+    if (validation?.valid === false) throw new Error(`OMA rejected the agent package: ${JSON.stringify(validation).slice(0, 400)}`);
     const published = await builder.call("publish_package", { package_id: packageId });
     const agentId = String(published?.agents?.[0]?.agent_id ?? "");
-    if (!agentId) throw new Error(`OMA 发布后没有返回 agent id：${JSON.stringify(published).slice(0, 300)}`);
+    if (!agentId) throw new Error(`OMA returned no agent id after publishing: ${JSON.stringify(published).slice(0, 300)}`);
     const previous = ctx.state.get<string>("agentId") ?? null;
     ctx.state.set("agentId", agentId);
     ctx.log(`OMA: package ${packageId} revision ${published.revision ?? "?"} published as agent ${agentId}`);
@@ -109,7 +109,7 @@ export class OmaAgentDriver implements DeployDriver {
     }
     const archived = await this.archive(String(manifest.agents[0].name), new Set([agentId, previous ?? "", ...moved.map((m) => m.previousAgentId)]), ctx);
     return {
-      message: `OMA 发布了新 agent ${agentId}${moved.length ? `，${moved.length} 个 Business Agent 已指向它` : "；还没有绑定的 Business Agent，请按首次安装步骤建好"}${archived ? `，归档了 ${archived} 个更早的 agent` : ""}`,
+      message: `OMA published new agent ${agentId}${moved.length ? `; ${moved.length} Business Agents now point at it` : "; no Business Agent is bound yet, create one as in the first-install steps"}${archived ? `; archived ${archived} older agents` : ""}`,
       detail: { packageId, agentId, previous, moved },
     };
   }
@@ -137,16 +137,16 @@ export class OmaAgentDriver implements DeployDriver {
     if (!moved.length) return null;
     const agents = await this.workbench.businessAgents();
     const wrong = moved.filter((m) => agents.find((a) => a.id === m.id)?.agentId !== result.detail.agentId);
-    return wrong.length ? `Business Agent ${wrong.map((w) => w.id).join("、")} 没有指向 ${result.detail.agentId}` : null;
+    return wrong.length ? `Business Agents ${wrong.map((w) => w.id).join(", ")} do not point at ${result.detail.agentId}` : null;
   }
 
   async rollback(ctx: StepContext, result: StepResult): Promise<Undo> {
     const moved = (result.detail.moved ?? []) as { id: string; previousAgentId: string }[];
     for (const m of moved) await this.workbench.pointAgent(m.id, m.previousAgentId);
     if (result.detail.previous) ctx.state.set("agentId", result.detail.previous);
-    return moved.length ? { message: `${moved.length} 个 Business Agent 指回原来的 agent（新 agent ${result.detail.agentId} 留在 OMA 里）`, undone: true }
-      : { message: `新 agent ${result.detail.agentId} 留在 OMA 里，没有 Business Agent 指向它`, undone: true };
+    return moved.length ? { message: `${moved.length} Business Agents point back at the previous agent (new agent ${result.detail.agentId} stays in OMA)`, undone: true }
+      : { message: `New agent ${result.detail.agentId} stays in OMA; no Business Agent points at it`, undone: true };
   }
 
-  impact(_component: Component): string { return "不中断：之后新开的对话用新的 Agent"; }
+  impact(_component: Component): string { return "No interruption: new conversations use the new agent"; }
 }

@@ -41,7 +41,7 @@ End your reply with one ` ```app-actions ` block; the page shows each action as 
 
 ````
 ```app-actions
-{"actions":[{"operation":"plan_deploy","label":"升级 · Studio（PROD）","payload":{"app":"studio","version":"2.9.0"},"display":[{"label":"版本","before":"2.8.0","after":"2.9.0"},{"label":"晋级依据","after":"UAT 2026-10-29 部署成功，已运行 26 小时"}]}]}
+{"actions":[{"operation":"plan_deploy","label":"Upgrade · Studio (PROD)","payload":{"app":"studio","version":"2.9.0"},"display":[{"label":"Version","before":"2.8.0","after":"2.9.0"},{"label":"Promotion basis","after":"Deployed successfully in UAT on 2026-10-29, running for 26 hours"}]}]}
 ```
 ````
 

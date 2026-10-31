@@ -27,7 +27,7 @@ test("parses env files the way compose reads them", () => {
     DOUBLE: 'line\none "q" $HOME', MULTI: "first\nsecond", EMPTY: "", LOGBOOK_ADMIN_NAME: "Jack Gao",
   });
   assert.equal(errors.length, 1);
-  assert.match(errors[0]!, /第 12 行/);
+  assert.match(errors[0]!, /Line 12 /);
 });
 
 test("writes values back so they read the same", () => {

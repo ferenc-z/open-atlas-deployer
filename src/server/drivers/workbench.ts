@@ -30,7 +30,7 @@ export class WorkbenchAdmin {
 
   private async request(method: string, path: string, body?: unknown): Promise<any> {
     const key = readToken(this.keyFile);
-    if (!key) throw new WorkbenchError("没有配置 Workbench API key（DEPLOYER_WORKBENCH_API_KEY_FILE）");
+    if (!key) throw new WorkbenchError("No Workbench API key is configured (DEPLOYER_WORKBENCH_API_KEY_FILE)");
     let response: Response;
     try {
       response = await this.fetcher(`${this.url}${path}`, {
@@ -39,13 +39,13 @@ export class WorkbenchAdmin {
         ...(body !== undefined ? { body: body instanceof FormData ? body : JSON.stringify(body) } : {}),
         signal: AbortSignal.timeout(120_000),
       });
-    } catch (error) { throw new WorkbenchError(`连不上 Workbench：${(error as Error).message}`); }
+    } catch (error) { throw new WorkbenchError(`Cannot reach Workbench: ${(error as Error).message}`); }
     const text = await response.text();
     let json: any = null;
     try { json = text ? JSON.parse(text) : null; } catch { json = null; }
     if (!response.ok) {
       const f = json?.finding;
-      throw new WorkbenchError(`Workbench 拒绝了 ${method} ${path}：HTTP ${response.status}${f ? ` ${f.code}（${f.expected ?? ""}）` : ""}`);
+      throw new WorkbenchError(`Workbench refused ${method} ${path}: HTTP ${response.status}${f ? ` ${f.code} (${f.expected ?? ""})` : ""}`);
     }
     return json;
   }
