@@ -12,7 +12,7 @@ import { hashPassword, permissionsFor, WorkbenchSessions } from "../src/server/a
 import type { Config } from "../src/server/config.ts";
 import { Deployments } from "../src/server/deploy.ts";
 import { EnvManager, Schemas } from "../src/server/env.ts";
-import { Handoff } from "../src/server/handoff.ts";
+import { EXECUTOR_VERSION, Handoff } from "../src/server/handoff.ts";
 import { Observer } from "../src/server/observe.ts";
 import { Peer } from "../src/server/peer.ts";
 import { SecretBox } from "../src/server/secretbox.ts";
@@ -448,6 +448,49 @@ test("D35: an executor calls in with its host's token, gets only its host's jobs
   await post(t, "/api/hosts/app2/revoke", "admin", {});
   assert.equal((await beat(t2)).status, 401, "a revoked token stops working");
   assert.ok(t.store.listAudit().some((e) => e.action === "host.token-revoked" && e.target === "app2"));
+
+  // app2 taken out of the environment: its last report no longer counts on the status page.
+  writeFileSync(join(t.dir, "environment.json"), JSON.stringify({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", hosts: { app1: hosts.app1 }, registries: { ghcr: "ghcr.io/acme" }, apps: { shop: { version: "1.2.0", host: "app1" } } }));
+  const without = await (await t.request("/api/status", { as: "viewer" })).json();
+  assert.ok(!JSON.stringify(without).includes("open-atlas-shop-1"));
+});
+
+test("§8.6: an administrator upgrades a host's executor to the version the Deployer ships; the host says how it ended", async () => {
+  assert.equal(readFileSync(join(import.meta.dirname, "../executor/deployer_executor.py"), "utf8").match(/^VERSION = "(.+)"$/m)?.[1], EXECUTOR_VERSION, "the Deployer ships the executor beside it");
+  const t = withBuiltApp();
+  writeFileSync(join(t.dir, "environment.json"), JSON.stringify({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", hosts, registries: { ghcr: "ghcr.io/acme" }, apps: { shop: { version: "1.2.0", host: "app2" } } }));
+  const { token } = await (await post(t, "/api/hosts/app1/token", "admin", {})).json();
+  const call = (path: string, init: RequestInit = {}) => t.app.request(`/deploy${path}`, { ...init, headers: { authorization: `Bearer ${token}`, ...(typeof init.body === "string" && init.body.startsWith("{") ? { "content-type": "application/json" } : {}) } });
+  const beat = (body: Record<string, unknown>) => call("/executor/v1/heartbeat", { method: "POST", body: JSON.stringify({ protocols: [2], project: "open-atlas", registries: [], databaseBackup: {}, busy: null, ...body }) });
+  const app1 = async () => (await (await t.request("/api/hosts", { as: "viewer" })).json()).hosts.find((h: { id: string }) => h.id === "app1").upgrade;
+
+  await beat({ version: "0.5.0", kinds: ["build", "deploy", "env", "env-read"] });
+  assert.match((await app1()).blocked, /cannot upgrade itself: install .* by hand once/);
+  assert.equal((await post(t, "/api/hosts/app1/upgrade-executor", "admin", {})).status, 409);
+  await beat({ version: "0.5.9", kinds: ["deploy", "executor-upgrade"], upgradeFrom: null });
+  assert.match((await app1()).blocked, /EXECUTOR_UPGRADE_FROM is not set on app1/);
+  await beat({ version: "0.5.9", kinds: ["deploy", "executor-upgrade"], upgradeFrom: "github" });
+  assert.deepEqual(await app1(), { available: true, job: null, from: "github" });
+
+  assert.equal((await post(t, "/api/hosts/app1/upgrade-executor", "uat", {})).status, 403, "administrators only");
+  const started = await post(t, "/api/hosts/app1/upgrade-executor", "admin", {});
+  assert.equal(started.status, 201);
+  const { job } = await started.json();
+  assert.deepEqual([job.kind, job.app, job.fromVersion, job.version], ["executor-upgrade", "executor@app1", "0.5.9", EXECUTOR_VERSION]);
+  assert.match((await app1()).blocked, /app1 is running executor-upgrade-/, "one at a time");
+  const got = await (await call("/executor/v1/jobs/next")).json();
+  assert.deepEqual([got.job.id, got.job.kind, got.job.version], [job.id, "executor-upgrade", EXECUTOR_VERSION], "the request names only the version");
+  assert.equal(Object.keys(got.job).sort().join(), "id,kind,protocol,requestedBy,version");
+
+  // The new executor, after its restart, reports the end; then it beats with the new version.
+  await call(`/executor/v1/jobs/${job.id}/status`, { method: "PUT", body: JSON.stringify({ state: "succeeded", steps: [], result: { from: "0.5.9", to: EXECUTOR_VERSION }, message: `Executor upgraded from 0.5.9 to ${EXECUTOR_VERSION}`, finishedAt: "2026-11-01T10:00:00Z" }) });
+  assert.equal((await (await t.request(`/api/jobs/${job.id}`, { as: "viewer" })).json()).job.state, "succeeded");
+  await beat({ version: EXECUTOR_VERSION, kinds: ["deploy", "executor-upgrade"], upgradeFrom: "github" });
+  const after = await app1();
+  assert.equal(after.available, false);
+  assert.equal(after.job.state, "succeeded");
+  assert.equal((await post(t, "/api/hosts/app1/upgrade-executor", "admin", {})).status, 409, "nothing newer to install");
+  assert.ok(t.store.listAudit().some((e) => e.action === "executor-upgrade.request" && e.target === `executor@app1@${EXECUTOR_VERSION}`));
 });
 
 test("D35: each host's compose root holds only the apps placed on it", async () => {
@@ -471,7 +514,7 @@ function withIngress() {
   const t = withBuiltApp();
   t.store.saveManifest({ ...shop, app: "api", components: [{ id: "web", type: "compose-service", service: "api", source: { kind: "public-registry", image: "nginx:1.27.0" }, ports: [{ container: 8787, host: 18787 }], environment: { SHOP_URL: "{{app:shop.url}}", SHOP_ORIGIN: "{{app:shop.origin}}" } }] }, { id: "t", via: "cli" });
   const write = (over: Record<string, unknown> = {}) => writeFileSync(join(t.dir, "environment.json"), JSON.stringify({
-    name: "uat", project: "open-atlas", bindIp: "127.0.0.1", hosts, domain: "atlas.example.internal", registries: { ghcr: "ghcr.io/acme" },
+    name: "uat", project: "open-atlas", bindIp: "127.0.0.1", hosts: { ...hosts, app1: { address: "10.0.1.11", bindIp: "10.0.1.11" } }, domain: "atlas.example.internal", registries: { ghcr: "ghcr.io/acme" },
     apps: { shop: { version: "1.2.0", host: "app1", ingress: { kind: "nginx", port: 443 } }, api: { version: "1.0.0", host: "app2", ingress: { kind: "direct" } } }, ...over,
   }));
   write();
@@ -490,6 +533,11 @@ test("D36: addresses come from the ingress setting; references resolve where the
   assert.match(plan.fragment, /SHOP_URL: "https:\/\/atlas\.example\.internal"/);
   assert.match(plan.fragment, /SHOP_ORIGIN: "https:\/\/atlas\.example\.internal"/);
   assert.equal(plan.request.url, "http://10.0.1.12:18787");
+  // app1 binds its ports to loopback: nginx can only forward there from app1 itself, and the configuration says so.
+  write({ hosts });
+  const loopback = await (await t.request("/api/ingress", { as: "viewer" })).json();
+  assert.equal(loopback.endpoints.find((e: { app: string }) => e.app === "shop").upstream, "127.0.0.1:18080");
+  assert.match(loopback.nginx.body, /# shop \(ports bound to loopback: nginx must run on host app1\)\n {4}location \/ \{\n {8}proxy_pass http:\/\/127\.0\.0\.1:18080;/);
   // shop without an ingress: api's reference cannot be resolved, and the plan says so.
   write({ apps: { shop: { version: "1.2.0", host: "app1" }, api: { version: "1.0.0", host: "app2", ingress: { kind: "direct" } } } });
   const blocked = await (await post(t, "/api/apps/api/plan", "uat", { version: "1.0.0" })).json();

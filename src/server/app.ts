@@ -7,7 +7,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
 import { Hono, type Context } from "hono";
 import type { Environment } from "../compose/generate.ts";
-import { covering } from "../manifest/version.ts";
+import { compareVersions, covering } from "../manifest/version.ts";
 import {
   EMERGENCY_COOKIE, EMERGENCY_TTL_MS, LoginThrottle, emergencyPrincipal, newToken, parseCookies, sha256, verifyPassword,
   type Permission, type Principal, type WorkbenchSessions,
@@ -21,7 +21,7 @@ import { OnboardingError, type Onboarding } from "./onboarding.ts";
 import type { Briefs } from "./brief.ts";
 import type { Drift } from "./drift.ts";
 import { PeerError, type Peer, type PeerStatus } from "./peer.ts";
-import { hostIds, hostOf, tokenSha256 } from "./handoff.ts";
+import { EXECUTOR_VERSION, hostIds, hostOf, newJobId, tokenSha256 } from "./handoff.ts";
 import { lineDiff } from "./ingress.ts";
 import { environmentStatus, hostStateOf, parseDockerPs, type Observer } from "./observe.ts";
 import { StoreError, type Actor, type Store } from "./store.ts";
@@ -133,6 +133,24 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     return c.json({ ok: true });
   }));
 
+  // §8.6: a host's executor is upgraded to the version this Deployer ships. The Deployer only names the version; the
+  // host takes the release from its own EXECUTOR_UPGRADE_FROM. An executor job's app is executor@<host>.
+  const upgradeOf = (env: Environment, host: string) => {
+    const info = handoff.executor(host);
+    const last = store.listJobs({ app: `executor@${host}`, kind: "executor-upgrade", limit: 1 })[0];
+    const job = last ? { id: last.id, state: last.state, version: last.version, message: last.message, finishedAt: last.finishedAt } : null;
+    const version = info.heartbeat?.version;
+    const available = Boolean(version && /^\d+\.\d+\.\d+(-.+)?$/.test(version) && compareVersions(version, EXECUTOR_VERSION) < 0);
+    const busy = store.activeJobs().find((j) => (j.kind === "executor-upgrade" ? j.app === `executor@${host}` : env.apps[j.app] !== undefined && hostOf(env, j.app) === host));
+    const blocked = !available ? undefined
+      : !info.online ? info.reason
+      : !info.heartbeat?.kinds?.includes("executor-upgrade") ? `Executor ${version} on ${host} cannot upgrade itself: install ${EXECUTOR_VERSION} there by hand once (install.sh)`
+      : !info.heartbeat.upgradeFrom ? `EXECUTOR_UPGRADE_FROM is not set on ${host}: set it in executor.env and restart the executor`
+      : busy ? `${host} is running ${busy.id}; upgrade when it ends`
+      : undefined;
+    return { available, ...(blocked ? { blocked } : {}), job, from: info.heartbeat?.upgradeFrom ?? null };
+  };
+
   // D35: the hosts of this environment, their executors, and the tokens they call in with.
   api.get("/api/hosts", async (c) => {
     const p = await authenticate(c, "view");
@@ -141,13 +159,31 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     const tokens = store.executorTokens();
     const reports = handoff.reports();
     return c.json({
+      executorVersion: EXECUTOR_VERSION,
       hosts: hostIds(env).map((id) => ({
         id, address: env.hosts?.[id]?.address ?? null, executor: handoff.executor(id),
         apps: Object.keys(env.apps).filter((a) => hostOf(env, a) === id),
         report: reports.find((r) => r.host === id) ? { at: reports.find((r) => r.host === id)!.at, stale: reports.find((r) => r.host === id)!.stale, containers: reports.find((r) => r.host === id)!.containers.length } : null,
         tokens: tokens.filter((t) => t.host === id).map(({ prefix, createdAt, createdBy, revokedAt }) => ({ prefix, createdAt, createdBy, revokedAt })),
+        upgrade: upgradeOf(env, id),
       })),
     });
+  });
+  api.post("/api/hosts/:id/upgrade-executor", async (c) => {
+    const p = await authenticate(c, "admin");
+    if (p instanceof Response) return p;
+    if (isKey(p)) return reject(c, 403, "auth/browser-only", "Executor upgrades are started only from a browser session, not API keys.");
+    const host = c.req.param("id");
+    const { env } = deployments.environment();
+    if (!hostIds(env).includes(host)) return reject(c, 404, "host/unknown", `${host} is not a host of this environment (environment.json hosts).`);
+    const upgrade = upgradeOf(env, host);
+    if (!upgrade.available) return reject(c, 409, "executor/up-to-date", `The executor on ${host} is not older than ${EXECUTOR_VERSION}.`);
+    if (upgrade.blocked) return reject(c, 409, "executor/upgrade-blocked", upgrade.blocked);
+    const id = newJobId("executor-upgrade");
+    const request = { kind: "executor-upgrade", version: EXECUTOR_VERSION };
+    store.addJob({ id, kind: "executor-upgrade", app: `executor@${host}`, version: EXECUTOR_VERSION, environment: env.name, fromVersion: handoff.executor(host).heartbeat?.version ?? null, manifest: null, pinFrom: null, request }, { id: p.id, via: p.via });
+    handoff.submit(id, { ...request, requestedBy: p.id }, host);
+    return c.json({ job: store.job(id) }, 201);
   });
   api.post("/api/hosts/:id/token", async (c) => {
     const p = await authenticate(c, "admin");
@@ -394,7 +430,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     let env: Environment;
     try { env = deployments.environment().env; } catch { return reject(c, 503, "environment/missing", `Cannot read the environment settings ${config.environmentFile}.`); }
     const apps = store.listApps().map((a) => ({ id: a.id, name: a.name, manifests: store.manifests(a.id) }));
-    const status = await environmentStatus(env, apps, hostStateOf(deployments.handoff.reports()), observer);
+    const status = await environmentStatus(env, apps, hostStateOf(deployments.handoff.reports(hostIds(env))), observer);
     let uat: (PeerStatus & { url?: string }) | { error: string } | undefined;
     if (peer?.configured) { try { uat = await peer.status(); } catch (error) { uat = { error: (error as Error).message }; } }
     return c.json({ ...status, ...(uat ? { peer: uat } : {}), executor: deployments.handoff.executors(env)[0], executors: deployments.handoff.executors(env), hostOf: Object.fromEntries(Object.keys(env.apps).map((a) => [a, hostOf(env, a)])), canDeploy: deployments.canDeploy(p), envEnabled: envVars.enabled, active: store.activeJobs().map((j) => ({ id: j.id, kind: j.kind, app: j.app, version: j.version, state: j.state })) });

@@ -229,7 +229,7 @@ class RequestTest(unittest.TestCase):
         self.ex.heartbeat()
         beat = self.api.beats[-1]
         self.assertEqual(beat["protocols"], [2])
-        self.assertEqual(beat["kinds"], ["build", "deploy", "env", "env-read", "bundle", "db-migration"])
+        self.assertEqual(beat["kinds"], ["build", "deploy", "env", "env-read", "bundle", "db-migration", "executor-upgrade"])
         self.assertEqual(beat["databaseBackup"], {"dossier": {"dump": True, "restore": False}})
 
 
@@ -350,6 +350,134 @@ class FileHashTest(unittest.TestCase):
             hashes = dx.Executor(cfg(d)).file_hashes()
             self.assertEqual(sorted(hashes), ["compose.yaml", "shop.env", "shop/compose.yaml"])
             self.assertEqual(hashes["shop.env"], hashlib.sha256(b"A=1\n").hexdigest())
+
+
+class UpgradeTest(unittest.TestCase):
+    """§8.6: a newer release from the host's own source, `current` switched, the result reported by whoever runs next."""
+
+    def setUp(self):
+        import hashlib
+        import io
+        import tarfile
+        self.hashlib, self.io, self.tarfile = hashlib, io, tarfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        self.base, self.source = self.root / "base", self.root / "source"
+        (self.base / "releases" / dx.VERSION).mkdir(parents=True)
+        (self.base / "releases" / dx.VERSION / "deployer_executor.py").write_text("old")
+        (self.base / "launch.sh").write_bytes((pathlib.Path(dx.__file__).parent / "launch.sh").read_bytes())
+        (self.base / "current").symlink_to(f"releases/{dx.VERSION}")
+        self.api = FakeApi()
+        self.devnull = open("/dev/null", "w")
+        self.addCleanup(self.devnull.close)
+        self.ex = dx.Executor(cfg(self.root, base=self.base, upgrade_from=str(self.source)), out=self.devnull, api=self.api)
+        self.ex.sleep = lambda s: None
+        self.work = self.ex.cfg["work"]
+        self.addCleanup(setattr, dx, "VERSION", dx.VERSION)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def release(self, version, files=None, sums=None):
+        """Publishes executor-v<version> in the directory source; returns the archive."""
+        code = (pathlib.Path(dx.__file__)).read_text().replace(f'VERSION = "{dx.VERSION}"', f'VERSION = "{version}"', 1)
+        files = files if files is not None else {"deployer_executor.py": code, "launch.sh": (self.base / "launch.sh").read_text()}
+        buf = self.io.BytesIO()
+        with self.tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            for name, text in files.items():
+                data = text.encode()
+                info = self.tarfile.TarInfo(name if "/" in name else f"{dx.PACKAGE}-{version}/{name}")
+                info.size = len(data)
+                tar.addfile(info, self.io.BytesIO(data))
+        d = self.source / f"executor-v{version}"
+        d.mkdir(parents=True, exist_ok=True)
+        name = f"{dx.PACKAGE}-{version}.tar.gz"
+        (d / name).write_bytes(buf.getvalue())
+        (d / "SHA256SUMS").write_text(sums if sums is not None else f"{self.hashlib.sha256(buf.getvalue()).hexdigest()}  {name}\n")
+        return buf.getvalue()
+
+    def upgrade(self, version, job="upgrade-0001"):
+        self.api.queue.append({"protocol": 2, "id": job, "kind": "executor-upgrade", "version": version})
+        return self.ex.run_once()
+
+    def test_installs_beside_the_running_release_switches_and_exits(self):
+        self.release("9.0.0")
+        with self.assertRaises(dx.Restarting):
+            self.upgrade("9.0.0")
+        self.assertEqual(dx.os.readlink(self.base / "current"), "releases/9.0.0")
+        self.assertTrue((self.base / "releases" / dx.VERSION / "deployer_executor.py").is_file(), "the running release stays")
+        self.assertIn('VERSION = "9.0.0"', (self.base / "releases" / "9.0.0" / "deployer_executor.py").read_text())
+        self.assertEqual((self.work / "upgrade-pending").read_text(), dx.VERSION, "launch.sh knows where to go back")
+        status = self.api.status["upgrade-0001"]
+        self.assertEqual(status["state"], "running")
+        self.assertEqual([s["name"] for s in status["steps"]], ["download", "install", "restart"])
+        self.assertEqual(status["result"]["to"], "9.0.0")
+        self.assertNotIn("note", status["result"], "launch.sh is unchanged")
+        self.assertFalse(self.ex.current_marker().exists(), "a restart is not an interrupted job")
+
+        # The new process: it passed its self-check, so it reports success and prunes old releases.
+        for old in ("0.1.0", "0.2.0", "0.3.0"):
+            (self.base / "releases" / old).mkdir()
+        dx.VERSION = "9.0.0"
+        self.ex.finish_upgrade()
+        status = self.api.status["upgrade-0001"]
+        self.assertEqual((status["state"], status["message"]), ("succeeded", f"Executor upgraded from {status['result']['from']} to 9.0.0"))
+        self.assertTrue(all(s["state"] == "done" for s in status["steps"]))
+        self.assertFalse((self.work / "upgrade-job.json").exists())
+        self.assertEqual(sorted(p.name for p in (self.base / "releases").iterdir()), sorted({"0.3.0", status["result"]["previous"], "9.0.0"}))
+
+    def test_after_launch_sh_went_back_the_old_release_reports_the_failure(self):
+        self.release("9.0.0")
+        with self.assertRaises(dx.Restarting):
+            self.upgrade("9.0.0")
+        (self.work / "upgrade-failed.json").write_text('{"rolledBackTo": "%s"}' % dx.VERSION)
+        self.ex.finish_upgrade()
+        status = self.api.status["upgrade-0001"]
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(status["message"], f"Executor 9.0.0 did not start after three failed starts; back on {dx.VERSION}")
+        self.assertFalse((self.work / "upgrade-failed.json").exists())
+
+    def test_refuses_or_fails_without_changing_the_running_release(self):
+        cases = [
+            ("0.0.1", None, "refused", "is not older"),
+            ("9.0.1", None, "failed", "does not hold"),
+        ]
+        self.release("9.0.2", sums="0" * 64 + f"  {dx.PACKAGE}-9.0.2.tar.gz\n")
+        cases.append(("9.0.2", None, "failed", "SHA256SUMS says"))
+        self.release("9.0.3", files={"deployer_executor.py": 'VERSION = "9.0.3"\n', "../evil": "x"})
+        cases.append(("9.0.3", None, "failed", "not one of the executor's files"))
+        self.release("9.0.4", files={"deployer_executor.py": 'VERSION = "9.0.5"\n'})
+        cases.append(("9.0.4", None, "failed", "is not version 9.0.4"))
+        self.release("9.0.6", files={"deployer_executor.py": 'VERSION = "9.0.6"\ndef broken(:\n'})
+        cases.append(("9.0.6", None, "failed", "does not compile"))
+        for i, (version, _, state, message) in enumerate(cases):
+            self.assertTrue(self.upgrade(version, job=f"upgrade-{i:04d}"))
+            status = self.api.status[f"upgrade-{i:04d}"]
+            self.assertEqual(status["state"], state, version)
+            self.assertIn(message, status["message"])
+        self.assertEqual(dx.os.readlink(self.base / "current"), f"releases/{dx.VERSION}")
+        self.assertFalse((self.work / "upgrade-pending").exists())
+        self.ex.cfg["upgrade_from"] = ""
+        self.assertTrue(self.upgrade("9.0.0", job="upgrade-nosource"))
+        self.assertIn("EXECUTOR_UPGRADE_FROM is not set", self.api.status["upgrade-nosource"]["message"])
+        self.assertEqual(self.api.beats[-1]["upgradeFrom"], None)
+
+    def test_a_github_source_is_the_release_executor_v_version(self):
+        archive = self.release("9.0.0")
+        sums = (self.source / "executor-v9.0.0" / "SHA256SUMS").read_text().encode()
+        urls = []
+
+        def get(url, accept, auth=True):
+            urls.append(url)
+            if url.endswith("/releases/tags/executor-v9.0.0"):
+                return json.dumps({"assets": [{"name": f"{dx.PACKAGE}-9.0.0.tar.gz", "url": "https://api.github.test/a/1"}, {"name": "SHA256SUMS", "url": "https://api.github.test/a/2"}]}).encode()
+            return {"https://api.github.test/a/1": archive, "https://api.github.test/a/2": sums}[url]
+        self.ex.http_get = get
+        self.ex.cfg.update(github_api="https://api.github.test", upgrade_from="acme/open-atlas-deployer")
+        self.assertEqual(self.ex.beat_body(None, {})["upgradeFrom"], "github")
+        with self.assertRaises(dx.Restarting):
+            self.upgrade("9.0.0")
+        self.assertEqual(urls[0], "https://api.github.test/repos/acme/open-atlas-deployer/releases/tags/executor-v9.0.0")
 
 
 class FragmentTest(unittest.TestCase):

@@ -62,6 +62,13 @@ test("applies the environment's overrides and merges extra compose fields", () =
   assert.match(out, /logging:\n {6}driver: "local"/);
 });
 
+test("adds the environment's extra hosts to every service, after the manifest's own", () => {
+  const out = generate([shop], { ...env, extraHosts: ["uat.example.com:host-gateway"] })["shop/compose.yaml"];
+  assert.equal(out.match(/extra_hosts:\n {6}- "uat.example.com:host-gateway"/g)?.length, 3);
+  const own = { ...shop, components: [{ ...shop.components[1]!, extraHosts: ["db.local:10.0.0.5"] }] };
+  assert.match(generate([own], { ...env, extraHosts: ["uat.example.com:host-gateway"] })["shop/compose.yaml"], /extra_hosts:\n {6}- "db.local:10.0.0.5"\n {6}- "uat.example.com:host-gateway"/);
+});
+
 test("refuses a service name or host port two apps both claim, and an unregistered registry", () => {
   const blog: Manifest = { v: 1, app: "blog", appliesFrom: "3.0.0", components: [
     { id: "web", type: "compose-service", service: "blog", source: { kind: "public-registry", image: "ghost:5.0" }, ports: [{ container: 2368, host: 18080 }] }] };

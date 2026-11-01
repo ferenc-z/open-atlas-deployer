@@ -20,7 +20,7 @@ import { WorkbenchAdmin } from "./drivers/workbench.ts";
 import { WorkbenchAppDriver } from "./drivers/workbench-app.ts";
 import { McpClient } from "./mcp-client.ts";
 import { EnvManager, Schemas } from "./env.ts";
-import { Handoff } from "./handoff.ts";
+import { Handoff, hostIds } from "./handoff.ts";
 import { Observer } from "./observe.ts";
 import { Peer } from "./peer.ts";
 import { SecretBox } from "./secretbox.ts";
@@ -64,7 +64,10 @@ const onboarding = new Onboarding({ store, deployments, oma: assessor, githubApi
 deployments.evaluated = (app, version) => onboarding.evaluated(app, version);
 // Phase 8: the maintenance notice before a deploy (W3), drift, the daily brief.
 if (config.workbenchApiKeyFile) deployments.maintenance = workbench;
-const statusOf = () => environmentStatus(deployments.environment().env, store.listApps().map((a) => ({ id: a.id, name: a.name, manifests: store.manifests(a.id) })), hostStateOf(deployments.handoff.reports()), observer);
+const statusOf = () => {
+  const { env } = deployments.environment();
+  return environmentStatus(env, store.listApps().map((a) => ({ id: a.id, name: a.name, manifests: store.manifests(a.id) })), hostStateOf(deployments.handoff.reports(hostIds(env))), observer);
+};
 const drift = new Drift(store, deployments, (host) => deployments.handoff.reports().find((r) => r.host === host)?.files, statusOf);
 const briefWriter = config.omaUrl && config.omaApiKeyFile && config.omaAgent
   ? new OmaSessions({ url: config.omaUrl, keyFile: config.omaApiKeyFile, agent: config.omaAgent, ...(config.omaEnvironment ? { environment: config.omaEnvironment } : {}), vaults: config.omaVaults, ...(config.omaApplicationId ? { application: config.omaApplicationId } : {}) })

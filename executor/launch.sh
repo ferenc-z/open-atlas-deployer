@@ -6,7 +6,7 @@
 # release's directory name. The executor deletes that file once its self-check passes. Until then each start
 # counts; after three failed starts this switches `current` back.
 set -eu
-base=/opt/open-atlas-deployer/executor
+base=${EXECUTOR_BASE:-/opt/open-atlas-deployer/executor}
 work=${EXECUTOR_WORK:-/var/lib/open-atlas-deployer-executor}
 marker="$work/upgrade-pending"
 if [ -f "$marker" ]; then

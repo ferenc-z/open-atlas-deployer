@@ -113,7 +113,7 @@ export interface EnvRevision {
   appliedJob: string | null;
 }
 
-export type JobKind = "build" | "deploy" | "env" | "env-read";
+export type JobKind = "build" | "deploy" | "env" | "env-read" | "executor-upgrade";
 
 /**
  * An immutable artifact (§6.1): app@version + component + digest. origin says how it first came here:

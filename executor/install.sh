@@ -1,7 +1,8 @@
 #!/bin/sh
 # First installation of the executor on a host (design §8.6, D29), run once by hand as root from an unpacked
-# release: sudo ./install.sh. Later versions arrive with Deployer upgrades; rerun this only when the release
-# notes say launch.sh or the systemd unit changed.
+# release: sudo ./install.sh. Later versions are installed from the Deployer's Hosts page (executor-upgrade, with
+# EXECUTOR_UPGRADE_FROM set in executor.env); rerun this only when the release notes say launch.sh or the systemd
+# unit changed.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 version=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' "$here/deployer_executor.py")
@@ -11,7 +12,9 @@ command -v docker >/dev/null || { echo "docker is required" >&2; exit 1; }
 python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' || { echo "python3 >= 3.9 is required" >&2; exit 1; }
 
 mkdir -p "$base/releases/$version"
-cp "$here/deployer_executor.py" "$base/releases/$version/"
+for f in deployer_executor.py launch.sh switch install.sh open-atlas-deployer-executor.service executor.env.example; do
+  [ -f "$here/$f" ] && cp "$here/$f" "$base/releases/$version/"
+done
 install -m 755 "$here/launch.sh" "$base/launch.sh"
 install -m 755 "$here/switch" "$base/switch"
 ln -sfn "releases/$version" "$base/current.tmp" && mv -T "$base/current.tmp" "$base/current"

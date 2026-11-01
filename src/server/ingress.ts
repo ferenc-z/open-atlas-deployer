@@ -18,6 +18,8 @@ export interface Endpoint {
   url?: string;
   /** nginx only: where it forwards, <host address>:<published port>. */
   upstream?: string;
+  /** nginx only: the host binds its ports to loopback, so nginx has to run on it. */
+  loopback?: string;
   /** Why no address could be worked out. */
   problem?: string;
 }
@@ -45,11 +47,15 @@ export function endpoint(env: Environment, appId: string, manifest: Manifest | u
   const address = hostAddress(env, host);
   const port = manifest ? publishedPort(env, manifest, appId, ingress.component, ingress.containerPort) : undefined;
   if (!port) return { app: appId, kind: ingress.kind, problem: `${appId} publishes no host port${ingress.component ? ` on ${ingress.component}` : ""}${ingress.containerPort ? ` for container port ${ingress.containerPort}` : ""}` };
-  if (!address) return { app: appId, kind: ingress.kind, problem: `host ${host} has no address in environment.json` };
+  // Ports bound to loopback are only reachable from the host itself: nginx then runs there and forwards to that address.
+  const bind = env.hosts?.[host]?.bindIp ?? env.bindIp;
+  const loopback = ingress.kind === "nginx" && bind.startsWith("127.");
+  if (!address && !loopback) return { app: appId, kind: ingress.kind, problem: `host ${host} has no address in environment.json` };
   if (ingress.kind === "direct") return { app: appId, kind: "direct", url: `http://${address}:${port}` };
-  if (!env.domain) return { app: appId, kind: "nginx", upstream: `${address}:${port}`, problem: "the environment has no domain (environment.json domain)" };
+  const upstream = `${loopback ? bind : address}:${port}`;
+  if (!env.domain) return { app: appId, kind: "nginx", upstream, problem: "the environment has no domain (environment.json domain)" };
   const path = ingress.path ?? "/";
-  return { app: appId, kind: "nginx", url: `https://${env.domain}${ingress.port === 443 ? "" : `:${ingress.port}`}${path}`, upstream: `${address}:${port}` };
+  return { app: appId, kind: "nginx", url: `https://${env.domain}${ingress.port === 443 ? "" : `:${ingress.port}`}${path}`, upstream, ...(loopback ? { loopback: host } : {}) };
 }
 
 const REF = /\{\{app:([a-z][a-z0-9-]{0,62})\.(url|origin)\}\}/g;
@@ -99,7 +105,7 @@ export function nginxConfig(env: Environment, manifests: Record<string, Manifest
     // Longest path first, so /deploy/ wins over /.
     for (const { e, ingress } of [...entries].sort((a, b) => (b.ingress.path ?? "/").length - (a.ingress.path ?? "/").length)) {
       lines.push("",
-        `    # ${e.app}`,
+        `    # ${e.app}${e.loopback ? ` (ports bound to loopback: nginx must run on host ${e.loopback})` : ""}`,
         `    location ${ingress.path ?? "/"} {`,
         `        proxy_pass http://${e.upstream};`,
         "        proxy_http_version 1.1;",

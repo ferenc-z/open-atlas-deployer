@@ -183,7 +183,11 @@ sudo systemctl restart open-atlas-deployer-executor
 python3 /opt/open-atlas-deployer/executor/current/deployer_executor.py check
 ```
 
-[executor/launch.sh](executor/launch.sh) 负责启动计数：有 `upgrade-pending` 标记时连续 3 次自检不过，就退回旧版本。[executor/switch](executor/switch) 用来手工切换版本。执行器随 Deployer 一起自升级的任务还没做：Deployer 还没有发布包，等它本身登记为应用（D16）时一起做。
+[executor/launch.sh](executor/launch.sh) 负责启动计数：有 `upgrade-pending` 标记时连续 3 次自检不过，就退回旧版本。[executor/switch](executor/switch) 用来手工切换版本。
+
+执行器的升级（2026-11-01 已实现，§8.6）：admin 在 Hosts 页对版本低于 Deployer 自带版本（`EXECUTOR_VERSION`，与 `executor/deployer_executor.py` 的 `VERSION` 一致，测试核对）的机器点"Upgrade executor"，Deployer 排一个 `executor-upgrade` 任务，请求里只有版本号。执行器只从本机 `executor.env` 的 `EXECUTOR_UPGRADE_FROM` 取发布包：GitHub 仓库 `owner/name` 的 release `executor-v<版本>`，或一个绝对路径目录下的 `executor-v<版本>/`；包是 `executor/package.sh` 打出的 `open-atlas-deployer-executor-<版本>.tar.gz` 和 `SHA256SUMS`。执行器核对哈希、只接受一层目录里那几个已知文件、代码里的版本号要对得上且能编译，装到 `releases/<版本>`，写 `upgrade-pending`，切 `current`，退出；systemd 经 `launch.sh` 拉起新版本，自检通过后由新版本回报成功并只保留当前、上一版和最新 3 个版本目录；连续 3 次起不来，`launch.sh` 退回旧版本，由旧版本回报失败。不接受降级（回旧版用 `switch`）；`launch.sh` 本身不随升级替换，变了会在结果里提示重跑 `install.sh`。只限 admin 的浏览器会话；机器离线、还在跑任务、执行器太旧（0.6.0 以前，要手工装一次）、没配 `EXECUTOR_UPGRADE_FROM` 时拦住并说明原因。
+
+第一次安装：在一台能连 GitHub 的机器上 `executor/package.sh <输出目录>`，把包和 `SHA256SUMS` 挂到 release `executor-v<版本>`（或放进内网目录），服务器上解压后 `sudo ./install.sh`。Deployer 自己的升级（D16）还没做，执行器的升级目前由 admin 在 Hosts 页逐台发起。
 
 ### 测试与验证（2026-10-30）
 
@@ -567,6 +571,8 @@ npm test
 - 一个环境一个域名（`domain`），应用的 `ingress`：`{ "kind": "nginx", "port": 8787, "path"?, "component"?, "containerPort"?, "maxBodySize"? }` 或 `{ "kind": "direct" }`，不写就是不对外。经 nginx 的地址是 `https://<domain>:<port><path>`，直连的是 `http://<机器地址>:<发布端口>`。
 - 应用之间互相引用写 `{{app:<id>.url}}` 或 `{{app:<id>.origin}}`：在清单的 `environment` 和 env 文件的值里都可以用，Deployer 生成片段、写 env 文件时换成实际地址；解析不了就拦住部署和写入。
 - nginx 由运维维护：Ingress 页生成推荐配置（每个端口一个 server，按路径分 location，长的路径在前；关缓冲、600 秒读超时、WebSocket、上传大小），存成修订（谁、何时、为什么），显示和上一修订的差异，可下载。部署走 nginx 的应用时，配置和最新修订不一致就在计划里提示。
+- 容器里的 DNS 不认识域名时（内网没有这条记录、或本地试用），环境写 `extraHosts`（如 `["uat.example.com:10.0.0.5"]`、`["oa.localhost:host-gateway"]`），加到每个容器的 `/etc/hosts`（2026-11-01）。
+- 机器把端口绑在 127.0.0.1（`bindIp`）时，nginx 只能在这台机器上、转发到 127.0.0.1，推荐配置在这个应用的注释里写明（2026-11-01）。
 - 内部 CA：admin 在 Ingress 页贴 PEM 证书；之后每次部署把它写到 `<应用>/ca/ca.pem`，只读挂到容器的 `/etc/open-atlas/ca.pem`，并设 `NODE_EXTRA_CA_CERTS`（加在系统 CA 之外）；JVM 应用要在 env 文件里用 `JAVA_OPTS` 指向 truststore。应用可以在环境里写 `"ca": false` 不挂。
 - 部署成功后经对外地址访问一次（信任内部 CA）：除 502/503/504 外的回答都算通；不通只在任务页提示"已部署，入口不通"并记审计，不回滚。
 - 地址变了：计划列出引用它的应用（要重写 env、重启），并提醒存在应用自己数据库里的地址要手工改（Workbench 的 OMA Integration、OMA 里 agent 的 MCP 地址和 Vault 凭据）。
@@ -577,7 +583,7 @@ npm test
 
 ### 测试与验证（2026-10-31）
 
-- `npm test` 78 个，执行器单元测试 23 个。新增：执行器凭据和长轮询、只领本机任务、别的机器改不了、吊销后拒绝、状态带机器名；按台生成根文件、同端口不同台不冲突；地址解析、引用解析不了时拦住；nginx 配置按端口和路径、修订和差异、下载；内部 CA 的挂载和请求；部署后复查失败只告警；地址和机器变化的提示；执行器的 HTTP 收发、中断标记、日志不含 env 内容。
+- `npm test` 80 个（2026-11-01 加 `extraHosts`、回环地址的上游、移出环境的机器不再算进状态页，以及执行器升级），执行器单元测试 27 个（升级：装好切换后退出、新版本回报成功并清理旧版本、退回后旧版本回报失败、哈希和文件和版本号不对就拒绝、GitHub 来源）。新增：执行器凭据和长轮询、只领本机任务、别的机器改不了、吊销后拒绝、状态带机器名；按台生成根文件、同端口不同台不冲突；地址解析、引用解析不了时拦住；nginx 配置按端口和路径、修订和差异、下载；内部 CA 的挂载和请求；部署后复查失败只告警；地址和机器变化的提示；执行器的 HTTP 收发、中断标记、日志不含 env 内容。
 - WSL 本地试用切到协议 2：本机执行器经 HTTP 在线、上报 4 个容器，导入 oma.env 成为修订 1。再模拟第二台机器 app2（单独的根目录、compose 项目和凭据，第二个执行器进程），登记一个 busybox 测试应用放在 app2、直连入口：部署成功，根文件只含它，复查 HTTP 200；改到 local 后计划提示换机器和地址变化。验证完删除了测试应用、app2 的执行器、凭据和目录，环境配置恢复原样。
-- 没有真实的 nginx 和内部 CA 环境，nginx 配置只在测试里核对了内容，没有在真实 nginx 上 `nginx -t`。
+- WSL 本地试用改成全部经 nginx（2026-11-01）：apt 装的 nginx 1.28 以用户身份运行，测试 CA 签 `oa.localhost` 的证书；环境写 `domain`、`nginx` 证书路径、`extraHosts` 和三个应用的 `ingress`（Workbench 8443、Studio 9443、OMA 9787，Deployer 手写在 8495 的 `/deploy/`）。Ingress 页保存的修订 1 原样放进 nginx，`nginx -t` 通过；Studio 设 `OPEN_ATLAS_STUDIO_TLS=off`，Workbench、OMA 的对外地址改成 `{{app:<id>.url}}`，经 env 页写入后重新部署。结果：经 nginx 的四个地址在 WSL 和 Windows 都返回 200；部署后复查（信任内部 CA）三个应用都 200；容器里 `oa.localhost` 经 `extraHosts` 解析到宿主机，用挂进去的 CA 访问别的应用的 https 地址 200，去掉 CA 则证书校验失败；Workbench 登录的 Cookie 带 `Secure`，同一个 Cookie 在 8495 上的 Deployer 认得出（Cookie 不分端口）；Workbench 的 SSE 经 nginx 即时到达。没测：WebSocket（现有应用没有用到）、浏览器里的页面（Windows 没导入测试 CA）。
 

@@ -27,11 +27,18 @@ checked against the sha256 the Deployer recorded; and a deploy may run database 
 scripts of the release, in name order, each in one transaction with its record in deployer.migrations, through
 psql inside the database container, after the database is up and before the rest of the app starts.
 
+Its own upgrade (design §8.6, D29): an executor-upgrade job names a newer version; the release comes only from the
+source this host configured (EXECUTOR_UPGRADE_FROM: a GitHub repository's release executor-v<version>, or a
+directory), checked against its SHA256SUMS, is installed beside the running one, and `current` points at it. The
+executor then exits; systemd starts the new one through launch.sh, which goes back after three failed starts. Whichever
+version runs afterwards reports how the job ended.
+
 Standard library only; Python 3.9 (Rocky 9's python3).
 """
 import base64
 import datetime as dt
 import hashlib
+import io
 import json
 import os
 import pathlib
@@ -46,10 +53,10 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 PROTOCOLS = [2]
 # Job kinds, plus what a deploy may ask for (bundle files, migrations): an older executor is not sent those.
-KINDS = ["build", "deploy", "env", "env-read", "bundle", "db-migration"]
+KINDS = ["build", "deploy", "env", "env-read", "bundle", "db-migration", "executor-upgrade"]
 ENV_FILE_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*\.env$")
 ENV_MAX_BYTES = 1024 * 1024
 BUILD_JSON_IN_IMAGE = "/opt/open-atlas/BUILD.json"
@@ -69,6 +76,10 @@ MIGRATIONS_TABLE = ("CREATE SCHEMA IF NOT EXISTS deployer; CREATE TABLE IF NOT E
                     "component text NOT NULL, name text NOT NULL, kind text NOT NULL, sha256 text NOT NULL, "
                     "applied_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (component, name));")
 FINAL = ("succeeded", "failed", "rolled-back", "refused")
+# The executor's release (§8.6): one directory in the archive, holding only these files.
+PACKAGE = "open-atlas-deployer-executor"
+PACKAGE_FILES = ("deployer_executor.py", "launch.sh", "switch", "install.sh", "open-atlas-deployer-executor.service", "executor.env.example")
+KEEP_RELEASES = 3
 
 
 class Refused(Exception):
@@ -77,6 +88,16 @@ class Refused(Exception):
 
 class Failed(Exception):
     """A step failed after it started."""
+
+
+class Restarting(Exception):
+    """A new release is in place: the process exits so systemd starts it (§8.6)."""
+
+
+def version_key(v):
+    """Orders x.y.z[-pre]; a pre-release comes before its release."""
+    m = re.match(r"^(\d+)\.(\d+)\.(\d+)(?:-(.+))?$", v)
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)), 0 if m.group(4) else 1, m.group(4) or "")
 
 
 def now_iso():
@@ -135,6 +156,9 @@ def config(env_file=None, environ=None):
         "poll_seconds": float(e.get("EXECUTOR_POLL_SECONDS", "2")),
         "state_seconds": float(e.get("EXECUTOR_STATE_SECONDS", "30")),
         "db": db,
+        # §8.6: where the installed releases are, and the only place a newer one may come from.
+        "base": pathlib.Path(e.get("EXECUTOR_BASE", "/opt/open-atlas-deployer/executor")),
+        "upgrade_from": e.get("EXECUTOR_UPGRADE_FROM", "").strip(),
     }
 
 
@@ -405,12 +429,18 @@ class Executor:
         db = {app: {"dump": "dump" in v, "restore": "restore" in v} for app, v in self.cfg["db"].items()}
         with self.beat_lock:
             try:
-                self.api.heartbeat({
-                    "version": VERSION, "protocols": PROTOCOLS, "kinds": KINDS, "at": now_iso(), "pid": os.getpid(), "root": str(self.cfg["root"]),
-                    "project": self.cfg["project"], "registries": self.cfg["registries"], "databaseBackup": db, "busy": busy,
-                })
+                self.api.heartbeat(self.beat_body(busy, db))
             except Exception as e:  # the Deployer may be restarting; the next beat tries again
                 self.say(f"heartbeat failed: {e}")
+
+    def beat_body(self, busy, db):
+        source = self.cfg["upgrade_from"]
+        return {
+            "version": VERSION, "protocols": PROTOCOLS, "kinds": KINDS, "at": now_iso(), "pid": os.getpid(), "root": str(self.cfg["root"]),
+            "project": self.cfg["project"], "registries": self.cfg["registries"], "databaseBackup": db, "busy": busy,
+            # §8.6: whether this host can upgrade its executor, and from what kind of source (never the source itself).
+            "upgradeFrom": ("directory" if source.startswith("/") else "github") if source else None,
+        }
 
     def report_state(self, force=False):
         """The project's containers on this host, for the status page."""
@@ -464,10 +494,14 @@ class Executor:
         self.cfg["work"].mkdir(parents=True, exist_ok=True)
         self.recover()
         self.selfcheck()
+        self.finish_upgrade()
         while True:
             try:
                 # The long poll waits at the Deployer; a heartbeat thread keeps the host online meanwhile.
                 self.run_once(wait=self.cfg["wait_seconds"])
+            except Restarting as e:
+                self.say(str(e))
+                return
             except Exception as e:  # keep serving; the job itself already recorded its failure
                 self.say(f"error: {e}")
                 self.sleep(self.cfg["poll_seconds"])
@@ -481,8 +515,7 @@ class Executor:
         waited = 0
         while True:
             try:
-                self.api.heartbeat({"version": VERSION, "protocols": PROTOCOLS, "kinds": KINDS, "at": now_iso(), "pid": os.getpid(), "root": str(self.cfg["root"]),
-                                    "project": self.cfg["project"], "registries": self.cfg["registries"], "databaseBackup": {}, "busy": None})
+                self.api.heartbeat(self.beat_body(None, {}))
                 break
             except Failed as e:
                 if "HTTP 401" in str(e):
@@ -523,8 +556,12 @@ class Executor:
                 self.env_write(request, status)
             elif request.get("kind") == "env-read":
                 self.env_read(request, status)
+            elif request.get("kind") == "executor-upgrade":
+                self.upgrade(request, status)
             else:
                 raise Refused(f"unknown job kind {request.get('kind')}")
+        except Restarting:
+            raise
         except Refused as e:
             self.finish(status, "refused", str(e))
         except Exception as e:
@@ -583,6 +620,143 @@ class Executor:
         self.write_status(status)
         self.log(f"=== {state}: {message}")
         self.say(f"{status['id']} {state}: {message}")
+
+    # --- executor-upgrade: a newer release of this executor (§8.6, D29) -----------------------------------------
+
+    def upgrade(self, req, status):
+        """Installs the release beside the running one, points `current` at it, and exits for systemd to start it.
+        The Deployer only names the version: the code comes from EXECUTOR_UPGRADE_FROM, checked against SHA256SUMS."""
+        version, source, base = req.get("version", ""), self.cfg["upgrade_from"], self.cfg["base"]
+        if not VERSION_RE.match(version):
+            raise Refused("version is malformed")
+        if version_key(version) <= version_key(VERSION):
+            raise Refused(f"executor {VERSION} is not older than {version}; going back is `switch <version>` on the host")
+        if not source:
+            raise Refused("EXECUTOR_UPGRADE_FROM is not set on this host")
+        current = base / "current"
+        if not current.is_symlink():
+            raise Refused(f"{current} is not a link to a release: install the executor with install.sh first")
+        previous = pathlib.PurePosixPath(os.readlink(current)).name
+        name = f"{PACKAGE}-{version}.tar.gz"
+
+        self.step(status, "download")
+        archive, sums = self.release_files(source, version, name)
+        want = next((line.split()[0] for line in sums.splitlines() if line.split()[1:] in ([name], [f"*{name}"])), "")
+        got = hashlib.sha256(archive).hexdigest()
+        if not SHA256_RE.match(want):
+            raise Failed(f"SHA256SUMS of executor-v{version} does not list {name}")
+        if got != want:
+            raise Failed(f"{name} is sha256:{got}, SHA256SUMS says sha256:{want}")
+        self.log(f"{name} sha256:{got}")
+
+        self.step(status, "install")
+        files = self.package_files(archive, version)
+        target, tmp = base / "releases" / version, base / "releases" / f".{version}.tmp"
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True)
+        for f, data in files.items():
+            (tmp / f).write_bytes(data)
+            os.chmod(tmp / f, 0o755 if f in ("launch.sh", "switch", "install.sh") else 0o644)
+        shutil.rmtree(target, ignore_errors=True)
+        os.replace(tmp, target)
+        status["result"] = {"from": VERSION, "to": version, "previous": previous, "sha256": got}
+        launch = base / "launch.sh"
+        if "launch.sh" in files and launch.is_file() and launch.read_bytes() != files["launch.sh"]:
+            # launch.sh is what takes a failed upgrade back, so an upgrade never replaces it (install.sh does).
+            status["result"]["note"] = f"launch.sh changed in {version}: run its install.sh on the host to take it"
+
+        self.step(status, "restart")
+        work = self.cfg["work"]
+        for f in ("upgrade-starts", "upgrade-failed.json"):
+            (work / f).unlink(missing_ok=True)
+        write_json(work / "upgrade-job.json", status, mode=0o600)
+        (work / "upgrade-pending").write_text(previous)
+        link = base / "current.tmp"
+        link.unlink(missing_ok=True)
+        os.symlink(f"releases/{version}", link)
+        os.replace(link, current)
+        self.write_status(status)
+        raise Restarting(f"executor {version} installed; exiting so that systemd starts it")
+
+    def release_files(self, source, version, name):
+        """The release archive and its SHA256SUMS, from a directory (<dir>/executor-v<version>/) or a GitHub release."""
+        tag = f"executor-v{version}"
+        if source.startswith("/"):
+            d = pathlib.Path(source) / tag
+            if not (d / name).is_file() or not (d / "SHA256SUMS").is_file():
+                raise Failed(f"{d} does not hold {name} and SHA256SUMS")
+            return (d / name).read_bytes(), (d / "SHA256SUMS").read_text()
+        if not REPO_RE.match(source):
+            raise Refused("EXECUTOR_UPGRADE_FROM is neither an absolute directory nor owner/name")
+        release = json.loads(self.http_get(f"{self.cfg['github_api']}/repos/{source}/releases/tags/{tag}", "application/vnd.github+json"))
+        found = {a.get("name"): a for a in release.get("assets") or []}
+        for wanted in (name, "SHA256SUMS"):
+            if wanted not in found:
+                raise Failed(f"{source} release {tag} has no asset {wanted}")
+        return self.http_get(found[name]["url"], "application/octet-stream"), self.http_get(found["SHA256SUMS"]["url"], "application/octet-stream").decode()
+
+    def package_files(self, archive, version):
+        """The release's files: one directory, only the known files, regular files only; the code must say its version."""
+        top, files = f"{PACKAGE}-{version}", {}
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
+            for m in tar.getmembers():
+                name = m.name[2:] if m.name.startswith("./") else m.name
+                if m.isdir() and name.rstrip("/") == top:
+                    continue
+                parts = name.split("/")
+                if not m.isfile() or len(parts) != 2 or parts[0] != top or parts[1] not in PACKAGE_FILES:
+                    raise Failed(f"the release holds {m.name}, which is not one of the executor's files")
+                with tar.extractfile(m) as f:
+                    files[parts[1]] = f.read()
+        code = files.get("deployer_executor.py")
+        if code is None:
+            raise Failed("the release has no deployer_executor.py")
+        said = re.search(rb'^VERSION = "([^"]+)"', code, re.M)
+        if not said or said.group(1).decode() != version:
+            raise Failed(f"the release's deployer_executor.py is not version {version}")
+        try:
+            compile(code, "deployer_executor.py", "exec")
+        except SyntaxError as e:
+            raise Failed(f"the release's deployer_executor.py does not compile: {e}")
+        return files
+
+    def finish_upgrade(self):
+        """After the restart an upgrade asked for: whichever version runs now says how the upgrade ended."""
+        work = self.cfg["work"]
+        path, failed = work / "upgrade-job.json", work / "upgrade-failed.json"
+        if not path.is_file():
+            return
+        status = json.loads(path.read_text())
+        to = status.get("result", {}).get("to")
+        if to == VERSION:
+            state, message = "succeeded", f"Executor upgraded from {status['result'].get('from')} to {VERSION}"
+            self.prune_releases(status["result"].get("previous"))
+        else:
+            gave_up = " after three failed starts" if failed.is_file() else ""
+            state, message = "failed", f"Executor {to} did not start{gave_up}; back on {VERSION}"
+        for s in status.get("steps", []):
+            if s.get("state") == "running":
+                s["state"] = "done" if state == "succeeded" else "failed"
+        status.update(state=state, finishedAt=now_iso(), message=message)
+        for attempt in range(5):
+            try:
+                self.api.put_status(status["id"], status)
+                break
+            except Exception as e:
+                self.say(f"cannot send the status of {status['id']}: {e}")
+                self.sleep(2)
+        self.say(f"{status['id']} {state}: {message}")
+        path.unlink()
+        failed.unlink(missing_ok=True)
+
+    def prune_releases(self, previous):
+        """Keeps the running release, the one before it, and the newest few."""
+        releases = self.cfg["base"] / "releases"
+        found = sorted((d.name for d in releases.iterdir() if d.is_dir() and VERSION_RE.match(d.name)), key=version_key)
+        keep = {VERSION, previous, *found[-KEEP_RELEASES:]}
+        for name in found:
+            if name not in keep:
+                shutil.rmtree(releases / name, ignore_errors=True)
 
     # --- build: the pinned release tools' build-images.sh (§5.2) ----------------------------------------
 

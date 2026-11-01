@@ -9,6 +9,8 @@ import type { Environment } from "../compose/generate.ts";
 import type { ExecutorStatus, Store } from "./store.ts";
 
 export const PROTOCOL = 2;
+/** §8.6: the executor release this Deployer ships with (executor/deployer_executor.py VERSION); hosts on an older one are offered the upgrade. */
+export const EXECUTOR_VERSION = "0.6.0";
 
 export interface Heartbeat {
   version: string;
@@ -22,6 +24,8 @@ export interface Heartbeat {
   kinds?: string[];
   /** The deploy root on its host. */
   root?: string;
+  /** §8.6: what kind of source the host upgrades its executor from (EXECUTOR_UPGRADE_FROM); null: not set. */
+  upgradeFrom?: "github" | "directory" | null;
 }
 
 export interface ExecutorInfo { online: boolean; host: string; reason?: string; heartbeat?: Heartbeat; ageSeconds?: number }
@@ -102,9 +106,9 @@ export class Handoff {
     return text.length > bytes ? `…\n${text.slice(-bytes)}` : text;
   }
 
-  /** What each host last reported; stale after five minutes. */
-  reports(): (HostReport & { stale: boolean })[] {
-    return this.store.executorHosts().filter((h) => h.stateAt).map((h) => ({
+  /** What each host last reported; stale after five minutes. hosts: only these (a host taken out of the environment keeps its last report). */
+  reports(hosts?: string[]): (HostReport & { stale: boolean })[] {
+    return this.store.executorHosts().filter((h) => h.stateAt && (!hosts || hosts.includes(h.host))).map((h) => ({
       host: h.host, containers: h.containers ?? [], files: h.files ?? {}, at: h.stateAt!, stale: this.now() - Date.parse(h.stateAt!) > 5 * 60_000,
     }));
   }

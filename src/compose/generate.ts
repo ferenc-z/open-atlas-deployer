@@ -56,6 +56,8 @@ export interface Environment {
   domain?: string;
   /** D36: where the certificate sits on the nginx host, for the recommended configuration. */
   nginx?: { certificate?: string; certificateKey?: string };
+  /** D36: "<name>:<address>" lines added to every container's /etc/hosts, for when the containers' DNS does not know the domain (e.g. "uat.example.com:host-gateway"). */
+  extraHosts?: string[];
   apps: Record<string, {
     version: string;
     /** D35: the host this app runs on (placed per app); the first host when absent. */
@@ -148,7 +150,8 @@ function service(manifest: Manifest, c: Component, env: Environment, options: Ge
     ? `./files/${v.file}:${v.target}:ro`
     : `${over.volumes?.[v.target] ?? `./${v.path}`}:${v.target}`), ...(ca ? [`./ca/ca.pem:${CA_PATH}:ro`] : [])];
   if (volumes.length) s.volumes = volumes;
-  if (c.extraHosts) s.extra_hosts = c.extraHosts;
+  const extraHosts = [...(c.extraHosts ?? []), ...(env.extraHosts ?? [])];
+  if (extraHosts.length) s.extra_hosts = extraHosts;
   if (Array.isArray(c.health)) s.healthcheck = { test: c.health, interval: "10s", timeout: "5s", retries: 30 };
   s.logging = LOGGING;
   return c.compose ? merge(s, c.compose) : s;

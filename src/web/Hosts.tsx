@@ -1,17 +1,20 @@
 // D35 page: the hosts of this environment (environment.json hosts), each running an executor that calls the Deployer
-// over HTTPS with its own token. An administrator issues a host's token here (shown once) and can revoke it.
+// over HTTPS with its own token. An administrator issues a host's token here (shown once) and can revoke it, and
+// upgrades a host's executor to the version this Deployer ships (§8.6): the host takes the release from its own source.
 
 import { useCallback, useEffect, useState } from "react";
 import * as api from "./api.ts";
 import type { HostView } from "./api.ts";
+import { JobState } from "./Deploy.tsx";
 
 const when = (iso: string) => new Date(iso).toLocaleString("en-US", { hour12: false });
 
 export function HostsPage({ isAdmin }: { isAdmin: boolean }) {
   const [list, setList] = useState<HostView[] | undefined>();
+  const [shipped, setShipped] = useState("");
   const [error, setError] = useState("");
   const [issued, setIssued] = useState<{ host: string; token: string } | undefined>();
-  const refresh = useCallback(() => { api.hosts().then((r) => setList(r.hosts), (e: Error) => setError(e.message)); }, []);
+  const refresh = useCallback(() => { api.hosts().then((r) => { setList(r.hosts); setShipped(r.executorVersion); }, (e: Error) => setError(e.message)); }, []);
   useEffect(() => { refresh(); const t = setInterval(refresh, 10_000); return () => clearInterval(t); }, [refresh]);
   const issue = (id: string) => {
     if (!confirm(`Issue a new executor token for ${id}? Earlier tokens of ${id} keep working until revoked.`)) return;
@@ -21,12 +24,16 @@ export function HostsPage({ isAdmin }: { isAdmin: boolean }) {
     if (!confirm(`Revoke every executor token of ${id}? Its executor stops reaching the Deployer at once.`)) return;
     api.revokeHost(id).then(refresh, (e: Error) => setError(e.message));
   };
+  const upgrade = (id: string, from: string) => {
+    if (!confirm(`Upgrade the executor on ${id} from ${from} to ${shipped}? The host installs the release from its own source and restarts the executor; if the new version does not start, it goes back to ${from} by itself.`)) return;
+    api.upgradeExecutor(id).then(refresh, (e: Error) => setError(e.message));
+  };
   if (!list) return error ? <p className="error">{error}</p> : <p className="muted">Loading…</p>;
   return (
     <>
       <div className="toolbar">
         <h1>Hosts</h1>
-        <span className="muted">Each host runs an executor that calls the Deployer with its own token; the Deployer never connects to a host. Hosts and where each app runs are set in environment.json.</span>
+        <span className="muted">Each host runs an executor that calls the Deployer with its own token; the Deployer never connects to a host. Hosts and where each app runs are set in environment.json. This Deployer ships executor {shipped}.</span>
       </div>
       {error && <p className="error">{error}</p>}
       {issued && (
@@ -49,11 +56,13 @@ export function HostsPage({ isAdmin }: { isAdmin: boolean }) {
                   {h.executor.online
                     ? <><span className="badge ok">Online</span> <span className="muted">{h.executor.heartbeat?.version}{h.executor.heartbeat?.busy ? ` · running ${h.executor.heartbeat.busy}` : ""}</span></>
                     : <><span className="badge bad">Offline</span> <span className="muted">{h.executor.reason}</span></>}
+                  <Upgrade h={h} shipped={shipped} />
                 </td>
                 <td>{h.apps.length ? h.apps.join(", ") : <span className="muted">None</span>}</td>
                 <td>{h.report ? <>{h.report.containers} <span className="muted">at {when(h.report.at)}</span>{h.report.stale && <span className="badge warn">Stale</span>}</> : <span className="muted">Not yet</span>}</td>
                 <td>{live.length ? live.map((t) => <span key={t.prefix} className="mono" title={`Issued by ${t.createdBy} at ${when(t.createdAt)}`}>{t.prefix}… </span>) : <span className="muted">None</span>}</td>
                 <td className="actions">
+                  {isAdmin && h.upgrade.available && !h.upgrade.blocked && <button className="link" onClick={() => upgrade(h.id, h.executor.heartbeat?.version ?? "")}>Upgrade executor</button>}
                   {isAdmin && <button className="link" onClick={() => issue(h.id)}>Issue token</button>}
                   {isAdmin && live.length > 0 && <button className="link danger" onClick={() => revoke(h.id)}>Revoke</button>}
                 </td>
@@ -63,5 +72,19 @@ export function HostsPage({ isAdmin }: { isAdmin: boolean }) {
         </tbody>
       </table>
     </>
+  );
+}
+
+/** The executor's upgrade on one host: running, how the last one ended, or why it cannot start now. */
+function Upgrade({ h, shipped }: { h: HostView; shipped: string }) {
+  const { job, available, blocked } = h.upgrade;
+  const active = job && (job.state === "queued" || job.state === "running");
+  return (
+    <div className="small">
+      {active && <><JobState state={job.state} /> <span className="muted">upgrading to {job.version}</span></>}
+      {!active && job && job.state !== "succeeded" && job.version === shipped && <><JobState state={job.state} /> <span className="muted">{job.message}</span></>}
+      {!active && available && <span className="badge warn">{shipped} available</span>}
+      {!active && available && blocked && <div className="muted">{blocked}</div>}
+    </div>
   );
 }

@@ -70,8 +70,10 @@ export interface JobView { job: Omit<Job, "request">; request: Record<string, un
 export const statusView = () => call<StatusView>("GET", "status");
 
 // D35: the hosts of this environment and their executors' tokens.
-export type HostView = { id: string; address: string | null; executor: ExecutorInfo; apps: string[]; report: { at: string; stale: boolean; containers: number } | null; tokens: { prefix: string; createdAt: string; createdBy: string; revokedAt: string | null }[] };
-export const hosts = () => call<{ hosts: HostView[] }>("GET", "hosts");
+export type ExecutorUpgrade = { available: boolean; blocked?: string; from: "github" | "directory" | null; job: { id: string; state: Job["state"]; version: string; message: string | null; finishedAt: string | null } | null };
+export type HostView = { id: string; address: string | null; executor: ExecutorInfo; apps: string[]; report: { at: string; stale: boolean; containers: number } | null; tokens: { prefix: string; createdAt: string; createdBy: string; revokedAt: string | null }[]; upgrade: ExecutorUpgrade };
+export const hosts = () => call<{ executorVersion: string; hosts: HostView[] }>("GET", "hosts");
+export const upgradeExecutor = (id: string) => call<{ job: Job }>("POST", `hosts/${encodeURIComponent(id)}/upgrade-executor`, {});
 export const issueHostToken = (id: string) => call<{ host: string; token: string }>("POST", `hosts/${encodeURIComponent(id)}/token`, {});
 export const revokeHost = (id: string) => call<{ revoked: number }>("POST", `hosts/${encodeURIComponent(id)}/revoke`, {});
 
