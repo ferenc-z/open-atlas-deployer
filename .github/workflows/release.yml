@@ -1,0 +1,99 @@
+# Publishes a release when a tag v<version> is pushed (design §8.6, D39):
+#   - the image ghcr.io/<owner>/open-atlas-deployer:<version>, which hosts' executors pull for D16 upgrades;
+#   - the GitHub release v<version>, whose list the Overview page reads through DEPLOYER_RELEASE_REPO (a version with a
+#     "-", such as 0.1.0-rc.1, becomes a pre-release: shown there, never announced);
+#   - the executor's release executor-v<executor version> with its archive and SHA256SUMS, unless it already exists
+#     (executors upgrade from it; its version moves only when the executor changes).
+# The tag must match package.json, and the executor version the Deployer offers (handoff.ts) must match the executor.
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check versions
+        id: v
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          package=$(node -p 'require("./package.json").version')
+          executor=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' executor/deployer_executor.py)
+          offered=$(sed -n 's/^export const EXECUTOR_VERSION = "\(.*\)";/\1/p' src/server/handoff.ts)
+          [ "$version" = "$package" ] || { echo "::error::tag $GITHUB_REF_NAME does not match package.json $package"; exit 1; }
+          [ "$executor" = "$offered" ] || { echo "::error::handoff.ts offers executor $offered, executor/deployer_executor.py is $executor"; exit 1; }
+          case "$version" in *-*) pre=true ;; *) pre=false ;; esac
+          owner=$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "executor=$executor" >> "$GITHUB_OUTPUT"
+          echo "pre=$pre" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/$owner/open-atlas-deployer" >> "$GITHUB_OUTPUT"
+
+      - name: Release notes
+        run: |
+          # The section of CHANGELOG.md under "## <version>", up to the next "## ".
+          awk -v v="## ${{ steps.v.outputs.version }}" '$0 == v || index($0, v " ") == 1 { on = 1; next } on && /^## / { exit } on' CHANGELOG.md > notes.md
+          [ -s notes.md ] || { echo "::error::CHANGELOG.md has no section for ${{ steps.v.outputs.version }}"; exit 1; }
+          printf '\nImage: `%s:%s` · executor %s\n' "${{ steps.v.outputs.image }}" "${{ steps.v.outputs.version }}" "${{ steps.v.outputs.executor }}" >> notes.md
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      - run: python -m unittest test_deployer_executor
+        working-directory: executor
+
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          build-args: |
+            VERSION=${{ steps.v.outputs.version }}
+            REVISION=${{ github.sha }}
+          # Links the GHCR package to this repository (its page, and the workflow's write access on later releases).
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          tags: |
+            ${{ steps.v.outputs.image }}:${{ steps.v.outputs.version }}
+            ${{ steps.v.outputs.pre == 'false' && format('{0}:latest', steps.v.outputs.image) || '' }}
+
+      - name: Executor release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="executor-v${{ steps.v.outputs.executor }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "$tag already exists"
+          else
+            sh executor/package.sh dist/executor
+            gh release create "$tag" dist/executor/*.tar.gz dist/executor/SHA256SUMS \
+              --title "Executor ${{ steps.v.outputs.executor }}" --latest=false \
+              --notes "Executor for Open Atlas Deployer ${{ steps.v.outputs.version }}. A first installation unpacks the archive and runs install.sh; installed executors upgrade from this release (design §8.6)."
+          fi
+
+      - name: Deployer release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          flags=""
+          [ "${{ steps.v.outputs.pre }}" = true ] && flags="--prerelease"
+          gh release create "$GITHUB_REF_NAME" --title "Open Atlas Deployer ${{ steps.v.outputs.version }}" --notes-file notes.md --verify-tag $flags

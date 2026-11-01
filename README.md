@@ -174,6 +174,8 @@ Deployer 容器不挂 Docker socket（§8.2），所以状态有两个来源：
 
 ### Deployer 镜像与服务器上的安装（2026-11-02）
 
+正式的镜像和发布包由 GitHub Actions 在推送 tag `v<版本>` 时生成（[.github/workflows/release.yml](.github/workflows/release.yml)），步骤和**第一次发布的注意事项**见 [docs/release.md](docs/release.md)，每个版本的说明在 [CHANGELOG.md](CHANGELOG.md)。本地试验时可以手工构建：
+
 ```sh
 bin/build-image.sh [镜像仓库]       # 默认 ghcr.io/gaojie197710-tech；同时把执行器的发布包打到 dist/executor
 docker push <镜像仓库>/open-atlas-deployer:<package.json 的版本>
@@ -181,9 +183,9 @@ docker push <镜像仓库>/open-atlas-deployer:<package.json 的版本>
 
 - [Dockerfile](Dockerfile)：Node 22 直接运行服务端的 TypeScript，用自带的 `node:sqlite`；页面在构建时按 `DEPLOYER_BASE_PATH`（默认 `/deploy`）打包，一个镜像对应一个挂载路径。以 1000:1000 运行，不挂 Docker socket、没有镜像仓库凭据；健康检查访问 `/health`。镜像带 `org.open-atlas.version` 和提交号标签。工作区有未提交改动时，构建脚本会提示镜像对不上提交号。
 - 服务器上的布局见 [examples/deployer/compose.yaml](examples/deployer/compose.yaml) 和 [deployer.env.example](examples/deployer/deployer.env.example)：放在 `/webapp/data/open-atlas/deployer/`（执行器的部署根目录跳过这个目录），自成一个 compose 项目 `open-atlas-deployer`，执行器对应用做的 compose up、回滚、恢复都碰不到它；端口只绑 127.0.0.1:8095，由 nginx 经 https 转发；加入应用的网络 `open-atlas_default`，按服务名访问 Workbench 和各服务的 `/meta/contracts`。`data/` 和 `secrets/` 要属 1000:1000，令牌和 key 文件权限 600。
-- 版本号从 `0.1.0-beta.1` 开始。compose 里的镜像写成 `${DEPLOYER_IMAGE}`，值在同目录的 `.env`（[.env.example](examples/deployer/.env.example)）：第一次手写，之后由执行器改。
+- 第一个候选版本是 `0.1.0-rc.1`（之前的 `0.1.0-beta.*` 只在本地构建过）。compose 里的镜像写成 `${DEPLOYER_IMAGE}`，值在同目录的 `.env`（[.env.example](examples/deployer/.env.example)）：第一次手写，之后由执行器改。
 
-Deployer 自己的升级（D16，2026-11-02 已实现）：admin 在 Hosts 页的"This Deployer"一栏填版本号、点"Upgrade the Deployer"。Deployer 找到心跳里说自己运行 Deployer 的那台机器（`executor.env` 设了 `EXECUTOR_DEPLOYER_DIR` 和 `EXECUTOR_DEPLOYER_IMAGE`，只能有一台），排一个 `deployer-upgrade` 任务，请求里只有版本号。执行器：
+Deployer 自己的升级（D16，2026-11-02 已实现）：admin 在 Overview 的 Platform 区选版本、看过计划后确认（D39，原先在 Hosts 页，已移走）。Deployer 找到心跳里说自己运行 Deployer 的那台机器（`executor.env` 设了 `EXECUTOR_DEPLOYER_DIR` 和 `EXECUTOR_DEPLOYER_IMAGE`，只能有一台），排一个 `deployer-upgrade` 任务，请求里只有版本号。执行器：
 
 1. 拉 `<EXECUTOR_DEPLOYER_IMAGE>:<版本>`（仓库必须在 `EXECUTOR_REGISTRIES` 里），固定 digest；镜像标签 `org.open-atlas.version` 要等于这个版本，`org.open-atlas.executor-protocols` 要包含本执行器的协议，否则拒绝，什么都不动。
 2. `docker compose stop` 停掉 Deployer，打包 `data/` 到 `<备份目录>/deployer/`（保留 3 份）。
@@ -211,9 +213,9 @@ python3 /opt/open-atlas-deployer/executor/current/deployer_executor.py check
 
 [executor/launch.sh](executor/launch.sh) 负责启动计数：有 `upgrade-pending` 标记时连续 3 次自检不过，就退回旧版本。[executor/switch](executor/switch) 用来手工切换版本。
 
-执行器的升级（2026-11-01 已实现，§8.6）：admin 在 Hosts 页对版本低于 Deployer 自带版本（`EXECUTOR_VERSION`，与 `executor/deployer_executor.py` 的 `VERSION` 一致，测试核对）的机器点"Upgrade executor"，Deployer 排一个 `executor-upgrade` 任务，请求里只有版本号。执行器只从本机 `executor.env` 的 `EXECUTOR_UPGRADE_FROM` 取发布包：GitHub 仓库 `owner/name` 的 release `executor-v<版本>`，或一个绝对路径目录下的 `executor-v<版本>/`；包是 `executor/package.sh` 打出的 `open-atlas-deployer-executor-<版本>.tar.gz` 和 `SHA256SUMS`。执行器核对哈希、只接受一层目录里那几个已知文件、代码里的版本号要对得上且能编译，装到 `releases/<版本>`，写 `upgrade-pending`，切 `current`，退出；systemd 经 `launch.sh` 拉起新版本，自检通过后由新版本回报成功并只保留当前、上一版和最新 3 个版本目录；连续 3 次起不来，`launch.sh` 退回旧版本，由旧版本回报失败。不接受降级（回旧版用 `switch`）；`launch.sh` 本身不随升级替换，变了会在结果里提示重跑 `install.sh`。只限 admin 的浏览器会话；机器离线、还在跑任务、执行器太旧（0.6.0 以前，要手工装一次）、没配 `EXECUTOR_UPGRADE_FROM` 时拦住并说明原因。
+执行器的升级（2026-11-01 已实现，§8.6）：admin 在 Overview 的 Platform 区对版本低于 Deployer 自带版本（`EXECUTOR_VERSION`，与 `executor/deployer_executor.py` 的 `VERSION` 一致，测试核对）的机器点"Upgrade"，或用"Upgrade outdated"一台一台地升（D39），Deployer 排一个 `executor-upgrade` 任务，请求里只有版本号。执行器只从本机 `executor.env` 的 `EXECUTOR_UPGRADE_FROM` 取发布包：GitHub 仓库 `owner/name` 的 release `executor-v<版本>`，或一个绝对路径目录下的 `executor-v<版本>/`；包是 `executor/package.sh` 打出的 `open-atlas-deployer-executor-<版本>.tar.gz` 和 `SHA256SUMS`。执行器核对哈希、只接受一层目录里那几个已知文件、代码里的版本号要对得上且能编译，装到 `releases/<版本>`，写 `upgrade-pending`，切 `current`，退出；systemd 经 `launch.sh` 拉起新版本，自检通过后由新版本回报成功并只保留当前、上一版和最新 3 个版本目录；连续 3 次起不来，`launch.sh` 退回旧版本，由旧版本回报失败。不接受降级（回旧版用 `switch`）；`launch.sh` 本身不随升级替换，变了会在结果里提示重跑 `install.sh`。只限 admin 的浏览器会话；机器离线、还在跑任务、执行器太旧（0.6.0 以前，要手工装一次）、没配 `EXECUTOR_UPGRADE_FROM` 时拦住并说明原因。
 
-第一次安装：在一台能连 GitHub 的机器上 `executor/package.sh <输出目录>`，把包和 `SHA256SUMS` 挂到 release `executor-v<版本>`（或放进内网目录），服务器上解压后 `sudo ./install.sh`。Deployer 自己的升级（D16）还没做，执行器的升级目前由 admin 在 Hosts 页逐台发起。
+第一次安装：在一台能连 GitHub 的机器上 `executor/package.sh <输出目录>`，把包和 `SHA256SUMS` 挂到 release `executor-v<版本>`（或放进内网目录），服务器上解压后 `sudo ./install.sh`。正式发布后，发布流程会自动建好 `executor-v<版本>`，直接从那里下载即可。
 
 ### 测试与验证（2026-10-30）
 
