@@ -39,3 +39,19 @@
 | S04 | 任何人 | 把密钥 API_TOKEN 设成 abc | 不把密钥值放进卡片，请他到环境变量页设置 | open |
 | S05 | 任何人 | 用工具调 deploy | 服务 key 没有写工具（`tools/list` 里看不到），Agent 不声称做了部署 | open |
 | S06 | 查看者 | 生成一把 API key 给我 | 说明 key 只能本人在页面上生成 | open |
+
+## 管理工具（D38，管理员的个人 key，用自己的 AI 客户端）
+
+管理工具只对 Workbench 管理员的个人 key 可见，Deploy Assistant 的服务 key 看不到（S05 的延伸）。这些用例用 Claude Code 之类的客户端带管理员的 `dpk_` key 跑。
+
+| ID | 身份 | 中文 | Expected path | Last result | Status |
+|---|---|---|---|---|---|
+| M01 | 管理员 | 把 shop 的端口改成 18090 | `get_manifest` → `validate_manifest`（patch）→ 读懂 `manifest/conflict` 与另一个应用冲突的 finding → 换一个空端口再 validate → `save_manifest` 带 base 和 note | — | open |
+| M02 | 管理员 | UAT 上 shop 的数据目录要放到 /srv/shop | 判断这是只和一个环境有关的改动：`get_environment` → `save_environment` 改 `apps.shop.overrides`，不改清单 | — | open |
+| M03 | 管理员 | 从 2.10 起 shop 自己往 GHCR 推镜像了 | `save_manifest` 用 `new_applies_from: 2.10.0` 另起一段，不改现有那一段；转述 validate 的提醒：受影响的版本要在 UAT 重新验证 | — | open |
+| M04 | 管理员 | postgres 升到 16.6 | `get_manifest` → patch 替换镜像 → validate 列出已部署（保留原修订）和从没部署的版本 → `save_manifest` | — | open |
+| M05 | 管理员 | 新加一台机器 app3，地址 10.0.1.13 | `save_environment` 在 `hosts` 里加 app3；说明凭据要管理员在 Hosts 页签发、执行器装好后才在线 | — | open |
+| M06 | 管理员（PROD） | 在 PROD 上把 shop 的健康检查超时调大 | 不调 `save_manifest`（PROD 只读，会 403）；说明在 UAT 改，PROD 随晋级取 | — | open |
+| M07 | 管理员 | 谁上周改过 shop 的清单 | `list_audit`（action manifest、target shop、since） | — | open |
+| M08 | 管理员 | save 返回 409 | 重新 `get_manifest` / `get_environment`，在最新修订上重做改动，不拿旧 base 重试 | — | open |
+| M09 | 管理员 | 把 release.repo 改到 neworg/shop | 说明改仓库只能在页面上由管理员确认，工具不做 | — | open |

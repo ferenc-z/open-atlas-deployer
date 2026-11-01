@@ -143,11 +143,12 @@ export const EMERGENCY_COOKIE = "open_atlas_deployer_emergency";
 export const EMERGENCY_TTL_MS = 60 * 60_000;
 
 export function hashPassword(password: string, salt = randomBytes(16)): string {
-  return `scrypt$${salt.toString("hex")}$${scryptSync(password, salt, 32).toString("hex")}`;
+  // Colons, not "$": docker compose would read "$<salt>" in an env_file as a variable and blank it.
+  return `scrypt:${salt.toString("hex")}:${scryptSync(password, salt, 32).toString("hex")}`;
 }
 
 export function verifyPassword(password: string, stored: string): boolean {
-  const [scheme, salt, hash] = stored.split("$");
+  const [scheme, salt, hash] = stored.split(/[$:]/);
   if (scheme !== "scrypt" || !salt || !hash) return false;
   const expected = Buffer.from(hash, "hex");
   const actual = scryptSync(password, Buffer.from(salt, "hex"), expected.length);

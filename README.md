@@ -36,7 +36,7 @@ Node 22.18 起直接运行 `.ts`（类型剥离），服务端不需要构建；
 | `DEPLOYER_BASE_PATH` | `/deploy` | 反向代理挂载的路径，与 Workbench 同域名（§9.1）；构建页面时也读它 |
 | `DEPLOYER_BIND` / `DEPLOYER_PORT` | `0.0.0.0` / `8095` | |
 | `DEPLOYER_DATA` | `./data` | 状态库目录 |
-| `DEPLOYER_ENVIRONMENT_FILE` | `<data>/environment.json` | 本环境的期望状态：名称、登记的镜像仓库、每个应用的版本（格式同 [examples/uat.environment.json](examples/uat.environment.json)）；每次请求重新读 |
+| `DEPLOYER_ENVIRONMENT_FILE` | `<data>/environment.json` | 本环境设置的初始文件：名称、登记的镜像仓库、每个应用的版本（格式同 [examples/uat.environment.json](examples/uat.environment.json)）。2026-11-02 起（D38）只在第一次启动时导入为状态库里的修订 1，之后在"Environment settings"页或 MCP 工具里改，文件不再读 |
 | `DEPLOYER_GITHUB_TOKEN_FILE` | 无 | GitHub 只读令牌，用来列出私有仓库的 tag，供选择版本 |
 | `DEPLOYER_OBSERVE_URLS` | 无 | JSON，服务名 → 地址；只在 compose 网络之外开发时用 |
 | `DEPLOYER_EMERGENCY_PASSWORD_HASH` | 无 | 紧急账号，`node bin/hash-password.ts` 从标准输入读密码生成；不设就没有紧急账号 |
@@ -54,6 +54,7 @@ Node 22.18 起直接运行 `.ts`（类型剥离），服务端不需要构建；
 | `DEPLOYER_OMA_ASSESSOR_AGENT` / `DEPLOYER_OMA_ASSESSOR_ENVIRONMENT` / `DEPLOYER_OMA_ASSESSOR_VAULTS` | 无 | 接入评估：Onboarding Assessor 的 agent id、**隔离的** Environment（只放行 git 站点和 Deployer MCP）、Vault（服务 key、私有仓库只读令牌）。不配就不能评估 |
 | `DEPLOYER_ISSUE_REPO` / `DEPLOYER_ISSUE_TOKEN_FILE` | 无 | 开 Issue 的 Deployer 仓库（owner/name）和 fine-grained token（只有 Issues: write） |
 | `DEPLOYER_BRIEF_HOUR` | `8` | 每日简报在这个钟点之后生成（服务器时间） |
+| `DEPLOYER_RELEASE_REPO` / `DEPLOYER_RELEASE_TAG` | 无 / `v{version}` | D39：Overview 上 Deployer 版本下拉框的来源，写成 `github:owner/name`（以后加 `bitbucket:`）；不设就手填版本 |
 | `DEPLOYER_GITHUB_API` | `https://api.github.com` | Deployer 读的 GitHub API：列 tag、查 Release、下载附件、读 `release.json` 和 `.env.example`（测试或本地试用时换成替身）；执行器对应 `EXECUTOR_GITHUB_API` |
 
 ### 认人与授权（§9）
@@ -170,6 +171,31 @@ Deployer 容器不挂 Docker socket（§8.2），所以状态有两个来源：
 - 每个部署任务带一份按 OMA `deployment-receipt:1` 取字段的记录（§8.5）。`config_revision` 是部署时服务器上的 env 版本（如 `dossier.env#7`），Deployer 还没接管 env 文件时为 null。
 - "部署记录"里任何一次成功的部署都可以"回到这一版"：请求里带上那次的 digest，拉取的是原样的镜像。用的清单是这个区间**当前**的那一版。
 - 构建、部署的请求和结果都记审计。
+
+### Deployer 镜像与服务器上的安装（2026-11-02）
+
+```sh
+bin/build-image.sh [镜像仓库]       # 默认 ghcr.io/gaojie197710-tech；同时把执行器的发布包打到 dist/executor
+docker push <镜像仓库>/open-atlas-deployer:<package.json 的版本>
+```
+
+- [Dockerfile](Dockerfile)：Node 22 直接运行服务端的 TypeScript，用自带的 `node:sqlite`；页面在构建时按 `DEPLOYER_BASE_PATH`（默认 `/deploy`）打包，一个镜像对应一个挂载路径。以 1000:1000 运行，不挂 Docker socket、没有镜像仓库凭据；健康检查访问 `/health`。镜像带 `org.open-atlas.version` 和提交号标签。工作区有未提交改动时，构建脚本会提示镜像对不上提交号。
+- 服务器上的布局见 [examples/deployer/compose.yaml](examples/deployer/compose.yaml) 和 [deployer.env.example](examples/deployer/deployer.env.example)：放在 `/webapp/data/open-atlas/deployer/`（执行器的部署根目录跳过这个目录），自成一个 compose 项目 `open-atlas-deployer`，执行器对应用做的 compose up、回滚、恢复都碰不到它；端口只绑 127.0.0.1:8095，由 nginx 经 https 转发；加入应用的网络 `open-atlas_default`，按服务名访问 Workbench 和各服务的 `/meta/contracts`。`data/` 和 `secrets/` 要属 1000:1000，令牌和 key 文件权限 600。
+- 版本号从 `0.1.0-beta.1` 开始。compose 里的镜像写成 `${DEPLOYER_IMAGE}`，值在同目录的 `.env`（[.env.example](examples/deployer/.env.example)）：第一次手写，之后由执行器改。
+
+Deployer 自己的升级（D16，2026-11-02 已实现）：admin 在 Hosts 页的"This Deployer"一栏填版本号、点"Upgrade the Deployer"。Deployer 找到心跳里说自己运行 Deployer 的那台机器（`executor.env` 设了 `EXECUTOR_DEPLOYER_DIR` 和 `EXECUTOR_DEPLOYER_IMAGE`，只能有一台），排一个 `deployer-upgrade` 任务，请求里只有版本号。执行器：
+
+1. 拉 `<EXECUTOR_DEPLOYER_IMAGE>:<版本>`（仓库必须在 `EXECUTOR_REGISTRIES` 里），固定 digest；镜像标签 `org.open-atlas.version` 要等于这个版本，`org.open-atlas.executor-protocols` 要包含本执行器的协议，否则拒绝，什么都不动。
+2. `docker compose stop` 停掉 Deployer，打包 `data/` 到 `<备份目录>/deployer/`（保留 3 份）。
+3. 把 `.env` 里的 `DEPLOYER_IMAGE` 换成固定 digest 的新镜像（旧的存为 `.env.previous`），`docker compose up -d`。
+4. 等容器 healthy，并且新 Deployer 对心跳的应答里自报的版本就是新版本（心跳应答现在带 `deployer` 版本）。
+5. 不行就换回 `.env.previous`，把新版本留下的 `data/` 改名为 `data.failed-<时间>`，从备份恢复 `data/`，再启动旧版本：成功记"已回滚"，旧版本也起不来记"失败，需要人处理"。
+
+升级期间 Deployer 不在，执行器回报不出去的状态和日志先存在本地 `<工作目录>/pending/`，等 Deployer 回来再补发；回滚时恢复的是升级前的状态库，这个任务在里面还是"进行中"，由补发的结果收尾。还在跑别的任务、执行器太旧（0.7.0 以前）、找不到或找到多台运行 Deployer 的机器时拦住。允许换到更旧的版本（坏版本要退回时用），只限 admin 的浏览器会话。Deployer 的版本取镜像构建时的 `DEPLOYER_VERSION`，从源码运行时取 `package.json`。
+
+- 第一次安装后，在运行 Deployer 的机器的 `executor.env` 里设 `EXECUTOR_DEPLOYER_DIR=/webapp/data/open-atlas/deployer`、`EXECUTOR_DEPLOYER_IMAGE=ghcr.io/gaojie197710-tech/open-atlas-deployer`，重启执行器。紧急时仍可手工：改 `.env` 后 `docker compose up -d`。
+- `deployer.env` 由 compose 读入，值里的 `$` 会被当成变量替换掉；紧急账号的哈希因此改成 `scrypt:<盐>:<值>`（2026-11-02，旧的 `$` 格式仍能验证，但放进 compose 前要换成冒号）。
+- 验证（WSL）：镜像构建成功（339 MB）；用它替换本地的 Node 进程（host 网络，同一份设置和状态库）后健康检查通过，经 nginx 的 https 页面和静态资源 200，未登录时正确指向 Workbench，执行器的心跳由容器里的 Deployer 写入；没挂 Docker socket，进程是 1000:1000。验证完已换回 Node 进程。
 
 ### 执行器安装（§8.6）
 
@@ -583,7 +609,41 @@ npm test
 
 ### 测试与验证（2026-10-31）
 
-- `npm test` 80 个（2026-11-01 加 `extraHosts`、回环地址的上游、移出环境的机器不再算进状态页，以及执行器升级），执行器单元测试 27 个（升级：装好切换后退出、新版本回报成功并清理旧版本、退回后旧版本回报失败、哈希和文件和版本号不对就拒绝、GitHub 来源）。新增：执行器凭据和长轮询、只领本机任务、别的机器改不了、吊销后拒绝、状态带机器名；按台生成根文件、同端口不同台不冲突；地址解析、引用解析不了时拦住；nginx 配置按端口和路径、修订和差异、下载；内部 CA 的挂载和请求；部署后复查失败只告警；地址和机器变化的提示；执行器的 HTTP 收发、中断标记、日志不含 env 内容。
+- `npm test` 83 个（2026-11-01 加 `extraHosts`、回环地址的上游、移出环境的机器不再算进状态页，以及执行器升级；2026-11-02 加 Deployer 升级、执行器断开的长轮询不再领任务、紧急密码哈希不含 `$`、未部署的已登记应用不再让漂移检查报错），执行器单元测试 31 个（执行器升级：装好切换后退出、新版本回报成功并清理旧版本、退回后旧版本回报失败、哈希和文件和版本号不对就拒绝、GitHub 来源；Deployer 升级：停机备份后切换、新版不应答就带着旧状态回退、动手前拒绝、Deployer 不在时状态存下再补发）。
+- 2026-11-02 WSL 端到端（D16）：本地 Deployer 改成执行器管理的容器（`/webapp/deployer`，即部署根目录下的 `deployer/`）；执行器 0.6.0 → 0.7.0 自升级；Deployer 0.1.0-beta.1 → beta.2 成功（新版以 beta.2 应答心跳，停机期间的状态事后补发）；升到故意起不来的 beta.3 时重启 6 次后判失败，换回 beta.2 并恢复升级前的状态库（`environment.json` 校验和不变），任务记为已回滚。试用中发现并修了两处：执行器重启时，它留在 Deployer 的长轮询仍会领走任务、任务从此没人执行；compose 读 `deployer.env` 会把紧急密码哈希里的 `$` 当变量。新增：执行器凭据和长轮询、只领本机任务、别的机器改不了、吊销后拒绝、状态带机器名；按台生成根文件、同端口不同台不冲突；地址解析、引用解析不了时拦住；nginx 配置按端口和路径、修订和差异、下载；内部 CA 的挂载和请求；部署后复查失败只告警；地址和机器变化的提示；执行器的 HTTP 收发、中断标记、日志不含 env 内容。
 - WSL 本地试用切到协议 2：本机执行器经 HTTP 在线、上报 4 个容器，导入 oma.env 成为修订 1。再模拟第二台机器 app2（单独的根目录、compose 项目和凭据，第二个执行器进程），登记一个 busybox 测试应用放在 app2、直连入口：部署成功，根文件只含它，复查 HTTP 200；改到 local 后计划提示换机器和地址变化。验证完删除了测试应用、app2 的执行器、凭据和目录，环境配置恢复原样。
 - WSL 本地试用改成全部经 nginx（2026-11-01）：apt 装的 nginx 1.28 以用户身份运行，测试 CA 签 `oa.localhost` 的证书；环境写 `domain`、`nginx` 证书路径、`extraHosts` 和三个应用的 `ingress`（Workbench 8443、Studio 9443、OMA 9787，Deployer 手写在 8495 的 `/deploy/`）。Ingress 页保存的修订 1 原样放进 nginx，`nginx -t` 通过；Studio 设 `OPEN_ATLAS_STUDIO_TLS=off`，Workbench、OMA 的对外地址改成 `{{app:<id>.url}}`，经 env 页写入后重新部署。结果：经 nginx 的四个地址在 WSL 和 Windows 都返回 200；部署后复查（信任内部 CA）三个应用都 200；容器里 `oa.localhost` 经 `extraHosts` 解析到宿主机，用挂进去的 CA 访问别的应用的 https 地址 200，去掉 CA 则证书校验失败；Workbench 登录的 Cookie 带 `Secure`，同一个 Cookie 在 8495 上的 Deployer 认得出（Cookie 不分端口）；Workbench 的 SSE 经 nginx 即时到达。没测：WebSocket（现有应用没有用到）、浏览器里的页面（Windows 没导入测试 CA）。
 
+
+## 管理工具、环境设置入库、平台升级入口（D38、D39，2026-11-02）
+
+### 环境设置收进状态库（D38 ①）
+
+- 新表 `environment_revisions`，只增不删，每次保存记谁、何时、经什么（页面 / key）、note、改了哪些路径（如 `apps.shop.version`）。第一次启动时把 `environment.json` 导入为修订 1（启动日志写明），之后以库为准；文件和最新修订不一致时，页面提示（不自动覆盖）。
+- 页面：左侧"Environment settings"，整份 JSON 编辑、Check（finding 和差异）、带 note 保存为新修订；修订列表、查看旧修订、导出。只有管理员能改，PROD 和 UAT 都能改。
+- 接口：`GET /api/environment[?revision]`、`POST /api/environment/validate`、`PUT /api/environment`（`{ base, patch | environment, note }`，base 不是最新返回 409，finding 返回 400）、`GET /api/environment/export`。
+- 计划和部署读最新修订；部署请求带 `environmentRevision`，部署记录（`deployment-receipt`）加 `environment_revision` 和 `manifest_ref`。
+- 新增机器（Hosts 页没有"新增"）：在这里的 `hosts` 里加，再到 Hosts 页签发凭据。
+
+### 清单（D38 ②③⑥）
+
+- `PUT /api/apps/:id/manifests`：`{ manifest | patch, appliesFrom?, newAppliesFrom?, base, note }`。改现有一段要带它最新的修订号作 base，不是最新返回 409（页面保存也带）；patch 是对 base 修订的 JSON Patch，必须用 `appliesFrom` 指明哪一段，改 `appliesFrom` 要用 `newAppliesFrom` 另起一段。`POST …/manifests/validate` 不保存，返回合并后的清单、finding、提醒（换来源要在 UAT 重新验证）、差异，以及这一段覆盖的版本：已部署过的（保留当时的修订，D31）和从没部署过的（会按这份部署）。页面"Check"后再保存。
+- 改 `release.repo` 允许了，但只在页面上由管理员勾选确认（工具里给 finding），审计记 `app.repo-change`。
+- PROD 上清单只读（保存返回 403）。PROD 计划用 UAT 那次部署记录里的清单修订（UAT 没部署过时用 UAT 现在覆盖这个版本的那份），从 UAT 的只读接口取来、按 UAT 的修订号存在本地；本地同号修订内容不同就拦住（`deploy/manifest-uat-mismatch`）。登记页在 PROD 有"Take from UAT"，一次取齐 UAT 各应用各段最新的清单。UAT 新增只读接口 `/api/peer/apps`、`/api/peer/apps/:id/manifests/:from/:revision`、`/api/peer/apps/:id/manifest?version=`。
+
+### MCP 管理工具（D38）
+
+- 只对 Workbench 管理员的个人 key 可见（服务 key、非管理员看不到）：`get_manifest`、`validate_manifest`、`save_manifest`、`get_environment`、`validate_environment`、`save_environment`、`get_ingress`、`get_nginx_config`、`save_nginx_config`、`list_hosts`、`revoke_host_token`、`list_keys`、`revoke_key`、`list_audit`（可按 actor、action、target、since 筛选）。每个都是页面同一个接口；写工具必须带 note 和 request_id，审计记 `mcp.<工具>` 和 note。
+- `destructiveHint` 分开标：保存类 false（不碰服务器，下次部署才生效），吊销类 true。签发执行器凭据、发起升级、查看密钥原值、生成 key、移除应用、改仓库都不做成工具。golden cases 见 [docs/golden-cases.md](docs/golden-cases.md)"管理工具"。
+
+### 平台升级入口（D39）
+
+- Overview 顶部"Platform"区，和下面的应用分开；都是最新时折叠成一行。所有人能看，升级只限管理员的浏览器会话。Hosts 页不再有升级按钮。
+- Deployer：版本下拉框来自 `DEPLOYER_RELEASE_REPO`（GitHub tag，格式 `DEPLOYER_RELEASE_TAG`），最新的在上，标 latest / newer / older (go back) / pre-release / running；预发布显示但不提醒；没配或连不上时手填。"Review upgrade"出计划（`GET /api/deployer/plan`：版本、机器、镜像、GitHub release 说明、步骤、拦住的原因、退回旧版的提示），确认后才升级；退回旧版要再确认一次（接口要 `confirmOlder`）。升级期间页面每 15 秒问一次 `/api/me`，版本变了就整页刷新。
+- 执行器：每台一行；"Upgrade outdated"（`POST /api/hosts/upgrade-outdated`）一台一台升，前一台成功才排下一台（Deployer 在任务结束时排），失败或退回就停，剩下的不动；进度存在设置里，页面显示。
+- `/api/platform` 给 Overview 用；`/api/me` 带 `deployerVersion`。
+
+### 测试与验证（2026-11-02）
+
+- `npm test` 88 个，新增：环境设置的导入、base、patch、finding、校验不保存、文件不同的提示、部署记录带修订号；清单的分段、base、patch、不许在 patch 里改 appliesFrom、受影响版本、换来源提醒、另起一段、改仓库的确认；PROD 随晋级取 UAT 的清单修订、PROD 只读、同号修订不一致时拦住、从 UAT 取登记；管理工具的可见性、`destructiveHint`、save 的 finding、审计带 note、审计筛选；平台的版本列表和标注、升级计划、退回旧版要确认、执行器一台一台升、失败就停。
+- WSL：用这份代码构建 0.1.0-beta.4、beta.5，经执行器升级本地 Deployer 成功；新版本启动时把 `environment.json` 导入为修订 1。页面上的平台区、环境设置页和登记页的新流程没在浏览器里看过（Windows 没导入测试 CA、我不处理登录凭据）；MCP 管理工具只有单元测试，没用真实的管理员 key 跑过。

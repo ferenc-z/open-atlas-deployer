@@ -33,6 +33,12 @@ directory), checked against its SHA256SUMS, is installed beside the running one,
 executor then exits; systemd starts the new one through launch.sh, which goes back after three failed starts. Whichever
 version runs afterwards reports how the job ended.
 
+The Deployer's own upgrade (design §8.6, D16): on the host that runs it (EXECUTOR_DEPLOYER_DIR, its own compose
+project), a deployer-upgrade job names a version of EXECUTOR_DEPLOYER_IMAGE. The executor pulls and pins it, stops the
+Deployer, backs up its state directory, switches the image in the project's .env and starts it; the new Deployer must
+become healthy and answer the heartbeat as that version. Otherwise the previous image comes back with the state from
+before. The Deployer is down meanwhile, so statuses it could not take are kept and sent once it answers again.
+
 Standard library only; Python 3.9 (Rocky 9's python3).
 """
 import base64
@@ -53,10 +59,10 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 PROTOCOLS = [2]
 # Job kinds, plus what a deploy may ask for (bundle files, migrations): an older executor is not sent those.
-KINDS = ["build", "deploy", "env", "env-read", "bundle", "db-migration", "executor-upgrade"]
+KINDS = ["build", "deploy", "env", "env-read", "bundle", "db-migration", "executor-upgrade", "deployer-upgrade"]
 ENV_FILE_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*\.env$")
 ENV_MAX_BYTES = 1024 * 1024
 BUILD_JSON_IN_IMAGE = "/opt/open-atlas/BUILD.json"
@@ -159,6 +165,10 @@ def config(env_file=None, environ=None):
         # §8.6: where the installed releases are, and the only place a newer one may come from.
         "base": pathlib.Path(e.get("EXECUTOR_BASE", "/opt/open-atlas-deployer/executor")),
         "upgrade_from": e.get("EXECUTOR_UPGRADE_FROM", "").strip(),
+        # D16: on the host that runs the Deployer, its compose project and the image repository it is upgraded from.
+        "deployer_dir": pathlib.Path(e["EXECUTOR_DEPLOYER_DIR"]) if e.get("EXECUTOR_DEPLOYER_DIR") else None,
+        "deployer_project": e.get("EXECUTOR_DEPLOYER_PROJECT", "open-atlas-deployer"),
+        "deployer_image": e.get("EXECUTOR_DEPLOYER_IMAGE", "").strip().rstrip("/"),
     }
 
 
@@ -296,7 +306,7 @@ class DeployerApi:
             raise Failed(f"cannot reach the Deployer at {self.cfg['deployer_url']}: {getattr(e, 'reason', e)}")
 
     def heartbeat(self, beat):
-        self.call("POST", "/executor/v1/heartbeat", body=beat)
+        return self.call("POST", "/executor/v1/heartbeat", body=beat)
 
     def next_job(self, wait):
         r = self.call("GET", f"/executor/v1/jobs/next?wait={int(wait)}", timeout=wait + 30)
@@ -326,6 +336,8 @@ class Executor:
         self.log_lock = threading.Lock()
         self.last_state = 0.0
         self.beat_lock = threading.Lock()
+        # How often a status is tried before it is kept for later (the Deployer's own upgrade tries once: it is down).
+        self.status_tries = 5
         # A job can run for minutes (a build, a health wait); the heartbeat keeps going meanwhile.
         self.beat_seconds = 10.0
 
@@ -440,6 +452,8 @@ class Executor:
             "project": self.cfg["project"], "registries": self.cfg["registries"], "databaseBackup": db, "busy": busy,
             # §8.6: whether this host can upgrade its executor, and from what kind of source (never the source itself).
             "upgradeFrom": ("directory" if source.startswith("/") else "github") if source else None,
+            # D16: this host runs the Deployer and can upgrade it.
+            "deployer": {"image": self.cfg["deployer_image"]} if self.cfg["deployer_dir"] and self.cfg["deployer_image"] else None,
         }
 
     def report_state(self, force=False):
@@ -479,7 +493,35 @@ class Executor:
             self.api.put_status(status["id"], status)
         marker.unlink()
 
+    def pending_dir(self):
+        return self.cfg["work"] / "pending"
+
+    def keep_pending(self, status, log=""):
+        """A status (and log) the Deployer could not take: sent again once it answers (deliver_pending)."""
+        path = self.pending_dir() / f"{status['id']}.json"
+        kept = json.loads(path.read_text()) if path.is_file() else {"log": ""}
+        write_json(path, {"status": status, "log": kept.get("log", "") + log}, mode=0o600)
+
+    def deliver_pending(self):
+        d = self.pending_dir()
+        if not d.is_dir():
+            return
+        for path in sorted(d.glob("*.json")):
+            kept = json.loads(path.read_text())
+            try:
+                if kept.get("log"):
+                    self.api.append_log(kept["status"]["id"], kept["log"])
+                    kept["log"] = ""
+                    write_json(path, kept, mode=0o600)
+                self.api.put_status(kept["status"]["id"], kept["status"])
+            except Exception as e:
+                self.say(f"cannot send the kept status of {kept['status']['id']} yet: {e}")
+                return
+            path.unlink()
+            self.say(f"sent the kept status of {kept['status']['id']}: {kept['status'].get('state')}")
+
     def run_once(self, wait=0):
+        self.deliver_pending()
         self.heartbeat()
         self.report_state()
         request = self.api.next_job(wait)
@@ -495,6 +537,7 @@ class Executor:
         self.recover()
         self.selfcheck()
         self.finish_upgrade()
+        self.deliver_pending()
         while True:
             try:
                 # The long poll waits at the Deployer; a heartbeat thread keeps the host online meanwhile.
@@ -558,6 +601,8 @@ class Executor:
                 self.env_read(request, status)
             elif request.get("kind") == "executor-upgrade":
                 self.upgrade(request, status)
+            elif request.get("kind") == "deployer-upgrade":
+                self.deployer_upgrade(request, status)
             else:
                 raise Refused(f"unknown job kind {request.get('kind')}")
         except Restarting:
@@ -571,6 +616,11 @@ class Executor:
             done.set()
             beating.join()
             self.flush_log()
+            with self.log_lock:
+                unsent, self.log_buffer = "".join(self.log_buffer), []
+            if unsent:
+                self.keep_pending(status, unsent)
+            self.status_tries = 5
             self.job_id = None
             self.current_marker().unlink(missing_ok=True)
             self.heartbeat()
@@ -585,13 +635,21 @@ class Executor:
         self.cfg["work"].mkdir(parents=True, exist_ok=True)
         write_json(self.current_marker(), status, mode=0o600)
         self.flush_log()
-        for attempt in range(5):
+        for attempt in range(self.status_tries):
             try:
                 self.api.put_status(status["id"], status)
+                kept = self.pending_dir() / f"{status['id']}.json"
+                if kept.is_file():
+                    # Taken now; a log kept earlier still goes out with the next delivery.
+                    if json.loads(kept.read_text()).get("log"):
+                        self.keep_pending(status)
+                    else:
+                        kept.unlink()
                 return
             except Exception as e:
-                if attempt == 4:
-                    self.say(f"cannot send the status of {status['id']}: {e}")
+                if attempt == self.status_tries - 1:
+                    self.say(f"cannot send the status of {status['id']}, kept for later: {e}")
+                    self.keep_pending(status)
                 else:
                     self.sleep(2)
 
@@ -677,6 +735,118 @@ class Executor:
         os.replace(link, current)
         self.write_status(status)
         raise Restarting(f"executor {version} installed; exiting so that systemd starts it")
+
+    # --- deployer-upgrade: the Deployer's own image (§8.6, D16) ----------------------------------------------------
+
+    def deployer_compose(self, *args, check=True):
+        return self.sh(["docker", "compose", "-p", self.cfg["deployer_project"], "-f", "compose.yaml", *args], cwd=self.cfg["deployer_dir"], check=check)
+
+    def deployer_containers(self, service):
+        return self.deployer_compose("ps", "-a", "-q", service, check=False).stdout.split()
+
+    def deployer_answers(self, version=None):
+        """Waits until the Deployer takes this host's heartbeat (as `version`, when given); the problem otherwise."""
+        deadline, last = time.monotonic() + self.cfg["health_seconds"], "no answer"
+        while True:
+            try:
+                answer = self.api.heartbeat(self.beat_body(self.job_id, {})) or {}
+                if version is None or answer.get("deployer") == version:
+                    return None
+                last = f"it answers as {answer.get('deployer') or 'an unknown version'}"
+            except Exception as e:
+                last = str(e)
+            if time.monotonic() >= deadline:
+                return last
+            self.sleep(5)
+
+    def deployer_upgrade(self, req, status):
+        """Pulls the version, backs up the state with the Deployer stopped, switches the image and checks the new one
+        answers; otherwise puts the previous image and the state back. The Deployer only names the version."""
+        version, d, image = req.get("version", ""), self.cfg["deployer_dir"], self.cfg["deployer_image"]
+        if not VERSION_RE.match(version):
+            raise Refused("version is malformed")
+        if not d or not image:
+            raise Refused("this host does not run the Deployer (EXECUTOR_DEPLOYER_DIR and EXECUTOR_DEPLOYER_IMAGE)")
+        if "@" in image or ":" in image.rsplit("/", 1)[-1] or not image_allowed(f"{image}:{version}", self.cfg["registries"]) or "/" not in image:
+            raise Refused(f"EXECUTOR_DEPLOYER_IMAGE {image} is not a repository in a registered registry (EXECUTOR_REGISTRIES)")
+        if not (d / "compose.yaml").is_file():
+            raise Refused(f"{d} has no compose.yaml")
+        self.status_tries = 1
+        ref = f"{image}:{version}"
+
+        self.step(status, "pull")
+        self.sh(["docker", "pull", "--quiet", ref], timeout=3600)
+        found = json.loads(self.sh(["docker", "image", "inspect", "--format", "{{json .RepoDigests}}", ref]).stdout or "[]")
+        digest = next((x.split("@", 1)[1] for x in found if x.split("@", 1)[0] == image), None)
+        if not digest:
+            raise Failed(f"{ref} has no registry digest")
+        labels = json.loads(self.sh(["docker", "image", "inspect", "--format", "{{json .Config.Labels}}", ref]).stdout or "{}") or {}
+        if labels.get("org.open-atlas.version") != version:
+            raise Refused(f"{ref} says it is version {labels.get('org.open-atlas.version')}")
+        speaks = [p for p in (labels.get("org.open-atlas.executor-protocols") or "").split(",") if p]
+        if speaks and not any(str(p) in speaks for p in PROTOCOLS):
+            raise Refused(f"Deployer {version} speaks executor protocol {','.join(speaks)}, this executor {PROTOCOLS}: upgrade the executors first")
+        new = pinned(ref, digest)
+        env_file = d / ".env"
+        lines = env_file.read_text().splitlines() if env_file.is_file() else []
+        previous = load_env_file(env_file).get("DEPLOYER_IMAGE", "")
+        status["result"] = {"from": previous, "to": new, "digest": digest}
+
+        self.step(status, "backup")
+        stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        data = d / "data"
+        dest = self.cfg["backups"] / "deployer"
+        dest.mkdir(parents=True, exist_ok=True)
+        os.chmod(dest, 0o700)
+        archive = dest / f"deployer-data-before-{version}-{stamp}.tar.gz"
+        self.deployer_compose("stop")
+        try:
+            part = archive.with_suffix(".part")
+            self.sh(["tar", "czf", str(part), "-C", str(d), "data"])
+            self.sh(["tar", "tzf", str(part)], quiet=True)
+            os.chmod(part, 0o600)
+            os.replace(part, archive)
+        except Exception:
+            self.deployer_compose("up", "-d", check=False)
+            raise
+        self.prune_backups("deployer")
+        self.log(f"state backed up to {archive}")
+
+        self.step(status, "switch")
+        (d / ".env.previous").write_text("\n".join(lines) + ("\n" if lines else ""))
+        kept = [x for x in lines if not x.startswith("DEPLOYER_IMAGE=")]
+        part = env_file.with_name(".env.part")
+        part.write_text("\n".join(kept + [f"DEPLOYER_IMAGE={new}"]) + "\n")
+        os.replace(part, env_file)
+        self.deployer_compose("up", "-d")
+
+        self.step(status, "verify")
+        problem = self.wait_healthy(["deployer"], ids_of=self.deployer_containers) or self.deployer_answers(version)
+        if not problem:
+            self.finish(status, "succeeded", f"Deployer {version} is running ({new})")
+            return
+
+        self.step(status, "verify", "failed", problem)
+        self.step(status, "rollback")
+        logs = self.cfg["work"] / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        for cid in self.deployer_containers("deployer"):
+            p = self.sh(["docker", "logs", "--tail", "3000", cid], check=False)
+            (logs / f"deployer-{version}-{stamp}.log").write_text(p.stdout + p.stderr)
+        why = f"Deployer {version} did not come up ({problem})"
+        self.deployer_compose("stop", check=False)
+        os.replace(d / ".env.previous", env_file)
+        failed = d / f"data.failed-{stamp}"
+        os.replace(data, failed)
+        self.sh(["tar", "xzf", str(archive), "-C", str(d)])
+        self.deployer_compose("up", "-d", check=False)
+        back = self.wait_healthy(["deployer"], ids_of=self.deployer_containers) or self.deployer_answers()
+        status["result"]["failedData"] = str(failed)
+        if back:
+            self.finish(status, "failed", f"{why}; the previous version did not come back either ({back}): a person has to look")
+        else:
+            self.step(status, "rollback", "done")
+            self.finish(status, "rolled-back", f"{why}; back on {previous or 'the previous image'} with the state from before the upgrade")
 
     def release_files(self, source, version, name):
         """The release archive and its SHA256SUMS, from a directory (<dir>/executor-v<version>/) or a GitHub release."""
@@ -1220,13 +1390,13 @@ class Executor:
     def containers(self, service):
         return self.compose("ps", "-a", "-q", service, check=False).stdout.split()
 
-    def wait_healthy(self, services, digests=None):
+    def wait_healthy(self, services, digests=None, ids_of=None):
         deadline = time.monotonic() + self.cfg["health_seconds"]
         last = "not started"
         while True:
             problems = []
             for s in services:
-                ids = self.containers(s)
+                ids = (ids_of or self.containers)(s)
                 if not ids:
                     problems.append(f"{s}: no container")
                     continue

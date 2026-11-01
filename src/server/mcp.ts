@@ -5,11 +5,16 @@
 // no authority, validation or audit of its own beyond the route's: the page and the AI run the same code. A refusal
 // comes back as a finding (code / at / expected). Commands take a request_id: a retry with the same one returns the
 // first answer instead of doing it twice. Arguments a tool does not declare are refused by name.
+//
+// Admin tools (§10.8, D38) read and change the Deployer's configuration: manifests, environment settings, the nginx
+// recommendation, hosts, keys, the audit log. Only a personal key of a Workbench admin sees them. Saving them does not
+// deploy anything; nothing secret (env values, tokens, keys) is ever a tool's answer.
 
 import type { Principal } from "./auth.ts";
 import type { Store } from "./store.ts";
 
 interface Property { type: "string" | "integer" | "boolean" | "array" | "object"; description: string; items?: { type: "object" | "string" } }
+type Method = "GET" | "POST" | "PUT" | "DELETE";
 export interface Tool {
   name: string;
   description: string;
@@ -17,9 +22,13 @@ export interface Tool {
   readOnly: boolean;
   /** Writes only an assessment's draft (§10.5.6): the service key sees it, and the route checks the task token. */
   draft?: boolean;
+  /** D38: a Workbench admin's personal key only. */
+  admin?: boolean;
+  /** D38: destructiveHint, when it is not simply "changes something" (a save that deploys nothing is not destructive). */
+  destructive?: boolean;
   properties: Record<string, Property>;
   required?: string[];
-  request: (a: Record<string, unknown>) => { method: "GET" | "POST" | "PUT"; path: string; query?: Record<string, unknown>; body?: unknown; headers?: Record<string, string> };
+  request: (a: Record<string, unknown>) => { method: Method; path: string; query?: Record<string, unknown>; body?: unknown; headers?: Record<string, string> };
 }
 
 const s = (description: string): Property => ({ type: "string", description });
@@ -41,6 +50,51 @@ function draft(name: string, operation: string, description: string, properties:
   };
 }
 const REQUEST_ID = s("Any string unique to this command; send the same one again to retry without doing it twice.");
+const NOTE = s("Why this change (kept with the revision and in the audit log).");
+const PATCH: Property = { type: "array", items: { type: "object" }, description: "JSON Patch (RFC 6902) operations on the base revision, e.g. [{\"op\":\"replace\",\"path\":\"/components/0/source/image\",\"value\":\"postgres:16.6\"}]. Prefer it to sending the whole document." };
+const BOUNDARY = "Only what is the same in every environment belongs in a manifest; a port, a data directory or the host for one environment goes in the environment settings (save_environment).";
+
+/** D38: the admin tools. Each is one of the page's own API calls; the route checks, audits and refuses. */
+const ADMIN: Tool[] = [
+  { name: "get_manifest", readOnly: true, admin: true, description: `One manifest of an app with its revision number (base for save_manifest): the newest revision of the newest range unless applies_from or revision say otherwise, and the app's ranges. ${BOUNDARY}`,
+    properties: { app: APP, applies_from: s("Optional: the range (its appliesFrom version)."), revision: n("Optional: a revision of that range.") }, required: ["app"],
+    request: (a) => ({ method: "GET", path: `/api/apps/${enc(a.app)}/manifest`, query: { applies_from: a.applies_from, revision: a.revision } }) },
+  { name: "validate_manifest", readOnly: true, admin: true, description: "Shows what save_manifest would save, without saving: the merged manifest, findings (code / at / expected), warnings (a changed source needs UAT again), the diff, and which versions the range covers, split into those already deployed (they keep their own revision) and those never deployed (they would take this one).",
+    properties: { app: APP, applies_from: s("The range to change (one of get_manifest's ranges)."), new_applies_from: s("Or: start a new range from this version (the patch applies to applies_from's revision)."), base: n("The revision the change is made on, from get_manifest."), patch: PATCH, manifest: { type: "object", description: "Or the whole manifest." } }, required: ["app"],
+    request: (a) => ({ method: "POST", path: `/api/apps/${enc(a.app)}/manifests/validate`, body: manifestBody(a) }) },
+  { name: "save_manifest", readOnly: false, admin: true, destructive: false, description: `Saves a manifest change as a new revision (UAT only; PROD takes manifests from UAT with each promotion). Say which range: applies_from changes it, new_applies_from starts one; base must be that range's newest revision, or it is refused (409) and you read it again. Takes effect at the next deploy. Changing release.repo is done only on the page. ${BOUNDARY}`,
+    properties: { app: APP, applies_from: s("The range to change."), new_applies_from: s("Or: start a new range from this version."), base: n("The revision the change is made on (from get_manifest)."), patch: PATCH, manifest: { type: "object", description: "Or the whole manifest." }, note: NOTE, request_id: REQUEST_ID }, required: ["app", "note", "request_id"],
+    request: (a) => ({ method: "PUT", path: `/api/apps/${enc(a.app)}/manifests`, body: { ...manifestBody(a), note: a.note } }) },
+  { name: "get_environment", readOnly: true, admin: true, description: "The environment settings (hosts, domain, registries, each app's version, host, ingress, overrides, settings) at their newest revision or the one given, with every revision and what it changed.",
+    properties: { revision: n("Optional: an earlier revision.") }, request: (a) => ({ method: "GET", path: "/api/environment", query: { revision: a.revision } }) },
+  { name: "validate_environment", readOnly: true, admin: true, description: "Shows what save_environment would save, without saving: the merged settings, findings (at / expected), changed paths and the diff.",
+    properties: { base: n("The revision the change is made on, from get_environment."), patch: PATCH, environment: { type: "object", description: "Or the whole settings." } }, required: ["base"],
+    request: (a) => ({ method: "POST", path: "/api/environment/validate", body: { base: a.base, patch: a.patch, environment: a.environment } }) },
+  { name: "save_environment", readOnly: false, admin: true, destructive: false, description: "Saves a change of the environment settings as a new revision; base must be the newest revision, or it is refused (409). Nothing is deployed: plans use the new settings from the next deploy on.",
+    properties: { base: n("The revision the change is made on."), patch: PATCH, environment: { type: "object", description: "Or the whole settings." }, note: NOTE, request_id: REQUEST_ID }, required: ["base", "note", "request_id"],
+    request: (a) => ({ method: "PUT", path: "/api/environment", body: { base: a.base, patch: a.patch, environment: a.environment, note: a.note } }) },
+  { name: "get_ingress", readOnly: true, admin: true, description: "How each app is reached (through nginx or directly), the recommended nginx configuration now and its saved revisions, and the internal CA's subject and validity.",
+    properties: {}, request: () => ({ method: "GET", path: "/api/ingress" }) },
+  { name: "get_nginx_config", readOnly: true, admin: true, description: "One saved revision of the recommended nginx configuration, as text.",
+    properties: { revision: n("The revision.") }, required: ["revision"], request: (a) => ({ method: "GET", path: `/api/ingress/nginx/${enc(a.revision)}` }) },
+  { name: "save_nginx_config", readOnly: false, admin: true, destructive: false, description: "Saves the recommended nginx configuration as it is now as a new revision, for operations to apply (nginx is not touched).",
+    properties: { note: NOTE, request_id: REQUEST_ID }, required: ["note", "request_id"], request: (a) => ({ method: "POST", path: "/api/ingress/nginx", body: { note: a.note } }) },
+  { name: "list_hosts", readOnly: true, admin: true, description: "The hosts, their executors (online, version, upgrade), the apps on each, and their tokens' prefixes (never the tokens).",
+    properties: {}, request: () => ({ method: "GET", path: "/api/hosts" }) },
+  { name: "revoke_host_token", readOnly: false, admin: true, destructive: true, description: "Revokes every executor token of a host: its executor stops reaching the Deployer at once, until an administrator issues a new token on the page.",
+    properties: { host: s("The host, as list_hosts names it."), note: NOTE, request_id: REQUEST_ID }, required: ["host", "note", "request_id"], request: (a) => ({ method: "POST", path: `/api/hosts/${enc(a.host)}/revoke`, body: {} }) },
+  { name: "list_keys", readOnly: true, admin: true, description: "API keys: name, kind, owner, prefix, expiry, last use (never the keys).",
+    properties: {}, request: () => ({ method: "GET", path: "/api/keys" }) },
+  { name: "revoke_key", readOnly: false, admin: true, destructive: true, description: "Revokes an API key at once.",
+    properties: { id: s("The key's id, from list_keys."), note: NOTE, request_id: REQUEST_ID }, required: ["id", "note", "request_id"], request: (a) => ({ method: "DELETE", path: `/api/keys/${enc(a.id)}` }) },
+  { name: "list_audit", readOnly: true, admin: true, description: "The audit log, newest first: who did what to what, and when (e.g. who changed a manifest).",
+    properties: { actor: s("Optional: only this actor."), action: s("Optional: actions starting with this, e.g. manifest."), target: s("Optional: targets starting with this, e.g. shop."), since: s("Optional: ISO time."), limit: n("Optional, default 100.") },
+    request: (a) => ({ method: "GET", path: "/api/audit", query: { actor: a.actor, action: a.action, target: a.target, since: a.since, limit: a.limit } }) },
+];
+
+function manifestBody(a: Record<string, unknown>) {
+  return { appliesFrom: a.applies_from, newAppliesFrom: a.new_applies_from, base: a.base, patch: a.patch, manifest: a.manifest };
+}
 
 export const TOOLS: Tool[] = [
   { name: "get_status", readOnly: true, description: "This environment: each app's desired and running version, container health, the executor, deploys in progress; in PROD also what UAT runs.", properties: {}, request: () => ({ method: "GET", path: "/api/status" }) },
@@ -76,6 +130,7 @@ export const TOOLS: Tool[] = [
   { name: "import_env", readOnly: false, description: "Read the app's env file on the server into a new revision (the first step before the Deployer writes it).", properties: { app: APP, request_id: REQUEST_ID }, required: ["app", "request_id"], request: (a) => ({ method: "POST", path: `/api/apps/${enc(a.app)}/env/import`, body: {} }) },
   { name: "stop_deploy", readOnly: false, description: "Stop a deploy that waits at a manual step; what is done stays done. Refused for a key in PROD.", properties: { job: s("The deploy id."), request_id: REQUEST_ID }, required: ["job", "request_id"], request: (a) => ({ method: "POST", path: `/api/jobs/${enc(a.job)}/stop`, body: {} }) },
   { name: "check_manual_item", readOnly: false, description: "Tick (or untick) one item of the manual step a deploy waits at. Refused for a key in PROD.", properties: { job: s("The deploy id."), component: s("The manual component id."), index: n("The item, from 0."), checked: { type: "boolean", description: "Optional, default true." }, request_id: REQUEST_ID }, required: ["job", "component", "index", "request_id"], request: (a) => ({ method: "POST", path: `/api/jobs/${enc(a.job)}/checks`, body: { component: a.component, index: a.index, checked: a.checked !== false } }) },
+  ...ADMIN,
 ];
 
 /** Tool arguments: only the declared ones, the required ones present, of the declared type. */
@@ -108,7 +163,8 @@ const text = (value: unknown, isError = false) => ({ content: [{ type: "text", t
 export async function handleMcp(message: any, ctx: McpContext): Promise<unknown> {
   const { principal, store } = ctx;
   const id = message?.id;
-  const visible = TOOLS.filter((t) => principal.via !== "service" || t.readOnly || t.draft);
+  const admin = principal.via !== "service" && principal.permissions.includes("admin");
+  const visible = TOOLS.filter((t) => (t.admin ? admin : principal.via !== "service" || t.readOnly || t.draft));
   if (message?.id === undefined) return null;
   switch (message?.method) {
     case "initialize":
@@ -119,7 +175,7 @@ export async function handleMcp(message: any, ctx: McpContext): Promise<unknown>
       return rpc(id, { tools: visible.map((t) => ({
         name: t.name, description: t.description,
         inputSchema: { type: "object", properties: t.properties, ...(t.required ? { required: t.required } : {}), additionalProperties: false },
-        annotations: { readOnlyHint: t.readOnly, destructiveHint: !t.readOnly, idempotentHint: t.readOnly || undefined, openWorldHint: false },
+        annotations: { readOnlyHint: t.readOnly, destructiveHint: t.destructive ?? !t.readOnly, idempotentHint: t.readOnly || undefined, openWorldHint: false },
       })) });
     case "tools/call": {
       const name = String(message.params?.name ?? "");
@@ -140,7 +196,7 @@ export async function handleMcp(message: any, ctx: McpContext): Promise<unknown>
       const answer = await ctx.call(tool.request(rest));
       const ok = answer.status < 400;
       const result = ok ? text(answer.body) : text({ finding: { code: answer.body?.error ?? `http/${answer.status}`, at: [tool.name], expected: answer.body?.message ?? `HTTP ${answer.status}` }, ...(answer.body?.details?.length ? { details: answer.body.details } : {}) }, true);
-      store.audit({ id: principal.id, via: principal.via === "service" ? "service" : "key" }, `mcp.${tool.name}`, String(args.app ?? args.job ?? "-"), { key: principal.keyId ?? null, status: answer.status, ...(requestId ? { requestId } : {}) });
+      store.audit({ id: principal.id, via: principal.via === "service" ? "service" : "key" }, `mcp.${tool.name}`, String(args.app ?? args.job ?? args.host ?? args.id ?? "-"), { key: principal.keyId ?? null, status: answer.status, ...(requestId ? { requestId } : {}), ...(typeof args.note === "string" ? { note: args.note } : {}) });
       if (!tool.readOnly && ok) store.saveMcpAnswer(keyId, String(requestId), tool.name, result);
       return rpc(id, result);
     }

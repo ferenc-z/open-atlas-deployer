@@ -3,6 +3,7 @@
 
 import { useEffect, useState, type FormEvent } from "react";
 import * as api from "./api.ts";
+import { Markdown } from "./Markdown.tsx";
 import type { AssessmentView } from "./api.ts";
 
 const STATE: Record<string, { label: string; tone: string }> = {
@@ -99,7 +100,7 @@ function AssessmentPanel({ id, canStart, isAdmin, onClose, onChanged, onJob }: {
         <button className="link" onClick={onClose}>Close</button>
       </div>
       {a.message && <p className={a.state === "failed" ? "error" : ""}>{a.message}</p>}
-      {a.report && <div><h3>Assessment report</h3><pre className="report">{a.report}</pre></div>}
+      {a.report && <div><h3>Assessment report</h3><Markdown text={a.report} /></div>}
       {a.state === "assessing" && <details open><summary>Progress (OMA session {a.session})</summary><ol className="steps">{a.progress.map((p, i) => <li key={i}>{p}</li>)}</ol></details>}
       <details open={Boolean(a.findings?.length)}>
         <summary>Draft {a.manifest.app ? `· ${a.manifest.app}` : ""} ({a.manifest.components?.length ?? 0} components, {a.draft.envKeys.length} env keys)</summary>
@@ -120,7 +121,7 @@ function AssessmentPanel({ id, canStart, isAdmin, onClose, onChanged, onJob }: {
       {a.issue && (
         <div className="panel">
           <h3>Issue draft ({a.issue.kind === "capability" ? "new Deployer capability" : "for the repository author"}): {a.issue.title}</h3>
-          <pre className="report">{a.issue.body}</pre>
+          <Markdown text={a.issue.body} />
           {a.issue.url ? <a href={a.issue.url} target="_blank" rel="noreferrer">{a.issue.url}</a> : canStart && <button onClick={() => act(api.openIssue(id))}>Open the issue in the Deployer repository</button>}
         </div>
       )}

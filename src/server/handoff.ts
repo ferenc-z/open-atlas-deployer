@@ -10,7 +10,7 @@ import type { ExecutorStatus, Store } from "./store.ts";
 
 export const PROTOCOL = 2;
 /** §8.6: the executor release this Deployer ships with (executor/deployer_executor.py VERSION); hosts on an older one are offered the upgrade. */
-export const EXECUTOR_VERSION = "0.6.0";
+export const EXECUTOR_VERSION = "0.7.0";
 
 export interface Heartbeat {
   version: string;
@@ -26,6 +26,8 @@ export interface Heartbeat {
   root?: string;
   /** §8.6: what kind of source the host upgrades its executor from (EXECUTOR_UPGRADE_FROM); null: not set. */
   upgradeFrom?: "github" | "directory" | null;
+  /** D16: this host runs the Deployer and upgrades it from this image repository (EXECUTOR_DEPLOYER_IMAGE). */
+  deployer?: { image: string } | null;
 }
 
 export interface ExecutorInfo { online: boolean; host: string; reason?: string; heartbeat?: Heartbeat; ageSeconds?: number }
@@ -119,18 +121,21 @@ export class Handoff {
     this.store.setHeartbeat(host, { ...heartbeat, at: new Date(this.now()).toISOString() });
   }
 
-  /** The next job for the host, waiting up to `waitMs` for one to be queued. */
-  async next(host: string, waitMs = 0): Promise<Record<string, unknown> | undefined> {
+  /** The next job for the host, waiting up to `waitMs` for one to be queued. `signal`: the executor's request; a poll
+   *  whose executor went away (restarted, network) takes no job, or it would be claimed with nobody to run it. */
+  async next(host: string, waitMs = 0, signal?: AbortSignal): Promise<Record<string, unknown> | undefined> {
+    if (signal?.aborted) return undefined;
     const now = this.store.claimExecutorJob(host);
     if (now || waitMs <= 0) return now;
     await new Promise<void>((resolve) => {
       const set = this.waiting.get(host) ?? new Set();
       this.waiting.set(host, set);
-      const done = () => { clearTimeout(timer); set.delete(done); resolve(); };
+      const done = () => { clearTimeout(timer); set.delete(done); signal?.removeEventListener("abort", done); resolve(); };
       const timer = setTimeout(done, waitMs);
       set.add(done);
+      signal?.addEventListener("abort", done, { once: true });
     });
-    return this.store.claimExecutorJob(host);
+    return signal?.aborted ? undefined : this.store.claimExecutorJob(host);
   }
 
   /** Whether a job belongs to the host asking about it. */

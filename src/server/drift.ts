@@ -45,7 +45,9 @@ export class Drift {
       if (fragment && !on) out.push({ key: `fragment:${app}`, app, kind: "fragment", detail: `${app}/compose.yaml is no longer on the server` });
     }
     for (const app of this.store.listApps()) {
-      const manifest = covering(this.store.manifests(app.id), deployed[app.id] ?? "") ?? this.store.manifests(app.id).at(-1);
+      // A registered app the environment does not deploy has no version to cover.
+      const version = deployed[app.id];
+      const manifest = (version ? covering(this.store.manifests(app.id), version) : undefined) ?? this.store.manifests(app.id).at(-1);
       const file = manifest?.env?.file;
       if (!file) continue;
       const expected = this.expectedEnv(app.id);

@@ -17,20 +17,29 @@ class FakeApi:
 
     def __init__(self):
         self.queue, self.status, self.logs, self.env, self.beats, self.states = [], {}, {}, {}, [], []
+        # D16: the Deployer's version as its heartbeat answer says, and whether it is down (restarting).
+        self.deployer, self.down = None, False
 
     def token(self):
         return "dpe_test"
 
     def heartbeat(self, beat):
+        if self.down:
+            raise dx.Failed("cannot reach the Deployer")
         self.beats.append(beat)
+        return {"ok": True, "deployer": self.deployer}
 
     def next_job(self, wait):
         return self.queue.pop(0) if self.queue else None
 
     def put_status(self, job_id, status):
+        if self.down:
+            raise dx.Failed("cannot reach the Deployer")
         self.status[job_id] = json.loads(json.dumps(status))
 
     def append_log(self, job_id, text):
+        if self.down:
+            raise dx.Failed("cannot reach the Deployer")
         self.logs[job_id] = self.logs.get(job_id, "") + text
 
     def put_env_content(self, job_id, text):
@@ -229,7 +238,7 @@ class RequestTest(unittest.TestCase):
         self.ex.heartbeat()
         beat = self.api.beats[-1]
         self.assertEqual(beat["protocols"], [2])
-        self.assertEqual(beat["kinds"], ["build", "deploy", "env", "env-read", "bundle", "db-migration", "executor-upgrade"])
+        self.assertEqual(beat["kinds"], ["build", "deploy", "env", "env-read", "bundle", "db-migration", "executor-upgrade", "deployer-upgrade"])
         self.assertEqual(beat["databaseBackup"], {"dossier": {"dump": True, "restore": False}})
 
 
@@ -478,6 +487,126 @@ class UpgradeTest(unittest.TestCase):
         with self.assertRaises(dx.Restarting):
             self.upgrade("9.0.0")
         self.assertEqual(urls[0], "https://api.github.test/repos/acme/open-atlas-deployer/releases/tags/executor-v9.0.0")
+
+
+class DeployerUpgradeTest(unittest.TestCase):
+    """D16: the Deployer's image switched on its host, its state backed up first and put back when the new one fails."""
+
+    def setUp(self):
+        import subprocess
+        self.subprocess = subprocess
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        self.dir = self.root / "deployer"
+        (self.dir / "data").mkdir(parents=True)
+        (self.dir / "data" / "deployer.db").write_text("state v1")
+        (self.dir / "compose.yaml").write_text('services:\n  deployer:\n    image: "${DEPLOYER_IMAGE}"\n')
+        (self.dir / ".env").write_text("DEPLOYER_IMAGE=localhost:5000/open-atlas-deployer:0.1.0@sha256:old\nCOMPOSE_FILE_NOTE=kept\n")
+        self.api = FakeApi()
+        self.devnull = open("/dev/null", "w")
+        self.addCleanup(self.devnull.close)
+        self.ex = dx.Executor(cfg(self.root, deployer_dir=self.dir, deployer_image="localhost:5000/open-atlas-deployer", health_seconds=0),
+                              out=self.devnull, api=self.api)
+        self.ex.sleep = lambda s: None
+        self.ran, self.labels, self.healthy, self.new_answers = [], {"org.open-atlas.version": "0.2.0", "org.open-atlas.executor-protocols": "2"}, True, True
+        self.ex.sh = self.sh
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def sh(self, args, **kw):
+        self.ran.append(args)
+        out = ""
+        if args[0] == "tar":
+            p = self.subprocess.run(args, capture_output=True, text=True)
+            assert p.returncode == 0, p.stderr
+        elif args[:3] == ["docker", "image", "inspect"]:
+            out = json.dumps(["localhost:5000/open-atlas-deployer@sha256:new"]) if "RepoDigests" in args[4] else json.dumps(self.labels)
+        elif "ps" in args:
+            out = "cid1"
+        elif args[:2] == ["docker", "inspect"]:
+            out = "running|healthy|0|img" if self.healthy else "running|unhealthy|0|img"
+        elif args[-2:] == ["up", "-d"]:
+            # The new version starts on the state: it changes it, and answers as itself when it works.
+            env = (self.dir / ".env").read_text()
+            if "sha256:new" in env:
+                (self.dir / "data" / "deployer.db").write_text("state v2")
+                self.api.deployer = "0.2.0" if self.new_answers else "0.1.0"
+            else:
+                self.api.deployer = "0.1.0"
+        return type("P", (), {"returncode": 0, "stdout": out, "stderr": ""})()
+
+    def upgrade(self, version="0.2.0", job="deployer-upgrade-0001"):
+        self.api.queue.append({"protocol": 2, "id": job, "kind": "deployer-upgrade", "version": version})
+        self.assertTrue(self.ex.run_once())
+        return self.api.status[job]
+
+    def test_switches_the_image_after_backing_up_the_state_with_the_deployer_stopped(self):
+        status = self.upgrade()
+        self.assertEqual(status["state"], "succeeded", status.get("message"))
+        self.assertEqual([x["name"] for x in status["steps"]], ["pull", "backup", "switch", "verify"])
+        self.assertEqual((self.dir / ".env").read_text(), "COMPOSE_FILE_NOTE=kept\nDEPLOYER_IMAGE=localhost:5000/open-atlas-deployer:0.2.0@sha256:new\n")
+        self.assertIn("sha256:old", (self.dir / ".env.previous").read_text())
+        compose = [a[6:] for a in self.ran if a[:2] == ["docker", "compose"] and "ps" not in a]
+        self.assertEqual(compose, [["stop"], ["up", "-d"]])
+        pull = self.ran.index(["docker", "pull", "--quiet", "localhost:5000/open-atlas-deployer:0.2.0"])
+        stop, tar = self.ran.index(["docker", "compose", "-p", "open-atlas-deployer", "-f", "compose.yaml", "stop"]), next(i for i, a in enumerate(self.ran) if a[:2] == ["tar", "czf"])
+        self.assertLess(pull, stop, "pulled before anything stops")
+        self.assertLess(stop, tar, "the state is copied with the Deployer stopped")
+        backups = list((self.ex.cfg["backups"] / "deployer").glob("deployer-data-before-0.2.0-*.tar.gz"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(self.api.beats[-1]["deployer"], {"image": "localhost:5000/open-atlas-deployer"})
+
+    def test_a_new_version_that_does_not_answer_goes_back_with_the_state_from_before(self):
+        self.new_answers = False
+        status = self.upgrade()
+        self.assertEqual(status["state"], "rolled-back", status.get("message"))
+        self.assertIn("did not come up (it answers as 0.1.0)", status["message"])
+        self.assertEqual([(x["name"], x["state"]) for x in status["steps"]][-2:], [("verify", "failed"), ("rollback", "done")])
+        self.assertIn("sha256:old", (self.dir / ".env").read_text())
+        self.assertEqual((self.dir / "data" / "deployer.db").read_text(), "state v1", "the state from before the upgrade")
+        failed = pathlib.Path(status["result"]["failedData"])
+        self.assertEqual((failed / "deployer.db").read_text(), "state v2", "what the new version left is kept aside")
+
+    def test_refuses_before_touching_anything(self):
+        cases = []
+        self.labels = {"org.open-atlas.version": "0.3.0"}
+        cases.append(("0.2.0", "says it is version 0.3.0"))
+        for i, (version, message) in enumerate(cases):
+            status = self.upgrade(version, job=f"deployer-upgrade-{i:04d}")
+            self.assertEqual(status["state"], "refused")
+            self.assertIn(message, status["message"])
+        self.labels = {"org.open-atlas.version": "0.2.0", "org.open-atlas.executor-protocols": "3"}
+        self.assertIn("upgrade the executors first", self.upgrade(job="deployer-upgrade-proto")["message"])
+        self.ex.cfg["deployer_image"] = "docker.io/someone/deployer"
+        self.assertIn("not a repository in a registered registry", self.upgrade(job="deployer-upgrade-reg")["message"])
+        self.ex.cfg["deployer_dir"] = None
+        self.assertIn("does not run the Deployer", self.upgrade(job="deployer-upgrade-none")["message"])
+        self.assertFalse(any(a[:2] == ["docker", "compose"] and "ps" not in a for a in self.ran), "nothing was stopped or started")
+        self.assertIn("sha256:old", (self.dir / ".env").read_text())
+
+    def test_statuses_the_deployer_could_not_take_are_sent_once_it_answers(self):
+        real = self.sh
+
+        def going_down(args, **kw):
+            if args[-1:] == ["stop"]:
+                self.api.down = True
+            if args[-2:] == ["up", "-d"]:
+                self.api.down = False
+            return real(args, **kw)
+        self.ex.sh = going_down
+        self.api.queue.append({"protocol": 2, "id": "deployer-upgrade-0009", "kind": "deployer-upgrade", "version": "0.2.0"})
+        self.api.down = False
+        self.ex.run_once()
+        self.assertEqual(self.api.status["deployer-upgrade-0009"]["state"], "succeeded")
+        # While it was down, a status was kept; once delivered nothing is left.
+        self.api.down = True
+        self.ex.write_status({"id": "deployer-upgrade-0010", "state": "succeeded", "steps": [], "result": {}})
+        self.assertTrue((self.ex.pending_dir() / "deployer-upgrade-0010.json").is_file())
+        self.api.down = False
+        self.ex.deliver_pending()
+        self.assertEqual(self.api.status["deployer-upgrade-0010"]["state"], "succeeded")
+        self.assertFalse(list(self.ex.pending_dir().glob("*.json")))
 
 
 class FragmentTest(unittest.TestCase):

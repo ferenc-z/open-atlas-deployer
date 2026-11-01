@@ -3,6 +3,7 @@
 // key's SHA-256; the key opens nothing but /api/peer/*.
 
 import { randomBytes } from "node:crypto";
+import type { Manifest } from "../compose/generate.ts";
 import type { DeployRecord } from "./store.ts";
 import { readToken } from "./versions.ts";
 
@@ -60,4 +61,13 @@ export class Peer {
   }
 
   fingerprint(app: string) { return this.get<Record<string, unknown>>(`apps/${encodeURIComponent(app)}/env/fingerprint`); }
+
+  /** D38 ⑤: UAT's registry, each range's newest manifest with its revision. */
+  apps() { return this.get<{ environment: string; apps: { id: string; name: string; repo: string; manifests: { revision: number; manifest: Manifest }[] }[] }>("apps"); }
+
+  /** D38 ⑤: one manifest revision UAT deployed with. */
+  manifest(app: string, appliesFrom: string, revision: number) { return this.get<Manifest>(`apps/${encodeURIComponent(app)}/manifests/${encodeURIComponent(appliesFrom)}/${revision}`); }
+
+  /** D38 ⑤: the manifest UAT would deploy a version with now. */
+  manifestFor(app: string, version: string) { return this.get<{ revision: number; manifest: Manifest }>(`apps/${encodeURIComponent(app)}/manifest?version=${encodeURIComponent(version)}`); }
 }

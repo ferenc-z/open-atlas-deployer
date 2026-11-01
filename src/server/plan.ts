@@ -74,6 +74,10 @@ export interface Plan {
 export interface PlanContext {
   /** The environment with each app's version as the Deployer last deployed it. */
   env: Environment;
+  /** D38: the revision of the environment settings the plan used; the deploy record carries it. */
+  environmentRevision?: number;
+  /** D38 ⑤, PROD: the manifest UAT deployed this version with (or UAT's current one), used instead of PROD's own. */
+  fromUat?: { body: Manifest; ref: string; note: string } | { error: string; blocking?: boolean };
   app: RegisteredApp;
   /** Current manifests per registered app. */
   manifests: Record<string, Manifest[]>;
@@ -129,12 +133,18 @@ export function plan(ctx: PlanContext, version: string): Plan {
   if (!principal.permissions.includes(need)) block("deploy/forbidden", `Deploying to ${env.name.toUpperCase()} needs the ${need} group.`);
   const current = covering(ctx.manifests[app.id] ?? [], version);
   const pinned = ctx.pins?.manifest;
-  const manifest = pinned?.body ?? current;
+  const uat = ctx.fromUat && "body" in ctx.fromUat ? ctx.fromUat : undefined;
+  const manifest = pinned?.body ?? uat?.body ?? current;
   if (!manifest) {
     block("deploy/no-manifest", `No manifest applies to ${version}: the earliest manifest starts at ${ctx.manifests[app.id]?.[0]?.appliesFrom ?? "—"}. Assess ${version} to extend the manifest to it (D32).`);
     return empty;
   }
-  const ref = pinned?.ref ?? manifestRef(app, manifest);
+  const ref = pinned?.ref ?? uat?.ref ?? manifestRef(app, manifest);
+  if (uat && !pinned) note("deploy/manifest-from-uat", uat.note);
+  if (ctx.fromUat && "error" in ctx.fromUat && !pinned) {
+    if (ctx.fromUat.blocking) block("deploy/manifest-uat-mismatch", ctx.fromUat.error);
+    else note("deploy/manifest-local", `Cannot take the manifest from UAT (${ctx.fromUat.error}); this plan uses ${ref} as kept here.`);
+  }
   if (pinned && current && pinned.ref !== manifestRef(app, current)) note("deploy/pinned-manifest", `Uses manifest ${pinned.ref}, as deploy ${ctx.pins!.from} did; the current manifest for ${version} is ${manifestRef(app, current)}.`);
   const bundle = manifest.bundle ? ctx.bundle?.info : undefined;
   if (manifest.bundle && !bundle) block("deploy/bundle", `Cannot get the release bundle ${manifest.bundle.asset.replaceAll("{version}", version)}: ${ctx.bundle?.error ?? "not downloaded"}`);
@@ -325,6 +335,7 @@ export function plan(ctx: PlanContext, version: string): Plan {
     ...(bundle ? { bundle: { repo: bundle.repo, tag: bundle.tag, asset: bundle.asset, digest: bundle.digest } } : {}),
     steps,
     ...(envState?.revision != null ? { envRevision: envState.revision } : {}),
+    ...(ctx.environmentRevision ? { environmentRevision: ctx.environmentRevision } : {}),
     ...(promotion ? { promotion } : {}),
     ...(own?.url ? { url: own.url } : {}),
     machine,

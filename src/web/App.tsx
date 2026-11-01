@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
 import * as api from "./api.ts";
-import type { AuditEntry, Manifest, Me, Principal, RegisteredApp, StatusView } from "./api.ts";
+import type { AuditEntry, Manifest, ManifestCheck, Me, Principal, RegisteredApp, StatusView } from "./api.ts";
 import { DeployPanel, History, JobPanel, JobState, KIND } from "./Deploy.tsx";
 import { EnvPage } from "./Env.tsx";
 import { Artifacts } from "./Artifacts.tsx";
@@ -9,8 +9,10 @@ import { OnboardingPage } from "./Onboarding.tsx";
 import { BriefCard, DriftBanner } from "./Brief.tsx";
 import { HostsPage } from "./Hosts.tsx";
 import { IngressPage } from "./Ingress.tsx";
+import { Platform } from "./Platform.tsx";
+import { SettingsPage } from "./Settings.tsx";
 
-type Tab = "status" | "history" | "hosts" | "env" | "registry" | "onboarding" | "ingress" | "keys" | "audit";
+type Tab = "status" | "history" | "hosts" | "settings" | "env" | "registry" | "onboarding" | "ingress" | "keys" | "audit";
 type Panel = { kind: "deploy"; app: string; initial?: { version: string; pinFrom?: string } } | { kind: "job"; id: string } | undefined;
 
 const VERDICT: Record<string, { label: string; tone: string }> = {
@@ -44,6 +46,13 @@ export function App() {
   const actions =useMemo(() => ({ openPlan: (app: string, version: string, pinFrom?: string) => { setPanel({ kind: "deploy", app, initial: { version, ...(pinFrom ? { pinFrom } : {}) } }); setTab("status"); } }), []);
   const load = useCallback(() => { api.me().then(setMe, () => setMe(undefined)); }, []);
   useEffect(load, [load]);
+  // D39: after the Deployer was upgraded, load the new version's page.
+  const loaded = me?.signedIn ? me.deployerVersion : undefined;
+  useEffect(() => {
+    if (!loaded) return;
+    const t = setInterval(() => { api.me().then((m) => { if (m.signedIn && m.deployerVersion && m.deployerVersion !== loaded) location.reload(); }, () => undefined); }, 15_000);
+    return () => clearInterval(t);
+  }, [loaded]);
 
   if (!me) return <main className="center"><p className="muted">Checking sign-in…</p></main>;
   if (!me.signedIn) return "forbidden" in me ? <Forbidden message={me.message} /> : <SignIn me={me} onSignedIn={load} />;
@@ -57,12 +66,13 @@ export function App() {
         {p.stale && <div className="banner warn">Workbench is not responding; using the last confirmed sign-in (valid for 15 minutes).</div>}
         {p.actAs && <div className="banner info">{p.actAs.administrator} is using Workbench as {p.displayName}, so permissions here are also those of {p.displayName}.</div>}
         <main>
-          {tab === "status" && <><DriftBanner /><BriefCard canRegenerate={p.permissions.includes("deploy-uat") || p.permissions.includes("deploy-prod")} /><Status panel={panel} setPanel={setPanel} isAdmin={p.permissions.includes("admin")} onAssessment={(id) => { setPanel(undefined); setAssessment(id); setTab("onboarding"); }} /></>}
+          {tab === "status" && <><DriftBanner /><Status panel={panel} setPanel={setPanel} isAdmin={p.permissions.includes("admin")} canRegenerate={p.permissions.includes("deploy-uat") || p.permissions.includes("deploy-prod")} onAssessment={(id) => { setPanel(undefined); setAssessment(id); setTab("onboarding"); }} /></>}
           {tab === "history" && <HistoryPage onBack={(j) => { setPanel({ kind: "deploy", app: j.app, initial: { version: j.version, pinFrom: j.id } }); setTab("status"); }} />}
           {tab === "hosts" && <HostsPage isAdmin={p.permissions.includes("admin") && p.via === "workbench"} />}
+          {tab === "settings" && <SettingsPage />}
           {tab === "env" && <EnvPage />}
           {tab === "ingress" && <IngressPage />}
-          {tab === "registry" && <Registry principal={p} />}
+          {tab === "registry" && <Registry principal={p} prod={me.environment?.toLowerCase() === "prod"} />}
           {tab === "onboarding" && <OnboardingPage key={assessment ?? ""} {...(assessment ? { initialOpen: assessment } : {})} canStart={p.permissions.includes("deploy-uat") && p.via === "workbench"} isAdmin={p.permissions.includes("admin")} onJob={(id) => { setPanel({ kind: "job", id }); setTab("status"); }} />}
           {tab === "keys" && <KeysPage isAdmin={p.permissions.includes("admin")} />}
           {tab === "audit" && p.permissions.includes("admin") && <Audit />}
@@ -77,7 +87,7 @@ export function App() {
 function Sidebar({ principal, environment, tab, setTab, onSignedOut, assistant, toggleAssistant }: { principal: Principal; environment?: string; tab: Tab; setTab: (t: Tab) => void; onSignedOut: () => void; assistant: boolean; toggleAssistant: () => void }) {
   const [open, setOpen] = useState(false);
   const groups: [string, [Tab, string][]][] = [
-    ["Deploy", [["status", "Overview"], ["history", "Deploy history"], ["hosts", "Hosts"]]],
+    ["Deploy", [["status", "Overview"], ["history", "Deploy history"], ["hosts", "Hosts"], ["settings", "Environment settings"]]],
     ["Apps", [["registry", "Apps & manifests"], ["onboarding", "Onboarding & assessments"], ["env", "Environment variables"], ["ingress", "Ingress"]]],
     ["Admin", [["keys", "API keys"], ...(principal.permissions.includes("admin") ? [["audit", "Audit"] as [Tab, string]] : [])]],
   ];
@@ -165,7 +175,7 @@ function Forbidden({ message }: { message: string }) {
   );
 }
 
-function Status({ panel, setPanel, isAdmin, onAssessment }: { panel: Panel; setPanel: (p: Panel) => void; isAdmin: boolean; onAssessment: (id: string) => void }) {
+function Status({ panel, setPanel, isAdmin, canRegenerate, onAssessment }: { panel: Panel; setPanel: (p: Panel) => void; isAdmin: boolean; canRegenerate: boolean; onAssessment: (id: string) => void }) {
   const [data, setData] = useState<StatusView | undefined>();
   const [error, setError] = useState("");
   const [open, setOpen] = useState<Record<string, boolean>>({});
@@ -185,16 +195,8 @@ function Status({ panel, setPanel, isAdmin, onAssessment }: { panel: Panel; setP
         </span>
         <button onClick={refresh}>Refresh</button>
       </div>
-      <p className="executor">
-        {data.executors.map((x) => (
-          <span key={x.host} className="executor-host">
-            {data.executors.length > 1 && <strong>{x.host}</strong>}
-            {x.online
-              ? <><span className="badge ok">Executor online</span> <span className="muted">{x.heartbeat?.version}{x.heartbeat?.busy ? ` · running ${x.heartbeat.busy}` : ""}</span></>
-              : <><span className="badge bad">Executor offline</span> <span className="muted">{x.reason}; apps on it can be viewed, not built or deployed</span></>}
-          </span>
-        ))}
-      </p>
+      <Platform />
+      <BriefCard canRegenerate={canRegenerate} />
       {data.peer && "error" in data.peer && <p className="banner warn">Cannot check the UAT records: {data.peer.error}. Only officially released versions can be deployed, or an admin can skip the promotion rule.</p>}
       {panel?.kind === "deploy" && <DeployPanel key={`${panel.app}-${panel.initial?.version ?? ""}-${panel.initial?.pinFrom ?? ""}`} app={panel.app} isAdmin={isAdmin} {...(panel.initial ? { initial: panel.initial } : {})} onClose={() => setPanel(undefined)} onJob={(id) => setPanel({ kind: "job", id })} onAssessment={onAssessment} />}
       {panel?.kind === "job" && <JobPanel id={panel.id} onClose={() => { setPanel(undefined); refresh(); }} />}
@@ -260,25 +262,29 @@ function AppRows({ app, open, toggle, action, peer, host }: { app: StatusView["a
   );
 }
 
-function Registry({ principal }: { principal: Principal }) {
+function Registry({ principal, prod }: { principal: Principal; prod: boolean }) {
   const [list, setList] = useState<RegisteredApp[] | undefined>();
   const [selected, setSelected] = useState<string | undefined>();
   const [adding, setAdding] = useState(false);
   const [error, setError] = useState("");
+  const [taken, setTaken] = useState("");
   const admin = principal.permissions.includes("admin");
   const refresh = useCallback(() => { api.apps().then((d) => setList(d.apps), (e: Error) => setError(e.message)); }, []);
   useEffect(refresh, [refresh]);
 
   if (error) return <p className="error">{error}</p>;
   if (!list) return <p className="muted">Loading…</p>;
-  if (selected) return <AppDetail id={selected} admin={admin} back={() => { setSelected(undefined); refresh(); }} />;
+  if (selected) return <AppDetail id={selected} admin={admin && !prod} back={() => { setSelected(undefined); refresh(); }} />;
+  const fromUat = () => api.takeRegistryFromUat().then((r) => { setTaken(r.added.length ? `Taken from UAT: ${r.added.join(", ")}` : "Already the same as UAT."); refresh(); }, (e: Error) => setError(e.message));
   return (
     <>
       <div className="toolbar">
         <h1>App registry</h1>
-        <span className="muted">The Deployer only deploys the apps listed here (§4.4){admin ? "" : "; only Workbench admins can change it"}</span>
-        {admin && <button onClick={() => setAdding(!adding)}>{adding ? "Cancel" : "Register an app"}</button>}
+        <span className="muted">The Deployer only deploys the apps listed here (§4.4){prod ? "; PROD takes them from UAT, with each promotion or here (D38)" : admin ? "" : "; only Workbench admins can change it"}</span>
+        {admin && !prod && <button onClick={() => setAdding(!adding)}>{adding ? "Cancel" : "Register an app"}</button>}
+        {admin && prod && <button onClick={fromUat}>Take from UAT</button>}
       </div>
+      {taken && <p className="banner info">{taken}</p>}
       {adding && <ManifestForm onSaved={() => { setAdding(false); refresh(); }} />}
       <table>
         <thead><tr><th>App</th><th>Repository</th><th>Manifests</th><th>Registered</th></tr></thead>
@@ -369,15 +375,24 @@ function ManifestForm({ initial, appId, onSaved }: { initial?: Manifest; appId?:
   const [text, setText] = useState(initial ? JSON.stringify(initial, null, 2) : "");
   const [name, setName] = useState("");
   const [note, setNote] = useState("");
+  const [repoChange, setRepoChange] = useState(false);
+  const [check, setCheck] = useState<{ id: string; manifest: unknown; result: ManifestCheck } | undefined>();
   const [error, setError] = useState<{ message: string; details: string[] } | undefined>();
+  const fail = (err: api.ApiError) => setError({ message: err.message, details: err.details });
+  // D38: check first (findings, the versions it affects, a changed source), then save on the revision it was read at.
   const submit = (e: FormEvent) => {
     e.preventDefault();
     setError(undefined);
-    let manifest: { app?: string };
+    let manifest: { app?: string; appliesFrom?: string };
     try { manifest = JSON.parse(text); } catch (err) { setError({ message: `Not valid JSON: ${(err as Error).message}`, details: [] }); return; }
     const id = appId ?? manifest.app;
     if (!id) { setError({ message: "The manifest has no app.", details: [] }); return; }
-    api.saveManifest(id, manifest, name || undefined, note || undefined).then(onSaved, (err: api.ApiError) => setError({ message: err.message, details: err.details }));
+    const base = appId && manifest.appliesFrom ? api.appManifest(id, manifest.appliesFrom).then((m) => m.revision, () => null) : Promise.resolve(null);
+    base.then((b) => api.checkManifest(id, manifest, b, repoChange)).then((result) => setCheck({ id, manifest, result }), fail);
+  };
+  const save = () => {
+    if (!check) return;
+    api.saveManifest(check.id, check.manifest, check.result.base, { ...(name ? { name } : {}), ...(note ? { note } : {}), repoChange }).then(onSaved, fail);
   };
   return (
     <form className="card manifest" onSubmit={submit}>
@@ -389,8 +404,23 @@ function ManifestForm({ initial, appId, onSaved }: { initial?: Manifest; appId?:
       <div className="row">
         {!appId && <input placeholder="Display name (optional)" value={name} onChange={(e) => setName(e.target.value)} />}
         <input placeholder="Change note (optional)" value={note} onChange={(e) => setNote(e.target.value)} />
-        <button type="submit" disabled={!text.trim()}>Validate and save</button>
+        <button type="submit" disabled={!text.trim()}>Check</button>
+        {check && !check.result.findings.length && <button type="button" className="primary" onClick={save}>{check.result.newRange ? `Save as a new range from ${check.result.appliesFrom}` : `Save as revision ${(check.result.base ?? 0) + 1}`}</button>}
       </div>
+      {check && (
+        <div className="plan">
+          {check.result.findings.length > 0 && <ul className="findings">{check.result.findings.map((f) => <li key={f} className="error mono">✕ {f}</li>)}</ul>}
+          {check.result.repoChange && <label className="row small"><input type="checkbox" checked={repoChange} onChange={(e) => { setRepoChange(e.target.checked); setCheck(undefined); }} /> I confirm the repository change (check again after ticking)</label>}
+          {check.result.warnings.map((w) => <p key={w} className="banner warn">{w}</p>)}
+          <p className="small muted">
+            Range from {check.result.affected.from}{check.result.affected.to ? ` up to ${check.result.affected.to}` : " on"}.
+            {check.result.affected.deployed.length > 0 && ` Already deployed (they keep the revision they went out with): ${check.result.affected.deployed.join(", ")}.`}
+            {check.result.affected.neverDeployed.length > 0 && ` Never deployed (they take this one): ${check.result.affected.neverDeployed.join(", ")}.`}
+            {check.result.affected.versionsUnknown && ` Cannot list the versions: ${check.result.affected.versionsUnknown}.`}
+          </p>
+          {check.result.diff && <details><summary>What changes</summary><pre className="diff">{check.result.diff.split("\n").map((l, i) => <span key={i} className={l.startsWith("+ ") ? "add" : l.startsWith("- ") ? "del" : ""}>{l}{"\n"}</span>)}</pre></details>}
+        </div>
+      )}
       {error && <div className="error">{error.message}{error.details.length > 0 && <ul>{error.details.map((d) => <li key={d} className="mono">{d}</li>)}</ul>}</div>}
     </form>
   );

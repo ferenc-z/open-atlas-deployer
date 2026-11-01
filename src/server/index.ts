@@ -48,6 +48,13 @@ const deployments = new Deployments(store, new Handoff(store), observer, config.
   bundles: new Bundles(join(config.dataDir, "bundles"), config.githubTokenFile, fetch, config.githubApi),
   contracts: new ContractDocs(config.githubTokenFile, fetch, config.githubApi),
 });
+// D38: the environment settings live in the state database; on the first start environment.json becomes revision 1.
+try {
+  const s = deployments.settings();
+  console.log(`Environment settings: revision ${s.revision}${s.source === "import" && s.revision === 1 ? ` (imported from ${config.environmentFile})` : ""}`);
+} catch (error) {
+  console.error(`Cannot read the environment settings (${config.environmentFile}): ${(error as Error).message}`);
+}
 const keptTemplates = join(config.dataDir, "templates");
 const env = new EnvManager(store, deployments, new Schemas(config.githubTokenFile, config.templatesDir, fetch, keptTemplates, config.githubApi), config.credentialKey ? new SecretBox(config.credentialKey) : undefined, config.compareKey);
 // Phase 6: personal and service API keys (need Workbench's API key to re-confirm owners), failure diagnosis through OMA.

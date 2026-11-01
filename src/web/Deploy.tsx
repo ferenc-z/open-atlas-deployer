@@ -25,7 +25,7 @@ const TYPE: Record<string, string> = {
 const WHERE: Record<string, string> = { host: "Executor", deployer: "Deployer", person: "Person" };
 const FINAL = ["succeeded", "failed", "rolled-back", "refused"];
 export const BASIS: Record<string, string> = { uat: "Deployed successfully in UAT", release: "Officially released", "prod-history": "Deployed successfully here", override: "Skipped by an admin" };
-export const KIND: Record<string, string> = { build: "Build", deploy: "Deploy", env: "Write env", "env-read": "Import env", "executor-upgrade": "Upgrade executor" };
+export const KIND: Record<string, string> = { build: "Build", deploy: "Deploy", env: "Write env", "env-read": "Import env", "executor-upgrade": "Upgrade executor", "deployer-upgrade": "Upgrade Deployer" };
 const when = (iso: string | null | undefined) => (iso ? new Date(iso).toLocaleString("en-US", { hour12: false }) : "—");
 
 export function JobState({ state }: { state: string }) {

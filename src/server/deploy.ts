@@ -20,7 +20,7 @@ import { buildRequests, deployPermission, isProd, manifestRef, plan, type Bundle
 import { isKey } from "./keys.ts";
 import { DEPLOYER_TYPES, RolloutError, Runner, type Rollout, type RolloutStep } from "./rollout.ts";
 import type { Versions } from "./versions.ts";
-import { FINAL_STATES, type Actor, type ExecutorStatus, type Job, type Store } from "./store.ts";
+import { FINAL_STATES, StoreError, type Actor, type DeployRecord, type EnvironmentRevision, type ExecutorStatus, type Job, type Store } from "./store.ts";
 
 export type EnvState = { managed: boolean; keys: string[]; revision: number | null; pending: boolean };
 
@@ -49,6 +49,9 @@ export function deploymentRecord(job: Job, repo: string | undefined) {
     artifact_digest: result.digests ?? null,
     // The env revision on the server when the deploy was planned (phase 3).
     config_revision: typeof job.request.envRevision === "number" ? `${job.app}.env#${job.request.envRevision}` : null,
+    // D38: the environment settings revision the plan used.
+    environment_revision: typeof job.request.environmentRevision === "number" ? job.request.environmentRevision : null,
+    manifest_ref: job.manifest,
     deployed_at: job.state === "succeeded" ? job.finishedAt : null,
     observation: job.observation ?? null,
     ...(job.diagnosis ? { diagnosis: job.diagnosis } : {}),
@@ -78,6 +81,8 @@ export class Deployments {
   /** Set by the env manager (phase 3): what the server's env file holds, and what to do when its jobs finish. */
   envState?: (app: string) => EnvState | undefined;
   afterJob?: (job: Job, status: ExecutorStatus) => Promise<void>;
+  /** More listeners for a job's end (D39: the next host of an executor upgrade batch). */
+  readonly onEnded: ((job: Job, status: ExecutorStatus) => Promise<void> | void)[] = [];
 
   /** The app's env file as last written to the server, decrypted (env manager), for ${KEY} in component settings. */
   envValues?: (app: string) => Record<string, string> | undefined;
@@ -117,9 +122,28 @@ export class Deployments {
     }, () => new Date(this.now()));
   }
 
-  /** The environment file's settings, with each app at the version the Deployer last deployed (§7.1). */
-  environment(): { env: Environment; deployed: Record<string, string> } {
+  /** D38: the environment settings as saved in the state database; environment.json is read once, on the first start,
+   *  as revision 1. Afterwards the file is only the starting point (the page says when it differs). */
+  settings(): EnvironmentRevision {
+    const latest = this.store.environmentRevision();
+    if (latest) return latest;
     const file = JSON.parse(readFileSync(this.environmentFile, "utf8")) as Environment;
+    try {
+      return this.store.saveEnvironment(file, null, { id: "deployer", via: "cli" }, { source: "import", note: `Imported from ${this.environmentFile}` });
+    } catch (error) {
+      if (error instanceof StoreError && error.code === "environment/stale") return this.store.environmentRevision()!;
+      throw error;
+    }
+  }
+
+  /** D38: whether environment.json no longer matches the newest revision (someone edited the file; it is not read again). */
+  fileDiffers(): boolean {
+    try { return JSON.stringify(JSON.parse(readFileSync(this.environmentFile, "utf8"))) !== JSON.stringify(this.settings().environment); } catch { return false; }
+  }
+
+  /** The environment settings, with each app at the version the Deployer last deployed (§7.1). */
+  environment(): { env: Environment; deployed: Record<string, string> } {
+    const file = this.settings().environment;
     const deployed: Record<string, string> = {};
     const apps = { ...file.apps };
     for (const app of this.store.listApps()) {
@@ -158,6 +182,44 @@ export class Deployments {
       release = this.releases ? await this.releases.release(manifest.release.repo, manifest.release.tag.replaceAll("{version}", version)) : { released: false, detail: "Cannot query GitHub Releases" };
     }
     return { soakHours: env.apps[appId]?.uatSoakHours ?? 0, uat, release, ...(override ? { override } : {}), now: this.now() };
+  }
+
+  /** D38 ⑤: PROD deploys with the manifest revision UAT deployed this version with, or the one UAT would use now, kept
+   *  here under UAT's revision number. Without a UAT Deployer, PROD's own copy is used and the plan says so. */
+  private async manifestFromUat(appId: string, version: string, record: DeployRecord | undefined): Promise<PlanContext["fromUat"]> {
+    if (!this.peer?.configured) return { error: "no UAT Deployer is configured (DEPLOYER_UAT_URL)" };
+    const actor: Actor = { id: "deployer", via: "cli" };
+    try {
+      const ref = /^(.+)@(.+)#(\d+)$/.exec(record?.manifest ?? "");
+      if (ref && ref[1] === appId) {
+        const revision = Number(ref[3]);
+        // Always UAT's copy: PROD's own one under the same number is compared with it, never trusted instead.
+        const body = await this.peer.manifest(appId, ref[2]!, revision);
+        this.store.mirrorManifest(body, revision, actor);
+        return { body, ref: record!.manifest!, note: `Uses manifest ${record!.manifest}, as UAT deploy ${record!.id} did (D38).` };
+      }
+      const now = await this.peer.manifestFor(appId, version);
+      this.store.mirrorManifest(now.manifest, now.revision, actor);
+      const r = `${appId}@${now.manifest.appliesFrom}#${now.revision}`;
+      return { body: now.manifest, ref: r, note: `Uses UAT's current manifest ${r} for ${version}${record ? ` (UAT deploy ${record.id} has no manifest revision recorded)` : ""} (D38).` };
+    } catch (error) {
+      if (error instanceof StoreError && error.code === "manifest/uat-mismatch") return { error: error.message, blocking: true };
+      return { error: (error as Error).message };
+    }
+  }
+
+  /** D38 ⑤: every app's newest manifests from UAT, kept here under UAT's revision numbers. */
+  async takeRegistryFromUat(actor: Actor): Promise<{ added: string[]; unchanged: number }> {
+    if (!isProd(this.environment().env)) throw new DeployError(409, "registry/not-prod", "Only PROD takes its registry from UAT.");
+    if (!this.peer?.configured) throw new DeployError(409, "registry/no-uat", "No UAT Deployer is configured (DEPLOYER_UAT_URL).");
+    const uat = await this.peer.apps().catch((error: Error) => { throw new DeployError(409, "registry/uat", error.message); });
+    const added: string[] = [];
+    let unchanged = 0;
+    for (const a of uat.apps) for (const m of a.manifests) {
+      if (this.store.mirrorManifest(m.manifest, m.revision, actor, a.name) === "added") added.push(`${a.id}@${m.manifest.appliesFrom}#${m.revision}`);
+      else unchanged++;
+    }
+    return { added, unchanged };
   }
 
   /** The release bundle a manifest names at a version (§5.1 release-asset): downloaded once, then from disk. */
@@ -257,9 +319,10 @@ export class Deployments {
       if (override.reason.trim().length < 4) throw new DeployError(400, "deploy/override-reason", "Skipping the promotion rule needs a reason.");
     }
     const promotion = await this.promotionInput(env, appId, version, override ? { reason: override.reason.trim(), by: principal.id } : undefined);
+    const fromUat = isProd(env) && !pins ? await this.manifestFromUat(appId, version, promotion?.uat.record) : undefined;
     const outside = await this.outside(env, appId, version, deployed[appId] ?? null, pins?.manifest?.body);
     return plan({
-      env, app, manifests: this.manifests(), deployed, principal, executor: this.handoff.executor(hostOf(env, appId)),
+      env, environmentRevision: this.settings().revision, app: this.store.app(appId) ?? app, manifests: this.manifests(), deployed, principal, ...(fromUat ? { fromUat } : {}), executor: this.handoff.executor(hostOf(env, appId)),
       active: this.store.activeJobs(), built: (v) => this.store.successfulBuild(appId, v), ...(pins ? { pins } : {}),
       ...(this.envState ? { envState: this.envState(appId) } : {}), ...(promotion ? { promotion } : {}), ...outside,
       ...(env.requireEvaluation ? { evaluated: Boolean(this.evaluated?.(appId, version)) || this.store.deployRecords(appId, version).length > 0 } : {}),
@@ -377,6 +440,7 @@ export class Deployments {
     this.recordArtifacts(job, status);
     if (job.kind === "deploy" && status.state === "succeeded") await this.observe(job);
     if (this.afterJob) await this.afterJob(job, status);
+    for (const listener of this.onEnded) await listener(job, status);
     if (job.kind === "deploy" && (status.state === "failed" || status.state === "rolled-back") && this.onFailure) await this.onFailure(job);
     if (job.rollout?.notice && this.maintenance) await this.maintenance.clearMaintenance().catch((error) => console.error(`maintenance notice of ${job.id}:`, error));
   }

@@ -230,3 +230,30 @@ table.env-values.edit input { width: 100%; box-sizing: border-box; }
 .edit-bar { position: sticky; bottom: 0; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 10px 12px; margin-top: 10px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 -4px 12px rgba(0, 0, 0, .06); }
 .edit-bar > .muted { flex-basis: 100%; font-size: 12px; }
 .edit-bar input { flex: 1; }
+
+/* D39: the Overview's Platform area, apart from the apps. */
+.platform { margin-bottom: 18px; }
+.platform.folded { display: flex; gap: 12px; align-items: center; padding: 8px 14px; }
+.platform-row { border-top: 1px solid var(--border); padding: 10px 0; }
+.platform-head { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.platform-head strong { min-width: 90px; }
+.platform select { min-width: 220px; }
+table.executors td { padding: 4px 10px 4px 0; border: none; }
+/* D38: the environment settings editor. */
+textarea.settings { width: 100%; font-size: 12px; }
+.md { line-height: 1.55; }
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p { margin: 6px 0; }
+.md h3, .md h4, .md h5, .md h6 { margin: 14px 0 4px; font-size: 14px; }
+.md ul, .md ol { margin: 4px 0 8px; padding-left: 20px; }
+.md li { margin: 2px 0; }
+.md code { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; font-size: 12px; }
+.md pre { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; overflow-x: auto; }
+.md pre code { border: 0; padding: 0; background: none; }
+.md-table { overflow-x: auto; margin: 6px 0; }
+.md-table table { border-collapse: collapse; }
+.md-table th, .md-table td { border: 1px solid var(--border); padding: 4px 8px; text-align: left; }
+.brief .md p:first-child { font-weight: 500; }
+.brief-first { margin-top: 8px; padding: 6px 10px; border-left: 3px solid var(--accent); background: var(--bg); border-radius: 0 6px 6px 0; }
+.brief-first p { margin: 0; }

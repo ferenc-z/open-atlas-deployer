@@ -6,8 +6,10 @@ import { randomBytes, X509Certificate } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
 import { Hono, type Context } from "hono";
-import type { Environment } from "../compose/generate.ts";
+import type { Environment, Manifest } from "../compose/generate.ts";
 import { compareVersions, covering } from "../manifest/version.ts";
+import { crossAppConflicts, validateManifest } from "../manifest/validate.ts";
+import { isProd } from "./plan.ts";
 import {
   EMERGENCY_COOKIE, EMERGENCY_TTL_MS, LoginThrottle, emergencyPrincipal, newToken, parseCookies, sha256, verifyPassword,
   type Permission, type Principal, type WorkbenchSessions,
@@ -25,6 +27,9 @@ import { EXECUTOR_VERSION, hostIds, hostOf, newJobId, tokenSha256 } from "./hand
 import { lineDiff } from "./ingress.ts";
 import { environmentStatus, hostStateOf, parseDockerPs, type Observer } from "./observe.ts";
 import { StoreError, type Actor, type Store } from "./store.ts";
+import { DEPLOYER_VERSION } from "./version.ts";
+import { validateEnvironment } from "./environment.ts";
+import { applyPatch, changedPaths, PatchError } from "./jsonpatch.ts";
 import type { Versions } from "./versions.ts";
 
 export interface Dependencies {
@@ -112,11 +117,11 @@ export function createApp({ config, store, sessions, observer, deployments, vers
   };
   api.post("/executor/v1/heartbeat", executorRoute(async (c, host) => {
     handoff.heartbeat(host, await c.req.json());
-    return c.json({ ok: true, host });
+    return c.json({ ok: true, host, deployer: DEPLOYER_VERSION });
   }));
   api.get("/executor/v1/jobs/next", executorRoute(async (c, host) => {
     const wait = Math.min(30, Math.max(0, Number(c.req.query("wait") ?? 0))) * 1000;
-    const job = await handoff.next(host, wait);
+    const job = await handoff.next(host, wait, c.req.raw.signal);
     return job ? c.json({ job }) : c.body(null, 204);
   }));
   const ownJob = (handler: (c: Context, id: string) => Promise<Response>) => executorRoute(async (c, host) => {
@@ -151,6 +156,110 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     return { available, ...(blocked ? { blocked } : {}), job, from: info.heartbeat?.upgradeFrom ?? null };
   };
 
+  // D16: the Deployer's own upgrade. The executor of the host that runs it (its heartbeat names the image repository)
+  // pulls the version, backs up the state, switches and checks; the Deployer is down meanwhile and the executor reports
+  // the end to whichever version runs afterwards. Its job's app is "deployer".
+  const selfOf = (env: Environment) => {
+    const runs = hostIds(env).map((h) => handoff.executor(h)).filter((e) => e.heartbeat?.deployer?.image);
+    const at = runs.length === 1 ? runs[0]! : undefined;
+    const last = store.listJobs({ app: "deployer", kind: "deployer-upgrade", limit: 1 })[0];
+    const active = store.activeJobs();
+    const blocked = !runs.length ? "No executor says it runs the Deployer: set EXECUTOR_DEPLOYER_DIR and EXECUTOR_DEPLOYER_IMAGE on its host"
+      : runs.length > 1 ? `Executors on ${runs.map((r) => r.host).join(", ")} all say they run the Deployer; only one may`
+      : !at!.online ? at!.reason
+      : !at!.heartbeat?.kinds?.includes("deployer-upgrade") ? `Executor ${at!.heartbeat?.version} on ${at!.host} cannot upgrade the Deployer: upgrade it to ${EXECUTOR_VERSION} first`
+      : active.length ? `${active.map((j) => j.id).join(", ")} ${active.length > 1 ? "are" : "is"} running; upgrade when nothing runs`
+      : undefined;
+    return {
+      version: DEPLOYER_VERSION, host: at?.host ?? null, image: at?.heartbeat?.deployer?.image ?? null, ...(blocked ? { blocked } : {}),
+      job: last ? { id: last.id, state: last.state, version: last.version, fromVersion: last.fromVersion, message: last.message, finishedAt: last.finishedAt } : null,
+    };
+  };
+  api.get("/api/deployer", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    return c.json(selfOf(deployments.environment().env));
+  });
+  api.post("/api/deployer/upgrade", async (c) => {
+    const p = await authenticate(c, "admin");
+    if (p instanceof Response) return p;
+    if (isKey(p)) return reject(c, 403, "auth/browser-only", "The Deployer is upgraded only from a browser session, not API keys.");
+    const version = String(((await c.req.json().catch(() => ({}))) as { version?: unknown }).version ?? "").trim();
+    if (!/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(version)) return reject(c, 400, "deployer/version", "Give the version to upgrade to, e.g. 0.2.0.");
+    if (version === DEPLOYER_VERSION) return reject(c, 409, "deployer/same-version", `The Deployer already runs ${version}.`);
+    const older = /^\d+\.\d+\.\d+/.test(DEPLOYER_VERSION) && compareVersions(version, DEPLOYER_VERSION) < 0;
+    if (older && ((await c.req.json().catch(() => ({}))) as { confirmOlder?: unknown }).confirmOlder !== true) return reject(c, 409, "deployer/older", `${version} is older than ${DEPLOYER_VERSION}: confirm going back.`);
+    const { env } = deployments.environment();
+    const self = selfOf(env);
+    if (self.blocked) return reject(c, 409, "deployer/upgrade-blocked", self.blocked);
+    const id = newJobId("deployer-upgrade");
+    const request = { kind: "deployer-upgrade", version };
+    store.addJob({ id, kind: "deployer-upgrade", app: "deployer", version, environment: env.name, fromVersion: DEPLOYER_VERSION, manifest: null, pinFrom: null, request }, { id: p.id, via: p.via });
+    handoff.submit(id, { ...request, requestedBy: p.id }, self.host!);
+    return c.json({ job: store.job(id) }, 201);
+  });
+
+  // D38: the environment settings as revisions in the state database (environment.json is read only on the first start).
+  // A change names the revision it was made on (base) and gives either the whole settings or a JSON Patch; it is checked
+  // before saving, and validate shows the result without saving. Saving does not deploy: plans read the newest revision.
+  type EnvironmentBody = { base?: unknown; environment?: unknown; patch?: unknown; note?: unknown };
+  const environmentChange = (body: EnvironmentBody) => {
+    const latest = deployments.settings();
+    if (typeof body.base !== "number") throw new DeployError(400, "environment/base", `Give base: the revision the change was made on (the newest is ${latest.revision}).`);
+    const from = store.environmentRevision(body.base);
+    if (!from) throw new DeployError(404, "environment/unknown", `There is no revision ${body.base} of the environment settings.`);
+    if ((body.patch === undefined) === (body.environment === undefined)) throw new DeployError(400, "environment/change", "Give either patch (JSON Patch on the base revision) or environment (the whole settings).");
+    const next = body.patch !== undefined ? applyPatch(from.environment, body.patch) : body.environment;
+    const findings = validateEnvironment(next);
+    return {
+      base: from.revision, latest: latest.revision, stale: from.revision !== latest.revision, environment: next as Environment, changes: changedPaths(from.environment, next),
+      findings, diff: lineDiff(JSON.stringify(from.environment, null, 2), JSON.stringify(next, null, 2)),
+    };
+  };
+  const environmentError = (c: Context, error: unknown) => {
+    if (error instanceof PatchError) return reject(c, 400, "patch/invalid", error.message, [error.at.join("/")]);
+    return deployError(c, error);
+  };
+  api.get("/api/environment", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    const latest = deployments.settings();
+    const shown = c.req.query("revision") ? store.environmentRevision(Number(c.req.query("revision"))) : latest;
+    if (!shown) return reject(c, 404, "environment/unknown", "No such revision of the environment settings.");
+    return c.json({ ...shown, latest: latest.revision, revisions: store.environmentRevisions(), fileDiffers: deployments.fileDiffers(), file: config.environmentFile, canSave: p.permissions.includes("admin") });
+  });
+  api.get("/api/environment/export", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    const r = c.req.query("revision") ? store.environmentRevision(Number(c.req.query("revision"))) : deployments.settings();
+    if (!r) return reject(c, 404, "environment/unknown", "No such revision of the environment settings.");
+    c.header("content-disposition", `attachment; filename="environment-${r.environment.name}-r${r.revision}.json"`);
+    return c.body(`${JSON.stringify(r.environment, null, 2)}\n`, 200, { "content-type": "application/json" });
+  });
+  api.post("/api/environment/validate", async (c) => {
+    const p = await authenticate(c, "admin");
+    if (p instanceof Response) return p;
+    try {
+      const change = environmentChange(await c.req.json().catch(() => ({})) as EnvironmentBody);
+      return c.json(change);
+    } catch (error) { return environmentError(c, error); }
+  });
+  api.put("/api/environment", async (c) => {
+    const p = await authenticate(c, "admin");
+    if (p instanceof Response) return p;
+    const body = await c.req.json().catch(() => ({})) as EnvironmentBody;
+    const newest = deployments.settings().revision;
+    if (typeof body.base === "number" && body.base !== newest) return reject(c, 409, "environment/stale", `The environment settings are at revision ${newest}, not ${body.base}: read them again and make the change on that.`);
+    try {
+      const change = environmentChange(body);
+      if (change.stale) return reject(c, 409, "environment/stale", `The environment settings are at revision ${change.latest}, not ${change.base}: read them again and make the change on that.`);
+      if (change.findings.length) return reject(c, 400, "environment/invalid", "The environment settings are not valid.", change.findings.map((f) => `${f.at}: ${f.expected}`));
+      if (!change.changes.length) return reject(c, 400, "environment/unchanged", "Nothing changed.");
+      const saved = store.saveEnvironment(change.environment, change.base, actorOf(p), { ...(typeof body.note === "string" && body.note.trim() ? { note: body.note.trim() } : {}) });
+      return c.json({ revision: saved.revision, changes: saved.changes, savedAt: saved.savedAt });
+    } catch (error) { return environmentError(c, error); }
+  });
+
   // D35: the hosts of this environment, their executors, and the tokens they call in with.
   api.get("/api/hosts", async (c) => {
     const p = await authenticate(c, "view");
@@ -169,21 +278,103 @@ export function createApp({ config, store, sessions, observer, deployments, vers
       })),
     });
   });
+  const startExecutorUpgrade = (actor: Actor, host: string) => {
+    const { env } = deployments.environment();
+    if (!hostIds(env).includes(host)) throw new DeployError(404, "host/unknown", `${host} is not a host of this environment (environment settings hosts).`);
+    const upgrade = upgradeOf(env, host);
+    if (!upgrade.available) throw new DeployError(409, "executor/up-to-date", `The executor on ${host} is not older than ${EXECUTOR_VERSION}.`);
+    if (upgrade.blocked) throw new DeployError(409, "executor/upgrade-blocked", upgrade.blocked);
+    const id = newJobId("executor-upgrade");
+    const request = { kind: "executor-upgrade", version: EXECUTOR_VERSION };
+    store.addJob({ id, kind: "executor-upgrade", app: `executor@${host}`, version: EXECUTOR_VERSION, environment: env.name, fromVersion: handoff.executor(host).heartbeat?.version ?? null, manifest: null, pinFrom: null, request }, actor);
+    handoff.submit(id, { ...request, requestedBy: actor.id }, host);
+    return store.job(id)!;
+  };
   api.post("/api/hosts/:id/upgrade-executor", async (c) => {
     const p = await authenticate(c, "admin");
     if (p instanceof Response) return p;
     if (isKey(p)) return reject(c, 403, "auth/browser-only", "Executor upgrades are started only from a browser session, not API keys.");
-    const host = c.req.param("id");
+    try { return c.json({ job: startExecutorUpgrade(actorOf(p), c.req.param("id")) }, 201); } catch (error) { return deployError(c, error); }
+  });
+
+  // D39: every outdated executor, one host after the other; a failed or rolled-back one stops the rest.
+  type Batch = { by: Actor; startedAt: string; current: { host: string; job: string } | null; remaining: string[]; done: string[]; stopped?: string; finishedAt?: string };
+  const batchOf = (): Batch | null => { const raw = store.setting("executor-upgrade-batch"); return raw ? JSON.parse(raw) as Batch : null; };
+  const saveBatch = (b: Batch) => store.setSetting("executor-upgrade-batch", JSON.stringify(b), { id: "deployer", via: "cli" });
+  const nextInBatch = (b: Batch) => {
+    while (b.remaining.length) {
+      const host = b.remaining.shift()!;
+      try { b.current = { host, job: startExecutorUpgrade(b.by, host).id }; return; } catch (error) { b.current = null; b.stopped = `${host}: ${(error as Error).message}`; return; }
+    }
+    b.current = null;
+    b.finishedAt = new Date().toISOString();
+  };
+  deployments.onEnded.push((job, status) => {
+    const b = batchOf();
+    if (job.kind !== "executor-upgrade" || !b?.current || b.current.job !== job.id) return;
+    if (status.state === "succeeded") { b.done.push(b.current.host); nextInBatch(b); }
+    else { b.stopped = `${b.current.host}: ${status.message ?? status.state}`; b.current = null; }
+    saveBatch(b);
+  });
+  api.post("/api/hosts/upgrade-outdated", async (c) => {
+    const p = await authenticate(c, "admin");
+    if (p instanceof Response) return p;
+    if (isKey(p)) return reject(c, 403, "auth/browser-only", "Executor upgrades are started only from a browser session, not API keys.");
+    const running = batchOf();
+    if (running?.current) return reject(c, 409, "executor/batch-running", `An upgrade of the executors is running (${running.current.host}).`);
     const { env } = deployments.environment();
-    if (!hostIds(env).includes(host)) return reject(c, 404, "host/unknown", `${host} is not a host of this environment (environment.json hosts).`);
-    const upgrade = upgradeOf(env, host);
-    if (!upgrade.available) return reject(c, 409, "executor/up-to-date", `The executor on ${host} is not older than ${EXECUTOR_VERSION}.`);
-    if (upgrade.blocked) return reject(c, 409, "executor/upgrade-blocked", upgrade.blocked);
-    const id = newJobId("executor-upgrade");
-    const request = { kind: "executor-upgrade", version: EXECUTOR_VERSION };
-    store.addJob({ id, kind: "executor-upgrade", app: `executor@${host}`, version: EXECUTOR_VERSION, environment: env.name, fromVersion: handoff.executor(host).heartbeat?.version ?? null, manifest: null, pinFrom: null, request }, { id: p.id, via: p.via });
-    handoff.submit(id, { ...request, requestedBy: p.id }, host);
-    return c.json({ job: store.job(id) }, 201);
+    const hosts = hostIds(env).filter((h) => { const u = upgradeOf(env, h); return u.available && !u.blocked; });
+    if (!hosts.length) return reject(c, 409, "executor/none-outdated", "No executor can be upgraded now.");
+    const b: Batch = { by: actorOf(p), startedAt: new Date().toISOString(), current: null, remaining: hosts, done: [] };
+    try { b.current = { host: hosts[0]!, job: startExecutorUpgrade(b.by, hosts[0]!).id }; b.remaining.shift(); } catch (error) { return deployError(c, error); }
+    saveBatch(b);
+    return c.json({ batch: b }, 201);
+  });
+
+  // D39: what the Overview's Platform area shows: the Deployer (versions to choose from) and each host's executor.
+  const deployerVersions = async () => {
+    const src = config.deployerRelease;
+    const running = DEPLOYER_VERSION;
+    if (!src) return { versions: [] as { version: string; prerelease: boolean; relation: string }[], error: "DEPLOYER_RELEASE_REPO is not set: type the version" };
+    if ("error" in src) return { versions: [], error: src.error };
+    const listed = await versions.list(src.repo, config.deployerReleaseTag);
+    const known = /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(running);
+    const all = [...new Set([...listed.versions, ...(known ? [running] : [])])].sort((a, b) => compareVersions(b, a)).slice(0, 30);
+    const list = all.map((v) => ({ version: v, prerelease: v.includes("-"), relation: !known ? "unknown" : compareVersions(v, running) > 0 ? "newer" : compareVersions(v, running) < 0 ? "older" : "running" }));
+    // A pre-release is offered but never announced, unless a pre-release is what runs.
+    const latest = list.find((v) => v.relation === "newer" && (!v.prerelease || running.includes("-")))?.version ?? null;
+    return { versions: list, latest, ...(listed.error ? { error: listed.error } : {}) };
+  };
+  api.get("/api/platform", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    const { env } = deployments.environment();
+    return c.json({
+      deployer: { ...selfOf(env), ...(await deployerVersions()), repo: config.deployerRelease && "repo" in config.deployerRelease ? config.deployerRelease.repo : null },
+      executors: hostIds(env).map((id) => { const e = handoff.executor(id); return { host: id, online: e.online, ...(e.reason ? { reason: e.reason } : {}), version: e.heartbeat?.version ?? null, upgrade: upgradeOf(env, id) }; }),
+      shipped: EXECUTOR_VERSION, batch: batchOf(), canUpgrade: p.permissions.includes("admin") && !isKey(p),
+    });
+  });
+  api.get("/api/deployer/plan", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    const version = c.req.query("version") ?? "";
+    if (!/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(version)) return reject(c, 400, "deployer/version", "Give the version to upgrade to, e.g. 0.2.0.");
+    const self = selfOf(deployments.environment().env);
+    const older = /^\d+\.\d+\.\d+/.test(DEPLOYER_VERSION) && compareVersions(version, DEPLOYER_VERSION) < 0;
+    const src = config.deployerRelease;
+    const release = src && "repo" in src ? await versions.release(src.repo, config.deployerReleaseTag.replaceAll("{version}", version)) : undefined;
+    return c.json({
+      from: DEPLOYER_VERSION, to: version, host: self.host, image: self.image, older, same: version === DEPLOYER_VERSION,
+      ...(self.blocked ? { blocked: self.blocked } : {}), ...(release ? { release } : {}),
+      steps: ["Pull the image and check its labels (version, executor protocols); a missing image stops here, before anything stops",
+        "Stop the Deployer: this page is unavailable for about a minute", "Back up its state directory (data/)", "Switch the image in .env and start it",
+        "Check it becomes healthy and answers as the new version", "If not: put the previous image and the state from before back"],
+      warnings: [
+        ...(older ? [`Going back from ${DEPLOYER_VERSION} to ${version}: the state database only gains tables and columns, so an older version usually reads it; if it does not start, the executor puts ${DEPLOYER_VERSION} back.`] : []),
+        "Afterwards the executors are offered the version the new Deployer ships.",
+      ],
+    });
   });
   api.post("/api/hosts/:id/token", async (c) => {
     const p = await authenticate(c, "admin");
@@ -277,7 +468,10 @@ export function createApp({ config, store, sessions, observer, deployments, vers
         ...(spec.body !== undefined ? { body: JSON.stringify(spec.body) } : {}),
       }));
       internal.delete(nonce);
-      return { status: res.status, body: await res.json().catch(() => null) };
+      const raw = await res.text();
+      let body: unknown = raw;
+      try { body = raw ? JSON.parse(raw) : null; } catch { /* a text answer, e.g. an nginx configuration */ }
+      return { status: res.status, body };
     };
     const reply = await handleMcp(message, { principal, store, call });
     return reply ? c.json(reply) : c.body(null, 202);
@@ -346,7 +540,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     try { keys.revoke(p, c.req.param("id")); return c.json({ revoked: true }); } catch (error) { return keyError(c, error); }
   });
 
-  const environment = (): Environment => JSON.parse(readFileSync(config.environmentFile, "utf8"));
+  const environment = (): Environment => deployments.settings().environment;
   const deployError = (c: Context, error: unknown) => {
     if (error instanceof DeployError) return reject(c, error.status, error.code, error.message, error.details);
     if (error instanceof StoreError) return reject(c, 400, error.code, error.message, error.details);
@@ -378,6 +572,22 @@ export function createApp({ config, store, sessions, observer, deployments, vers
 
   api.get("/api/peer/apps/:id/deployments", (c) => c.json({ environment: deployments.environment().env.name, records: store.deployRecords(c.req.param("id"), c.req.query("version") || undefined).slice(0, 20) }));
 
+  // D38 ⑤: PROD takes its manifests from here, by the revision a deploy used or the one that covers a version now.
+  api.get("/api/peer/apps", (c) => c.json({
+    environment: deployments.environment().env.name,
+    apps: store.listApps().map((a) => ({ id: a.id, name: a.name, repo: a.repo, manifests: store.manifestSegments(a.id).map((s) => ({ revision: s.revision, manifest: store.manifestRevision(a.id, s.appliesFrom, s.revision)! })) })),
+  }));
+  api.get("/api/peer/apps/:id/manifests/:from/:revision", (c) => {
+    const m = store.manifestRevision(c.req.param("id"), c.req.param("from"), Number(c.req.param("revision")));
+    return m ? c.json(m) : reject(c, 404, "manifest/unknown", "No such manifest revision.");
+  });
+  api.get("/api/peer/apps/:id/manifest", (c) => {
+    const id = c.req.param("id");
+    const m = covering(store.manifests(id), c.req.query("version") ?? "");
+    if (!m) return reject(c, 404, "manifest/none", `No manifest covers ${c.req.query("version")} here.`);
+    return c.json({ revision: store.manifestSegments(id).find((s) => s.appliesFrom === m.appliesFrom)!.revision, manifest: m });
+  });
+
   api.get("/api/peer/apps/:id/env/fingerprint", (c) => {
     try { return c.json(envVars.fingerprintOf(c.req.param("id"))); } catch (error) { return deployError(c, error); }
   });
@@ -392,7 +602,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     }
     let environmentName: string | undefined;
     try { environmentName = environment().name; } catch { environmentName = undefined; }
-    return c.json({ signedIn: true, principal: p, environment: environmentName, workbenchUrl: config.workbenchPublicUrl });
+    return c.json({ signedIn: true, principal: p, environment: environmentName, workbenchUrl: config.workbenchPublicUrl, deployerVersion: DEPLOYER_VERSION });
   });
 
   api.post("/api/emergency/login", async (c) => {
@@ -638,6 +848,21 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     return c.json({ app, manifests: store.manifests(app.id) });
   });
 
+  // D38: one manifest with its revision number (the base of a change), by default the newest range's newest revision.
+  api.get("/api/apps/:id/manifest", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    const id = c.req.param("id");
+    if (!store.app(id)) return reject(c, 404, "app/unknown", "This app is not in the registry.");
+    const ranges = store.manifestSegments(id);
+    const range = c.req.query("applies_from") ? ranges.find((r) => r.appliesFrom === c.req.query("applies_from")) : ranges.at(-1);
+    if (!range) return reject(c, 404, "manifest/unknown", `No range from ${c.req.query("applies_from")}; the ranges start at ${ranges.map((r) => r.appliesFrom).join(", ")}.`);
+    const revision = c.req.query("revision") ? Number(c.req.query("revision")) : range.revision;
+    const manifest = store.manifestRevision(id, range.appliesFrom, revision);
+    if (!manifest) return reject(c, 404, "manifest/unknown", `No revision ${revision} of ${id} from ${range.appliesFrom}.`);
+    return c.json({ app: id, appliesFrom: range.appliesFrom, revision, newest: revision === range.revision, manifest, ranges });
+  });
+
   // One revision as deploy.json (D27: the manifest can be exported).
   api.get("/api/apps/:id/manifests/:from/:revision", async (c) => {
     const p = await authenticate(c, "view");
@@ -648,18 +873,93 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     return c.json(manifest);
   });
 
+  // D38: a manifest change names the range it changes (appliesFrom) or starts (newAppliesFrom) and the revision it was
+  // made on (base), and gives the whole manifest or a JSON Patch on that revision. validate shows the merged manifest,
+  // the findings, what changed and which versions it affects, without saving. PROD takes manifests from UAT (D38 ③⑤).
+  type ManifestBody = { manifest?: unknown; patch?: unknown; appliesFrom?: unknown; newAppliesFrom?: unknown; base?: unknown; note?: unknown; name?: unknown; repoChange?: unknown };
+  const manifestChange = async (p: Principal, appId: string, body: ManifestBody) => {
+    const registered = store.app(appId);
+    const segments = store.manifestSegments(appId);
+    const text = (v: unknown) => (typeof v === "string" && v.trim() ? v.trim() : undefined);
+    const appliesFrom = text(body.appliesFrom), newAppliesFrom = text(body.newAppliesFrom);
+    if (appliesFrom && newAppliesFrom && body.manifest !== undefined) throw new DeployError(400, "manifest/range", "Give appliesFrom (change that range) or newAppliesFrom (start one), not both.");
+    let merged: unknown, source: { appliesFrom: string; revision: number } | undefined;
+    if (body.patch !== undefined) {
+      if (body.manifest !== undefined) throw new DeployError(400, "manifest/change", "Give either patch or manifest, not both.");
+      source = segments.find((s) => s.appliesFrom === appliesFrom);
+      if (!source) throw new DeployError(400, "manifest/range", `A patch applies to an existing range: give appliesFrom, one of ${segments.map((s) => s.appliesFrom).join(", ") || "none (register the app with a whole manifest first)"}.`);
+      if (body.base !== source.revision) throw new DeployError(409, "manifest/stale", `${appId} from ${source.appliesFrom} is at revision ${source.revision}, not ${String(body.base ?? "none")}: read it again (get_manifest) and patch that.`);
+      const patched = applyPatch(store.manifestRevision(appId, source.appliesFrom, source.revision)!, body.patch) as { appliesFrom?: unknown };
+      if (patched.appliesFrom !== source.appliesFrom) throw new DeployError(400, "manifest/range", "A patch cannot change appliesFrom: start a range with newAppliesFrom instead.");
+      merged = newAppliesFrom ? { ...patched, appliesFrom: newAppliesFrom } : patched;
+      if (newAppliesFrom && segments.some((s) => s.appliesFrom === newAppliesFrom)) throw new DeployError(400, "manifest/range", `A range from ${newAppliesFrom} exists already: change it with appliesFrom.`);
+    } else if (body.manifest !== undefined) {
+      merged = body.manifest;
+      const target = (merged as { appliesFrom?: unknown })?.appliesFrom;
+      if (appliesFrom && target !== appliesFrom) throw new DeployError(400, "manifest/range", `The manifest's appliesFrom is ${String(target)}, not ${appliesFrom}.`);
+      if (newAppliesFrom && target !== newAppliesFrom) throw new DeployError(400, "manifest/range", `The manifest's appliesFrom is ${String(target)}, not ${newAppliesFrom}.`);
+      source = segments.find((s) => s.appliesFrom === target);
+      if (newAppliesFrom && source) throw new DeployError(400, "manifest/range", `A range from ${newAppliesFrom} exists already: change it with appliesFrom.`);
+      if (source && body.base !== source.revision) throw new DeployError(409, "manifest/stale", `${appId} from ${source.appliesFrom} is at revision ${source.revision}, not ${String(body.base ?? "none")}: read it again and make the change on that.`);
+    } else throw new DeployError(400, "manifest/missing", "The request has no manifest or patch.");
+    const m = merged as Manifest;
+    if (m?.app !== appId) throw new DeployError(400, "manifest/app-mismatch", `The manifest's app is not ${appId}.`);
+    const findings = validateManifest(m);
+    if (!findings.length) findings.push(...crossAppConflicts([...store.listApps().filter((a) => a.id !== appId).flatMap((a) => store.manifests(a.id)), m]));
+    const warnings: string[] = [];
+    // What the change is compared with: the revision it was made on; the range it lands in is the one saved to.
+    const before = source ? store.manifestRevision(appId, source.appliesFrom, source.revision) : covering(store.manifests(appId), m.appliesFrom ?? "0.0.0");
+    const target = segments.find((s) => s.appliesFrom === m.appliesFrom);
+    const repoChange = Boolean(registered && m.release?.repo && registered.repo !== m.release.repo);
+    if (repoChange) {
+      if (isKey(p)) findings.push(`release.repo: changing the repository (${registered!.repo} → ${m.release!.repo}) is done only on the page, by an administrator`);
+      else if (body.repoChange !== true) findings.push(`release.repo: changes the repository from ${registered!.repo} to ${m.release!.repo}; confirm the change to save it`);
+      warnings.push(`The repository changes from ${registered!.repo} to ${m.release!.repo}: verify the first deploy after it in UAT.`);
+    }
+    for (const c of m.components ?? []) {
+      const was = before?.components.find((x) => x.id === c.id);
+      if (was && JSON.stringify(was.source ?? null) !== JSON.stringify(c.source ?? null)) warnings.push(`${c.id} takes its image from a different source: deploy the affected versions in UAT again before PROD.`);
+    }
+    // Which versions the range covers: deployed ones went out with their own revision (D31); the others take this one.
+    const next = segments.map((s) => s.appliesFrom).filter((v) => /^\d+\.\d+\.\d+/.test(v) && m.appliesFrom && /^\d+\.\d+\.\d+/.test(m.appliesFrom) && compareVersions(v, m.appliesFrom) > 0).sort(compareVersions)[0] ?? null;
+    const inRange = (v: string) => /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(v) && compareVersions(v, m.appliesFrom) >= 0 && (!next || compareVersions(v, next) < 0);
+    const deployedVersions = [...new Set(store.deployRecords(appId).map((r) => r.version))].filter(inRange);
+    const listed = m.release && typeof m.appliesFrom === "string" ? await versions.list(m.release.repo, m.release.tag) : { versions: [] as string[], error: "the manifest has no release" };
+    const affected = { from: m.appliesFrom ?? null, to: next, deployed: deployedVersions, neverDeployed: listed.versions.filter((v) => inRange(v) && !deployedVersions.includes(v)), ...(listed.error ? { versionsUnknown: listed.error } : {}) };
+    const diff = lineDiff(before ? JSON.stringify(before, null, 2) : "", JSON.stringify(m, null, 2));
+    return { app: appId, appliesFrom: m.appliesFrom, base: target?.revision ?? null, newRange: !target, manifest: m, findings, warnings, affected, diff, repoChange };
+  };
+  const manifestError = (c: Context, error: unknown) => {
+    if (error instanceof PatchError) return reject(c, 400, "patch/invalid", error.message, [error.at.join("/")]);
+    if (error instanceof StoreError) return reject(c, error.code === "manifest/stale" ? 409 : 400, error.code, error.message, error.details);
+    return deployError(c, error);
+  };
+  api.post("/api/apps/:id/manifests/validate", async (c) => {
+    const p = await authenticate(c, "admin");
+    if (p instanceof Response) return p;
+    try { return c.json(await manifestChange(p, c.req.param("id"), await c.req.json().catch(() => ({})) as ManifestBody)); } catch (error) { return manifestError(c, error); }
+  });
   api.put("/api/apps/:id/manifests", async (c) => {
     const p = await authenticate(c, "admin");
     if (p instanceof Response) return p;
-    const body = await c.req.json().catch(() => undefined) as { manifest?: { app?: unknown }; name?: string; note?: string } | undefined;
-    if (!body?.manifest) return reject(c, 400, "manifest/missing", "The request has no manifest.");
-    if (body.manifest.app !== c.req.param("id")) return reject(c, 400, "manifest/app-mismatch", `The manifest's app is not ${c.req.param("id")}.`);
+    if (isProd(deployments.environment().env)) return reject(c, 403, "manifest/prod-read-only", "PROD takes its manifests from UAT with each promotion (D38): change the manifest in UAT.");
+    const body = await c.req.json().catch(() => ({})) as ManifestBody;
     try {
-      return c.json(store.saveManifest(body.manifest, actorOf(p), { ...(body.name ? { name: body.name } : {}), ...(body.note ? { note: body.note } : {}) }));
-    } catch (error) {
-      if (error instanceof StoreError) return reject(c, 400, error.code, error.message, error.details);
-      throw error;
-    }
+      const change = await manifestChange(p, c.req.param("id"), body);
+      if (change.findings.length) return reject(c, 400, "manifest/invalid", "The manifest is not valid.", change.findings);
+      const saved = store.saveManifest(change.manifest, actorOf(p), {
+        base: change.base, repoChange: change.repoChange,
+        ...(typeof body.name === "string" && body.name ? { name: body.name } : {}), ...(typeof body.note === "string" && body.note.trim() ? { note: body.note.trim() } : {}),
+      });
+      return c.json({ ...saved, warnings: change.warnings, affected: change.affected });
+    } catch (error) { return manifestError(c, error); }
+  });
+
+  // D38 ⑤: PROD's registry follows UAT's: an administrator takes every app's newest manifests from UAT here.
+  api.post("/api/registry/from-uat", async (c) => {
+    const p = await authenticate(c, "admin");
+    if (p instanceof Response) return p;
+    try { return c.json(await deployments.takeRegistryFromUat(actorOf(p))); } catch (error) { return deployError(c, error); }
   });
 
   api.delete("/api/apps/:id", async (c) => {
@@ -677,7 +977,8 @@ export function createApp({ config, store, sessions, observer, deployments, vers
   api.get("/api/audit", async (c) => {
     const p = await authenticate(c, "admin");
     if (p instanceof Response) return p;
-    return c.json({ entries: store.listAudit(Number(c.req.query("limit") ?? 100)) });
+    const q = (k: string) => c.req.query(k) || undefined;
+    return c.json({ entries: store.listAudit(Number(c.req.query("limit") ?? 100), { actor: q("actor"), action: q("action"), target: q("target"), since: q("since") }) });
   });
 
   api.all("/api/*", (c) => reject(c, 404, "not-found", "No such endpoint."));

@@ -28,6 +28,9 @@ export interface Config {
   templatesDir: string;
   /** GitHub's API (release bundles, release.json for contracts); a stand-in for tests and local runs. */
   githubApi: string;
+  /** D39: where the Deployer's own versions are listed: "github:owner/name" (later "bitbucket:…"), tags as deployerReleaseTag. */
+  deployerRelease?: { kind: "github"; repo: string } | { error: string };
+  deployerReleaseTag: string;
   /** Workbench Administration → API keys key the drivers use (workbench-app, oma-agent; instead of W2 for now). */
   workbenchApiKeyFile?: string;
   /** Studio Builder MCP and the workspace token (oaw_v1., read + write) for studio-graph. */
@@ -80,6 +83,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...(env.DEPLOYER_COMPARE_KEY ? { compareKey: env.DEPLOYER_COMPARE_KEY } : {}),
     templatesDir: resolve(env.DEPLOYER_TEMPLATES_DIR ?? "templates"),
     githubApi: env.DEPLOYER_GITHUB_API ?? "https://api.github.com",
+    ...(env.DEPLOYER_RELEASE_REPO ? { deployerRelease: releaseSource(env.DEPLOYER_RELEASE_REPO) } : {}),
+    deployerReleaseTag: env.DEPLOYER_RELEASE_TAG ?? "v{version}",
     ...(env.DEPLOYER_WORKBENCH_API_KEY_FILE ? { workbenchApiKeyFile: resolve(env.DEPLOYER_WORKBENCH_API_KEY_FILE) } : {}),
     ...(env.DEPLOYER_STUDIO_BUILDER_URL ? { studioBuilderUrl: env.DEPLOYER_STUDIO_BUILDER_URL } : {}),
     ...(env.DEPLOYER_STUDIO_TOKEN_FILE ? { studioTokenFile: resolve(env.DEPLOYER_STUDIO_TOKEN_FILE) } : {}),
@@ -103,4 +108,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     secureCookies: (env.DEPLOYER_SECURE_COOKIES ?? "true") !== "false",
     webDir: resolve(env.DEPLOYER_WEB_DIR ?? "dist/web"),
   };
+}
+
+/** D39: one source for the Deployer's versions, written "<kind>:<repository>"; only GitHub is read for now. */
+export function releaseSource(value: string): { kind: "github"; repo: string } | { error: string } {
+  const m = /^(?:(\w+):)?([A-Za-z0-9][A-Za-z0-9-]*\/[A-Za-z0-9._-]+)$/.exec(value.trim());
+  if (!m) return { error: `DEPLOYER_RELEASE_REPO ${value} is not "github:owner/name"` };
+  if (m[1] && m[1] !== "github") return { error: `DEPLOYER_RELEASE_REPO: ${m[1]} is not read yet; only github: is` };
+  return { kind: "github", repo: m[2]! };
 }

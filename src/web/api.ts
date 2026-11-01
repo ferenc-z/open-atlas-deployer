@@ -9,7 +9,7 @@ import type { Manifest } from "../compose/generate.ts";
 export type { AuditEntry, EnvironmentStatus, Manifest, Principal, RegisteredApp };
 
 export type Me =
-  | { signedIn: true; principal: Principal; environment?: string; workbenchUrl: string }
+  | { signedIn: true; principal: Principal; environment?: string; workbenchUrl: string; deployerVersion?: string }
   | { signedIn: false; workbenchUrl: string; emergencyAvailable: boolean; reason: "unauthenticated" | "workbench-unavailable" }
   | { signedIn: false; forbidden: true; message: string };
 
@@ -51,8 +51,23 @@ export const apps = () => call<{ apps: RegisteredApp[] }>("GET", "apps");
 export const app = (id: string) => call<{ app: RegisteredApp; manifests: Manifest[] }>("GET", `apps/${encodeURIComponent(id)}`);
 export const revision = (id: string, from: string, rev: number) => call<Manifest>("GET", `apps/${encodeURIComponent(id)}/manifests/${encodeURIComponent(from)}/${rev}`);
 export const revisionUrl = (id: string, from: string, rev: number) => `${BASE}api/apps/${encodeURIComponent(id)}/manifests/${encodeURIComponent(from)}/${rev}?download`;
-export const saveManifest = (id: string, manifest: unknown, name?: string, note?: string) =>
-  call<{ revision: number }>("PUT", `apps/${encodeURIComponent(id)}/manifests`, { manifest, ...(name ? { name } : {}), ...(note ? { note } : {}) });
+/** D38: what a manifest change would save: merged manifest, findings, warnings, the versions it affects, the diff. */
+export type ManifestCheck = { appliesFrom: string; base: number | null; newRange: boolean; findings: string[]; warnings: string[]; repoChange: boolean; diff: string;
+  affected: { from: string | null; to: string | null; deployed: string[]; neverDeployed: string[]; versionsUnknown?: string } };
+export const appManifest = (id: string, appliesFrom?: string) => call<{ appliesFrom: string; revision: number; manifest: Manifest; ranges: { appliesFrom: string; revision: number }[] }>("GET", `apps/${encodeURIComponent(id)}/manifest${appliesFrom ? `?applies_from=${encodeURIComponent(appliesFrom)}` : ""}`);
+export const checkManifest = (id: string, manifest: unknown, base: number | null, repoChange = false) => call<ManifestCheck>("POST", `apps/${encodeURIComponent(id)}/manifests/validate`, { manifest, ...(base !== null ? { base } : {}), ...(repoChange ? { repoChange: true } : {}) });
+export const saveManifest = (id: string, manifest: unknown, base: number | null, options: { name?: string; note?: string; repoChange?: boolean } = {}) =>
+  call<{ revision: number; warnings: string[] }>("PUT", `apps/${encodeURIComponent(id)}/manifests`, { manifest, ...(base !== null ? { base } : {}), ...(options.name ? { name: options.name } : {}), ...(options.note ? { note: options.note } : {}), ...(options.repoChange ? { repoChange: true } : {}) });
+export const takeRegistryFromUat = () => call<{ added: string[]; unchanged: number }>("POST", "registry/from-uat", {});
+
+/** D38: the environment settings, kept as revisions. */
+export type EnvironmentView = { revision: number; environment: Record<string, unknown>; changes: string[]; source: string; savedAt: string; savedBy: string; note: string | null;
+  latest: number; revisions: { revision: number; changes: string[]; source: string; savedAt: string; savedBy: string; via: string; note: string | null }[]; fileDiffers: boolean; file: string; canSave: boolean };
+export type EnvironmentCheck = { base: number; latest: number; stale: boolean; changes: string[]; findings: { at: string; expected: string }[]; diff: string };
+export const environmentSettings = (revision?: number) => call<EnvironmentView>("GET", `environment${revision ? `?revision=${revision}` : ""}`);
+export const environmentExportUrl = (revision: number) => `${BASE}api/environment/export?revision=${revision}`;
+export const checkEnvironment = (base: number, environment: unknown) => call<EnvironmentCheck>("POST", "environment/validate", { base, environment });
+export const saveEnvironment = (base: number, environment: unknown, note?: string) => call<{ revision: number; changes: string[] }>("PUT", "environment", { base, environment, ...(note ? { note } : {}) });
 export const removeApp = (id: string) => call<{ removed: string }>("DELETE", `apps/${encodeURIComponent(id)}`);
 export const audit = () => call<{ entries: AuditEntry[] }>("GET", "audit");
 export const emergencyLogin = (password: string) => call<{ signedIn: true }>("POST", "emergency/login", { password });
@@ -74,6 +89,21 @@ export type ExecutorUpgrade = { available: boolean; blocked?: string; from: "git
 export type HostView = { id: string; address: string | null; executor: ExecutorInfo; apps: string[]; report: { at: string; stale: boolean; containers: number } | null; tokens: { prefix: string; createdAt: string; createdBy: string; revokedAt: string | null }[]; upgrade: ExecutorUpgrade };
 export const hosts = () => call<{ executorVersion: string; hosts: HostView[] }>("GET", "hosts");
 export const upgradeExecutor = (id: string) => call<{ job: Job }>("POST", `hosts/${encodeURIComponent(id)}/upgrade-executor`, {});
+/** D39: the Overview's Platform area. */
+export type UpgradeJob = { id: string; state: Job["state"]; version: string; fromVersion?: string | null; message: string | null; finishedAt: string | null };
+export type PlatformView = {
+  deployer: { version: string; host: string | null; image: string | null; blocked?: string; job: UpgradeJob | null; repo: string | null; latest?: string | null; error?: string;
+    versions: { version: string; prerelease: boolean; relation: "newer" | "older" | "running" | "unknown" }[] };
+  executors: { host: string; online: boolean; reason?: string; version: string | null; upgrade: ExecutorUpgrade }[];
+  shipped: string; canUpgrade: boolean;
+  batch: { startedAt: string; current: { host: string; job: string } | null; remaining: string[]; done: string[]; stopped?: string; finishedAt?: string } | null;
+};
+export type DeployerPlan = { from: string; to: string; host: string | null; image: string | null; older: boolean; same: boolean; blocked?: string; steps: string[]; warnings: string[];
+  release?: { released: boolean; detail: string; notes?: string; url?: string } };
+export const platform = () => call<PlatformView>("GET", "platform");
+export const deployerPlan = (version: string) => call<DeployerPlan>("GET", `deployer/plan?version=${encodeURIComponent(version)}`);
+export const upgradeDeployer = (version: string, confirmOlder = false) => call<{ job: Job }>("POST", "deployer/upgrade", { version, ...(confirmOlder ? { confirmOlder: true } : {}) });
+export const upgradeOutdated = () => call<{ batch: PlatformView["batch"] }>("POST", "hosts/upgrade-outdated", {});
 export const issueHostToken = (id: string) => call<{ host: string; token: string }>("POST", `hosts/${encodeURIComponent(id)}/token`, {});
 export const revokeHost = (id: string) => call<{ revoked: number }>("POST", `hosts/${encodeURIComponent(id)}/revoke`, {});
 

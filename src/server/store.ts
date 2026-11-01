@@ -7,7 +7,8 @@ import type { Diagnosis } from "./diagnose.ts";
 import type { DriftItem } from "./drift.ts";
 import type { ApiKey } from "./keys.ts";
 import type { Rollout } from "./rollout.ts";
-import type { Manifest } from "../compose/generate.ts";
+import type { Environment, Manifest } from "../compose/generate.ts";
+import { changedPaths } from "./jsonpatch.ts";
 import { crossAppConflicts, validateManifest } from "../manifest/validate.ts";
 import { compareVersions } from "../manifest/version.ts";
 
@@ -78,6 +79,9 @@ CREATE INDEX IF NOT EXISTS executor_jobs_host ON executor_jobs (host, picked_at,
 CREATE TABLE IF NOT EXISTS executor_hosts (
   host TEXT PRIMARY KEY, heartbeat TEXT, beat_at TEXT, containers TEXT, files TEXT, state_at TEXT);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS environment_revisions (
+  revision INTEGER PRIMARY KEY, body TEXT NOT NULL, changes TEXT NOT NULL, source TEXT NOT NULL, saved_at TEXT NOT NULL,
+  saved_by TEXT NOT NULL, via TEXT NOT NULL, note TEXT);
 CREATE TABLE IF NOT EXISTS nginx_revisions (
   revision INTEGER PRIMARY KEY, body TEXT NOT NULL, sha256 TEXT NOT NULL, saved_at TEXT NOT NULL, saved_by TEXT NOT NULL, note TEXT);
 `;
@@ -113,7 +117,20 @@ export interface EnvRevision {
   appliedJob: string | null;
 }
 
-export type JobKind = "build" | "deploy" | "env" | "env-read" | "executor-upgrade";
+/** D38: one saved version of the environment settings; source import: environment.json read on first start. */
+export interface EnvironmentRevision {
+  revision: number;
+  environment: Environment;
+  /** Paths that changed against the revision before, e.g. apps.shop.version. */
+  changes: string[];
+  source: "import" | "edit";
+  savedAt: string;
+  savedBy: string;
+  via: string;
+  note: string | null;
+}
+
+export type JobKind = "build" | "deploy" | "env" | "env-read" | "executor-upgrade" | "deployer-upgrade";
 
 /**
  * An immutable artifact (§6.1): app@version + component + digest. origin says how it first came here:
@@ -133,7 +150,7 @@ export interface Artifact {
 }
 
 /** A successful deploy as the other Deployer sees it (§6.3): what ran, from when, until when. */
-export interface DeployRecord { id: string; version: string; digests: Record<string, string>; deployedAt: string; replacedAt: string | null; envRevision: number | null }
+export interface DeployRecord { id: string; version: string; digests: Record<string, string>; deployedAt: string; replacedAt: string | null; envRevision: number | null; manifest?: string | null }
 
 export interface Job {
   id: string;
@@ -227,6 +244,12 @@ export class Store {
     return rows.map((r) => JSON.parse(r.body) as Manifest).sort((a, b) => compareVersions(a.appliesFrom, b.appliesFrom));
   }
 
+  /** Each manifest range's newest revision number, oldest appliesFrom first. */
+  manifestSegments(app: string): { appliesFrom: string; revision: number }[] {
+    const rows = this.db.prepare("SELECT applies_from, MAX(revision) AS revision FROM manifests WHERE app = ? GROUP BY applies_from").all(app) as Row[];
+    return rows.map((r) => ({ appliesFrom: r.applies_from, revision: r.revision })).sort((a, b) => compareVersions(a.appliesFrom, b.appliesFrom));
+  }
+
   manifestRevision(app: string, appliesFrom: string, revision: number): Manifest | undefined {
     const r = this.db.prepare("SELECT body FROM manifests WHERE app = ? AND applies_from = ? AND revision = ?").get(app, appliesFrom, revision) as Row | undefined;
     return r && JSON.parse(r.body);
@@ -236,12 +259,12 @@ export class Store {
    * Validates and saves a manifest as a new revision. The first manifest registers the app (§4.4);
    * later ones must keep its release repo, which is what the registry whitelists.
    */
-  saveManifest(value: unknown, actor: Actor, options: { name?: string; note?: string } = {}): { app: string; appliesFrom: string; revision: number } {
+  saveManifest(value: unknown, actor: Actor, options: { name?: string; note?: string; base?: number | null; repoChange?: boolean } = {}): { app: string; appliesFrom: string; revision: number } {
     const errors = validateManifest(value);
     if (errors.length) throw new StoreError("manifest/invalid", "The manifest is not a valid deploy manifest v1.", errors);
     const manifest = value as Manifest;
     const existing = this.app(manifest.app);
-    if (existing && existing.repo !== manifest.release!.repo) {
+    if (existing && existing.repo !== manifest.release!.repo && !options.repoChange) {
       throw new StoreError("manifest/repo-changed", `${manifest.app} is registered for ${existing.repo}; a manifest for ${manifest.release!.repo} needs a new registration.`);
     }
     const others = this.listApps().filter((a) => a.id !== manifest.app).flatMap((a) => this.manifests(a.id));
@@ -261,12 +284,84 @@ export class Store {
         this.db.prepare("UPDATE apps SET name = ? WHERE id = ?").run(options.name, manifest.app);
       }
       const last = this.db.prepare("SELECT MAX(revision) AS r FROM manifests WHERE app = ? AND applies_from = ?").get(manifest.app, manifest.appliesFrom) as Row;
+      // D38: a change names the revision it was made on; an older one would overwrite a change nobody saw.
+      if (options.base !== undefined && (last.r ?? null) !== options.base) {
+        throw new StoreError("manifest/stale", `${manifest.app} from ${manifest.appliesFrom} is at revision ${last.r ?? "none"}, not ${options.base ?? "none"}: read it again and make the change on that.`);
+      }
+      if (existing && existing.repo !== manifest.release!.repo) {
+        this.db.prepare("UPDATE apps SET repo = ? WHERE id = ?").run(manifest.release!.repo, manifest.app);
+        this.insertAudit(actor, "app.repo-change", manifest.app, { from: existing.repo, to: manifest.release!.repo });
+      }
       const revision = (last.r ?? 0) + 1;
       this.db.prepare("INSERT INTO manifests (app, applies_from, revision, body, saved_at, saved_by, note) VALUES (?, ?, ?, ?, ?, ?, ?)")
         .run(manifest.app, manifest.appliesFrom, revision, JSON.stringify(manifest), at, actor.id, options.note ?? null);
       this.insertAudit(actor, existing ? "manifest.save" : "app.register", `${manifest.app}@${manifest.appliesFrom}`, { revision });
       this.db.exec("COMMIT");
       return { app: manifest.app, appliesFrom: manifest.appliesFrom, revision };
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /** D38: the environment settings at a revision; the newest when none is given. */
+  environmentRevision(revision?: number): EnvironmentRevision | undefined {
+    const r = (revision === undefined
+      ? this.db.prepare("SELECT * FROM environment_revisions ORDER BY revision DESC LIMIT 1").get()
+      : this.db.prepare("SELECT * FROM environment_revisions WHERE revision = ?").get(revision)) as Row | undefined;
+    return r && { revision: r.revision, environment: JSON.parse(r.body), changes: JSON.parse(r.changes), source: r.source, savedAt: r.saved_at, savedBy: r.saved_by, via: r.via, note: r.note ?? null };
+  }
+
+  environmentRevisions(): Omit<EnvironmentRevision, "environment">[] {
+    return (this.db.prepare("SELECT revision, changes, source, saved_at, saved_by, via, note FROM environment_revisions ORDER BY revision DESC").all() as Row[])
+      .map((r) => ({ revision: r.revision, changes: JSON.parse(r.changes), source: r.source, savedAt: r.saved_at, savedBy: r.saved_by, via: r.via, note: r.note ?? null }));
+  }
+
+  /** Saves a new revision of the environment settings. base: the revision the change was made on (null for the first);
+   *  an older one is refused, so nobody overwrites a change they did not see. The caller checks it (validateEnvironment). */
+  saveEnvironment(environment: Environment, base: number | null, actor: Actor, options: { note?: string; source?: "import" | "edit" } = {}): EnvironmentRevision {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const latest = this.environmentRevision();
+      if ((latest?.revision ?? null) !== base) {
+        throw new StoreError("environment/stale", latest ? `The environment settings are at revision ${latest.revision}, not ${base ?? "none"}: read them again and make the change on that.` : "There are no environment settings yet: save without a base.");
+      }
+      const revision = (latest?.revision ?? 0) + 1;
+      const changes = latest ? changedPaths(latest.environment, environment) : ["(imported)"];
+      const source = options.source ?? "edit";
+      this.db.prepare("INSERT INTO environment_revisions (revision, body, changes, source, saved_at, saved_by, via, note) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+        .run(revision, JSON.stringify(environment), JSON.stringify(changes), source, this.stamp(), actor.id, actor.via, options.note ?? null);
+      this.insertAudit(actor, source === "import" ? "environment.import" : "environment.save", `environment#${revision}`, { changes, ...(options.note ? { note: options.note } : {}) });
+      this.db.exec("COMMIT");
+      return this.environmentRevision(revision)!;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /** D38 ⑤: PROD keeps UAT's manifest revisions under UAT's numbers. One already here must be the same, or PROD and UAT
+   *  would deploy different manifests under one name. Registers the app on its first manifest. */
+  mirrorManifest(manifest: Manifest, revision: number, actor: Actor, name?: string): "added" | "unchanged" {
+    const kept = this.manifestRevision(manifest.app, manifest.appliesFrom, revision);
+    if (kept) {
+      if (JSON.stringify(kept) !== JSON.stringify(manifest)) throw new StoreError("manifest/uat-mismatch", `${manifest.app}@${manifest.appliesFrom}#${revision} here differs from UAT's: PROD's copy was changed here. Compare the two and take UAT's.`);
+      return "unchanged";
+    }
+    const existing = this.app(manifest.app);
+    const at = this.stamp();
+    this.db.exec("BEGIN");
+    try {
+      if (!existing || existing.repo !== manifest.release?.repo) {
+        this.db.prepare(`INSERT INTO apps (id, name, repo, added_at, added_by) VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT (id) DO UPDATE SET repo = excluded.repo, removed_at = NULL, removed_by = NULL`)
+          .run(manifest.app, name ?? existing?.name ?? manifest.app, manifest.release?.repo ?? "", at, actor.id);
+      }
+      this.db.prepare("INSERT INTO manifests (app, applies_from, revision, body, saved_at, saved_by, note) VALUES (?, ?, ?, ?, ?, ?, ?)")
+        .run(manifest.app, manifest.appliesFrom, revision, JSON.stringify(manifest), at, actor.id, "Taken from UAT");
+      this.insertAudit(actor, existing ? "manifest.from-uat" : "app.register-from-uat", `${manifest.app}@${manifest.appliesFrom}`, { revision });
+      this.db.exec("COMMIT");
+      return "added";
     } catch (error) {
       this.db.exec("ROLLBACK");
       throw error;
@@ -286,8 +381,9 @@ export class Store {
       .run(this.stamp(), actor.id, actor.via, action, target, detail === null ? null : JSON.stringify(detail));
   }
 
-  listAudit(limit = 100): AuditEntry[] {
-    const rows = this.db.prepare("SELECT * FROM audit ORDER BY id DESC LIMIT ?").all(limit) as Row[];
+  listAudit(limit = 100, filter: { actor?: string; action?: string; target?: string; since?: string } = {}): AuditEntry[] {
+    const rows = this.db.prepare(`SELECT * FROM audit WHERE (?1 IS NULL OR actor = ?1) AND (?2 IS NULL OR action LIKE ?2 || '%') AND (?3 IS NULL OR target LIKE ?3 || '%')
+      AND (?4 IS NULL OR at >= ?4) ORDER BY id DESC LIMIT ?5`).all(filter.actor ?? null, filter.action ?? null, filter.target ?? null, filter.since ?? null, limit) as Row[];
     return rows.map((r) => ({ id: r.id, at: r.at, actor: r.actor, via: r.via, action: r.action, target: r.target, detail: r.detail ? JSON.parse(r.detail) : null }));
   }
 
@@ -508,6 +604,8 @@ export class Store {
     const records = rows.map((j, i) => ({
       id: j.id, version: j.version, digests: j.status?.result.digests ?? {}, deployedAt: j.finishedAt!, replacedAt: rows[i + 1]?.finishedAt ?? null,
       envRevision: typeof j.request.envRevision === "number" ? j.request.envRevision : null,
+      // D38 ⑤: PROD deploys with the manifest revision UAT deployed with.
+      manifest: j.manifest,
     }));
     return records.filter((r) => !version || r.version === version).reverse();
   }

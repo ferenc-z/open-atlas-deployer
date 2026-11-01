@@ -8,11 +8,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { createApp } from "../src/server/app.ts";
-import { hashPassword, permissionsFor, WorkbenchSessions } from "../src/server/auth.ts";
+import { hashPassword, permissionsFor, verifyPassword, WorkbenchSessions } from "../src/server/auth.ts";
 import type { Config } from "../src/server/config.ts";
+import type { Environment } from "../src/compose/generate.ts";
 import { Deployments } from "../src/server/deploy.ts";
 import { EnvManager, Schemas } from "../src/server/env.ts";
-import { EXECUTOR_VERSION, Handoff } from "../src/server/handoff.ts";
+import { EXECUTOR_VERSION, Handoff, PROTOCOL } from "../src/server/handoff.ts";
+import { DEPLOYER_VERSION } from "../src/server/version.ts";
 import { Observer } from "../src/server/observe.ts";
 import { Peer } from "../src/server/peer.ts";
 import { SecretBox } from "../src/server/secretbox.ts";
@@ -77,6 +79,8 @@ function setup(options: SetupOptions = {}) {
   const config: Config = {
     bind: "127.0.0.1", port: 0, basePath: "/deploy", dataDir: dir, workbenchUrl: "http://workbench:8090", workbenchPublicUrl: "/",
     environmentFile, observeUrls: {}, secureCookies: false, webDir: join(dir, "web"), templatesDir: join(dir, "templates"), peerKeySha256: options.peerKeys ?? [], githubApi: "https://api.github.com", omaVaults: [], omaAssessorVaults: [], briefHour: 8,
+    // D39: the fake GitHub lists shop-1.2.0, v9 and shop-1.10.0 for any repository.
+    deployerRelease: { kind: "github", repo: "acme/open-atlas-deployer" }, deployerReleaseTag: "shop-{version}",
     ...(options.emergency ? { emergencyPasswordHash: hashPassword(options.emergency) } : {}),
   };
   let now = Date.parse("2026-10-30T10:00:00Z");
@@ -141,6 +145,14 @@ function setup(options: SetupOptions = {}) {
   return { app, request, store, users, workbench, dir, beat, example, released, deployments, reach, advance: (ms: number) => { now += ms; } };
 }
 
+
+/** D38: the environment settings are revisions in the state database; a test sets them as a save would (and writes the
+ *  file too, for a Deployer that has not imported it yet). */
+function setEnvironment(t: { dir: string; store: Store }, value: unknown) {
+  writeFileSync(join(t.dir, "environment.json"), JSON.stringify(value));
+  t.store.saveEnvironment(value as Environment, t.store.environmentRevision()?.revision ?? null, { id: "test", via: "cli" });
+}
+
 const shop = { v: 1, app: "shop", appliesFrom: "1.0.0", release: { repo: "acme/shop", tag: "v{version}", manifest: "package.json" },
   components: [{ id: "web", type: "compose-service", service: "shop", source: { kind: "public-registry", image: "nginx:1.27.0" } }] };
 
@@ -179,9 +191,10 @@ test("only administrators change the registry, and only with the CSRF token", as
   assert.equal((await put("admin")).status, 403);
   const saved = await put("admin", "csrf-admin");
   assert.equal(saved.status, 200);
-  assert.deepEqual(await saved.json(), { app: "shop", appliesFrom: "1.0.0", revision: 1 });
+  const body = await saved.json();
+  assert.deepEqual([body.app, body.appliesFrom, body.revision], ["shop", "1.0.0", 1]);
   assert.equal(store.listAudit()[0]!.actor, "a@x");
-  const bad = await request("/api/apps/shop/manifests", { method: "PUT", as: "admin", headers: { "x-csrf-token": "csrf-admin", "content-type": "application/json" }, body: JSON.stringify({ manifest: { ...shop, components: [] } }) });
+  const bad = await request("/api/apps/shop/manifests", { method: "PUT", as: "admin", headers: { "x-csrf-token": "csrf-admin", "content-type": "application/json" }, body: JSON.stringify({ manifest: { ...shop, components: [] }, base: 1 }) });
   assert.equal(bad.status, 400);
   assert.ok((await bad.json()).details.length > 0);
   const exported = await request("/api/apps/shop/manifests/1.0.0/1?download", { as: "viewer" });
@@ -215,11 +228,19 @@ test("the emergency account works only while Workbench is unreachable, and is au
   const me = await (await request("/api/me", { cookie })).json();
   assert.equal(me.principal.via, "emergency");
   assert.deepEqual(me.principal.permissions, ["view", "deploy-uat", "deploy-prod", "admin"]);
-  assert.deepEqual(store.listAudit().map((e) => e.action), ["emergency.login", "emergency.login-failed"]);
+  assert.deepEqual(store.listAudit().map((e) => e.action).filter((a) => a.startsWith("emergency.")), ["emergency.login", "emergency.login-failed"]);
 
   workbench.up = true;
   advance(20_000);
   assert.equal((await request("/api/me", { cookie })).status, 401);
+});
+
+test("the emergency password hash has no $, which docker compose would read as a variable; older hashes still work", () => {
+  const hash = hashPassword("correct horse battery staple");
+  assert.ok(!hash.includes("$"));
+  assert.ok(verifyPassword("correct horse battery staple", hash));
+  assert.ok(verifyPassword("correct horse battery staple", hash.replaceAll(":", "$")));
+  assert.ok(!verifyPassword("wrong", hash));
 });
 
 test("emergency logins are throttled after five failures", async () => {
@@ -252,7 +273,7 @@ const built = { v: 1, app: "shop", appliesFrom: "1.0.0", release: { repo: "acme/
 
 function withBuiltApp() {
   const t = setup();
-  writeFileSync(join(t.dir, "environment.json"), JSON.stringify({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", registries: { ghcr: "ghcr.io/acme" }, apps: { shop: { version: "1.2.0" } } }));
+  setEnvironment(t, ({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", registries: { ghcr: "ghcr.io/acme" }, apps: { shop: { version: "1.2.0" } } }));
   t.store.saveManifest(built, { id: "t", via: "cli" });
   return t;
 }
@@ -403,7 +424,7 @@ const hosts = { app1: { address: "10.0.1.11" }, app2: { address: "10.0.1.12", bi
 
 test("D35: an executor calls in with its host's token, gets only its host's jobs, and reports back", async () => {
   const t = withBuiltApp();
-  writeFileSync(join(t.dir, "environment.json"), JSON.stringify({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", hosts, registries: { ghcr: "ghcr.io/acme" }, apps: { shop: { version: "1.2.0", host: "app2" } } }));
+  setEnvironment(t, ({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", hosts, registries: { ghcr: "ghcr.io/acme" }, apps: { shop: { version: "1.2.0", host: "app2" } } }));
   const call = (path: string, token: string | undefined, init: RequestInit = {}) => t.app.request(`/deploy${path}`, { ...init, headers: { ...(token ? { authorization: `Bearer ${token}` } : {}), ...(init.body && typeof init.body === "string" && init.body.startsWith("{") ? { "content-type": "application/json" } : {}) } });
   assert.equal((await call("/executor/v1/heartbeat", "dpe_nope", { method: "POST", body: "{}" })).status, 401);
   assert.equal((await post(t, "/api/hosts/app9/token", "admin", {})).status, 404, "only hosts of the environment");
@@ -450,7 +471,7 @@ test("D35: an executor calls in with its host's token, gets only its host's jobs
   assert.ok(t.store.listAudit().some((e) => e.action === "host.token-revoked" && e.target === "app2"));
 
   // app2 taken out of the environment: its last report no longer counts on the status page.
-  writeFileSync(join(t.dir, "environment.json"), JSON.stringify({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", hosts: { app1: hosts.app1 }, registries: { ghcr: "ghcr.io/acme" }, apps: { shop: { version: "1.2.0", host: "app1" } } }));
+  setEnvironment(t, ({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", hosts: { app1: hosts.app1 }, registries: { ghcr: "ghcr.io/acme" }, apps: { shop: { version: "1.2.0", host: "app1" } } }));
   const without = await (await t.request("/api/status", { as: "viewer" })).json();
   assert.ok(!JSON.stringify(without).includes("open-atlas-shop-1"));
 });
@@ -458,7 +479,7 @@ test("D35: an executor calls in with its host's token, gets only its host's jobs
 test("§8.6: an administrator upgrades a host's executor to the version the Deployer ships; the host says how it ended", async () => {
   assert.equal(readFileSync(join(import.meta.dirname, "../executor/deployer_executor.py"), "utf8").match(/^VERSION = "(.+)"$/m)?.[1], EXECUTOR_VERSION, "the Deployer ships the executor beside it");
   const t = withBuiltApp();
-  writeFileSync(join(t.dir, "environment.json"), JSON.stringify({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", hosts, registries: { ghcr: "ghcr.io/acme" }, apps: { shop: { version: "1.2.0", host: "app2" } } }));
+  setEnvironment(t, ({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", hosts, registries: { ghcr: "ghcr.io/acme" }, apps: { shop: { version: "1.2.0", host: "app2" } } }));
   const { token } = await (await post(t, "/api/hosts/app1/token", "admin", {})).json();
   const call = (path: string, init: RequestInit = {}) => t.app.request(`/deploy${path}`, { ...init, headers: { authorization: `Bearer ${token}`, ...(typeof init.body === "string" && init.body.startsWith("{") ? { "content-type": "application/json" } : {}) } });
   const beat = (body: Record<string, unknown>) => call("/executor/v1/heartbeat", { method: "POST", body: JSON.stringify({ protocols: [2], project: "open-atlas", registries: [], databaseBackup: {}, busy: null, ...body }) });
@@ -493,11 +514,40 @@ test("§8.6: an administrator upgrades a host's executor to the version the Depl
   assert.ok(t.store.listAudit().some((e) => e.action === "executor-upgrade.request" && e.target === `executor@app1@${EXECUTOR_VERSION}`));
 });
 
+test("D16: an administrator upgrades the Deployer through the executor of the host that runs it", async () => {
+  assert.equal(DEPLOYER_VERSION, JSON.parse(readFileSync(join(import.meta.dirname, "../package.json"), "utf8")).version);
+  assert.match(readFileSync(join(import.meta.dirname, "../Dockerfile"), "utf8"), new RegExp(`org\\.open-atlas\\.executor-protocols="${PROTOCOL}"`), "the image says which executor protocol it speaks");
+  const t = withBuiltApp();
+  setEnvironment(t, ({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", hosts, registries: { ghcr: "ghcr.io/acme" }, apps: { shop: { version: "1.2.0", host: "app2" } } }));
+  const { token } = await (await post(t, "/api/hosts/app1/token", "admin", {})).json();
+  const beat = async (body: Record<string, unknown>) => (await t.app.request("/deploy/executor/v1/heartbeat", { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ version: EXECUTOR_VERSION, protocols: [2], project: "open-atlas", registries: [], databaseBackup: {}, busy: null, ...body }) })).json();
+  const self = async () => (await t.request("/api/deployer", { as: "viewer" })).json();
+
+  assert.match((await self()).blocked, /No executor says it runs the Deployer/);
+  await beat({ version: "0.6.0", kinds: ["deploy", "executor-upgrade"], deployer: { image: "ghcr.io/acme/open-atlas-deployer" } });
+  assert.match((await self()).blocked, /cannot upgrade the Deployer: upgrade it to .* first/);
+  const answer = await beat({ kinds: ["deploy", "deployer-upgrade"], deployer: { image: "ghcr.io/acme/open-atlas-deployer" } });
+  assert.equal(answer.deployer, DEPLOYER_VERSION, "the heartbeat answer says which Deployer took it");
+  assert.deepEqual(await self(), { version: DEPLOYER_VERSION, host: "app1", image: "ghcr.io/acme/open-atlas-deployer", job: null });
+
+  assert.equal((await post(t, "/api/deployer/upgrade", "uat", { version: "9.0.0" })).status, 403, "administrators only");
+  assert.equal((await post(t, "/api/deployer/upgrade", "admin", { version: "latest" })).status, 400);
+  assert.equal((await post(t, "/api/deployer/upgrade", "admin", { version: DEPLOYER_VERSION })).status, 409);
+  const started = await post(t, "/api/deployer/upgrade", "admin", { version: "9.0.0" });
+  assert.equal(started.status, 201);
+  const { job } = await started.json();
+  assert.deepEqual([job.kind, job.app, job.fromVersion, job.version], ["deployer-upgrade", "deployer", DEPLOYER_VERSION, "9.0.0"]);
+  assert.match((await self()).blocked, /deployer-upgrade-.* is running/, "one at a time, and not beside other jobs");
+  const got = await (await t.app.request("/deploy/executor/v1/jobs/next", { headers: { authorization: `Bearer ${token}` } })).json();
+  assert.deepEqual(Object.keys(got.job).sort(), ["id", "kind", "protocol", "requestedBy", "version"], "the request names only the version");
+  assert.equal(got.job.kind, "deployer-upgrade");
+});
+
 test("D35: each host's compose root holds only the apps placed on it", async () => {
   const t = withBuiltApp();
   t.store.saveManifest({ ...shop, app: "blog", components: [{ id: "web", type: "compose-service", service: "blog", source: { kind: "public-registry", image: "nginx:1.27.0" }, ports: [{ container: 80, host: 18090 }] }] }, { id: "t", via: "cli" });
   // The registry keeps default host ports apart; an environment may put two apps on the same port on different hosts.
-  writeFileSync(join(t.dir, "environment.json"), JSON.stringify({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", hosts, registries: { ghcr: "ghcr.io/acme" }, apps: { shop: { version: "1.2.0", host: "app1" }, blog: { version: "1.0.0", host: "app2", overrides: { web: { ports: { "80": 18080 } } } } } }));
+  setEnvironment(t, ({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", hosts, registries: { ghcr: "ghcr.io/acme" }, apps: { shop: { version: "1.2.0", host: "app1" }, blog: { version: "1.0.0", host: "app2", overrides: { web: { ports: { "80": 18080 } } } } } }));
   t.store.recordArtifact({ app: "shop", service: "shop", digest: "sha256:x", version: "1.2.0", ref: "r", origin: "build", build: null, job: "j" });
   t.store.addJob({ id: "deploy-shop-0001", kind: "deploy", app: "shop", version: "1.2.0", environment: "uat", fromVersion: null, manifest: "shop@1.0.0#1", pinFrom: null, request: {} }, { id: "t", via: "cli" });
   t.store.updateJob("deploy-shop-0001", { state: "succeeded", steps: [], result: {} });
@@ -513,7 +563,7 @@ const CA = "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIUWwz3v1uq6GdV8iXkWQ9
 function withIngress() {
   const t = withBuiltApp();
   t.store.saveManifest({ ...shop, app: "api", components: [{ id: "web", type: "compose-service", service: "api", source: { kind: "public-registry", image: "nginx:1.27.0" }, ports: [{ container: 8787, host: 18787 }], environment: { SHOP_URL: "{{app:shop.url}}", SHOP_ORIGIN: "{{app:shop.origin}}" } }] }, { id: "t", via: "cli" });
-  const write = (over: Record<string, unknown> = {}) => writeFileSync(join(t.dir, "environment.json"), JSON.stringify({
+  const write = (over: Record<string, unknown> = {}) => setEnvironment(t, ({
     name: "uat", project: "open-atlas", bindIp: "127.0.0.1", hosts: { ...hosts, app1: { address: "10.0.1.11", bindIp: "10.0.1.11" } }, domain: "atlas.example.internal", registries: { ghcr: "ghcr.io/acme" },
     apps: { shop: { version: "1.2.0", host: "app1", ingress: { kind: "nginx", port: 443 } }, api: { version: "1.0.0", host: "app2", ingress: { kind: "direct" } } }, ...over,
   }));
@@ -618,7 +668,7 @@ test("D36: after a deploy the app is reached once at its address; a failure only
 test("PROD does not build", async () => {
   const t = withBuiltApp();
   t.beat();
-  writeFileSync(join(t.dir, "environment.json"), JSON.stringify({ name: "prod", project: "open-atlas", bindIp: "127.0.0.1", registries: { ghcr: "ghcr.io/acme" }, apps: {} }));
+  setEnvironment(t, ({ name: "prod", project: "open-atlas", bindIp: "127.0.0.1", registries: { ghcr: "ghcr.io/acme" }, apps: {} }));
   const r = await post(t, "/api/apps/shop/build", "admin", { version: "1.2.0" });
   assert.equal(r.status, 409);
   assert.equal((await r.json()).error, "build/prod");
@@ -764,7 +814,7 @@ const peerKeySha = createHash("sha256").update(PEER_KEY).digest("hex");
 /** UAT has built and deployed shop 1.2.0 (digest sha256:uat1); PROD knows the same manifest. */
 async function uatAndProd(options: { soakHours?: number; key?: string } = {}) {
   const uat = setup({ peerKeys: [peerKeySha] });
-  writeFileSync(join(uat.dir, "environment.json"), JSON.stringify({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", registries: { ghcr: "ghcr.io/acme" }, apps: { shop: { version: "1.2.0" } } }));
+  setEnvironment(uat, ({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", registries: { ghcr: "ghcr.io/acme" }, apps: { shop: { version: "1.2.0" } } }));
   uat.store.saveManifest(built, { id: "t", via: "cli" });
   uat.beat();
   const b = (await (await post(uat, "/api/apps/shop/build", "uat", { version: "1.2.0" })).json()).jobs[0].id;
@@ -774,7 +824,7 @@ async function uatAndProd(options: { soakHours?: number; key?: string } = {}) {
   await finishDeploy(uat, d, { digests: { shop: "sha256:uat1" }, builds: { shop: { version: "1.2.0", commit: "c0ffee" } } });
 
   const prod = setup({ uat: { app: uat.app, key: options.key ?? PEER_KEY } });
-  writeFileSync(join(prod.dir, "environment.json"), JSON.stringify({ name: "prod", project: "open-atlas", bindIp: "127.0.0.1", registries: { ghcr: "ghcr.io/acme" },
+  setEnvironment(prod, ({ name: "prod", project: "open-atlas", bindIp: "127.0.0.1", registries: { ghcr: "ghcr.io/acme" },
     apps: { shop: { version: "1.2.0", ...(options.soakHours ? { uatSoakHours: options.soakHours } : {}) } } }));
   prod.store.saveManifest(built, { id: "t", via: "cli" });
   prod.beat();
@@ -900,7 +950,7 @@ function withBook(manifest: Record<string, unknown> = book) {
   s.workbench.apps.push({ id: "book", version: "0.9.0", agentSlots: { assistant: { name: "Book Assistant", businessAgentId: "ba1" } } });
   s.workbench.agents.push({ id: "ba1", name: "Book Assistant", agentId: "agent_old", enabled: true });
   const t = setup({ services: s });
-  const environment = (workbench: string) => writeFileSync(join(t.dir, "environment.json"), JSON.stringify({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", registries: {},
+  const environment = (workbench: string) => setEnvironment(t, ({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", registries: {},
     apps: { workbench: { version: workbench }, book: { version: "1.0.0", settings: { graph: { graph: "acme/book" }, assistant: { model: "claude-x", mcpUrl: "https://dp:9632/mcp/g-uat" } } } } }));
   environment("1.24.0");
   mkdirSync(join(t.dir, "templates"), { recursive: true });
@@ -999,7 +1049,7 @@ test("a failing Deployer step rolls back the ones before it; with no containers 
 test("missing settings and credentials block the plan and say where to set them", async () => {
   const t = withBook();
   t.beat();
-  writeFileSync(join(t.dir, "environment.json"), JSON.stringify({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", registries: {}, apps: { workbench: { version: "1.24.0" }, book: { version: "1.0.0" } } }));
+  setEnvironment(t, ({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", registries: {}, apps: { workbench: { version: "1.24.0" }, book: { version: "1.0.0" } } }));
   t.s.workbench.key = "rotated";
   const p = await (await post(t, "/api/apps/book/plan", "uat", { version: "1.0.0" })).json();
   const blocking = p.findings.filter((f: { blocking: boolean }) => f.blocking).map((f: { code: string; message: string }) => `${f.code} ${f.message}`);
@@ -1089,7 +1139,7 @@ test("/mcp: tools are the page's calls; a service key sees only the read-only on
 test("PROD execution, overriding promotion and revealing secrets take a browser session", async () => {
   const t = withBook();
   t.beat();
-  writeFileSync(join(t.dir, "environment.json"), JSON.stringify({ name: "prod", project: "open-atlas", bindIp: "127.0.0.1", registries: {}, apps: { workbench: { version: "1.24.0" }, book: { version: "1.0.0", settings: { graph: { graph: "acme/book" }, assistant: { model: "m", mcpUrl: "u" } } } } }));
+  setEnvironment(t, ({ name: "prod", project: "open-atlas", bindIp: "127.0.0.1", registries: {}, apps: { workbench: { version: "1.24.0" }, book: { version: "1.0.0", settings: { graph: { graph: "acme/book" }, assistant: { model: "m", mcpUrl: "u" } } } } }));
   const admin = (await makeKey(t, "admin", { name: "admin cli", days: 1 })).body.key as string;
   const deploy = await tool(t, admin, "deploy", { app: "book", version: "1.0.0", request_id: "p1" });
   assert.equal(deploy.value.finding.code, "auth/browser-only");
@@ -1215,8 +1265,8 @@ test("level C drafts an issue for the Deployer's own repository; a person opens 
 test("D27: where the environment requires it, a new version deploys after its assessment is adopted", async () => {
   const t = withBook();
   t.beat();
-  const env = JSON.parse(readFileSync(join(t.dir, "environment.json"), "utf8"));
-  writeFileSync(join(t.dir, "environment.json"), JSON.stringify({ ...env, requireEvaluation: true }));
+  const env = t.store.environmentRevision()!.environment;
+  setEnvironment(t, ({ ...env, requireEvaluation: true }));
   t.s.assets["acme/book@v1.1.0/book-1.1.0.tar.gz"] = t.s.assets["acme/book@v1.0.0/book-1.0.0.tar.gz"]!;
   t.s.manifests["acme/book@v1.1.0"] = t.s.manifests["acme/book@v1.0.0"]!;
   t.s.compares["acme/book v1.0.0...v1.1.0"] = { files: [{ filename: "src/app.ts", status: "modified" }, { filename: ".env.example", status: "modified", patch: "+NEW_FLAG=" }], commits: [{ commit: { message: "1.1.0: a new flag" } }] };
@@ -1323,6 +1373,21 @@ test("drift: a container on another version, a fragment or env file edited by ha
   verdict = "ok";
   assert.deepEqual(await drift.check(), []);
   assert.equal(t.store.listAudit().filter((e) => e.action === "drift.resolved").length, 3);
+
+  // A registered app the environment does not deploy has no version: nothing to compare, and no error.
+  t.store.saveManifest({ ...shop, app: "blog", release: { ...shop.release, repo: "acme/blog" }, components: [{ ...shop.components[0], service: "blog" }], env: { file: "blog.env" } }, { id: "admin", via: "workbench" });
+  assert.deepEqual(await drift.check(), []);
+});
+
+test("D35: a long poll whose executor went away takes no job, which would be claimed with nobody to run it", async () => {
+  const handoff = new Handoff(new Store(join(mkdtempSync(join(tmpdir(), "handoff-")), "deployer.db")));
+  const gone = new AbortController();
+  const waiting = handoff.next("app1", 5000, gone.signal);
+  gone.abort();
+  handoff.submit("deploy-1", { kind: "deploy" }, "app1");
+  assert.equal(await waiting, undefined);
+  assert.equal(await handoff.next("app1", 0, AbortSignal.abort()), undefined);
+  assert.equal((await handoff.next("app1", 0))?.id, "deploy-1", "the job waits for a poll that is still there");
 });
 
 test("the daily brief: the facts once a day after its hour, written up by the Deploy Assistant when OMA is there", async () => {
@@ -1361,4 +1426,158 @@ test("the brief's facts come from what the Deployer already knows", async () => 
   assert.deepEqual(facts.apps, [{ app: "book", desired: "1.0.0", verdict: "ok", newer: ["1.2.0", "1.1.0"] }]);
   assert.deepEqual(facts.promotable, [{ app: "book", uat: "1.1.0", here: null }]);
   assert.equal(facts.drift[0]!.detail, "book.env was changed");
+});
+
+
+// D38: the environment settings and manifests as revisions, changed by JSON Patch on the revision they were read at.
+
+test("D38: environment.json is imported once as revision 1; later changes are saved on a base, checked, and carried by deploys", async () => {
+  const t = withBuiltApp();
+  const view = await (await t.request("/api/environment", { as: "viewer" })).json();
+  assert.equal(view.latest, view.revision);
+  assert.equal(view.canSave, false, "administrators save");
+  const base = view.revision;
+  const change = (body: unknown, as = "admin") => t.request("/api/environment", { method: "PUT", as, headers: { "content-type": "application/json", "x-csrf-token": `csrf-${as}` }, body: JSON.stringify(body) });
+  assert.equal((await change({ base, patch: [{ op: "replace", path: "/apps/shop/version", value: "1.3.0" }] }, "uat")).status, 403);
+  const bad = await change({ base, patch: [{ op: "replace", path: "/apps/shop/version", value: "latest" }] });
+  assert.equal(bad.status, 400);
+  assert.deepEqual((await bad.json()).details, ["apps.shop.version: a version like 1.2.0"]);
+  const nowhere = await (await change({ base, patch: [{ op: "replace", path: "/apps/blog/version", value: "1.0.0" }] })).json();
+  assert.equal(nowhere.error, "patch/invalid");
+  const checked = await (await post(t, "/api/environment/validate", "admin", { base, patch: [{ op: "add", path: "/domain", value: "uat.example.internal" }] })).json();
+  assert.deepEqual([checked.findings, checked.changes], [[], ["domain"]]);
+  assert.match(checked.diff, /\+\s+"domain": "uat\.example\.internal"/);
+  assert.equal(t.store.environmentRevision()!.revision, base, "validate saves nothing");
+  const saved = await (await change({ base, patch: [{ op: "add", path: "/domain", value: "uat.example.internal" }], note: "nginx in front" })).json();
+  assert.deepEqual([saved.revision, saved.changes], [base + 1, ["domain"]]);
+  assert.equal((await change({ base, patch: [{ op: "remove", path: "/domain" }] })).status, 409, "a change on an older revision is refused");
+  const after = await (await t.request("/api/environment", { as: "viewer" })).json();
+  assert.equal(after.fileDiffers, true, "the file is not read again; the page says it differs");
+  assert.equal(after.revisions[0].note, "nginx in front");
+
+  t.beat();
+  const b = (await (await post(t, "/api/apps/shop/build", "uat", { version: "1.2.0" })).json()).jobs[0].id;
+  finish(t, b, "succeeded", { image: "ghcr.io/acme/open-atlas-shop:1.2.0", digest: "sha256:d", build: { version: "1.2.0", commit: "c", dirty: false } });
+  await t.request("/api/jobs", { as: "viewer" });
+  const plan = await (await post(t, "/api/apps/shop/plan", "uat", { version: "1.2.0" })).json();
+  assert.equal(plan.request.environmentRevision, base + 1);
+  const { job } = await (await post(t, "/api/apps/shop/deploy", "uat", { version: "1.2.0", acknowledgeManual: true })).json();
+  const record = (await (await t.request(`/api/jobs/${job.id}`, { as: "viewer" })).json()).record;
+  assert.equal(record.environment_revision, base + 1);
+  assert.equal(record.manifest_ref, "shop@1.0.0#1");
+});
+
+test("D38: a manifest change names its range and base; validate lists the versions it affects and a changed source", async () => {
+  const t = withBuiltApp();
+  t.beat();
+  const b = (await (await post(t, "/api/apps/shop/build", "uat", { version: "1.2.0" })).json()).jobs[0].id;
+  finish(t, b, "succeeded", { image: "ghcr.io/acme/open-atlas-shop:1.2.0", digest: "sha256:d", build: { version: "1.2.0", commit: "c", dirty: false } });
+  await t.request("/api/jobs", { as: "viewer" });
+  const d = (await (await post(t, "/api/apps/shop/deploy", "uat", { version: "1.2.0", acknowledgeManual: true })).json()).job.id;
+  await finishDeploy(t, d, { digests: { shop: "sha256:d" } });
+  const put = (body: unknown) => t.request("/api/apps/shop/manifests", { method: "PUT", as: "admin", headers: { "content-type": "application/json", "x-csrf-token": "csrf-admin" }, body: JSON.stringify(body) });
+  const current = await (await t.request("/api/apps/shop/manifest", { as: "viewer" })).json();
+  assert.deepEqual([current.appliesFrom, current.revision, current.ranges], ["1.0.0", 1, [{ appliesFrom: "1.0.0", revision: 1 }]]);
+
+  assert.equal((await put({ manifest: current.manifest })).status, 409, "an existing range needs its base");
+  assert.equal((await put({ patch: [{ op: "add", path: "/components/0/init", value: true }] })).status, 400, "a patch names its range");
+  const moved = await (await put({ appliesFrom: "1.0.0", base: 1, patch: [{ op: "replace", path: "/appliesFrom", value: "2.0.0" }] })).json();
+  assert.match(moved.message, /new_applies_from|newAppliesFrom/);
+  const source = [{ op: "replace", path: "/components/0/source", value: { kind: "public-registry", image: "acme/shop:1.2.0" } }];
+  const check = await (await post(t, "/api/apps/shop/manifests/validate", "admin", { appliesFrom: "1.0.0", base: 1, patch: source })).json();
+  assert.deepEqual(check.findings, []);
+  assert.deepEqual([check.affected.deployed, check.affected.neverDeployed], [["1.2.0"], ["1.10.0"]], "1.2.0 keeps its revision; 1.10.0 would take this one");
+  assert.match(check.warnings[0], /different source: deploy the affected versions in UAT again/);
+  const saved = await (await put({ appliesFrom: "1.0.0", base: 1, patch: source, note: "the project pushes its own image" })).json();
+  assert.equal(saved.revision, 2);
+  assert.equal((await put({ appliesFrom: "1.0.0", base: 1, patch: source })).status, 409, "base 1 is old now");
+  const range = await (await put({ appliesFrom: "1.0.0", newAppliesFrom: "2.0.0", base: 2, patch: [{ op: "add", path: "/components/0/init", value: true }] })).json();
+  assert.deepEqual([range.appliesFrom, range.revision], ["2.0.0", 1], "a new range from 2.0.0");
+
+  // The repository changes only on the page, by an administrator who confirms it.
+  const moving = { ...current.manifest, release: { ...current.manifest.release, repo: "neworg/shop" } };
+  const unconfirmed = await (await put({ manifest: { ...moving, appliesFrom: "2.0.0" }, base: 1 })).json();
+  assert.match(unconfirmed.details[0], /confirm the change/);
+  assert.equal((await put({ manifest: { ...moving, appliesFrom: "2.0.0" }, base: 1, repoChange: true })).status, 200);
+  assert.equal(t.store.app("shop")!.repo, "neworg/shop");
+  assert.ok(t.store.listAudit().some((e) => e.action === "app.repo-change"));
+});
+
+test("D38: PROD takes its manifests from UAT, by the revision UAT deployed with; it does not edit them", async () => {
+  const { uat, prod, uatDeploy } = await uatAndProd();
+  // UAT changes the manifest after its deploy; PROD still deploys 1.2.0 with what UAT ran.
+  uat.store.saveManifest({ ...built, components: [{ ...built.components[0], init: true }] }, { id: "t", via: "cli" });
+  const p = await (await post(prod, "/api/apps/shop/plan", "prod", { version: "1.2.0" })).json();
+  assert.equal(p.manifest, "shop@1.0.0#1");
+  assert.match(p.findings.find((f: { code: string }) => f.code === "deploy/manifest-from-uat").message, new RegExp(`as UAT deploy ${uatDeploy} did`));
+  const taken = await (await post(prod, "/api/registry/from-uat", "admin", {})).json();
+  assert.deepEqual(taken.added, ["shop@1.0.0#2"]);
+  assert.equal((await prod.request("/api/apps/shop/manifests", { method: "PUT", as: "admin", headers: { "content-type": "application/json", "x-csrf-token": "csrf-admin" }, body: JSON.stringify({ manifest: built, base: 2 }) })).status, 403);
+  // PROD's own copy of a revision differs from UAT's: refused, not deployed silently.
+  const other = setup({ uat: { app: uat.app, key: PEER_KEY } });
+  setEnvironment(other, ({ name: "prod", project: "open-atlas", bindIp: "127.0.0.1", registries: { ghcr: "ghcr.io/acme" }, apps: { shop: { version: "1.2.0" } } }));
+  other.store.saveManifest({ ...built, components: [{ ...built.components[0], init: true }] }, { id: "t", via: "cli" });
+  other.beat();
+  const refused = await (await post(other, "/api/apps/shop/plan", "prod", { version: "1.2.0" })).json();
+  assert.ok(refused.findings.some((f: { code: string; blocking: boolean }) => f.code === "deploy/manifest-uat-mismatch" && f.blocking), JSON.stringify(refused.findings));
+});
+
+test("D38: admin tools are seen by an admin's personal key only; saving is not destructive, revoking is", async () => {
+  const t = withBook();
+  t.beat();
+  const service = (await makeKey(t, "admin", { kind: "service", name: "deploy-assistant", days: 365 })).body.key as string;
+  const personal = (await makeKey(t, "uat", { name: "cli", days: 30 })).body.key as string;
+  const admin = (await makeKey(t, "admin", { name: "claude-code", days: 30 })).body.key as string;
+  const names = async (key: string) => ((await mcp(t, key, "tools/list")).body.result.tools as { name: string }[]).map((x) => x.name);
+  assert.ok(!(await names(service)).includes("get_manifest"));
+  assert.ok(!(await names(personal)).includes("save_manifest"));
+  const tools = (await mcp(t, admin, "tools/list")).body.result.tools as { name: string; annotations: { destructiveHint: boolean } }[];
+  const hint = (n: string) => tools.find((x) => x.name === n)!.annotations.destructiveHint;
+  assert.deepEqual([hint("save_manifest"), hint("save_environment"), hint("revoke_key"), hint("revoke_host_token")], [false, false, true, true]);
+
+  const got = await tool(t, admin, "get_manifest", { app: "book" });
+  assert.equal(got.value.revision, 1);
+  const saved = await tool(t, admin, "save_manifest", { app: "book", applies_from: got.value.appliesFrom, base: 1, patch: [{ op: "add", path: "/components/0/note", value: "x" }], note: "try", request_id: "m1" });
+  assert.equal(saved.isError, true, "the route's findings come back");
+  assert.equal(saved.value.finding.code, "manifest/invalid");
+  const env = await tool(t, admin, "get_environment");
+  const changed = await tool(t, admin, "save_environment", { base: env.value.revision, patch: [{ op: "add", path: "/domain", value: "uat.example.internal" }], note: "nginx", request_id: "e1" });
+  assert.equal(changed.value.revision, env.value.revision + 1);
+  assert.ok(t.store.listAudit().some((e) => e.action === "mcp.save_environment" && (e.detail as { note?: string }).note === "nginx"));
+  const audit = await tool(t, admin, "list_audit", { action: "environment" });
+  assert.ok(audit.value.entries.every((e: { action: string }) => e.action.startsWith("environment")));
+});
+
+// D39: the Platform area on the Overview.
+
+test("D39: the Deployer's versions to choose from, a plan before an upgrade, and executors upgraded one host after the other", async () => {
+  const t = withBuiltApp();
+  setEnvironment(t, ({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", hosts: { app1: { address: "10.0.1.11" }, app2: { address: "10.0.1.12" } }, registries: { ghcr: "ghcr.io/acme" }, apps: { shop: { version: "1.2.0", host: "app1" } } }));
+  const tokens: Record<string, string> = {};
+  for (const h of ["app1", "app2"]) tokens[h] = (await (await post(t, `/api/hosts/${h}/token`, "admin", {})).json()).token;
+  const beat = (h: string, body: Record<string, unknown> = {}) => t.app.request("/deploy/executor/v1/heartbeat", { method: "POST", headers: { authorization: `Bearer ${tokens[h]}`, "content-type": "application/json" },
+    body: JSON.stringify({ version: "0.6.0", protocols: [2], kinds: ["deploy", "executor-upgrade", "deployer-upgrade"], upgradeFrom: "github", project: "open-atlas", registries: [], databaseBackup: {}, busy: null, ...body }) });
+  await beat("app1", { deployer: { image: "ghcr.io/acme/open-atlas-deployer" } });
+  await beat("app2");
+
+  const view = await (await t.request("/api/platform", { as: "viewer" })).json();
+  assert.deepEqual(view.deployer.versions.map((v: { version: string; relation: string }) => [v.version, v.relation]), [["1.10.0", "newer"], ["1.2.0", "newer"], [DEPLOYER_VERSION, "running"]]);
+  assert.equal(view.deployer.latest, "1.10.0");
+  assert.equal(view.canUpgrade, false, "administrators upgrade");
+  assert.deepEqual(view.executors.map((e: { host: string; upgrade: { available: boolean } }) => [e.host, e.upgrade.available]), [["app1", true], ["app2", true]]);
+  const plan = await (await t.request("/api/deployer/plan?version=1.10.0", { as: "viewer" })).json();
+  assert.deepEqual([plan.from, plan.to, plan.host, plan.older], [DEPLOYER_VERSION, "1.10.0", "app1", false]);
+  assert.equal((await post(t, "/api/deployer/upgrade", "admin", { version: "0.0.1" })).status, 409, "going back is confirmed twice");
+
+  const started = await (await post(t, "/api/hosts/upgrade-outdated", "admin", {})).json();
+  assert.deepEqual([started.batch.current.host, started.batch.remaining], ["app1", ["app2"]]);
+  finish(t, started.batch.current.job, "succeeded");
+  await t.request("/api/jobs", { as: "viewer" });
+  const second = (await (await t.request("/api/platform", { as: "viewer" })).json()).batch;
+  assert.deepEqual([second.done, second.current.host, second.remaining], [["app1"], "app2", []], "app2 starts once app1 succeeded");
+  finish(t, second.current.job, "failed");
+  await t.request("/api/jobs", { as: "viewer" });
+  const stopped = (await (await t.request("/api/platform", { as: "viewer" })).json()).batch;
+  assert.match(stopped.stopped, /^app2: failed/);
+  assert.equal(stopped.current, null);
 });

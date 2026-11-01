@@ -1,0 +1,41 @@
+# The Deployer on the host that runs it (design §8.6): its own compose project beside the apps' one, so nothing the
+# executor does to the apps (compose up, rollback, restore) touches it. Behind nginx (D36), e.g. at
+# https://<domain>:8495/deploy/ forwarding to 127.0.0.1:8095.
+#
+#   /webapp/data/open-atlas/deployer/          (the executors' deploy root skips this directory)
+#   ├─ compose.yaml                            this file
+#   ├─ .env                                    DEPLOYER_IMAGE=<repository>:<version>; the executor rewrites it on upgrades
+#   ├─ deployer.env                            from deployer.env.example, mode 600
+#   ├─ data/                                   state: deployer.db, environment.json; owned by 1000:1000
+#   └─ secrets/                                token and key files the settings name; owned by 1000:1000, mode 600
+#
+#   docker compose up -d                       (after the apps' project exists: it joins their network)
+#
+# Upgrades (D16) come from the Deployer's Hosts page: the executor on this host (EXECUTOR_DEPLOYER_DIR pointing here,
+# EXECUTOR_DEPLOYER_IMAGE the repository) stops the service, backs up data/, sets the new image in .env, starts it, and
+# puts both back when the new version does not answer. The service must stay named "deployer".
+name: open-atlas-deployer
+services:
+  deployer:
+    image: "${DEPLOYER_IMAGE:?set DEPLOYER_IMAGE in .env}"
+    restart: "unless-stopped"
+    env_file:
+      - "deployer.env"
+    ports:
+      - "127.0.0.1:8095:8095"
+    volumes:
+      - "./data:/data/deployer"
+      - "./secrets:/secrets:ro"
+    # The apps' network: the Deployer reaches Workbench and asks each own-built service its version (/meta/contracts)
+    # by service name. On a host without the apps, set DEPLOYER_WORKBENCH_URL to an address instead and drop this.
+    networks:
+      - "apps"
+    # When containers cannot resolve the domain nginx serves (no internal DNS record), as environment.json extraHosts:
+    # extra_hosts:
+    #   - "uat.example.internal:host-gateway"
+    logging:
+      driver: "local"
+networks:
+  apps:
+    name: "open-atlas_default"
+    external: true
