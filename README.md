@@ -177,7 +177,7 @@ Deployer 容器不挂 Docker socket（§8.2），所以状态有两个来源：
 正式的镜像和发布包由 GitHub Actions 在推送 tag `v<版本>` 时生成（[.github/workflows/release.yml](.github/workflows/release.yml)），步骤和**第一次发布的注意事项**见 [docs/release.md](docs/release.md)，每个版本的说明在 [CHANGELOG.md](CHANGELOG.md)。本地试验时可以手工构建：
 
 ```sh
-bin/build-image.sh [镜像仓库]       # 默认 ghcr.io/gaojie197710-tech；同时把执行器的发布包打到 dist/executor
+bin/build-image.sh [镜像仓库]       # 默认 ghcr.io/godfengz；同时把执行器的发布包打到 dist/executor
 docker push <镜像仓库>/open-atlas-deployer:<package.json 的版本>
 ```
 
@@ -195,7 +195,7 @@ Deployer 自己的升级（D16，2026-11-02 已实现）：admin 在 Overview �
 
 升级期间 Deployer 不在，执行器回报不出去的状态和日志先存在本地 `<工作目录>/pending/`，等 Deployer 回来再补发；回滚时恢复的是升级前的状态库，这个任务在里面还是"进行中"，由补发的结果收尾。还在跑别的任务、执行器太旧（0.7.0 以前）、找不到或找到多台运行 Deployer 的机器时拦住。允许换到更旧的版本（坏版本要退回时用），只限 admin 的浏览器会话。Deployer 的版本取镜像构建时的 `DEPLOYER_VERSION`，从源码运行时取 `package.json`。
 
-- 第一次安装后，在运行 Deployer 的机器的 `executor.env` 里设 `EXECUTOR_DEPLOYER_DIR=/webapp/data/open-atlas/deployer`、`EXECUTOR_DEPLOYER_IMAGE=ghcr.io/gaojie197710-tech/open-atlas-deployer`，重启执行器。紧急时仍可手工：改 `.env` 后 `docker compose up -d`。
+- 第一次安装后，在运行 Deployer 的机器的 `executor.env` 里设 `EXECUTOR_DEPLOYER_DIR=/webapp/data/open-atlas/deployer`、`EXECUTOR_DEPLOYER_IMAGE=ghcr.io/godfengz/open-atlas-deployer`，重启执行器。紧急时仍可手工：改 `.env` 后 `docker compose up -d`。
 - `deployer.env` 由 compose 读入，值里的 `$` 会被当成变量替换掉；紧急账号的哈希因此改成 `scrypt:<盐>:<值>`（2026-11-02，旧的 `$` 格式仍能验证，但放进 compose 前要换成冒号）。
 - 验证（WSL）：镜像构建成功（339 MB）；用它替换本地的 Node 进程（host 网络，同一份设置和状态库）后健康检查通过，经 nginx 的 https 页面和静态资源 200，未登录时正确指向 Workbench，执行器的心跳由容器里的 Deployer 写入；没挂 Docker socket，进程是 1000:1000。验证完已换回 Node 进程。
 

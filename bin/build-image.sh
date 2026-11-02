@@ -2,10 +2,10 @@
 # Builds the Deployer's image <registry>/open-atlas-deployer:<package.json version> (design §8.6), and the executor's
 # release of the same commit into dist/executor (executor/package.sh). Pushing the image and attaching the executor's
 # release are left to whoever holds the registry login and the GitHub permission.
-#   bin/build-image.sh [registry]   (default ghcr.io/gaojie197710-tech; DEPLOYER_BASE_PATH changes the page's path)
+#   bin/build-image.sh [registry]   (default ghcr.io/godfengz; DEPLOYER_BASE_PATH changes the page's path)
 set -eu
 cd "$(dirname "$0")/.."
-registry=${1:-ghcr.io/gaojie197710-tech}
+registry=${1:-ghcr.io/godfengz}
 version=$(node -p 'require("./package.json").version')
 revision=$(git rev-parse HEAD 2>/dev/null || echo unknown)
 if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
