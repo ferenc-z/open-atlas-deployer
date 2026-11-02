@@ -8,7 +8,7 @@
 4. 如果 GitHub release `executor-v<执行器版本>` 还不存在，就打包执行器建这个 release，附件是 `open-atlas-deployer-executor-<版本>.tar.gz` 和 `SHA256SUMS`。
 5. 建 GitHub release `v<版本>`，说明就是第 2 步从 [CHANGELOG.md](../CHANGELOG.md) 的 `## <版本>` 一节取出的内容。版本号带 `-` 的（比如 `0.1.0-rc.1`）标成 pre-release。
 
-平时的检查由 [.github/workflows/ci.yml](../.github/workflows/ci.yml) 负责：每次推送都跑类型检查、测试、页面构建，执行器测试在 Python 3.9 和 3.12 上各跑一遍。
+推送分支不触发 GitHub 上的任何流程。平时的检查在本地跑：[bin/check.sh](../bin/check.sh) 依次跑类型检查、服务端测试、页面构建和执行器测试，只打印一行结果，完整输出在 `.check/<提交>.log`，最近一次的结果在 `.check/last`。Claude Code 会话里每次 `git commit` 之后，[.claude/settings.json](../.claude/settings.json) 的钩子在后台跑它：通过时不出声，失败时才把失败的步骤和日志末尾交回会话。[.github/workflows/ci.yml](../.github/workflows/ci.yml) 只能手动触发（Actions → ci → Run workflow），执行器测试在 Python 3.9 和 3.12 上各跑一遍。
 
 ## 每次发布
 
@@ -16,7 +16,7 @@
 # 1. 版本号：package.json 和 package-lock.json 一起改
 npm version 0.1.1 --no-git-tag-version
 # 2. CHANGELOG.md 加上 "## 0.1.1" 一节；执行器代码改了，就同时调 executor/deployer_executor.py 的 VERSION 和 handoff.ts 的 EXECUTOR_VERSION
-# 3. 提交、推送分支，等 ci 通过
+# 3. 提交，确认本地检查通过（.check/last 是 "<提交> ok"，或手动跑 sh bin/check.sh），再推送分支
 git push origin main
 # 4. 打 tag 并推送，release 流程随之开始
 git tag -a v0.1.1 -m "Open Atlas Deployer 0.1.1"

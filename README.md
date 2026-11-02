@@ -22,7 +22,7 @@ npm run build:web                       # 页面 → dist/web
 node bin/import-manifests.ts data ../open-atlas-docs/docs/proposals/deploy-manifests   # 导入四份初始清单
 cp examples/uat.environment.json data/environment.json
 DEPLOYER_WORKBENCH_URL=http://workbench:8090 npm start   # http://<host>:8095/deploy/
-npm test && npm run typecheck
+sh bin/check.sh                        # 类型检查、测试、页面构建、执行器测试，只打印一行结果（日志在 .check/）
 ```
 
 Node 22.18 起直接运行 `.ts`（类型剥离），服务端不需要构建；状态库用 Node 自带的 `node:sqlite`（`data/deployer.db`）。
