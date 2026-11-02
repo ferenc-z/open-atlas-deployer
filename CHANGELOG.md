@@ -3,7 +3,12 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
-## Unreleased
+## 0.2.0
+
+First setup (D41): a new installation goes from `bootstrap.sh` on the server to Workbench signing people in on one
+Setup page, and then lists what the AI features still need. Executor 0.7.2, unchanged. An installation on 0.1.0
+upgrades from the Overview as before; it opens on the Setup page until its Workbench is 1.24.0 or newer and the
+deploy groups exist, both done from that page.
 
 **First setup (D41, phase 1)**
 - A new installation opens on a Setup page, the only page until Workbench signs people in and the Deployer has its
@@ -45,6 +50,16 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   would not embed on Workbench's page (http inside https, another site) is refused, and an entry with one is not done.
 - `examples/oma.manifest.json`: a starting point for registering OMA (no build, `oma-beta-v{version}` images, one
   data directory for both services).
+
+**Tried before this release**
+- On the local UAT (a real Workbench and OMA), upgraded in place from 0.1.0: Workbench 1.23.1 to 1.25.1 from the Setup
+  page, the deploy groups, the AI checklist against what runs, registering the Deployer in Workbench and opening it
+  from there with the embedded chat, OMA 0.1.0-beta.8 to beta.9 with the example manifest.
+
+**Known limits**
+- `bootstrap.sh` on a fresh server and the setup steps before Workbench answers have run only in tests and on a
+  local test instance, not on a real server.
+- OMA's settings stay in `deployer.env` (a restart after changing them); the Business Agent is created in Workbench.
 
 ## 0.1.0
 

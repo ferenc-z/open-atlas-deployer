@@ -185,7 +185,7 @@ docker push <镜像仓库>/open-atlas-deployer:<package.json 的版本>
 
 - [Dockerfile](Dockerfile)：Node 22 直接运行服务端的 TypeScript，用自带的 `node:sqlite`；页面在构建时按 `DEPLOYER_BASE_PATH`（默认 `/deploy`）打包，一个镜像对应一个挂载路径。以 1000:1000 运行，不挂 Docker socket、没有镜像仓库凭据；健康检查访问 `/health`。镜像带 `org.open-atlas.version` 和提交号标签。工作区有未提交改动时，构建脚本会提示镜像对不上提交号。
 - 服务器上的布局见 [examples/deployer/compose.yaml](examples/deployer/compose.yaml) 和 [deployer.env.example](examples/deployer/deployer.env.example)：放在 `/webapp/data/open-atlas/deployer/`（执行器的部署根目录跳过这个目录），自成一个 compose 项目 `open-atlas-deployer`，执行器对应用做的 compose up、回滚、恢复都碰不到它；端口只绑 127.0.0.1:8095，由 nginx 经 https 转发；加入应用的网络 `open-atlas_default`，按服务名访问 Workbench 和各服务的 `/meta/contracts`。`data/` 和 `secrets/` 要属 1000:1000，令牌和 key 文件权限 600。
-- 第一个正式版是 `0.1.0`（之前有 `0.1.0-rc.1` 到 `rc.5` 五个候选版本；`0.1.0-beta.*` 只在本地构建过）。compose 里的镜像写成 `${DEPLOYER_IMAGE}`，值在同目录的 `.env`（[.env.example](examples/deployer/.env.example)）：第一次手写，之后由执行器改。
+- 第一个正式版是 `0.1.0`（之前有 `0.1.0-rc.1` 到 `rc.5` 五个候选版本；`0.1.0-beta.*` 只在本地构建过），`0.2.0` 加了首次初始化（D41）。compose 里的镜像写成 `${DEPLOYER_IMAGE}`，值在同目录的 `.env`（[.env.example](examples/deployer/.env.example)）：第一次手写，之后由执行器改。
 
 Deployer 自己的升级（D16，2026-11-02 已实现）：admin 在 Overview 的 Platform 区选版本、看过计划后确认（D39，原先在 Hosts 页，已移走）。Deployer 找到心跳里说自己运行 Deployer 的那台机器（`executor.env` 设了 `EXECUTOR_DEPLOYER_DIR` 和 `EXECUTOR_DEPLOYER_IMAGE`，只能有一台），排一个 `deployer-upgrade` 任务，请求里只有版本号。执行器：
 
@@ -714,7 +714,7 @@ sudo ./bootstrap.sh --workbench-public-url https://uat.example.internal:8443/
 - 服务端测试：全新安装用紧急账号从 L0 走到 L1（表单校验、只能建一次修订、紧急账号签发令牌、心跳、导入清单、重复导入被拒），生成 Workbench 的 env（密码只出现一次、页面上看不到原值、只能生成一次），Workbench 通了以后紧急会话失效；admin 贴入 key（非 admin 被拒、错的 key 被拒、存的是密文）、建出缺的 Group，到 L2；可选的 appLinks 一步；删掉页面上的 key 后回到"下一步"。已有的 Workbench：版本太旧时拦住，≥ 1.24.0 时要求接管，文件里的 key 优先，部署记录有了以后完成；PROD 不导入内置清单。`sh bin/check.sh` 全部通过（91 个测试）。
 - 第二期在本地全新实例上重启后经接口试过生成 env：返回一次密码，并自动排了读取服务器 env 文件的任务。
 - 第三期：服务端测试走一遍 AI 清单（OMA 不通、通但不是本 Deployer 部署、从样例清单登记并部署、Vault 凭据和服务 key、Business Agent 指错 agent、一键登记及重复登记保留字段、agent 归档），共 92 个测试通过。本地实例上 `/api/setup/ai` 在什么都没配时列出 7 项未完成。
-- 第三期在 WSL 本地 UAT 上验证（2026-11-02，真的 Workbench 和 OMA）：用当前代码构建本地镜像，把 0.1.0 的 Deployer 换上去，状态库原样沿用。Setup 页认出 Workbench 1.23.1 太旧，在页面上构建并部署 1.25.1，建 Group，初始化完成（L2）；Overview 那一行、Setup 页的 AI 区块按真实状态显示；一键登记把 Workbench 里的条目改成 https 地址，从 Workbench 打开 Deployer，助手面板里嵌入的对话能显示；用和样例一致的清单把 OMA 从 beta.8 部署到 beta.9，清单七项全部完成。验证中发现并修了三处：OMA 不给非所有者列 Vault 凭据（原来一律报 404）；早于 1.24.0 的 Workbench 被当成完成；指向 http 地址的条目被当成能嵌入。助手面板顶部显示的名字是 "AI builder" 而不是 "Deploy Assistant"，没有再查。
+- 第三期在 WSL 本地 UAT 上验证（2026-11-02，真的 Workbench 和 OMA）：用当前代码构建本地镜像，把 0.1.0 的 Deployer 换上去，状态库原样沿用。Setup 页认出 Workbench 1.23.1 太旧，在页面上构建并部署 1.25.1，建 Group，初始化完成（L2）；Overview 那一行、Setup 页的 AI 区块按真实状态显示；一键登记把 Workbench 里的条目改成 https 地址，从 Workbench 打开 Deployer，助手面板里嵌入的对话能显示；用和样例一致的清单把 OMA 从 beta.8 部署到 beta.9，清单七项全部完成。验证中发现并修了四处：OMA 不给非所有者列 Vault 凭据（原来一律报 404）；没设 Application id 时 O1 不算完成；早于 1.24.0 的 Workbench 被当成完成；指向 http 地址的条目被当成能嵌入。助手面板顶部显示的名字是 "AI builder" 而不是 "Deploy Assistant"，没有再查。
 - 本地验证时第一次构建 Workbench 1.25.1 失败：WSL 里留着手工构建时的同名本地 tag，release-tools 不覆盖；删掉这两个本地 tag 后重建成功。
 - 本地起一个全新实例（没有 `environment.json`，Workbench 不通），经接口走完同样的流程，Workbench 1.25.1 的部署计划没有拦截项。提示里有一条：`ferenc-z/open-atlas-workbench` 是私有仓库，没有令牌时读不到 `release.json`，契约核对只能跳过。
 - `bin/package-setup.sh` 在 WSL 上打包成功；镜像里的 `hash-password.ts` 能从标准输入算出冒号格式的哈希。`bootstrap.sh` 本身还没在真实服务器上以 root 跑过。
