@@ -5,6 +5,7 @@
 import { useCallback, useEffect, useState } from "react";
 import * as api from "./api.ts";
 import type { IngressView } from "./api.ts";
+import { ask } from "./Confirm.tsx";
 
 const when = (iso: string) => new Date(iso).toLocaleString("en-US", { hour12: false });
 const KIND: Record<string, string> = { nginx: "Through nginx", direct: "Direct", none: "Not reachable from outside its host" };
@@ -125,7 +126,7 @@ function Ca({ data, onSaved }: { data: IngressView; onSaved: () => void }) {
           <textarea className="mono" rows={6} spellCheck={false} value={pem} onChange={(e) => setPem(e.target.value)} placeholder="-----BEGIN CERTIFICATE-----&#10;…&#10;-----END CERTIFICATE-----" />
           <div className="row">
             <button className="primary" disabled={!pem.trim()} onClick={() => save(pem)}>{data.ca ? "Replace" : "Save"}</button>
-            {data.ca && <button className="danger" onClick={() => { if (confirm("Remove the internal CA? Deploys from now on stop mounting it.")) save(""); }}>Remove</button>}
+            {data.ca && <button className="danger" onClick={async () => { if (await ask("Remove the internal CA? Deploys from now on stop mounting it.", { confirm: "Remove", danger: true })) save(""); }}>Remove</button>}
             <span className="muted">Takes effect at each app's next deploy.</span>
           </div>
         </>

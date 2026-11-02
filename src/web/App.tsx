@@ -12,6 +12,7 @@ import { IngressPage } from "./Ingress.tsx";
 import { Platform } from "./Platform.tsx";
 import { SettingsPage } from "./Settings.tsx";
 import { SetupPage } from "./Setup.tsx";
+import { ask } from "./Confirm.tsx";
 
 type Tab = "setup" | "status" | "history" | "hosts" | "settings" | "env" | "registry" | "onboarding" | "ingress" | "keys" | "audit";
 type Panel = { kind: "deploy"; app: string; initial?: { version: string; pinFrom?: string } } | { kind: "job"; id: string } | undefined;
@@ -342,8 +343,8 @@ function AppDetail({ id, admin, back }: { id: string; admin: boolean; back: () =
   useEffect(refresh, [refresh]);
 
   const show = (from: string, rev: number) => api.revision(id, from, rev).then((body) => setShown({ from, rev, body }), (e: Error) => setError(e.message));
-  const remove = () => {
-    if (!confirm(`Remove ${id} from the registry? Its manifest history is kept, but the Deployer will no longer deploy it.`)) return;
+  const remove = async () => {
+    if (!(await ask(`Remove ${id} from the registry? Its manifest history is kept, but the Deployer will no longer deploy it.`, { confirm: "Remove", danger: true }))) return;
     api.removeApp(id).then(back, (e: Error) => setError(e.message));
   };
 

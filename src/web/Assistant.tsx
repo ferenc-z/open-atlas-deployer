@@ -6,6 +6,7 @@
 import { useEffect, useRef, useState, type CSSProperties, type FormEvent, type PointerEvent as ReactPointerEvent } from "react";
 import * as api from "./api.ts";
 import { AiMissing } from "./Setup.tsx";
+import { ask } from "./Confirm.tsx";
 
 export const HOST_OPERATIONS = ["plan_deploy", "plan_rollback", "build_artifact", "set_env_value"] as const;
 
@@ -152,7 +153,7 @@ export function KeysPage({ isAdmin }: { isAdmin: boolean }) {
     setError("");
     api.createKey(kind, name, days).then((r) => { setMade(r.key); setName(""); refresh(); }, (e: Error) => setError(e.message));
   };
-  const revoke = (id: string) => { if (confirm("Revoke this key? Clients using it stop working immediately.")) api.revokeKey(id).then(refresh, (e: Error) => setError(e.message)); };
+  const revoke = async (id: string) => { if (await ask("Revoke this key? Clients using it stop working immediately.", { confirm: "Revoke", danger: true })) api.revokeKey(id).then(refresh, (e: Error) => setError(e.message)); };
   return (
     <>
       <div className="toolbar"><h1>API keys</h1><span className="muted">For AI clients (the Deployer's /mcp). A key can do what you can do on the page, but running in PROD, skipping promotion and seeing secret values accept only browser sessions</span></div>

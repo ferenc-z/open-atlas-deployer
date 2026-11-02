@@ -5,6 +5,7 @@
 import { useCallback, useEffect, useState } from "react";
 import * as api from "./api.ts";
 import type { HostView } from "./api.ts";
+import { ask } from "./Confirm.tsx";
 
 const when = (iso: string) => new Date(iso).toLocaleString("en-US", { hour12: false });
 
@@ -15,12 +16,12 @@ export function HostsPage({ isAdmin, compact = false }: { isAdmin: boolean; comp
   const [issued, setIssued] = useState<{ host: string; token: string } | undefined>();
   const refresh = useCallback(() => { api.hosts().then((r) => setList(r.hosts), (e: Error) => setError(e.message)); }, []);
   useEffect(() => { refresh(); const t = setInterval(refresh, 10_000); return () => clearInterval(t); }, [refresh]);
-  const issue = (id: string) => {
-    if (!confirm(`Issue a new executor token for ${id}? Earlier tokens of ${id} keep working until revoked.`)) return;
+  const issue = async (id: string) => {
+    if (!(await ask(`Issue a new executor token for ${id}? Earlier tokens of ${id} keep working until revoked.`, { confirm: "Issue token" }))) return;
     api.issueHostToken(id).then((r) => { setIssued(r); refresh(); }, (e: Error) => setError(e.message));
   };
-  const revoke = (id: string) => {
-    if (!confirm(`Revoke every executor token of ${id}? Its executor stops reaching the Deployer at once.`)) return;
+  const revoke = async (id: string) => {
+    if (!(await ask(`Revoke every executor token of ${id}? Its executor stops reaching the Deployer at once.`, { confirm: "Revoke", danger: true }))) return;
     api.revokeHost(id).then(refresh, (e: Error) => setError(e.message));
   };
   if (!list) return error ? <p className="error">{error}</p> : <p className="muted">Loading…</p>;

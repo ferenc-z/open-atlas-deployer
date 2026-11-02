@@ -6,6 +6,7 @@ import * as api from "./api.ts";
 import { Markdown } from "./Markdown.tsx";
 import { AiMissing } from "./Setup.tsx";
 import type { AssessmentView } from "./api.ts";
+import { ask } from "./Confirm.tsx";
 
 const STATE: Record<string, { label: string; tone: string }> = {
   assessing: { label: "Assessing", tone: "info" }, ready: { label: "Assessed", tone: "ok" }, failed: { label: "Failed", tone: "bad" },
@@ -136,7 +137,7 @@ function AssessmentPanel({ id, canStart, isAdmin, onClose, onChanged, onJob }: {
         {isAdmin && ((a.kind === "onboarding" && a.state === "trial") || (a.kind === "version" && a.state === "ready")) && (
           <button className="primary" onClick={() => act(api.registerAssessment(id))}>{a.kind === "version" ? (a.level === "unchanged" ? "Confirm keeping the manifest" : "Adopt the new manifest") : "Register the app"}</button>
         )}
-        {canStart && !["registered", "adopted", "closed"].includes(a.state) && <button className="link" onClick={() => { if (confirm("Close this assessment? An app in trial deploy is removed from the registry.")) act(api.closeAssessment(id)); }}>Close assessment</button>}
+        {canStart && !["registered", "adopted", "closed"].includes(a.state) && <button className="link" onClick={async () => { if (await ask("Close this assessment? An app in trial deploy is removed from the registry.", { confirm: "Close assessment", danger: true })) act(api.closeAssessment(id)); }}>Close assessment</button>}
       </div>
       {error && <div className="error">{error.message}{error.details.length > 0 && <ul>{error.details.map((d) => <li key={d}>{d}</li>)}</ul>}</div>}
     </section>

@@ -7,6 +7,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import * as api from "./api.ts";
 import type { EnvEdit, EnvPlan, EnvView, Fingerprint, RegisteredApp } from "./api.ts";
 import { JobPanel } from "./Deploy.tsx";
+import { ask } from "./Confirm.tsx";
 
 const when = (iso: string | null | undefined) => (iso ? new Date(iso).toLocaleString("en-US", { hour12: false }) : "—");
 const SOURCE: Record<string, string> = { edit: "Edit", import: "Imported from the server", revert: "Back to an old revision" };
@@ -103,8 +104,8 @@ export function EnvApp({ app, onChanged }: { app: string; onChanged: () => void 
   const viewingOld = revision !== undefined && revision !== latest;
   const startImport = () => api.importEnv(app).then((r) => setJob(r.job.id), (e: api.ApiError) => setError(toFail(e)));
   const reveal = (key: string) => api.revealEnv(app, shown!, key).then((r) => setRevealed({ ...revealed, [key]: r.value }), (e: api.ApiError) => setError(toFail(e)));
-  const revert = (rev: number) => {
-    if (!confirm(`Save the values of revision ${rev} as a new revision? It still has to be written to the server to take effect.`)) return;
+  const revert = async (rev: number) => {
+    if (!(await ask(`Save the values of revision ${rev} as a new revision? It still has to be written to the server to take effect.`, { confirm: "Save as new revision" }))) return;
     api.revertEnv(app, rev, latest).then(() => { refresh(); onChanged(); }, (e: api.ApiError) => setError(toFail(e)));
   };
   const done = () => { refresh(); onChanged(); };

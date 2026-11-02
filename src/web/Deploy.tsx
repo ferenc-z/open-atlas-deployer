@@ -6,6 +6,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import * as api from "./api.ts";
 import type { Job, JobView as JobData, Plan } from "./api.ts";
 import { diffLines } from "./diff.ts";
+import { ask } from "./Confirm.tsx";
 
 const STEP: Record<string, string> = {
   clone: "Clone tag", tools: "Get release tools", build: "Build and push", "verify-build": "Check BUILD.json",
@@ -174,9 +175,9 @@ export function JobPanel({ id, onClose, onBack }: { id: string; onClose: () => v
     setActionError("");
     api.check(id, component, index, checked).then(reload, (e: Error) => setActionError(e.message));
   };
-  const stopHere = () => {
+  const stopHere = async () => {
     const scheduled = data?.job.rollout?.scheduled && !data.job.rollout.scheduled.submitted;
-    if (!confirm(scheduled ? "Cancel this scheduled deploy? The maintenance notice in Workbench will be removed." : "Stop the deploy at this manual step? Finished steps are kept and the deploy is marked failed.")) return;
+    if (!(await ask(scheduled ? "Cancel this scheduled deploy? The maintenance notice in Workbench will be removed." : "Stop the deploy at this manual step? Finished steps are kept and the deploy is marked failed.", { confirm: scheduled ? "Cancel deploy" : "Stop deploy", danger: true }))) return;
     api.stopJob(id).then(reload, (e: Error) => setActionError(e.message));
   };
   useEffect(() => { logRef.current?.scrollTo(0, logRef.current.scrollHeight); }, [data?.log]);

@@ -6,6 +6,7 @@ import { useCallback, useEffect, useState } from "react";
 import * as api from "./api.ts";
 import type { DeployerPlan, PlatformView } from "./api.ts";
 import { JobState } from "./Deploy.tsx";
+import { ask } from "./Confirm.tsx";
 
 const RELATION: Record<string, string> = { newer: "newer", older: "older (go back)", running: "running", unknown: "" };
 const active = (state?: string) => state === "queued" || state === "running";
@@ -54,9 +55,9 @@ function DeployerRow({ data, onChanged }: { data: PlatformView; onChanged: () =>
   const version = choice === "other" || !d.versions.length ? other.trim() : choice;
   const running = active(d.job?.state);
   const review = () => { setError(""); api.deployerPlan(version).then(setPlan, (e: Error) => setError(e.message)); };
-  const confirm_ = () => {
+  const confirm_ = async () => {
     if (!plan) return;
-    if (plan.older && !confirm(`Go back from ${plan.from} to ${plan.to}? Data the newer version wrote may not be used by the older one.`)) return;
+    if (plan.older && !(await ask(`Go back from ${plan.from} to ${plan.to}? Data the newer version wrote may not be used by the older one.`, { confirm: `Go back to ${plan.to}`, danger: true }))) return;
     api.upgradeDeployer(plan.to, plan.older).then(() => { setPlan(undefined); onChanged(); }, (e: Error) => setError(e.message));
   };
   return (
@@ -112,13 +113,13 @@ function ExecutorRows({ data, onChanged }: { data: PlatformView; onChanged: () =
   const startable = data.executors.filter((e) => e.upgrade.available && !e.upgrade.blocked);
   const batch = data.batch;
   const batchRunning = Boolean(batch?.current);
-  const one = (host: string, from: string | null) => {
-    if (!confirm(`Upgrade the executor on ${host} from ${from} to ${data.shipped}? It takes the release from the host's own source and restarts; if the new version does not start, it goes back by itself.`)) return;
+  const one = async (host: string, from: string | null) => {
+    if (!(await ask(`Upgrade the executor on ${host} from ${from} to ${data.shipped}? It takes the release from the host's own source and restarts; if the new version does not start, it goes back by itself.`, { confirm: "Upgrade" }))) return;
     setError("");
     api.upgradeExecutor(host).then(onChanged, (e: Error) => setError(e.message));
   };
-  const all = () => {
-    if (!confirm(`Upgrade ${startable.length} executors to ${data.shipped}, one host after the other? A failed host stops the rest.`)) return;
+  const all = async () => {
+    if (!(await ask(`Upgrade ${startable.length} executors to ${data.shipped}, one host after the other? A failed host stops the rest.`, { confirm: "Upgrade all" }))) return;
     setError("");
     api.upgradeOutdated().then(onChanged, (e: Error) => setError(e.message));
   };
