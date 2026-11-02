@@ -183,7 +183,7 @@ docker push <镜像仓库>/open-atlas-deployer:<package.json 的版本>
 
 - [Dockerfile](Dockerfile)：Node 22 直接运行服务端的 TypeScript，用自带的 `node:sqlite`；页面在构建时按 `DEPLOYER_BASE_PATH`（默认 `/deploy`）打包，一个镜像对应一个挂载路径。以 1000:1000 运行，不挂 Docker socket、没有镜像仓库凭据；健康检查访问 `/health`。镜像带 `org.open-atlas.version` 和提交号标签。工作区有未提交改动时，构建脚本会提示镜像对不上提交号。
 - 服务器上的布局见 [examples/deployer/compose.yaml](examples/deployer/compose.yaml) 和 [deployer.env.example](examples/deployer/deployer.env.example)：放在 `/webapp/data/open-atlas/deployer/`（执行器的部署根目录跳过这个目录），自成一个 compose 项目 `open-atlas-deployer`，执行器对应用做的 compose up、回滚、恢复都碰不到它；端口只绑 127.0.0.1:8095，由 nginx 经 https 转发；加入应用的网络 `open-atlas_default`，按服务名访问 Workbench 和各服务的 `/meta/contracts`。`data/` 和 `secrets/` 要属 1000:1000，令牌和 key 文件权限 600。
-- 第一个候选版本是 `0.1.0-rc.1`（之前的 `0.1.0-beta.*` 只在本地构建过）。compose 里的镜像写成 `${DEPLOYER_IMAGE}`，值在同目录的 `.env`（[.env.example](examples/deployer/.env.example)）：第一次手写，之后由执行器改。
+- 第一个正式版是 `0.1.0`（之前有 `0.1.0-rc.1` 到 `rc.5` 五个候选版本；`0.1.0-beta.*` 只在本地构建过）。compose 里的镜像写成 `${DEPLOYER_IMAGE}`，值在同目录的 `.env`（[.env.example](examples/deployer/.env.example)）：第一次手写，之后由执行器改。
 
 Deployer 自己的升级（D16，2026-11-02 已实现）：admin 在 Overview 的 Platform 区选版本、看过计划后确认（D39，原先在 Hosts 页，已移走）。Deployer 找到心跳里说自己运行 Deployer 的那台机器（`executor.env` 设了 `EXECUTOR_DEPLOYER_DIR` 和 `EXECUTOR_DEPLOYER_IMAGE`，只能有一台），排一个 `deployer-upgrade` 任务，请求里只有版本号。执行器：
 

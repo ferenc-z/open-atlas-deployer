@@ -3,6 +3,32 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
+## 0.1.0
+
+The first release: the same code as 0.1.0-rc.5, with executor 0.7.2. What it does is under 0.1.0-rc.1; the release
+candidates after it fixed what trying them turned up.
+
+**What it does**
+- Deploys apps from manifests the Deployer keeps (per app and version range), through an executor on each host, with
+  a plan before every deploy, backups, rollback and an audit log.
+- Promotes to PROD only what UAT has run, by UAT's image digests and with UAT's manifest revision; an administrator
+  can skip the rule with a reason.
+- Upgrades itself and its executors from the Overview's Platform area, from this repository's releases.
+- Environment variables, environment settings and nginx configuration as revisions; API keys and an MCP endpoint,
+  with admin tools for manifests and settings; the Deploy Assistant and failure diagnosis through OMA.
+
+**Tried before this release**
+- On a local UAT and PROD (one machine): installing from this repository's releases, upgrading the Deployer and the
+  executors from the page, a missing version refused before anything stops, promotion and its block, the admin MCP
+  tools.
+
+**Known limits**
+- Not yet installed on a real server: the executor's `install.sh` (root, systemd) and a system nginx have not run
+  there. Report what a first installation runs into; fixes follow in 0.1.x.
+- Checking that the versions affected by a manifest's new image source have images there follows in 0.1.x (saving
+  such a manifest warns).
+- The Deployer's version list is cached for 5 minutes: a release just published may need "Other version…".
+
 ## 0.1.0-rc.5
 
 - Executor 0.7.2, for upgrading the Deployer (D16):
