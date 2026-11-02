@@ -317,6 +317,7 @@ function Registry({ principal, prod }: { principal: Principal; prod: boolean }) 
       <table>
         <thead><tr><th>App</th><th>Repository</th><th>Manifests</th><th>Registered</th></tr></thead>
         <tbody>
+          {list.length === 0 && <tr><td colSpan={4} className="muted">No apps registered yet.{admin && !prod ? " Use Register an app to paste the first manifest." : prod && admin ? " Use Take from UAT." : ""}</td></tr>}
           {list.map((a) => {
             const ranges = [...new Set(a.manifests.map((m) => m.appliesFrom))];
             return (
@@ -399,6 +400,17 @@ function AppDetail({ id, admin, back }: { id: string; admin: boolean; back: () =
   );
 }
 
+// A smallest manifest to start a registration from: one service from a public image. Every value is a placeholder.
+const TEMPLATE = JSON.stringify({
+  v: 1,
+  app: "my-app",
+  appliesFrom: "1.0.0",
+  release: { repo: "owner/my-app", tag: "v{version}", manifest: "package.json" },
+  components: [
+    { id: "web", type: "compose-service", service: "my-app-web", source: { kind: "public-registry", image: "owner/my-app:1.0.0" }, ports: [{ container: 8080, host: 8080 }] },
+  ],
+}, null, 2);
+
 function ManifestForm({ initial, appId, onSaved }: { initial?: Manifest; appId?: string; onSaved: () => void }) {
   const [text, setText] = useState(initial ? JSON.stringify(initial, null, 2) : "");
   const [name, setName] = useState("");
@@ -422,19 +434,35 @@ function ManifestForm({ initial, appId, onSaved }: { initial?: Manifest; appId?:
     if (!check) return;
     api.saveManifest(check.id, check.manifest, check.result.base, { ...(name ? { name } : {}), ...(note ? { note } : {}), repoChange }).then(onSaved, fail);
   };
+  // A changed text needs checking again before it can be saved.
+  const edit = (value: string) => { setText(value); setCheck(undefined); };
+  const load = (file: File | undefined) => {
+    if (!file) return;
+    file.text().then(edit, (err: Error) => setError({ message: `Cannot read ${file.name}: ${err.message}`, details: [] }));
+  };
   return (
     <form className="card manifest" onSubmit={submit}>
-      <p className="muted">
-        {appId ? "Changing appliesFrom starts a separate manifest from the new version; otherwise it is saved as a new revision for the same range." : "Paste a deploy manifest v1 (deploy.json). The first manifest registers the app; the repository comes from release.repo."}
-        It is validated against format v1 before saving, and checked for conflicts in service names and host ports with other apps.
-      </p>
-      <textarea spellCheck={false} value={text} onChange={(e) => setText(e.target.value)} placeholder='{ "v": 1, "app": "…", "appliesFrom": "…", … }' />
+      <h2>{appId ? `New manifest or revision for ${appId}` : "Register an app"}</h2>
+      <ol className="steps-hint">
+        <li>{appId ? "Edit the manifest below: it starts as the newest one." : "Paste the app's deploy manifest (deploy.json, format v1) below, open the file, or drop it on the box."}</li>
+        <li><b>Check</b> validates it against format v1 and looks for service names and host ports other apps already use; it lists what to fix and which versions it affects.</li>
+        <li>When the check finds nothing to fix, <b>Save</b> appears. {appId ? "Changing appliesFrom starts a separate manifest from that version; otherwise it saves a new revision of the same range." : "The first manifest registers the app; its repository comes from release.repo."}</li>
+      </ol>
+      <div className="row">
+        <label className="button">Open deploy.json…<input type="file" accept=".json,application/json" hidden onChange={(e) => { load(e.target.files?.[0]); e.target.value = ""; }} /></label>
+        {!appId && !text.trim() && <button type="button" onClick={() => edit(TEMPLATE)}>Start from a template</button>}
+      </div>
+      <textarea spellCheck={false} value={text} onChange={(e) => edit(e.target.value)}
+        onDragOver={(e) => e.preventDefault()} onDrop={(e) => { e.preventDefault(); load(e.dataTransfer.files[0]); }}
+        placeholder={"Paste deploy.json here, or drop the file on this box.\n\n{\n  \"v\": 1,\n  \"app\": \"my-app\",\n  \"appliesFrom\": \"1.0.0\",\n  \"release\": { \"repo\": \"owner/my-app\", \"tag\": \"v{version}\", \"manifest\": \"package.json\" },\n  \"components\": [ … ]\n}"} />
       <div className="row">
         {!appId && <input placeholder="Display name (optional)" value={name} onChange={(e) => setName(e.target.value)} />}
         <input placeholder="Change note (optional)" value={note} onChange={(e) => setNote(e.target.value)} />
-        <button type="submit" disabled={!text.trim()}>Check</button>
+        <button type="submit" className={check ? "" : "primary"} disabled={!text.trim()}>Check</button>
         {check && !check.result.findings.length && <button type="button" className="primary" onClick={save}>{check.result.newRange ? `Save as a new range from ${check.result.appliesFrom}` : `Save as revision ${(check.result.base ?? 0) + 1}`}</button>}
       </div>
+      {!text.trim() && <p className="small muted">Check is available once there is a manifest in the box.</p>}
+      {check && check.result.findings.length > 0 && <p className="small muted">Fix what is listed below in the box and check again.</p>}
       {check && (
         <div className="plan">
           {check.result.findings.length > 0 && <ul className="findings">{check.result.findings.map((f) => <li key={f} className="error mono">✕ {f}</li>)}</ul>}

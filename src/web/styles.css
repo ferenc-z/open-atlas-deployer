@@ -153,7 +153,9 @@ td.actions { display: flex; gap: 12px; white-space: nowrap; }
 .badge.muted { background: var(--bg); color: var(--muted); }
 
 form.manifest { display: grid; gap: 10px; margin-bottom: 16px; }
-form.manifest p { margin: 0; }
+form.manifest p, form.manifest h2 { margin: 0; }
+.steps-hint { margin: 0; padding-left: 20px; color: var(--muted); display: grid; gap: 4px; }
+.steps-hint b { color: var(--text); }
 form.manifest textarea { min-height: 280px; font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 12px; }
 .row { display: flex; gap: 8px; flex-wrap: wrap; }
 .row input { flex: 1; min-width: 160px; }
