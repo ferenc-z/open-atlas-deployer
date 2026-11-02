@@ -3,6 +3,15 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
+## 0.1.0-rc.5
+
+- Executor 0.7.2, for upgrading the Deployer (D16):
+  - when `docker compose up` itself fails on the new version (a port taken, a container in the way), the upgrade goes
+    back to the previous image and state; before, it stopped there with `.env` already naming the new version;
+  - it refuses before touching anything when the Deployer's `compose.yaml` names a different project than
+    `EXECUTOR_DEPLOYER_PROJECT` (the executor's `-p` wins over the file, so it would have stopped another project).
+- Found upgrading a local UAT and PROD on one machine; upgrade the executors from the Platform area after the Deployer.
+
 ## 0.1.0-rc.4
 
 - MCP: an administrator's personal key can revoke API keys with `revoke_key` (it was listed but always refused, since
