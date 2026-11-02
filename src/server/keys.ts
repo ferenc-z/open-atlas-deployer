@@ -63,10 +63,11 @@ export class Keys {
   }
 
   revoke(p: Principal, id: string) {
-    if (p.via !== "workbench") throw new KeyError(403, "key/browser-only", "Keys are revoked on the page.");
+    // D38: an administrator's own key may revoke keys too (revoking only takes access away); making one stays on the page.
+    if (p.via !== "workbench" && !(p.via === "key" && p.isAdmin)) throw new KeyError(403, "key/browser-only", "Keys are revoked on the page.");
     const k = this.store.listKeys().find((x) => x.id === id);
     if (!k || (!p.isAdmin && k.owner !== p.id) || (k.kind === "service" && !p.isAdmin)) throw new KeyError(404, "key/unknown", "No such key.");
-    this.store.revokeKey(id, { id: p.id, via: "workbench" });
+    this.store.revokeKey(id, { id: p.id, via: p.via });
   }
 
   /** The principal behind a bearer key: a service key as is; a personal key as its owner is in Workbench right now. */

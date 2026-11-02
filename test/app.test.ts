@@ -1567,6 +1567,15 @@ test("D38: admin tools are seen by an admin's personal key only; saving is not d
   assert.ok(t.store.listAudit().some((e) => e.action === "mcp.save_environment" && (e.detail as { note?: string }).note === "nginx"));
   const audit = await tool(t, admin, "list_audit", { action: "environment" });
   assert.ok(audit.value.entries.every((e: { action: string }) => e.action.startsWith("environment")));
+
+  // Revoking only takes access away, so an admin's key may do it; the revoked key stops at once.
+  const listed = await tool(t, admin, "list_keys");
+  const cli = listed.value.keys.find((k: { name: string }) => k.name === "cli");
+  const revoked = await tool(t, admin, "revoke_key", { id: cli.id, note: "lost laptop", request_id: "k1" });
+  assert.equal(revoked.value.revoked, true, JSON.stringify(revoked.value));
+  assert.equal((await bearer(t, "/api/status", personal)).status, 401);
+  assert.equal(t.store.listAudit().find((e) => e.action === "key.revoke")!.via, "key");
+  assert.equal((await bearer(t, `/api/keys/${cli.id}`, personal, { method: "DELETE" })).status, 401);
 });
 
 // D39: the Platform area on the Overview.

@@ -511,7 +511,8 @@ export function createApp({ config, store, sessions, observer, deployments, vers
   api.post("/api/assessments/:id/close", (c) => withOnboarding(c, "view", (p, o) => c.json(o.view(o.close(p, c.req.param("id"))))));
   api.post("/api/assessments/:id/issue", (c) => withOnboarding(c, "view", async (p, o) => c.json(o.view(await o.openIssue(p, c.req.param("id"))))));
 
-  // API keys (§9.4): made and revoked on the page with a Workbench session; a key never makes a key.
+  // API keys (§9.4): made on the page with a Workbench session (a key never makes a key); revoked there or with an
+  // administrator's key (D38).
   const keyError = (c: Context, error: unknown) => {
     if (error instanceof KeyError) return reject(c, error.status, error.code, error.message);
     throw error;

@@ -391,7 +391,7 @@ python3 /opt/open-atlas-deployer/executor/current/deployer_executor.py check
 
 - **个人 key**（`dpk_`）：本人用 Workbench 登录生成，绑定本人；只显示一次，只存 SHA-256；有效期 1–365 天。每次调用都用 Workbench API key 向 Workbench 重新确认主人仍然启用、在哪些组，所以停用或移出组下一次调用就生效。能做的和主人在页面上一样，但 **PROD 的部署、写环境变量、勾选人工步骤，跳过晋级，查看密钥原值**只认浏览器会话（`auth/browser-only`）。
 - **服务 key**（`dps_`）：管理员生成，给 OMA Vault 里的 Deploy Assistant 用，只读，没有人在它背后。
-- 不能用 key 生成或吊销 key。生成、吊销都记审计。
+- 不能用 key 生成 key；吊销 key 可以在页面上做，也可以用管理员的个人 key 经 `/mcp` 的 `revoke_key` 做（吊销只会收回权限，D38）。生成、吊销都记审计。
 
 要启用 key，需要 `DEPLOYER_WORKBENCH_API_KEY_FILE`（向 Workbench 确认主人）。
 
