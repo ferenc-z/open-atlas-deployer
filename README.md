@@ -157,7 +157,7 @@ Deployer 容器不挂 Docker socket（§8.2），所以状态有两个来源：
    - 违反策略：`privileged`、`cap_add`、`devices`、宿主机网络或 pid 等命名空间、`unconfined`、`build`、挂载 Docker socket、在应用目录和 `EXECUTOR_BIND_ROOTS` 之外的 bind 挂载、不在登记仓库里的镜像或 `latest` 公共镜像；
    - 宿主机端口被本应用之外的容器占用。比如 Dossier 迁移时旧的 `proxy` 占着 18100，要先手工停掉。
 4. **备份**：暂停容器，打包数据目录（不含 `logs/`），每个应用保留 3 份。宿主机配了 `EXECUTOR_DB_DUMP_<APP>` 的，再导出数据库，导出失败就不部署（Dossier 的库在清单之外，沿用旧升级器的做法）。
-5. **切换**：留下上一版的片段、根文件和 `files/`；第一次接管时，旧的手写根文件另存为 `compose.yaml.before-deployer`。缺失的数据目录按镜像的 `USER` 设属主。
+5. **切换**：留下上一版的片段、根文件和 `files/`；第一次接管时，旧的手写根文件另存为 `compose.yaml.before-deployer`。缺失或还是空的数据目录（比如服务器上用别的账号事先建好的）按镜像的 `USER` 设属主，并写进任务日志；里面已有文件的目录不改。
 6. **启动并验证**：只 `up` 这个应用的服务，不加 `--remove-orphans`，所以别的应用和还没迁移的旧容器不受影响。等每个服务都 running，有健康检查的要 healthy；默认等 300 秒，重启超过 3 次直接判失败。
 7. **失败自动回滚**：先存下容器日志。
    - 换回上一版的片段和文件，重新启动；
@@ -714,7 +714,7 @@ sudo ./bootstrap.sh --workbench-public-url https://uat.example.internal:8443/
 - 服务端测试：全新安装用紧急账号从 L0 走到 L1（表单校验、只能建一次修订、紧急账号签发令牌、心跳、导入清单、重复导入被拒），生成 Workbench 的 env（密码只出现一次、页面上看不到原值、只能生成一次），Workbench 通了以后紧急会话失效；admin 贴入 key（非 admin 被拒、错的 key 被拒、存的是密文）、建出缺的 Group，到 L2；可选的 appLinks 一步；删掉页面上的 key 后回到"下一步"。已有的 Workbench：版本太旧时拦住，≥ 1.24.0 时要求接管，文件里的 key 优先，部署记录有了以后完成；PROD 不导入内置清单。`sh bin/check.sh` 全部通过（91 个测试）。
 - 第二期在本地全新实例上重启后经接口试过生成 env：返回一次密码，并自动排了读取服务器 env 文件的任务。
 - 第三期：服务端测试走一遍 AI 清单（OMA 不通、通但不是本 Deployer 部署、从样例清单登记并部署、Vault 凭据和服务 key、Business Agent 指错 agent、一键登记及重复登记保留字段、agent 归档），共 92 个测试通过。本地实例上 `/api/setup/ai` 在什么都没配时列出 7 项未完成。
-- 第三期在 WSL 本地 UAT 上验证（2026-11-02，真的 Workbench 和 OMA）：用当前代码构建本地镜像，把 0.1.0 的 Deployer 换上去，状态库原样沿用。Setup 页认出 Workbench 1.23.1 太旧，在页面上构建并部署 1.25.1，建 Group，初始化完成（L2）；Overview 那一行、Setup 页的 AI 区块按真实状态显示；一键登记把 Workbench 里的条目改成 https 地址，从 Workbench 打开 Deployer，助手面板里嵌入的对话能显示；用和样例一致的清单把 OMA 从 beta.8 部署到 beta.9，清单七项全部完成。验证中发现并修了四处：OMA 不给非所有者列 Vault 凭据（原来一律报 404）；没设 Application id 时 O1 不算完成；早于 1.24.0 的 Workbench 被当成完成；指向 http 地址的条目被当成能嵌入。助手面板顶部显示的名字是 "AI builder" 而不是 "Deploy Assistant"，没有再查。
+- 第三期在 WSL 本地 UAT 上验证（2026-11-02，真的 Workbench 和 OMA）：用当前代码构建本地镜像，把 0.1.0 的 Deployer 换上去，状态库原样沿用。Setup 页认出 Workbench 1.23.1 太旧，在页面上构建并部署 1.25.1，建 Group，初始化完成（L2）；Overview 那一行、Setup 页的 AI 区块按真实状态显示；一键登记把 Workbench 里的条目改成 https 地址，从 Workbench 打开 Deployer，助手面板里嵌入的对话能显示；用和样例一致的清单把 OMA 从 beta.8 部署到 beta.9，清单七项全部完成。验证中发现并修了四处：OMA 不给非所有者列 Vault 凭据（原来一律报 404）；没设 Application id 时 O1 不算完成；早于 1.24.0 的 Workbench 被当成完成；指向 http 地址的条目被当成能嵌入。助手面板顶部显示的名字是 "AI builder"：这是 Workbench 嵌入对话的固定标题，任何嵌入的应用都一样，实际回答的是 Deploy Assistant（对话的 agent 就是 `DEPLOYER_OMA_AGENT`）；要改得改 Workbench。
 - 本地验证时第一次构建 Workbench 1.25.1 失败：WSL 里留着手工构建时的同名本地 tag，release-tools 不覆盖；删掉这两个本地 tag 后重建成功。
 - 本地起一个全新实例（没有 `environment.json`，Workbench 不通），经接口走完同样的流程，Workbench 1.25.1 的部署计划没有拦截项。提示里有一条：`ferenc-z/open-atlas-workbench` 是私有仓库，没有令牌时读不到 `release.json`，契约核对只能跳过。
 - `bin/package-setup.sh` 在 WSL 上打包成功；镜像里的 `hash-password.ts` 能从标准输入算出冒号格式的哈希。`bootstrap.sh` 本身还没在真实服务器上以 root 跑过。

@@ -3,6 +3,15 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
+## 0.2.1
+
+Executor 0.7.3; the Deployer is unchanged apart from carrying it. Upgrade the executors from the Overview after the
+Deployer.
+
+- Executor 0.7.3: a data directory made beforehand and still empty (by another account on the host) now goes to the user
+  the image runs as, like a new one, and the job log says so; before, only a missing directory did, and Workbench
+  (1000) could not write to one made by another account. A directory with files in it keeps its owner.
+
 ## 0.2.0
 
 First setup (D41): a new installation goes from `bootstrap.sh` on the server to Workbench signing people in on one

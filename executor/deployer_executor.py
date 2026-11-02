@@ -59,7 +59,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "0.7.2"
+VERSION = "0.7.3"
 PROTOCOLS = [2]
 # Job kinds, plus what a deploy may ask for (bundle files, migrations): an older executor is not sent those.
 KINDS = ["build", "deploy", "env", "env-read", "bundle", "db-migration", "executor-upgrade", "deployer-upgrade"]
@@ -1273,16 +1273,24 @@ class Executor:
         return resolved
 
     def ensure_data_dir(self, path, image):
-        """A new data directory belongs to the user the image runs as (Studio 10001, Workbench 1000)."""
+        """A new data directory belongs to the user the image runs as (Studio 10001, Workbench 1000). So does one made
+        beforehand and still empty (by another account on the host, such as the one that laid out the apps' root);
+        a directory with files in it keeps its owner."""
         if path.exists():
-            return
-        path.mkdir(parents=True)
+            if not path.is_dir() or any(path.iterdir()):
+                return
+        else:
+            path.mkdir(parents=True)
         if not image or os.geteuid() != 0:
             return
         user = self.sh(["docker", "image", "inspect", "--format", "{{.Config.User}}", image], check=False).stdout.strip()
         m = re.match(r"^(\d+)(?::(\d+))?$", user)
         if m:
-            os.chown(path, int(m.group(1)), int(m.group(2) or m.group(1)))
+            uid, gid = int(m.group(1)), int(m.group(2) or m.group(1))
+            st = path.stat()
+            if (st.st_uid, st.st_gid) != (uid, gid):
+                os.chown(path, uid, gid)
+                self.log(f"data directory {path} now belongs to {uid}:{gid}, the user {image} runs as")
 
     def fetch_files(self, files, dest):
         """The release's files the fragment mounts read-only (e.g. Dossier's deploy/Caddyfile) or the migrations

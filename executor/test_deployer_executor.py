@@ -344,6 +344,45 @@ class BundleTest(unittest.TestCase):
             self.ex.deploy(req, {"steps": [], "result": {}})
 
 
+class DataDirTest(unittest.TestCase):
+    """A data directory goes to the image's user when it is new or still empty, as root only."""
+
+    def setUp(self):
+        from unittest import mock
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        self.ex = dx.Executor(cfg(self.root), out=open(self.root / "out.log", "w"))
+        self.ex.sh = lambda args, **kw: type("P", (), {"returncode": 0, "stdout": "54321:54321\n", "stderr": ""})()
+        self.chowned = []
+        for name, value in (("geteuid", lambda: 0), ("chown", lambda p, u, g: self.chowned.append((pathlib.Path(p).name, u, g)))):
+            patcher = mock.patch.object(dx.os, name, value, create=True)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        self.ex.out.close()
+        self.tmp.cleanup()
+
+    def test_new_and_empty_directories_take_the_images_user_and_full_ones_keep_theirs(self):
+        self.ex.ensure_data_dir(self.root / "new", "wb:1")
+        (self.root / "empty").mkdir()
+        self.ex.ensure_data_dir(self.root / "empty", "wb:1")
+        (self.root / "full").mkdir()
+        (self.root / "full" / "workbench.db").write_text("x")
+        self.ex.ensure_data_dir(self.root / "full", "wb:1")
+        self.assertTrue((self.root / "new").is_dir())
+        self.assertEqual(self.chowned, [("new", 54321, 54321), ("empty", 54321, 54321)])
+
+    def test_not_root_or_no_numeric_user_changes_nothing(self):
+        from unittest import mock
+        with mock.patch.object(dx.os, "geteuid", lambda: 1001, create=True):
+            self.ex.ensure_data_dir(self.root / "a", "wb:1")
+        self.ex.sh = lambda args, **kw: type("P", (), {"returncode": 0, "stdout": "node\n", "stderr": ""})()
+        self.ex.ensure_data_dir(self.root / "b", "wb:1")
+        self.assertEqual(self.chowned, [])
+        self.assertTrue((self.root / "a").is_dir() and (self.root / "b").is_dir())
+
+
 class FileHashTest(unittest.TestCase):
     def test_hashes_the_compose_and_env_files_it_manages(self):
         import hashlib
