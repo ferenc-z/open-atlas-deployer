@@ -310,7 +310,7 @@ test("§15: a new installation is set up with the emergency account up to Workbe
   s = await steps();
   assert.equal(s.level, "L1");
   assert.equal(s.state["workbench-deploy"], "next");
-  assert.deepEqual(setupStep(s, "workbench-deploy").workbench, { takeover: false, version: "1.25.1", envRevisions: 0, envWritten: false });
+  assert.deepEqual(setupStep(s, "workbench-deploy").workbench, { takeover: false, version: "1.25.1", envRevisions: 0, envWritten: false, nginx: { saved: null, changed: true } });
 
   // Step 4: Workbench's env is generated; the initial admin's password comes back once, and the file is read first.
   assert.equal((await call("POST", "/api/setup/workbench-env", { adminEmail: "not an email" })).status, 400);
@@ -323,6 +323,12 @@ test("§15: a new installation is set up with the emergency account up to Workbe
   assert.ok(!shown.includes(gen.password), "the password is not shown again");
   assert.ok(shown.includes("first@example.com") && shown.includes("{{app:workbench.url}}"));
   assert.equal((await call("POST", "/api/setup/workbench-env", { adminEmail: "first@example.com" })).status, 409, "only once");
+  // Workbench is behind nginx: the recommended configuration is saved from step 4, the Ingress page is not open yet.
+  assert.match(setupStep(await steps(), "workbench-deploy").detail, /nginx configuration/);
+  assert.equal((await call("POST", "/api/ingress/nginx", { note: "first setup" })).status, 201);
+  s = await steps();
+  assert.deepEqual(setupStep(s, "workbench-deploy").workbench.nginx, { saved: 1, changed: false });
+  assert.doesNotMatch(setupStep(s, "workbench-deploy").detail, /nginx configuration/);
 
   // Deployed; Workbench answers: the emergency account is gone, an admin signs in with Workbench.
   deployedWorkbench(t);

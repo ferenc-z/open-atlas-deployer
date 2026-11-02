@@ -59,7 +59,8 @@ function Addresses({ data }: { data: IngressView }) {
   );
 }
 
-function Nginx({ data, onSaved }: { data: IngressView; onSaved: () => void }) {
+/** Also shown in setup step 4 (§15), where the Ingress page is not open yet. */
+export function Nginx({ data, onSaved }: { data: IngressView; onSaved: () => void }) {
   const [note, setNote] = useState("");
   const [error, setError] = useState("");
   const latest = data.nginx.latest;

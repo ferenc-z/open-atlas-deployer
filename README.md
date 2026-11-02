@@ -680,7 +680,7 @@ sudo ./bootstrap.sh --workbench-public-url https://uat.example.internal:8443/
 | Environment settings | 有没有环境修订 | 没有时填表单（环境名、项目、域名、Workbench 的 https 端口、证书路径、`ghcr` 镜像仓库，默认 `ghcr.io/ferenc-z`）保存为修订 1，同时写入 `apps.workbench`（1.25.1，有域名时走 nginx）。`POST /api/setup/environment`；已有修订或已有 `environment.json` 时拒绝 |
 | Executors | 每台机器的执行器在线 | 在 Setup 页里直接签发令牌（紧急账号也能签发，D41），放进 `EXECUTOR_TOKEN_FILE` 后重启执行器 |
 | Workbench manifest | 注册表里有没有 Workbench | 一键导入镜像自带的 [manifests/initial/workbench.json](manifests/initial/workbench.json)（`POST /api/setup/workbench-manifest`），只在没有 Workbench 时可用。PROD 不导入，从 UAT 取 |
-| Deploy Workbench | Workbench 的 `/health` 通不通，是不是这个 Deployer 部署的 | 新 Workbench：填初始管理员的邮箱，页面生成 env（`POST /api/setup/workbench-env`），初始密码只在这一次的回答里出现，Deployer 照常把它加密保存；随后自动读一次服务器上的 env 文件，再写入、部署。部署前提示：Workbench 一通，紧急账号就失效 |
+| Deploy Workbench | Workbench 的 `/health` 通不通，是不是这个 Deployer 部署的 | 新 Workbench：填初始管理员的邮箱，页面生成 env（`POST /api/setup/workbench-env`），初始密码只在这一次的回答里出现，Deployer 照常把它加密保存；随后自动读一次服务器上的 env 文件，再写入、部署。部署前提示：Workbench 一通，紧急账号就失效。Workbench 走 nginx 时，这一步里也能存推荐的 nginx 配置修订（初始化期间 Ingress 页还进不去），交给运维应用 |
 | Take over Workbench | 同上；Workbench 通、但不是这个 Deployer 部署的 | 版本要 ≥ 1.24.0（读 `/api/workbench/version`）。先从服务器导入它的 env 文件，再部署一次 1.25.1 或更新的版本；Workbench 重启一次，旧的根文件留作 `compose.yaml.before-deployer`。这时 Workbench 是好的，所以用 Workbench admin 登录做，不用紧急账号 |
 | Sign in with Workbench | 当前会话是不是 Workbench admin | 用初始管理员（或已有的 admin）登录 Workbench，再打开 Deployer |
 | Workbench API key | key 能不能用：拿它调一次 Workbench 的 Groups 接口 | 在 Workbench Administration → API keys 建一把，贴进 Setup 页（`PUT /api/setup/workbench-key`）：先试用，通过后用 `DEPLOYER_CREDENTIAL_ENCRYPTION_KEY` 加密存进状态库，立即生效。`DEPLOYER_WORKBENCH_API_KEY_FILE` 有内容时以文件为准，页面不能改 |

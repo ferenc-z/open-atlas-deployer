@@ -166,7 +166,7 @@ pre.json { background: var(--surface); border: 1px solid var(--border); border-r
 /* phase 2 */
 .executor { margin: -4px 0 12px; display: flex; flex-wrap: wrap; gap: 6px 18px; }
 .executor-host { display: inline-flex; align-items: center; gap: 6px; }
-.panel { margin-bottom: 16px; display: grid; gap: 12px; }
+.panel { margin-bottom: 16px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }
 .panel h2, .panel h3 { margin: 0; }
 .plan { display: grid; gap: 10px; }
 .findings { margin: 0; padding-left: 4px; list-style: none; display: grid; gap: 4px; }
@@ -263,13 +263,14 @@ textarea.settings { width: 100%; font-size: 12px; }
 .brief-first p { margin: 0; }
 
 /* §15 Setup */
-.setup-steps { list-style: none; padding: 0; margin: 0; display: grid; gap: 10px; }
+/* minmax(0, 1fr): a long line inside a step (the nginx configuration, a table) scrolls in its box instead of widening every step. */
+.setup-steps { list-style: none; padding: 0; margin: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
 .setup-step { padding: 12px 16px; }
 .setup-step p { margin: 4px 0 0; }
 .setup-step.done { opacity: 0.8; }
 .setup-step.current { border-color: var(--info); box-shadow: 0 0 0 2px var(--info-bg); }
 .setup-head { display: flex; align-items: center; gap: 8px; }
-.setup-action { margin-top: 12px; display: grid; gap: 12px; }
+.setup-action { margin-top: 12px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }
 .setup-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
 .setup-form > p, .setup-form > .row, .setup-form > .error { grid-column: 1 / -1; margin: 0; }
 .setup-field { display: grid; gap: 4px; }

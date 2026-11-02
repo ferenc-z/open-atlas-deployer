@@ -8,6 +8,7 @@ import type { SetupStatus, SetupStep } from "./api.ts";
 import { DeployPanel, JobPanel } from "./Deploy.tsx";
 import { EnvApp } from "./Env.tsx";
 import { HostsPage } from "./Hosts.tsx";
+import { Nginx } from "./Ingress.tsx";
 
 const STATE: Record<SetupStep["state"], { label: string; tone: string }> = {
   done: { label: "Done", tone: "ok" }, next: { label: "Next", tone: "info" }, waiting: { label: "Waiting", tone: "muted" }, blocked: { label: "Blocked", tone: "bad" },
@@ -108,7 +109,7 @@ function EnvironmentForm({ onSaved }: { onSaved: () => void }) {
 
 /** Step 4: a new Workbench (generate its env, write it, deploy) or one to take over (import its env, deploy). */
 function DeployWorkbench({ info, onDone }: { info: NonNullable<SetupStep["workbench"]>; onDone: () => void }) {
-  const [open, setOpen] = useState<"env" | "deploy" | undefined>();
+  const [open, setOpen] = useState<"env" | "nginx" | "deploy" | undefined>();
   const [job, setJob] = useState<string | undefined>();
   // A job still queued or running when the page was opened (the env read queued with the generated env, say) shows too.
   const [closed, setClosed] = useState<string | undefined>();
@@ -143,15 +144,26 @@ function DeployWorkbench({ info, onDone }: { info: NonNullable<SetupStep["workbe
       {info.envRevisions > 0 && (
         <div className="row">
           <button className={open === "env" ? "active" : ""} onClick={() => setOpen(open === "env" ? undefined : "env")}>Environment variables{info.envWritten ? "" : " (not written yet)"}</button>
+          {info.nginx && <button className={open === "nginx" ? "active" : ""} onClick={() => setOpen(open === "nginx" ? undefined : "nginx")}>nginx configuration{info.nginx.changed ? (info.nginx.saved ? " (changed)" : " (not saved yet)") : ""}</button>}
           <button className={info.envWritten ? "primary" : ""} onClick={() => setOpen("deploy")}>{info.takeover ? "Take over: deploy Workbench…" : "Deploy Workbench…"}</button>
         </div>
       )}
       {shown && <JobPanel key={shown} id={shown} onClose={done} />}
       {open === "env" && <EnvApp app="workbench" onChanged={onDone} />}
+      {open === "nginx" && <SetupNginx onSaved={onDone} />}
       {open === "deploy" && <DeployPanel app="workbench" label="Workbench" initial={{ version: info.version }} isAdmin onClose={() => setOpen(undefined)} onJob={(id) => { setOpen(undefined); setJob(id); }} onAssessment={() => undefined} />}
       {error && <p className="error">{error}</p>}
     </>
   );
+}
+
+function SetupNginx({ onSaved }: { onSaved: () => void }) {
+  const [data, setData] = useState<api.IngressView | undefined>();
+  const [error, setError] = useState("");
+  const refresh = useCallback(() => { api.ingress().then(setData, (e: Error) => setError(e.message)); }, []);
+  useEffect(refresh, [refresh]);
+  if (!data) return error ? <p className="error">{error}</p> : <p className="muted">Loading…</p>;
+  return <Nginx data={data} onSaved={() => { refresh(); onSaved(); }} />;
 }
 
 function KeyForm({ onSaved }: { onSaved: () => void }) {

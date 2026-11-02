@@ -37,7 +37,7 @@ export interface SetupStep {
   optional?: boolean;
   hosts?: { id: string; online: boolean; reason?: string; tokens: number }[];
   /** workbench-deploy: a new Workbench (env to generate) or one to take over (env to import first). */
-  workbench?: { takeover: boolean; running?: string; version: string; envRevisions: number; envWritten: boolean; job?: { id: string; kind: string; state: string } };
+  workbench?: { takeover: boolean; running?: string; version: string; envRevisions: number; envWritten: boolean; job?: { id: string; kind: string; state: string }; nginx?: { saved: number | null; changed: boolean } };
   key?: { source: "file" | "page" | null; canSet: boolean; reason?: string };
   missingGroups?: string[];
 }
@@ -110,8 +110,17 @@ export async function setupStatus(ctx: SetupContext, principal: Principal): Prom
   const wbEnv = registered ? ctx.env.latestValues(WORKBENCH) : undefined;
   // A job of Workbench still queued or running (the env read queued with the generated env, a write, a deploy) stays on the page after a reload.
   const active = store.activeJobs().find((j) => j.app === WORKBENCH);
-  const envInfo = { envRevisions: wbEnv?.revision ?? 0, envWritten: Boolean(wbEnv && wbEnv.applied === wbEnv.revision), ...(active ? { job: { id: active.id, kind: active.kind, state: active.state } } : {}) };
+  // Workbench behind nginx: people reach it only once operations apply the recommended configuration, saved here as a
+  // revision (D36); the Ingress page is not open until setup is complete.
+  const behindNginx = registered && env?.apps[WORKBENCH]?.ingress?.kind === "nginx";
+  const latestNginx = behindNginx ? store.nginxRevision() : undefined;
+  const nginx = behindNginx ? { saved: latestNginx?.revision ?? null, changed: latestNginx?.sha256 !== deployments.nginx().sha256 } : undefined;
+  const envInfo = {
+    envRevisions: wbEnv?.revision ?? 0, envWritten: Boolean(wbEnv && wbEnv.applied === wbEnv.revision),
+    ...(active ? { job: { id: active.id, kind: active.kind, state: active.state } } : {}), ...(nginx ? { nginx } : {}),
+  };
   const planned = env?.apps[WORKBENCH]?.version ?? WORKBENCH_MIN_VERSION;
+  const nginxNote = nginx?.changed ? " Save the recommended nginx configuration too and hand it to operations: people reach Workbench through nginx." : "";
   const ready = registered && !offline.length && Boolean(env);
   if (reachable && deployed) {
     steps.push({ id: "workbench-deploy", state: "done", title: "Deploy Workbench", detail: `Workbench ${deployed} runs, deployed by this Deployer, and answers at ${ctx.workbenchUrl}.` });
@@ -124,14 +133,14 @@ export async function setupStatus(ctx: SetupContext, principal: Principal): Prom
       ? { id: "workbench-deploy", state: "blocked", title: "Take over Workbench", detail: `Workbench answers at ${ctx.workbenchUrl} but ${running ? `runs ${running}` : "does not say its version"}; the Deployer takes over ${TAKEOVER_MIN_VERSION} or newer. Upgrade it by hand first.`, workbench }
       : !ready
         ? { id: "workbench-deploy", state: "waiting", title: "Take over Workbench", detail: `Workbench ${running} runs but was not deployed by this Deployer. Taking it over waits for the executors and the Workbench manifest.`, workbench }
-        : { id: "workbench-deploy", state: "next", title: "Take over Workbench", detail: `Workbench ${running} runs but was not deployed by this Deployer. Import its env file from the server, then deploy ${compareVersions(running, WORKBENCH_MIN_VERSION) < 0 ? WORKBENCH_MIN_VERSION : running} or newer: Workbench restarts once, and the old compose root is kept as compose.yaml.before-deployer.`, workbench });
+        : { id: "workbench-deploy", state: "next", title: "Take over Workbench", detail: `Workbench ${running} runs but was not deployed by this Deployer. Import its env file from the server, then deploy ${compareVersions(running, WORKBENCH_MIN_VERSION) < 0 ? WORKBENCH_MIN_VERSION : running} or newer: Workbench restarts once, and the old compose root is kept as compose.yaml.before-deployer.${nginxNote}`, workbench });
   } else if (deployed) {
     steps.push({ id: "workbench-deploy", state: "blocked", title: "Deploy Workbench", detail: `Workbench ${deployed} was deployed but ${ctx.workbenchUrl}/health does not answer: check the container and DEPLOYER_WORKBENCH_URL.` });
   } else {
     const workbench = { takeover: false, version: planned, ...envInfo };
     steps.push(!ready
       ? { id: "workbench-deploy", state: "waiting", title: "Deploy Workbench", detail: "Waits for the executors and the Workbench manifest.", workbench }
-      : { id: "workbench-deploy", state: "next", title: "Deploy Workbench", detail: `${envInfo.envRevisions ? "Write Workbench's environment variables to the server" : "Generate Workbench's environment variables (the initial admin's password is shown once)"}, then deploy ${WORKBENCH_MIN_VERSION} or newer. Once Workbench answers, this emergency sign-in stops working: keep the initial admin's password at hand.`, workbench });
+      : { id: "workbench-deploy", state: "next", title: "Deploy Workbench", detail: `${envInfo.envRevisions ? "Write Workbench's environment variables to the server" : "Generate Workbench's environment variables (the initial admin's password is shown once)"}, then deploy ${WORKBENCH_MIN_VERSION} or newer. Once Workbench answers, this emergency sign-in stops working: keep the initial admin's password at hand.${nginxNote}`, workbench });
   }
 
   const admin = principal.via === "workbench" && principal.permissions.includes("admin");

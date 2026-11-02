@@ -26,6 +26,8 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
 - A Workbench the Deployer did not deploy (1.24.0 or newer) is taken over: import its env file, deploy it once.
 - Setup checks that the Workbench API key works and creates the missing deploy groups; it is complete once the
   Deployer runs Workbench, the key works and the groups exist.
+- When Workbench is behind nginx, the recommended nginx configuration is saved from the Workbench step, since the
+  Ingress page is not open until setup is complete.
 
 ## 0.1.0
 
