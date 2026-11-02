@@ -3,11 +3,15 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
-## Unreleased
+## 0.1.0-rc.3
 
 - Environment variables: values saved before the first import (a new environment, where the file does not exist on
   the server yet) are no longer buried under the empty imported revision: they come back as the newest revision, so
   the next write still carries them. Importing a file the Deployer already wrote or imported adds no revision.
+- Tried on a local UAT and PROD together: promotion by UAT's digests, the block on versions UAT has not run, the
+  administrator override.
+- Not in 0.1.0: checking that the versions affected by a manifest's new image source have images there. Saving such
+  a manifest still warns to deploy those versions in UAT again first; the check follows in 0.1.x.
 
 ## 0.1.0-rc.2
 
