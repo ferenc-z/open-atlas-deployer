@@ -14,13 +14,13 @@
 
 ```sh
 # 1. 版本号：package.json 和 package-lock.json 一起改
-npm version 0.2.2 --no-git-tag-version
-# 2. CHANGELOG.md 加上 "## 0.2.2" 一节；执行器代码改了，就同时调 executor/deployer_executor.py 的 VERSION 和 handoff.ts 的 EXECUTOR_VERSION
+npm version 0.2.3 --no-git-tag-version
+# 2. CHANGELOG.md 加上 "## 0.2.3" 一节；执行器代码改了，就同时调 executor/deployer_executor.py 的 VERSION 和 handoff.ts 的 EXECUTOR_VERSION
 # 3. 提交，确认本地检查通过（.check/last 是 "<提交> ok"，或手动跑 sh bin/check.sh），再推送分支
 git push origin main
 # 4. 打 tag 并推送，release 流程随之开始
-git tag -a v0.2.2 -m "Open Atlas Deployer 0.2.2"
-git push origin v0.2.2
+git tag -a v0.2.3 -m "Open Atlas Deployer 0.2.3"
+git push origin v0.2.3
 ```
 
 发布完成后，管理员在各环境 Deployer 的 Overview → Platform 里就能看到新版本：先升 UAT，跑一段时间再升 PROD。执行器有新版本时，在同一个区域里升级。
@@ -53,7 +53,7 @@ git push origin v0.2.2
 自升级只能从已经装好的版本开始，所以第一次要在服务器上装一次。0.2.0 起用安装包：从 release `v<版本>` 下载 `open-atlas-deployer-setup-<版本>.tar.gz`，解压后 `sudo ./bootstrap.sh`。它装好执行器、布置 Deployer 目录、把密钥直接生成进 `deployer.env`、启动 Deployer；紧急密码在同目录的 `emergency-password` 里。之后用紧急账号打开页面，按 Setup 页做完初始化（README "首次初始化"一节）。下面是手工装的做法，安装包做的也是这几步：
 
 1. **执行器**：从 release `executor-v0.7.3` 下载包，解压后运行 `sudo ./install.sh`，再编辑 `/etc/open-atlas-deployer/executor.env`，参照 [executor.env.example](../executor/executor.env.example)。0.6.0 以前的执行器都要这样手工装一次，之后才能在页面上升级。
-2. **Deployer**：按 [examples/deployer](../examples/deployer) 布置目录。`.env` 里手写 `DEPLOYER_IMAGE=ghcr.io/ferenc-z/open-atlas-deployer:0.2.1`，写死版本，不要用 `latest`；之后执行器升级时会改写这一行。
+2. **Deployer**：按 [examples/deployer](../examples/deployer) 布置目录。`.env` 里手写 `DEPLOYER_IMAGE=ghcr.io/ferenc-z/open-atlas-deployer:0.2.2`，写死版本，不要用 `latest`；之后执行器升级时会改写这一行。
 3. **让 Deployer 能自升级**：在运行 Deployer 的那台机器上，`executor.env` 里设 `EXECUTOR_DEPLOYER_DIR` 和 `EXECUTOR_DEPLOYER_IMAGE`，设 `EXECUTOR_UPGRADE_FROM=ferenc-z/open-atlas-deployer`，并且 `EXECUTOR_REGISTRIES` 要包含 `ghcr.io/ferenc-z`。改完重启执行器。
 4. **在 Deployer 的设置里加 `DEPLOYER_RELEASE_REPO=github:ferenc-z/open-atlas-deployer`**，Overview 才会列出可选版本。
 

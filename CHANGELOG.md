@@ -3,6 +3,14 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
+## 0.2.2
+
+Executor 0.7.3, unchanged; only the page changed.
+
+- Confirmations open in the page's own dialog, in its style and colour scheme, instead of the browser's `confirm()`.
+  Each confirm button is named after its action; on destructive ones (remove, revoke, stop a deploy, go back a
+  version) it is red and Enter stays on Cancel. Escape or a click outside cancels.
+
 ## 0.2.1
 
 Executor 0.7.3; the Deployer is unchanged apart from carrying it. Upgrade the executors from the Overview after the
