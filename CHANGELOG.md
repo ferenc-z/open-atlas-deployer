@@ -3,6 +3,13 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
+## 0.1.0-rc.4
+
+- MCP: an administrator's personal key can revoke API keys with `revoke_key` (it was listed but always refused, since
+  `/mcp` takes only keys). Making a key stays on the page.
+- Tried the admin MCP tools from a client: reading and saving environment settings (a repeated `request_id` saves
+  once), manifests read-only on PROD, PROD deploys refused to keys, every call in the audit log with its key.
+
 ## 0.1.0-rc.3
 
 - Environment variables: values saved before the first import (a new environment, where the file does not exist on
