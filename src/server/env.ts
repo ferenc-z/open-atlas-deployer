@@ -318,8 +318,22 @@ export class EnvManager {
       this.store.markEnvApplied(job.app, latest.meta.revision, job.id);
       return;
     }
+    // The server still has what the Deployer last wrote or imported: nothing new to import.
+    const applied = this.store.appliedEnv(job.app);
+    if (applied && !changedKeys(this.plain(applied.values), parsed.values, secrets).length) {
+      this.store.markEnvApplied(job.app, applied.meta.revision, job.id);
+      return;
+    }
     const note = [found?.exists ? `Imported from ${job.request.file} on the server` : `${job.request.file} does not exist on the server`, ...parsed.errors].join("; ");
-    this.store.saveEnv(job.app, this.seal(manifest, parsed.values), changes, "import", { id: job.requestedBy, via: job.via as Actor["via"] }, { note, appliedJob: job.id });
+    const actor = { id: job.requestedBy, via: job.via as Actor["via"] };
+    this.store.saveEnv(job.app, this.seal(manifest, parsed.values), changes, "import", actor, { note, appliedJob: job.id });
+    // Edits saved before this import and never written stay the newest revision, so the next write still carries them
+    // and nobody edits on top of the imported file by mistake (a first install saves values, then has to import).
+    if (latest && !latest.meta.appliedAt) {
+      const kept = before;
+      const again = changedKeys(parsed.values, kept, this.secretKeys(manifest, [...Object.keys(parsed.values), ...Object.keys(kept)]));
+      if (again.length) this.store.saveEnv(job.app, latest.values, again, "revert", actor, { note: `Back to revision ${latest.meta.revision}: saved before the import and not written yet`, detail: { from: latest.meta.revision } });
+    }
   }
 
   /** For comparing UAT and PROD (§7.2): values as they are on the server; secrets only as an HMAC under the shared compare key. */

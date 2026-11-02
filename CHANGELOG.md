@@ -3,6 +3,12 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
+## Unreleased
+
+- Environment variables: values saved before the first import (a new environment, where the file does not exist on
+  the server yet) are no longer buried under the empty imported revision: they come back as the newest revision, so
+  the next write still carries them. Importing a file the Deployer already wrote or imported adds no revision.
+
 ## 0.1.0-rc.2
 
 - The Deploy Assistant says why it is blank: when Workbench's chat has not loaded after 10 seconds (Workbench

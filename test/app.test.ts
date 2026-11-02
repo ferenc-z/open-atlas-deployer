@@ -736,6 +736,27 @@ test("each save is a revision naming the changed keys; secrets kept unseen; stal
   assert.equal((await (await post(t, "/api/apps/shop/env/reveal", "admin", { revision: 4, key: "API_TOKEN" })).json()).value, "old");
 });
 
+test("values saved before the first import stay on top of the imported file", async () => {
+  const t = withEnvApp();
+  await put(t, "/api/apps/shop/env", "uat", { base: null, values: [{ key: "GREETING", value: "hi" }, { key: "API_TOKEN", value: "s3cret" }] });
+  await importFile(t, null);
+  const view = await (await t.request("/api/apps/shop/env", { as: "viewer" })).json();
+  assert.deepEqual(view.revisions.map((r: { revision: number; source: string }) => `${r.revision} ${r.source}`), ["3 revert", "2 import", "1 edit"]);
+  assert.equal(view.applied, 2, "the server has the imported (missing) file");
+  assert.match(view.revision.note, /^Back to revision 1/);
+  assert.equal((await (await post(t, "/api/apps/shop/env/reveal", "admin", { revision: 3, key: "API_TOKEN" })).json()).value, "s3cret");
+  const p = await (await post(t, "/api/apps/shop/env/plan", "uat", { revision: 3 })).json();
+  assert.deepEqual(p.changes.map((c: { key: string; change: string }) => `${c.key} ${c.change}`), ["API_TOKEN added", "GREETING added"]);
+
+  // Importing a file the Deployer already wrote adds nothing on top.
+  const again = withEnvApp();
+  await importFile(again, "GREETING=hi\n");
+  await put(again, "/api/apps/shop/env", "uat", { base: 1, values: [{ key: "GREETING", value: "hello" }] });
+  await importFile(again, "GREETING=hi\n");
+  const v2 = await (await again.request("/api/apps/shop/env", { as: "viewer" })).json();
+  assert.deepEqual(v2.revisions.map((r: { revision: number }) => r.revision), [2, 1], "an unchanged server file is not imported again, the edit stays newest");
+});
+
 test("writing goes through a plan; the request carries the file, the job record only its hash", async () => {
   const t = withEnvApp();
   const planFirst = await (await post(t, "/api/apps/shop/env/plan", "uat", {})).json();
