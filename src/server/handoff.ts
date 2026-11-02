@@ -10,7 +10,7 @@ import type { ExecutorStatus, Store } from "./store.ts";
 
 export const PROTOCOL = 2;
 /** §8.6: the executor release this Deployer ships with (executor/deployer_executor.py VERSION); hosts on an older one are offered the upgrade. */
-export const EXECUTOR_VERSION = "0.7.1";
+export const EXECUTOR_VERSION = "0.7.2";
 
 export interface Heartbeat {
   version: string;

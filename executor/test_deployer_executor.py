@@ -585,6 +585,32 @@ class DeployerUpgradeTest(unittest.TestCase):
         self.assertFalse(any(a[:2] == ["docker", "compose"] and "ps" not in a for a in self.ran), "nothing was stopped or started")
         self.assertIn("sha256:old", (self.dir / ".env").read_text())
 
+    def test_refuses_when_the_compose_file_names_another_project(self):
+        (self.dir / "compose.yaml").write_text('name: open-atlas-deployer-prod\nservices:\n  deployer:\n    image: "${DEPLOYER_IMAGE}"\n')
+        status = self.upgrade()
+        self.assertEqual(status["state"], "refused")
+        self.assertIn("names project open-atlas-deployer-prod", status["message"])
+        self.assertFalse(any(a[:2] == ["docker", "compose"] for a in self.ran), "no project was stopped")
+        (self.dir / "compose.yaml").write_text('name: "open-atlas-deployer"\nservices:\n  deployer:\n    image: "${DEPLOYER_IMAGE}"\n')
+        self.assertEqual(self.upgrade(job="deployer-upgrade-same")["state"], "succeeded")
+
+    def test_compose_failing_to_start_the_new_version_goes_back_too(self):
+        real = self.sh
+
+        def refusing(args, **kw):
+            if args[-2:] == ["up", "-d"] and "sha256:new" in (self.dir / ".env").read_text():
+                self.ran.append(args)
+                raise dx.Failed("docker compose -p failed (exit 1): container name already in use")
+            return real(args, **kw)
+        self.ex.sh = refusing
+        status = self.upgrade()
+        self.assertEqual(status["state"], "rolled-back", status.get("message"))
+        self.assertIn("docker compose up failed", status["message"])
+        self.assertIn("sha256:old", (self.dir / ".env").read_text(), "the previous image is back in .env")
+        self.assertEqual((self.dir / "data" / "deployer.db").read_text(), "state v1")
+        ups = [a for a in self.ran if a[-2:] == ["up", "-d"]]
+        self.assertEqual(len(ups), 2, "the new version was tried, then the previous one started again")
+
     def test_statuses_the_deployer_could_not_take_are_sent_once_it_answers(self):
         real = self.sh
 

@@ -59,7 +59,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "0.7.1"
+VERSION = "0.7.2"
 PROTOCOLS = [2]
 # Job kinds, plus what a deploy may ask for (bundle files, migrations): an older executor is not sent those.
 KINDS = ["build", "deploy", "env", "env-read", "bundle", "db-migration", "executor-upgrade", "deployer-upgrade"]
@@ -771,6 +771,10 @@ class Executor:
             raise Refused(f"EXECUTOR_DEPLOYER_IMAGE {image} is not a repository in a registered registry (EXECUTOR_REGISTRIES)")
         if not (d / "compose.yaml").is_file():
             raise Refused(f"{d} has no compose.yaml")
+        # The project is named here (-p), which wins over the file's own name: a mismatch would stop another project.
+        named = re.search(r'^name:\s*["\']?([^"\'\s#]+)', (d / "compose.yaml").read_text(), re.M)
+        if named and named.group(1) != self.cfg["deployer_project"]:
+            raise Refused(f"{d}/compose.yaml names project {named.group(1)}, this host EXECUTOR_DEPLOYER_PROJECT={self.cfg['deployer_project']}: set it to the same")
         self.status_tries = 1
         ref = f"{image}:{version}"
 
@@ -818,10 +822,15 @@ class Executor:
         part = env_file.with_name(".env.part")
         part.write_text("\n".join(kept + [f"DEPLOYER_IMAGE={new}"]) + "\n")
         os.replace(part, env_file)
-        self.deployer_compose("up", "-d")
+        # Compose itself can fail here (a port taken, a container in the way): that goes back too, not just a bad start.
+        try:
+            self.deployer_compose("up", "-d")
+            problem = None
+        except Exception as e:
+            problem = f"docker compose up failed: {e}"
 
         self.step(status, "verify")
-        problem = self.wait_healthy(["deployer"], ids_of=self.deployer_containers) or self.deployer_answers(version)
+        problem = problem or self.wait_healthy(["deployer"], ids_of=self.deployer_containers) or self.deployer_answers(version)
         if not problem:
             self.finish(status, "succeeded", f"Deployer {version} is running ({new})")
             return
