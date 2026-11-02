@@ -85,6 +85,10 @@ main { overflow-x: auto; }
 .assistant .toolbar > .muted { font-size: 12px; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .assistant iframe { flex: 1; border: 0; width: 100%; min-height: 0; }
 .assistant.dragging iframe { pointer-events: none; }
+.assistant-hint { padding: 10px 12px; border-bottom: 1px solid var(--border); background: var(--bg); font-size: 13px; }
+.assistant-hint p { margin: 0 0 6px; }
+.assistant-hint p:last-child { margin: 0; }
+.assistant.collapsed .assistant-hint { display: none; }
 .assistant-resizer { position: absolute; left: -3px; top: 0; bottom: 0; width: 6px; cursor: col-resize; z-index: 2; }
 .assistant-resizer:hover, .assistant.dragging .assistant-resizer { background: var(--info); opacity: .5; }
 .assistant.collapsed { width: 40px; }

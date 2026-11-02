@@ -10,6 +10,6 @@ export default defineConfig({
   root: "src/web",
   base,
   plugins: [react()],
-  server: { host: "127.0.0.1", proxy: { [`${base}api`]: api } },
+  server: { host: "127.0.0.1", proxy: { [`${base}api/`]: api } },
   build: { outDir: fileURLToPath(new URL("dist/web", import.meta.url)), emptyOutDir: true },
 });

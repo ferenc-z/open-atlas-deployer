@@ -61,11 +61,17 @@ export function AssistantPanel({ workbenchUrl, environment, page, app, actions, 
   const src = new URL(`embed/chat?app=deployer&key=${encodeURIComponent(`env:${environment ?? "unknown"}`)}&title=${encodeURIComponent(`Deployer ${(environment ?? "").toUpperCase()}`)}`, base.href.endsWith("/") ? base.href : `${base.href}/`).href;
   const context = { env: environment ?? "unknown", page, ...(app ? { app } : {}) };
   const send = (message: Record<string, unknown>) => frame.current?.contentWindow?.postMessage(message, origin);
+  // A frame Workbench cannot load (unreachable, or a certificate this browser does not trust) stays blank without an
+  // error, so after a while without "ready" the panel says so and offers Workbench in a tab of its own.
+  const [ready, setReady] = useState(false);
+  const [slow, setSlow] = useState(false);
+  const [attempt, setAttempt] = useState(0);
+  useEffect(() => { setSlow(false); const t = setTimeout(() => setSlow(true), 10_000); return () => clearTimeout(t); }, [attempt]);
 
   useEffect(() => {
     const onMessage = (e: MessageEvent) => {
       if (e.origin !== origin || e.source !== frame.current?.contentWindow || typeof e.data?.type !== "string") return;
-      if (e.data.type === "workbench-chat:ready") send({ type: "workbench-chat:context", pageContext: context });
+      if (e.data.type === "workbench-chat:ready") { setReady(true); send({ type: "workbench-chat:context", pageContext: context }); }
       if (e.data.type === "workbench-chat:action") {
         const { id, operation, payload } = e.data as { id: string; operation: string; payload: Payload };
         runHostOperation(String(operation), payload ?? {}, actions).then((r) => send({ type: "workbench-chat:action-result", id, ...r }));
@@ -115,7 +121,13 @@ export function AssistantPanel({ workbenchUrl, environment, page, app, actions, 
             </div>
           </>
         )}
-        <iframe ref={frame} src={src} title="Deploy Assistant" />
+        {!ready && slow && mode !== "collapsed" && (
+          <div className="assistant-hint">
+            <p>The assistant has not loaded from Workbench ({origin}). The frame stays blank when Workbench is unreachable or this browser does not trust its certificate.</p>
+            <p><a href={src} target="_blank" rel="noreferrer">Open Workbench in a new tab</a> to see the error, then <button className="link" onClick={() => setAttempt(attempt + 1)}>try again</button>.</p>
+          </div>
+        )}
+        <iframe key={attempt} ref={frame} src={src} title="Deploy Assistant" />
       </aside>
     </>
   );
