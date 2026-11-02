@@ -3,6 +3,15 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
+## 0.2.3
+
+Executor 0.7.3, unchanged; only the page changed.
+
+- Apps & manifests: the form for registering an app or changing its manifest says what to do in three steps
+  (paste or open deploy.json, Check, Save), opens the file from disk or takes it dropped on the box, offers a starting
+  template for a new app, and says why Check is not available yet. Changing the text after a check asks for a new
+  check before Save, so what is saved is what was checked. An empty registry says how to add the first app.
+
 ## 0.2.2
 
 Executor 0.7.3, unchanged; only the page changed.
