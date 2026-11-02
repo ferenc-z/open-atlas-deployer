@@ -4,7 +4,7 @@
 
 1. 核对版本：tag 和 `package.json` 一致，Deployer 自带的执行器版本（`src/server/handoff.ts` 的 `EXECUTOR_VERSION`）和 `executor/deployer_executor.py` 的 `VERSION` 一致。
 2. 从 CHANGELOG 取出这个版本的说明（取不到就停），再跑类型检查、服务端测试，以及 Python 3.9 下的执行器测试。
-3. 构建并推送镜像 `ghcr.io/godfengz/open-atlas-deployer:<版本>`。只有正式版另外推 `:latest`。
+3. 构建并推送镜像 `ghcr.io/ferenc-z/open-atlas-deployer:<版本>`。只有正式版另外推 `:latest`。
 4. 如果 GitHub release `executor-v<执行器版本>` 还不存在，就打包执行器建这个 release，附件是 `open-atlas-deployer-executor-<版本>.tar.gz` 和 `SHA256SUMS`。
 5. 建 GitHub release `v<版本>`，说明就是第 2 步从 [CHANGELOG.md](../CHANGELOG.md) 的 `## <版本>` 一节取出的内容。版本号带 `-` 的（比如 `0.1.0-rc.1`）标成 pre-release。
 
@@ -31,7 +31,7 @@ git push origin v0.1.0-rc.2
 
 ### GitHub 仓库
 
-- **仓库是 `github.com/godfengz/open-atlas-deployer`**（本地 `origin` 已指向 `git@github.com:godfengz/open-atlas-deployer.git`），要先在 GitHub 上建好这个空仓库再推送。workflow 里的镜像地址取自仓库所有者，所以 Deployer 的镜像是 `ghcr.io/godfengz/open-atlas-deployer`，执行器的发布包在这个仓库的 release 里。应用的镜像仍在 `ghcr.io/gaojie197710-tech`，所以服务器上 `EXECUTOR_REGISTRIES` 两个都要写（空格分开），`EXECUTOR_DEPLOYER_IMAGE`、`EXECUTOR_UPGRADE_FROM` 指向 godfengz，见 [executor.env.example](../executor/executor.env.example)。
+- **仓库是 `github.com/ferenc-z/open-atlas-deployer`**（本地 `origin` 已指向 `git@github.com:ferenc-z/open-atlas-deployer.git`），要先在 GitHub 上建好这个空仓库再推送。workflow 里的镜像地址取自仓库所有者，所以 Deployer 的镜像是 `ghcr.io/ferenc-z/open-atlas-deployer`，执行器的发布包在这个仓库的 release 里。应用的镜像仍在 `ghcr.io/gaojie197710-tech`，所以服务器上 `EXECUTOR_REGISTRIES` 两个都要写（空格分开），`EXECUTOR_DEPLOYER_IMAGE`、`EXECUTOR_UPGRADE_FROM` 指向 ferenc-z，见 [executor.env.example](../executor/executor.env.example)。
 - **Actions 要能写。** workflow 自己声明了 `contents: write` 和 `packages: write`，但如果仓库或组织在 Settings → Actions → General → Workflow permissions 里把上限限成了只读，建 release 和推镜像都会失败。遇到这种情况，改成 "Read and write permissions"。
 - **先让 ci 通过一次，再打 tag。** 第一次推送时就能看出 Actions 是否启用、Python 3.9 的测试能否通过。
 
@@ -42,20 +42,20 @@ git push origin v0.1.0-rc.2
   - 或者在 GitHub 的 Packages → open-atlas-deployer → Package settings 里把包改成公开。
   
   workflow 给镜像加了 `org.opencontainers.image.source` 标签，包会自动关联到仓库。注意：一台服务器对 `ghcr.io` 只存一份登录凭据，应用镜像（`gaojie197710-tech`）用的也是它。如果 Deployer 的包保持私有，这份凭据就得同时能读两个所有者的包，所以改成公开最省事。
-- **建议把 `godfengz/open-atlas-deployer` 设成公开仓库。** Deployer 和执行器读 GitHub 都只有一个令牌文件（`DEPLOYER_GITHUB_TOKEN_FILE`、`EXECUTOR_GITHUB_TOKEN_FILE`），现在这个令牌是给 `gaojie197710-tech` 下的应用仓库用的。fine-grained 令牌只能授权一个所有者，读不到 `godfengz` 下的私有仓库。仓库公开后：
+- **建议把 `ferenc-z/open-atlas-deployer` 设成公开仓库。** Deployer 和执行器读 GitHub 都只有一个令牌文件（`DEPLOYER_GITHUB_TOKEN_FILE`、`EXECUTOR_GITHUB_TOKEN_FILE`），现在这个令牌是给 `gaojie197710-tech` 下的应用仓库用的。fine-grained 令牌只能授权一个所有者，读不到 `ferenc-z` 下的私有仓库。仓库公开后：
   - Deployer 读版本列表（`DEPLOYER_RELEASE_REPO`）和执行器下载升级包（`EXECUTOR_UPGRADE_FROM`）都不需要额外权限；
   - 镜像包也可以一起改成公开，服务器就不用为它 `docker login`。
 
-  仓库必须私有的话，只能把现有令牌换成 classic 令牌（`repo` 权限，对两个所有者都能读），或者让 `godfengz` 成为 `gaojie197710-tech` 下仓库的协作者，再用一个能同时读两边的令牌。不配的话，版本下拉框会退回手填，执行器升级会报下载失败。
+  仓库必须私有的话，只能把现有令牌换成 classic 令牌（`repo` 权限，对两个所有者都能读），或者让 `ferenc-z` 成为 `gaojie197710-tech` 下仓库的协作者，再用一个能同时读两边的令牌。不配的话，版本下拉框会退回手填，执行器升级会报下载失败。
 
 ### 服务器上第一次安装
 
 自升级只能从已经装好的版本开始，所以第一次全部要手工装：
 
 1. **执行器**：从 release `executor-v0.7.0` 下载包，解压后运行 `sudo ./install.sh`，再编辑 `/etc/open-atlas-deployer/executor.env`，参照 [executor.env.example](../executor/executor.env.example)。0.6.0 以前的执行器都要这样手工装一次，之后才能在页面上升级。
-2. **Deployer**：按 [examples/deployer](../examples/deployer) 布置目录。`.env` 里手写 `DEPLOYER_IMAGE=ghcr.io/godfengz/open-atlas-deployer:0.1.0-rc.1`，写死版本，不要用 `latest`；之后执行器升级时会改写这一行。
-3. **让 Deployer 能自升级**：在运行 Deployer 的那台机器上，`executor.env` 里设 `EXECUTOR_DEPLOYER_DIR` 和 `EXECUTOR_DEPLOYER_IMAGE`，设 `EXECUTOR_UPGRADE_FROM=godfengz/open-atlas-deployer`，并且 `EXECUTOR_REGISTRIES` 要包含 `ghcr.io/godfengz`。改完重启执行器。
-4. **在 Deployer 的设置里加 `DEPLOYER_RELEASE_REPO=github:godfengz/open-atlas-deployer`**，Overview 才会列出可选版本。
+2. **Deployer**：按 [examples/deployer](../examples/deployer) 布置目录。`.env` 里手写 `DEPLOYER_IMAGE=ghcr.io/ferenc-z/open-atlas-deployer:0.1.0-rc.1`，写死版本，不要用 `latest`；之后执行器升级时会改写这一行。
+3. **让 Deployer 能自升级**：在运行 Deployer 的那台机器上，`executor.env` 里设 `EXECUTOR_DEPLOYER_DIR` 和 `EXECUTOR_DEPLOYER_IMAGE`，设 `EXECUTOR_UPGRADE_FROM=ferenc-z/open-atlas-deployer`，并且 `EXECUTOR_REGISTRIES` 要包含 `ghcr.io/ferenc-z`。改完重启执行器。
+4. **在 Deployer 的设置里加 `DEPLOYER_RELEASE_REPO=github:ferenc-z/open-atlas-deployer`**，Overview 才会列出可选版本。
 
 ### 本地试验版本迁移过来时
 
