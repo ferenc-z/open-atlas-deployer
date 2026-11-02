@@ -34,11 +34,15 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   and Workbench: OMA deployed by this Deployer and answering, the Deployer's OMA key and Application, the Deploy
   Assistant and the Onboarding Assessor with its Environment, a service key in an OMA Vault for the Deployer's
   `/mcp`, the "Deploy Assistant" Business Agent, and the Deployer's entry in Workbench (`chat.embed`).
-  `GET /api/setup/ai`; deploys do not depend on it.
+  `GET /api/setup/ai`; deploys do not depend on it. OMA shows a Vault's credentials only to its owner, so when the
+  Deployer's key cannot list them, a service key that has been used counts; the Application id is a note, not a step.
+- An installation whose Workbench (deployed by the Deployer) is older than 1.24.0 is asked to deploy 1.25.1 or newer
+  from the Setup page before the deploy groups are created.
 - The Overview's "Setup complete" line says how many AI items are open; the Deploy Assistant panel and the
   Onboarding page say what they still miss.
 - The Deployer registers itself in Workbench's application list with one click (an application entry that embeds
-  the chat, visible to the deploy groups); an entry that is there keeps its other fields.
+  the chat, visible to the deploy groups); an entry that is there keeps its other fields. An address the browser
+  would not embed on Workbench's page (http inside https, another site) is refused, and an entry with one is not done.
 - `examples/oma.manifest.json`: a starting point for registering OMA (no build, `oma-beta-v{version}` images, one
   data directory for both services).
 

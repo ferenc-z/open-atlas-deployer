@@ -31,7 +31,7 @@ import { DEPLOYER_VERSION } from "./version.ts";
 import { validateEnvironment } from "./environment.ts";
 import { applyPatch, changedPaths, PatchError } from "./jsonpatch.ts";
 import type { Versions } from "./versions.ts";
-import { aiStatus, deployerEntry } from "./setup-ai.ts";
+import { aiStatus, deployerEntry, embedProblem } from "./setup-ai.ts";
 import { DEPLOY_GROUPS, environmentFromForm, initialWorkbenchManifest, newWorkbenchEnv, setupStatus, WORKBENCH, withDeployerLink, type SetupEnvironmentForm } from "./setup.ts";
 import { WorkbenchAdmin } from "./drivers/workbench.ts";
 import { WorkbenchKey } from "./workbench-key.ts";
@@ -400,7 +400,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     const p = await authenticate(c, "view");
     if (p instanceof Response) return p;
     return c.json(await aiStatus({
-      store, workbench, basePath: config.basePath, ...(deps.omaFetcher ? { fetcher: deps.omaFetcher } : {}),
+      store, workbench, basePath: config.basePath, workbenchPublicUrl: config.workbenchPublicUrl, ...(deps.omaFetcher ? { fetcher: deps.omaFetcher } : {}),
       oma: {
         ...(config.omaUrl ? { url: config.omaUrl } : {}), ...(config.omaApiKeyFile ? { keyFile: config.omaApiKeyFile } : {}), ...(config.omaApplicationId ? { applicationId: config.omaApplicationId } : {}),
         ...(config.omaAgent ? { agent: config.omaAgent } : {}), ...(config.omaEnvironment ? { environment: config.omaEnvironment } : {}), vaults: config.omaVaults,
@@ -416,6 +416,8 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     let url: string;
     try { url = new URL(String(((await c.req.json().catch(() => ({}))) as { deployerUrl?: unknown }).deployerUrl ?? "")).href; } catch { return reject(c, 400, "setup/deployer-url", "Give the Deployer's address, e.g. https://uat.example.internal:8495/deploy/."); }
     if (!url.startsWith("https:") && !/^http:\/\/(localhost|127\.0\.0\.1)[:/]/.test(url)) return reject(c, 400, "setup/deployer-https", "Workbench embeds its chat only in https pages on its own domain: open the Deployer by its https address.");
+    const problem = embedProblem(url, config.workbenchPublicUrl);
+    if (problem) return reject(c, 400, "setup/deployer-embed", `${url}: ${problem}. Give the address people open the Deployer by.`);
     try {
       const plugins = await workbench.plugins();
       const { dataTokenConfigured: _t, graphTokens: _g, visibility: _v, linkedAgents: _a, ...existing } = (plugins.find((x) => x.id === "deployer") ?? {}) as Record<string, unknown>;

@@ -62,7 +62,7 @@ export interface FakeState {
     /** OMA's REST API (x-api-key oma_test): sessions the Deployer opens, and what the Agent answers in them. */
     sessions: { id: string; body: Record<string, unknown>; messages: string[] }[]; reply: string;
     /** §15.4 step 6: what OMA's REST API knows (agents by id, Environments, Vault credentials), and whether it answers. */
-    down?: boolean; rest?: { agents: Record<string, { archived_at?: string }>; environments: string[]; credentials: Record<string, { auth: { mcp_server_url: string }; archived_at?: string | null }[]> } };
+    down?: boolean; rest?: { agents: Record<string, { archived_at?: string }>; environments: string[]; credentials: Record<string, { auth: { mcp_server_url: string }; archived_at?: string | null }[]>; hidden?: string[] } };
 }
 
 export function fakeState(): FakeState {
@@ -216,6 +216,9 @@ export function fakeServices(s: FakeState): typeof fetch {
       if (r && request.method === "GET") { const a = rest.agents[r[1]!]; return a ? Response.json({ id: r[1], archived_at: a.archived_at ?? null }) : new Response("{}", { status: 404 }); }
       r = /^\/v1\/environments\/([^/]+)$/.exec(url.pathname);
       if (r && request.method === "GET") return rest.environments.includes(r[1]!) ? Response.json({ id: r[1] }) : new Response("{}", { status: 404 });
+      // Like OMA, a Vault the key does not own reads fine but its credentials are hidden (resource_not_found).
+      r = /^\/v1\/vaults\/([^/]+)$/.exec(url.pathname);
+      if (r && request.method === "GET") return rest.credentials[r[1]!] || rest.hidden?.includes(r[1]!) ? Response.json({ id: r[1], archived_at: null }) : new Response("{}", { status: 404 });
       r = /^\/v1\/vaults\/([^/]+)\/credentials$/.exec(url.pathname);
       if (r && request.method === "GET") { const c = rest.credentials[r[1]!]; return c ? Response.json({ data: c }) : new Response("{}", { status: 404 }); }
       if (url.pathname === "/v1/sessions" && request.method === "POST") {

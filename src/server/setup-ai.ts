@@ -23,6 +23,8 @@ export interface AiContext {
   store: Store;
   workbench: WorkbenchAdmin;
   basePath: string;
+  /** Where people open Workbench (DEPLOYER_WORKBENCH_PUBLIC_URL): the Deployer's entry has to be embeddable there. */
+  workbenchPublicUrl?: string;
   oma: {
     url?: string; keyFile?: string; applicationId?: string;
     agent?: string; environment?: string; vaults: string[];
@@ -58,6 +60,17 @@ export function deployerEntry(url: string, existing?: Record<string, unknown>): 
 export function isDeployerUrl(url: unknown, basePath: string): boolean {
   if (typeof url !== "string") return false;
   try { return new URL(url, "https://x").pathname.replace(/\/+$/, "") === basePath.replace(/\/+$/, ""); } catch { return false; }
+}
+
+/** Why a browser on Workbench's page would not embed the Deployer at `url`: an http page inside https, or another site
+ * (the Workbench session cookie does not reach it). Sites are compared by their last two host labels. */
+export function embedProblem(url: string, workbenchPublicUrl?: string): string {
+  let page: URL, workbench: URL;
+  try { workbench = new URL(workbenchPublicUrl ?? ""); page = new URL(url, workbench); } catch { return ""; }
+  if (workbench.protocol === "https:" && page.protocol !== "https:") return `Workbench is served over https (${workbench.origin}) and the browser does not embed an http page there`;
+  const site = (host: string) => host.split(".").slice(-2).join(".");
+  if (site(page.hostname) !== site(workbench.hostname)) return `it is not on the same site as Workbench (${workbench.origin}), so the chat cannot be embedded`;
+  return "";
 }
 
 export async function aiStatus(ctx: AiContext): Promise<AiStatus> {
@@ -102,9 +115,7 @@ export async function aiStatus(ctx: AiContext): Promise<AiStatus> {
       ? { id: "oma-key", state: "next", title: "The Deployer's OMA application and key (O1)", detail: "Create an Application for the Deployer in OMA with an API key; put the key in the file DEPLOYER_OMA_API_KEY_FILE names, set DEPLOYER_OMA_APPLICATION_ID and restart the Deployer.", uses: ALL }
       : !keyWorks
         ? { id: "oma-key", state: "blocked", title: "The Deployer's OMA application and key (O1)", detail: `OMA does not accept the key in DEPLOYER_OMA_API_KEY_FILE: ${keyError}.`, uses: ALL }
-        : !oma.applicationId
-          ? { id: "oma-key", state: "next", title: "The Deployer's OMA application and key (O1)", detail: "The key works; set DEPLOYER_OMA_APPLICATION_ID to the Deployer's Application so its sessions are filed under it, and restart the Deployer.", uses: ALL }
-          : { id: "oma-key", state: "done", title: "The Deployer's OMA application and key (O1)", detail: `The key works; sessions are filed under Application ${oma.applicationId}.`, uses: ALL });
+        : { id: "oma-key", state: "done", title: "The Deployer's OMA application and key (O1)", detail: oma.applicationId ? `The key works; sessions are filed under Application ${oma.applicationId}.` : "The key works. Sessions are not filed under an Application: set DEPLOYER_OMA_APPLICATION_ID and restart the Deployer to file them under the Deployer's.", uses: ALL });
 
   // O4: the two agents, published with bin/publish-assistant.ts; O2: the Assessor's isolated Environment.
   const assistantUses: AiUse[] = ["assistant", "diagnosis", "briefs"];
@@ -130,30 +141,46 @@ export async function aiStatus(ctx: AiContext): Promise<AiStatus> {
       : { id: "oma-assessor", state: "done", title: "Onboarding Assessor and its isolated Environment (O2, O4)", detail: `Agent ${oma.assessorAgent} in Environment ${oma.assessorEnvironment}.`, uses: ["assessments"] });
   }
 
-  // O3: a read-only service key of this Deployer, kept in an OMA Vault under the Deployer's /mcp address.
+  // O3: a read-only service key of this Deployer, kept in an OMA Vault under the Deployer's /mcp address. OMA shows a
+  // Vault's credentials only to its owner and workspace admins, so the Deployer's key usually cannot list them; then
+  // a live service key that has been used is the evidence that a Vault holds it.
   const service = store.listKeys().filter((k) => k.kind === "service" && !k.revokedAt && (!k.expiresAt || Date.parse(k.expiresAt) > Date.now()));
+  const used = service.map((k) => k.lastUsedAt).filter((t): t is string => Boolean(t)).sort().at(-1);
   const vaults = [...new Set([...oma.vaults, ...oma.assessorVaults])];
   const mcpPath = `${ctx.basePath.replace(/\/+$/, "")}/mcp`;
   let stored: string | undefined;
-  let vaultError = "";
+  const missingVaults: string[] = [];
+  const hidden: string[] = [];
   if (keyWorks && vaults.length) {
     for (const vault of vaults) {
+      const wrong = await exists(`/v1/vaults/${encodeURIComponent(vault)}`);
+      if (wrong) { missingVaults.push(`Vault ${vault} ${wrong}`); continue; }
       try {
         const credentials = ((await get(`/v1/vaults/${encodeURIComponent(vault)}/credentials`)).data ?? []) as { archived_at?: string | null; auth?: { mcp_server_url?: string } }[];
         if (credentials.some((c) => !c.archived_at && typeof c.auth?.mcp_server_url === "string" && new URL(c.auth.mcp_server_url).pathname.replace(/\/+$/, "") === mcpPath)) { stored = vault; break; }
-      } catch (error) { vaultError = `Vault ${vault} cannot be read (${(error as Error).message})`; }
+      } catch { hidden.push(vault); }
     }
   }
   const serviceNote = service.length ? "" : " First create a service key under API keys (Service key, read-only).";
+  const usedNote = used ? `last used ${used}` : "not used yet";
+  const title = "Read-only service key in an OMA Vault (O3)";
   items.push(!keyWorks
-    ? { id: "oma-vault", state: "waiting", title: "Read-only service key in an OMA Vault (O3)", detail: "Waits for the Deployer's OMA key.", uses: ALL }
+    ? { id: "oma-vault", state: "waiting", title, detail: "Waits for the Deployer's OMA key.", uses: ALL }
     : !vaults.length
-      ? { id: "oma-vault", state: "next", title: "Read-only service key in an OMA Vault (O3)", detail: `Create a Vault in OMA, store a service key of this Deployer in it for the address ending in ${mcpPath}, then set DEPLOYER_OMA_VAULTS (and DEPLOYER_OMA_ASSESSOR_VAULTS) and restart the Deployer.${serviceNote}`, uses: ALL }
-      : !stored
-        ? { id: "oma-vault", state: vaultError ? "blocked" : "next", title: "Read-only service key in an OMA Vault (O3)", detail: `${vaultError ? `${vaultError}. ` : ""}No credential in ${vaults.join(", ")} is for the Deployer's MCP address (ending in ${mcpPath}): store a service key there.${serviceNote}`, uses: ALL }
-        : !service.length
-          ? { id: "oma-vault", state: "blocked", title: "Read-only service key in an OMA Vault (O3)", detail: `Vault ${stored} has a credential for ${mcpPath}, but this Deployer has no live service key: create one under API keys and store it in place of the old one.`, uses: ALL }
-          : { id: "oma-vault", state: "done", title: "Read-only service key in an OMA Vault (O3)", detail: `Vault ${stored} holds a credential for ${mcpPath}; ${service.length} live service key${service.length > 1 ? "s" : ""}${service[0]!.lastUsedAt ? `, last used ${service[0]!.lastUsedAt}` : ", not used yet"}.`, uses: ALL });
+      ? { id: "oma-vault", state: "next", title, detail: `Create a Vault in OMA, store a service key of this Deployer in it for the address ending in ${mcpPath}, then set DEPLOYER_OMA_VAULTS (and DEPLOYER_OMA_ASSESSOR_VAULTS) and restart the Deployer.${serviceNote}`, uses: ALL }
+      : missingVaults.length
+        ? { id: "oma-vault", state: "blocked", title, detail: `${missingVaults.join("; ")}: create the Vault again and set its id in DEPLOYER_OMA_VAULTS (and DEPLOYER_OMA_ASSESSOR_VAULTS).`, uses: ALL }
+        : stored
+          ? (!service.length
+            ? { id: "oma-vault", state: "blocked", title, detail: `Vault ${stored} has a credential for ${mcpPath}, but this Deployer has no live service key: create one under API keys and store it in place of the old one.`, uses: ALL }
+            : { id: "oma-vault", state: "done", title, detail: `Vault ${stored} holds a credential for ${mcpPath}; ${service.length} live service key${service.length > 1 ? "s" : ""}, ${usedNote}.`, uses: ALL })
+          : hidden.length
+            ? (!service.length
+              ? { id: "oma-vault", state: "next", title, detail: `Create a service key under API keys (Service key, read-only) and store it in ${hidden.join(", ")} for the address ending in ${mcpPath}.`, uses: ALL }
+              : used
+                ? { id: "oma-vault", state: "done", title, detail: `OMA does not show this Deployer's key the credentials in ${hidden.join(", ")}; a live service key was ${usedNote}, so OMA reaches ${mcpPath} with it.`, uses: ALL }
+                : { id: "oma-vault", state: "next", title, detail: `OMA does not show this Deployer's key the credentials in ${hidden.join(", ")}, and no service key has been used yet. Store a live service key there for the address ending in ${mcpPath}; this item is done once OMA calls ${mcpPath} with it.`, uses: ALL })
+            : { id: "oma-vault", state: "next", title, detail: `No credential in ${vaults.join(", ")} is for the Deployer's MCP address (ending in ${mcpPath}): store a service key there.${serviceNote}`, uses: ALL });
 
   // Workbench: the Business Agent people talk to, and the Deployer's entry that embeds it (chat.embed).
   let agents: { id: string; name: string; agentId: string; enabled: boolean }[] | undefined;
@@ -176,11 +203,12 @@ export async function aiStatus(ctx: AiContext): Promise<AiStatus> {
           : { id: "workbench-agent", state: "done", title: `Business Agent "${ASSISTANT_NAME}" in Workbench`, detail: `It points at OMA agent ${named[0]!.agentId}.`, uses: ["assistant"] });
 
   const entry = plugins?.find((p) => p.id === "deployer");
+  const embed = entry?.url ? embedProblem(entry.url, ctx.workbenchPublicUrl) : "";
   const entryProblem = !entry ? "" : entry.kind !== "application" ? "is not an application"
     : entry.enabled === false ? "is switched off"
     : !entry.chat?.embed ? "does not embed the chat (chat.embed)"
     : !isDeployerUrl(entry.url, ctx.basePath) ? `links ${entry.url ?? "nothing"}, not this Deployer's page`
-    : "";
+    : embed && `links ${entry.url}, but ${embed}`;
   const visibility = entry?.visibility;
   const visibleNote = !visibility || visibility.mode === "all" ? " Everyone in Workbench sees it: limit it to the deploy groups under Administration → Applications if you like." : "";
   items.push(!plugins

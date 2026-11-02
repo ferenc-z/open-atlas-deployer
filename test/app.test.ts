@@ -361,6 +361,17 @@ test("§15: a new installation is set up with the emergency account up to Workbe
   assert.equal(asAdmin.complete, true);
   assert.equal(asAdmin.level, "L2");
 
+  // An installation from before setup runs a Workbench without the deploy groups (older than 1.24.0): deploy a newer one first.
+  deployedWorkbench(t, "1.23.1");
+  asAdmin = await (await t.request("/api/setup", { as: "admin" })).json();
+  assert.equal(asAdmin.complete, false);
+  assert.equal(setupStates(asAdmin)["workbench-deploy"], "next");
+  assert.match(setupStep(asAdmin, "workbench-deploy").detail, /1\.23\.1 runs.*need 1\.24\.0 or newer/);
+  assert.equal(setupStep(asAdmin, "workbench-deploy").workbench.version, "1.25.1");
+  assert.equal(setupStates(asAdmin)["workbench-groups"], "waiting");
+  deployedWorkbench(t, "1.25.2");
+  assert.equal((await (await t.request("/api/setup", { as: "admin" })).json()).complete, true);
+
   // Step 8 (optional): the link is in the saved revision but not on the server yet; adding it again replaces it.
   assert.match(setupStep(asAdmin, "workbench-applinks").detail, /not on the server yet/);
   const linked = await post(t, "/api/setup/workbench-applinks", "admin", { deployerUrl: "https://uat.example.internal:9495/deploy/" });
@@ -408,7 +419,7 @@ test("§15: a Workbench the Deployer did not deploy is taken over; a key in the 
 
 test("§15.4 step 6: the AI checklist is checked against OMA and Workbench; the Deployer registers itself in Workbench", async () => {
   const services = fakeState();
-  const t = setup({ services, oma: { omaUrl: "http://oma.test", omaApplicationId: "app_deployer", omaAgent: "agent_assistant", omaEnvironment: "env_main", omaVaults: ["vlt_deployer"], omaAssessorAgent: "agent_assessor", omaAssessorEnvironment: "env_isolated" } });
+  const t = setup({ services, oma: { omaUrl: "http://oma.test", omaApplicationId: "app_deployer", omaAgent: "agent_assistant", omaEnvironment: "env_main", omaVaults: ["vlt_deployer"], omaAssessorAgent: "agent_assessor", omaAssessorEnvironment: "env_isolated", workbenchPublicUrl: "https://wb.example.internal" } });
   const ai = async () => { const a = await (await t.request("/api/setup/ai", { as: "viewer" })).json(); return { ...a, state: Object.fromEntries(a.items.map((i: { id: string; state: string }) => [i.id, i.state])) }; };
   const item = (a: { items: { id: string }[] }, id: string) => a.items.find((i) => i.id === id) as Record<string, any>;
   assert.equal((await t.request("/api/setup/ai")).status, 401);
@@ -440,6 +451,17 @@ test("§15.4 step 6: the AI checklist is checked against OMA and Workbench; the 
   assert.equal((await makeKey(t, "admin", { kind: "service", name: "deploy-assistant", days: 365 })).status, 201);
   assert.equal((await ai()).state["oma-vault"], "done");
 
+  // OMA hides a Vault's credentials from a key that does not own it: then a service key that has been used counts.
+  services.oma.rest.credentials = {};
+  services.oma.rest.hidden = ["vlt_deployer"];
+  a = await ai();
+  assert.equal(a.state["oma-vault"], "next");
+  assert.match(item(a, "oma-vault").detail, /does not show.*no service key has been used yet/);
+  t.store.touchKey(t.store.listKeys().find((k) => k.kind === "service")!.id);
+  a = await ai();
+  assert.equal(a.state["oma-vault"], "done");
+  assert.match(item(a, "oma-vault").detail, /does not show.*last used/);
+
   // The Business Agent has to point at the agent published last.
   services.workbench.agents.push({ id: "ba_1", name: "Deploy Assistant", agentId: "agent_old", enabled: true });
   a = await ai();
@@ -450,6 +472,17 @@ test("§15.4 step 6: the AI checklist is checked against OMA and Workbench; the 
   // The Deployer's entry in Workbench: administrators, https, visible to the deploy groups; a second time keeps other fields.
   assert.equal((await post(t, "/api/setup/workbench-entry", "uat", { deployerUrl: "https://uat.example.internal/deploy/" })).status, 403);
   assert.equal((await post(t, "/api/setup/workbench-entry", "admin", { deployerUrl: "http://uat.example.internal/deploy/" })).status, 400);
+  // Workbench is opened over https on example.internal: an http page or another site cannot be embedded there.
+  for (const deployerUrl of ["http://localhost:8095/deploy/", "https://deploy.other.test/deploy/"]) {
+    const refused = await post(t, "/api/setup/workbench-entry", "admin", { deployerUrl });
+    assert.equal(refused.status, 400, deployerUrl);
+    assert.equal((await refused.json()).error, "setup/deployer-embed");
+  }
+  services.workbench.plugins.push({ id: "deployer", kind: "application", url: "http://localhost:8095/deploy/", chat: { embed: true } });
+  a = await ai();
+  assert.equal(a.state["workbench-entry"], "next");
+  assert.match(item(a, "workbench-entry").detail, /served over https \(https:\/\/wb\.example\.internal\)/);
+  services.workbench.plugins.length = 0;
   assert.equal((await post(t, "/api/setup/workbench-entry", "admin", { deployerUrl: "https://uat.example.internal/deploy/" })).status, 200);
   const entry = services.workbench.plugins[0] as Record<string, any>;
   assert.equal(entry.kind, "application");
@@ -471,6 +504,12 @@ test("§15.4 step 6: the AI checklist is checked against OMA and Workbench; the 
   a = await ai();
   assert.equal(a.state["oma-assistant"], "blocked");
   assert.deepEqual(a.missing.assessments, [], "the Assessor does not use the Deploy Assistant");
+
+  // A Vault that is gone.
+  services.oma.rest.hidden = [];
+  a = await ai();
+  assert.equal(a.state["oma-vault"], "blocked");
+  assert.match(item(a, "oma-vault").detail, /Vault vlt_deployer cannot be read \(HTTP 404\)/);
 });
 
 test("emergency logins are throttled after five failures", async () => {

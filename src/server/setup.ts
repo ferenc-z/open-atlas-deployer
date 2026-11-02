@@ -122,7 +122,11 @@ export async function setupStatus(ctx: SetupContext, principal: Principal): Prom
   const planned = env?.apps[WORKBENCH]?.version ?? WORKBENCH_MIN_VERSION;
   const nginxNote = nginx?.changed ? " Save the recommended nginx configuration too and hand it to operations: people reach Workbench through nginx." : "";
   const ready = registered && !offline.length && Boolean(env);
-  if (reachable && deployed) {
+  // An installation from before setup existed can run a Workbench too old for the deploy groups (W1, 1.24.0).
+  const tooOld = Boolean(deployed) && (!VERSION.test(deployed!) || compareVersions(deployed!, TAKEOVER_MIN_VERSION) < 0);
+  if (reachable && deployed && tooOld) {
+    steps.push({ id: "workbench-deploy", state: "next", title: "Deploy Workbench", detail: `Workbench ${deployed} runs, deployed by this Deployer, but the deploy groups need ${TAKEOVER_MIN_VERSION} or newer: deploy ${WORKBENCH_MIN_VERSION} or newer.`, workbench: { takeover: !envInfo.envRevisions, running: deployed, version: WORKBENCH_MIN_VERSION, ...envInfo } });
+  } else if (reachable && deployed) {
     steps.push({ id: "workbench-deploy", state: "done", title: "Deploy Workbench", detail: `Workbench ${deployed} runs, deployed by this Deployer, and answers at ${ctx.workbenchUrl}.` });
   } else if (reachable) {
     const running = await ctx.workbench.version();
@@ -166,11 +170,13 @@ export async function setupStatus(ctx: SetupContext, principal: Principal): Prom
         : { id: "workbench-key", state: "done", title: "Workbench API key", detail: `The Deployer's key works (${source === "file" ? "from DEPLOYER_WORKBENCH_API_KEY_FILE" : "pasted on this page, kept sealed"}).`, key });
 
   const missingGroups = groups ? DEPLOY_GROUPS.map(([g]) => g).filter((g) => !groups!.some((x) => x.name === g && x.enabled !== false)) : undefined;
-  steps.push(!groups
-    ? { id: "workbench-groups", state: "waiting", title: "Deploy groups", detail: "Waits for a working Workbench API key." }
-    : missingGroups!.length
-      ? { id: "workbench-groups", state: "next", title: "Deploy groups", detail: `Workbench has no ${missingGroups!.join(", ")} group. Create ${missingGroups!.length > 1 ? "them" : "it"} here, then add people in Workbench Administration → Groups.`, missingGroups }
-      : { id: "workbench-groups", state: "done", title: "Deploy groups", detail: "deploy-viewer, deploy-uat and deploy-prod exist in Workbench; members are managed there." });
+  steps.push(tooOld
+    ? { id: "workbench-groups", state: "waiting", title: "Deploy groups", detail: `Waits for Workbench ${TAKEOVER_MIN_VERSION} or newer.` }
+    : !groups
+      ? { id: "workbench-groups", state: "waiting", title: "Deploy groups", detail: "Waits for a working Workbench API key." }
+      : missingGroups!.length
+        ? { id: "workbench-groups", state: "next", title: "Deploy groups", detail: `Workbench has no ${missingGroups!.join(", ")} group. Create ${missingGroups!.length > 1 ? "them" : "it"} here, then add people in Workbench Administration → Groups.`, missingGroups }
+        : { id: "workbench-groups", state: "done", title: "Deploy groups", detail: "deploy-viewer, deploy-uat and deploy-prod exist in Workbench; members are managed there." });
 
   // Step 8 (optional): the Deployer in Workbench's app menu, which Workbench reads from WORKBENCH_APP_LINKS in its env.
   const links = wbEnv ? appLinks(wbEnv.values.WORKBENCH_APP_LINKS) : undefined;
@@ -185,7 +191,7 @@ export async function setupStatus(ctx: SetupContext, principal: Principal): Prom
 
   // The highest level reached: once Workbench and its key are there, an executor that is offline for a while is a
   // problem of its own (Hosts, Overview), not a reason to go back to setup.
-  const l2 = Boolean(env) && reachable && Boolean(deployed) && Boolean(groups) && missingGroups?.length === 0;
+  const l2 = Boolean(env) && reachable && Boolean(deployed) && !tooOld && Boolean(groups) && missingGroups?.length === 0;
   const level = l2 ? "L2" : env && !offline.length ? "L1" : "L0";
   return { complete: l2, level, environment: env ? { name: env.name, prod } : null, steps, canAct: principal.permissions.includes("admin") };
 }
