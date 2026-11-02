@@ -14,13 +14,13 @@
 
 ```sh
 # 1. 版本号：package.json 和 package-lock.json 一起改
-npm version 0.1.0-rc.2 --no-git-tag-version
-# 2. CHANGELOG.md 加上 "## 0.1.0-rc.2" 一节；执行器代码改了，就同时调 executor/deployer_executor.py 的 VERSION 和 handoff.ts 的 EXECUTOR_VERSION
+npm version 0.1.0-rc.3 --no-git-tag-version
+# 2. CHANGELOG.md 加上 "## 0.1.0-rc.3" 一节；执行器代码改了，就同时调 executor/deployer_executor.py 的 VERSION 和 handoff.ts 的 EXECUTOR_VERSION
 # 3. 提交、推送分支，等 ci 通过
 git push origin main
 # 4. 打 tag 并推送，release 流程随之开始
-git tag -a v0.1.0-rc.2 -m "Open Atlas Deployer 0.1.0-rc.2"
-git push origin v0.1.0-rc.2
+git tag -a v0.1.0-rc.3 -m "Open Atlas Deployer 0.1.0-rc.3"
+git push origin v0.1.0-rc.3
 ```
 
 发布完成后，管理员在各环境 Deployer 的 Overview → Platform 里就能看到新版本：先升 UAT，跑一段时间再升 PROD。执行器有新版本时，在同一个区域里升级。
@@ -52,8 +52,8 @@ git push origin v0.1.0-rc.2
 
 自升级只能从已经装好的版本开始，所以第一次全部要手工装：
 
-1. **执行器**：从 release `executor-v0.7.0` 下载包，解压后运行 `sudo ./install.sh`，再编辑 `/etc/open-atlas-deployer/executor.env`，参照 [executor.env.example](../executor/executor.env.example)。0.6.0 以前的执行器都要这样手工装一次，之后才能在页面上升级。
-2. **Deployer**：按 [examples/deployer](../examples/deployer) 布置目录。`.env` 里手写 `DEPLOYER_IMAGE=ghcr.io/ferenc-z/open-atlas-deployer:0.1.0-rc.1`，写死版本，不要用 `latest`；之后执行器升级时会改写这一行。
+1. **执行器**：从 release `executor-v0.7.1` 下载包，解压后运行 `sudo ./install.sh`，再编辑 `/etc/open-atlas-deployer/executor.env`，参照 [executor.env.example](../executor/executor.env.example)。0.6.0 以前的执行器都要这样手工装一次，之后才能在页面上升级。
+2. **Deployer**：按 [examples/deployer](../examples/deployer) 布置目录。`.env` 里手写 `DEPLOYER_IMAGE=ghcr.io/ferenc-z/open-atlas-deployer:0.1.0-rc.2`，写死版本，不要用 `latest`；之后执行器升级时会改写这一行。
 3. **让 Deployer 能自升级**：在运行 Deployer 的那台机器上，`executor.env` 里设 `EXECUTOR_DEPLOYER_DIR` 和 `EXECUTOR_DEPLOYER_IMAGE`，设 `EXECUTOR_UPGRADE_FROM=ferenc-z/open-atlas-deployer`，并且 `EXECUTOR_REGISTRIES` 要包含 `ghcr.io/ferenc-z`。改完重启执行器。
 4. **在 Deployer 的设置里加 `DEPLOYER_RELEASE_REPO=github:ferenc-z/open-atlas-deployer`**，Overview 才会列出可选版本。
 
@@ -65,6 +65,6 @@ git push origin v0.1.0-rc.2
 
 ### 出错时
 
-- **tag 发出后就不要再挪。** 服务器可能已经按这个版本拉了镜像，换掉同名 tag 会让两边对不上。发布失败时，删掉失败的 release 和 tag，换下一个版本号重新发，比如 `rc.2`。
+- **tag 发出后就不要再挪。** 服务器可能已经按这个版本拉了镜像，换掉同名 tag 会让两边对不上。发布失败时，删掉失败的 release 和 tag，换下一个版本号重新发，比如 `rc.3`。
 - **执行器的 release 只在不存在时才建。** 改了执行器代码却没调 `VERSION`，旧的 `executor-v…` release 会原样留着，服务器上的执行器也不会更新。调了 `VERSION`、却忘了同时改 `handoff.ts`，版本核对那一步就会失败。
 - **CHANGELOG 没有这个版本的一节，或者版本号对不上**，流程会在最开始停下，镜像和 release 都还没生成。补上之后，删掉 tag 重新推即可；这是唯一可以重推同名 tag 的情况。

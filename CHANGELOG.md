@@ -3,6 +3,14 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
+## 0.1.0-rc.2
+
+- The Deploy Assistant says why it is blank: when Workbench's chat has not loaded after 10 seconds (Workbench
+  unreachable, or a certificate the browser does not trust), the panel says so, links to Workbench in a new tab and
+  offers to try again.
+- Executor 0.7.1: the same code as 0.7.0, released so hosts can try upgrading an executor from GitHub.
+- Development: `npm run dev:web` no longer sends the page's own `api.ts` to the API server.
+
 ## 0.1.0-rc.1
 
 The first release candidate: everything below is new.
@@ -17,7 +25,7 @@ The first release candidate: everything below is new.
   ingress through nginx with saved configuration revisions.
 
 **Running the platform**
-- The Deployer is a container image (`ghcr.io/<owner>/open-atlas-deployer`), installed with `examples/deployer`.
+- The Deployer is a container image (`ghcr.io/ferenc-z/open-atlas-deployer`), installed with `examples/deployer`.
 - Executors (Python 3.9+, systemd) talk to the Deployer over HTTPS long-poll with per-host tokens, and upgrade
   themselves from the release `executor-v<version>`, checked against its SHA256SUMS, rolling back if the new one does
   not start.

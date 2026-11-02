@@ -59,7 +59,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "0.7.0"
+VERSION = "0.7.1"
 PROTOCOLS = [2]
 # Job kinds, plus what a deploy may ask for (bundle files, migrations): an older executor is not sent those.
 KINDS = ["build", "deploy", "env", "env-read", "bundle", "db-migration", "executor-upgrade", "deployer-upgrade"]
