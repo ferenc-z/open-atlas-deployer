@@ -115,6 +115,7 @@ main.center { display: grid; place-items: center; min-height: 80vh; }
 .banner.bad { background: var(--bad-bg); color: var(--bad); }
 .banner.warn { background: var(--warn-bg); color: var(--warn); }
 .banner.info { background: var(--info-bg); color: var(--info); }
+.banner.inline { border-radius: 8px; padding: 8px 12px; margin-bottom: 12px; }
 
 .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 20px; }
 .card.narrow { width: min(440px, 100%); }

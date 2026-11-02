@@ -1,0 +1,43 @@
+{
+  "v": 1,
+  "app": "oma",
+  "appliesFrom": "0.1.0-beta.9",
+  "release": { "repo": "bladexxx/oma-onpremise", "tag": "oma-beta-v{version}", "manifest": "package.json" },
+  "env": {
+    "file": "oma.env",
+    "template": "templates/oma.env.example",
+    "secrets": ["ANTHROPIC_API_KEY", "BETTER_AUTH_SECRET", "PLATFORM_ROOT_SECRET"]
+  },
+  "components": [
+    {
+      "id": "vault",
+      "type": "compose-service",
+      "service": "oma-vault",
+      "source": { "kind": "company-registry", "registry": "oma", "image": "oma-vault", "tag": "oma-beta-v{version}" },
+      "volumes": [{ "target": "/app/data", "path": "data" }],
+      "environment": { "DATABASE_PATH": "/app/data/oma.db", "OMA_VAULT_CA_DIR": "/app/data/oma-vault-ca", "OMA_VAULT_PORT": "14322", "OMA_TENANT": "*" },
+      "health": "none"
+    },
+    {
+      "id": "server",
+      "type": "compose-service",
+      "service": "oma-server",
+      "dependsOn": ["vault"],
+      "source": { "kind": "company-registry", "registry": "oma", "image": "oma-main-node", "tag": "oma-beta-v{version}" },
+      "ports": [{ "name": "http", "container": 8787, "host": 8787 }],
+      "volumes": [{ "target": "/app/data", "path": "data" }],
+      "environment": {
+        "DATABASE_PATH": "/app/data/oma.db",
+        "AUTH_DATABASE_PATH": "/app/data/auth.db",
+        "SANDBOX_WORKDIR": "/app/data/sandboxes",
+        "MEMORY_BLOB_DIR": "/app/data/memory-blobs",
+        "SESSION_OUTPUTS_DIR": "/app/data/session-outputs",
+        "FILES_BLOB_DIR": "/app/data/files-blobs",
+        "OMA_VAULT_PROXY_URL": "http://oma-vault:14322",
+        "OMA_VAULT_CA_CERT": "/app/data/oma-vault-ca/ca.crt"
+      },
+      "envFile": true,
+      "health": ["CMD", "node", "-e", "fetch('http://localhost:8787/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+    }
+  ]
+}

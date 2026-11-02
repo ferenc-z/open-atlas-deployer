@@ -4,7 +4,7 @@
 
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import * as api from "./api.ts";
-import type { SetupStatus, SetupStep } from "./api.ts";
+import type { AiItem, AiStatus, AiUse, SetupStatus, SetupStep } from "./api.ts";
 import { DeployPanel, JobPanel } from "./Deploy.tsx";
 import { EnvApp } from "./Env.tsx";
 import { HostsPage } from "./Hosts.tsx";
@@ -14,7 +14,7 @@ const STATE: Record<SetupStep["state"], { label: string; tone: string }> = {
   done: { label: "Done", tone: "ok" }, next: { label: "Next", tone: "info" }, waiting: { label: "Waiting", tone: "muted" }, blocked: { label: "Blocked", tone: "bad" },
 };
 
-export function SetupPage({ workbenchUrl, onChanged }: { workbenchUrl: string; onChanged: (s: SetupStatus) => void }) {
+export function SetupPage({ workbenchUrl, onChanged, onGo }: { workbenchUrl: string; onChanged: (s: SetupStatus) => void; onGo?: (page: "registry" | "keys") => void }) {
   const [status, setStatus] = useState<SetupStatus | undefined>();
   const [error, setError] = useState("");
   const refresh = useCallback(() => { api.setup().then((s) => { setStatus(s); setError(""); onChanged(s); }, (e: Error) => setError(e.message)); }, [onChanged]);
@@ -52,7 +52,80 @@ export function SetupPage({ workbenchUrl, onChanged }: { workbenchUrl: string; o
           );
         })}
       </ol>
+      {status.complete && <AiSteps canAct={status.canAct} workbenchUrl={workbenchUrl} {...(onGo ? { onGo } : {})} />}
     </>
+  );
+}
+
+/** Step 6 (L3, optional): what the assistant, assessments, diagnosis and briefs need, checked on the spot (§15.4). */
+function AiSteps({ canAct, workbenchUrl, onGo }: { canAct: boolean; workbenchUrl: string; onGo?: (page: "registry" | "keys") => void }) {
+  const [ai, setAi] = useState<AiStatus | undefined>();
+  const [error, setError] = useState("");
+  const refresh = useCallback(() => { api.setupAi().then((a) => { setAi(a); setError(""); }, (e: Error) => setError(e.message)); }, []);
+  useEffect(() => { refresh(); }, [refresh]);
+  return (
+    <>
+      <div className="toolbar">
+        <h2>AI</h2>
+        <span className="muted">Optional: deploys do not need it. The assistant, onboarding assessments, failure diagnosis and the daily brief run on OMA and say what they still miss.</span>
+        {ai && <span className={`badge ${ai.left ? "info" : "ok"}`}>{ai.left ? `${ai.left} of ${ai.items.length} open` : "Done"}</span>}
+        <button onClick={refresh}>Check again</button>
+      </div>
+      {error && <p className="error">{error}</p>}
+      {!ai && !error && <p className="muted">Checking OMA and Workbench…</p>}
+      {ai && (
+        <ol className="setup-steps">
+          {ai.items.map((s) => (
+            <li key={s.id} className={`card setup-step ${s.state}`}>
+              <div className="setup-head">
+                <strong>{s.title}</strong>
+                <span className={`badge ${STATE[s.state].tone}`}>{STATE[s.state].label}</span>
+                <span className="small muted">For {s.uses.map((u) => USE[u]).join(", ")}</span>
+              </div>
+              <p className={s.state === "blocked" ? "error" : "muted"}>{s.detail}</p>
+              {s.state !== "done" && s.state !== "waiting" && <AiAction item={s} canAct={canAct} workbenchUrl={workbenchUrl} onDone={refresh} {...(onGo ? { onGo } : {})} />}
+            </li>
+          ))}
+        </ol>
+      )}
+    </>
+  );
+}
+
+const USE: Record<AiUse, string> = { assistant: "the assistant", assessments: "assessments", diagnosis: "failure diagnosis", briefs: "the daily brief" };
+
+function AiAction({ item, canAct, workbenchUrl, onDone, onGo }: { item: AiItem; canAct: boolean; workbenchUrl: string; onDone: () => void; onGo?: (page: "registry" | "keys") => void }) {
+  const [url, setUrl] = useState(api.deployerUrl());
+  const [error, setError] = useState("");
+  switch (item.id) {
+    case "oma": return onGo ? <div className="row"><button onClick={() => onGo("registry")}>Open Apps & manifests</button></div> : null;
+    case "oma-vault": return onGo ? <div className="row"><button onClick={() => onGo("keys")}>Open API keys</button></div> : null;
+    case "workbench-agent": return <div className="row"><a className="button" href={workbenchUrl}>Open Workbench</a></div>;
+    case "workbench-entry":
+      if (!canAct) return <p className="small muted">An administrator does this step.</p>;
+      return (
+        <>
+          <div className="row">
+            <input value={url} onChange={(e) => setUrl(e.target.value)} />
+            <button className="primary" onClick={() => { setError(""); api.registerInWorkbench(url).then(onDone, (e: Error) => setError(e.message)); }}>Register the Deployer in Workbench</button>
+          </div>
+          {error && <p className="error">{error}</p>}
+        </>
+      );
+    default: return null;
+  }
+}
+
+/** The assistant and onboarding entry points: what they still miss, with a way to the AI steps (§15.4 step 6). */
+export function AiMissing({ use, what, onSetup }: { use: AiUse; what: string; onSetup?: () => void }) {
+  const [missing, setMissing] = useState<string[] | undefined>();
+  useEffect(() => { api.setupAi().then((a) => setMissing(a.missing[use]), () => setMissing(undefined)); }, [use]);
+  if (!missing?.length) return null;
+  return (
+    <div className="banner warn inline">
+      {what} is not configured yet. Still missing: {missing.join("; ")}.{" "}
+      {onSetup && <button className="link" onClick={onSetup}>Show the AI steps</button>}
+    </div>
   );
 }
 

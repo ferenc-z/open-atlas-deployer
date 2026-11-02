@@ -31,6 +31,7 @@ import { DEPLOYER_VERSION } from "./version.ts";
 import { validateEnvironment } from "./environment.ts";
 import { applyPatch, changedPaths, PatchError } from "./jsonpatch.ts";
 import type { Versions } from "./versions.ts";
+import { aiStatus, deployerEntry } from "./setup-ai.ts";
 import { DEPLOY_GROUPS, environmentFromForm, initialWorkbenchManifest, newWorkbenchEnv, setupStatus, WORKBENCH, withDeployerLink, type SetupEnvironmentForm } from "./setup.ts";
 import { WorkbenchAdmin } from "./drivers/workbench.ts";
 import { WorkbenchKey } from "./workbench-key.ts";
@@ -55,6 +56,8 @@ export interface Dependencies {
   /** §15.6 ③: Workbench's Administration API with the Deployer's key, and where that key comes from. */
   workbench?: WorkbenchAdmin;
   workbenchKey?: WorkbenchKey;
+  /** §15.4 step 6: how the AI checks reach OMA (tests pass a fake). */
+  omaFetcher?: typeof fetch;
 }
 
 const reject = (c: Context, status: 400 | 401 | 403 | 404 | 409 | 429 | 503, code: string, message: string, details: string[] = []) =>
@@ -389,6 +392,39 @@ export function createApp({ config, store, sessions, observer, deployments, vers
       const values = [...Object.keys(latest.values).filter((k) => k !== "WORKBENCH_APP_LINKS").map((key) => ({ key, keep: true })), { key: "WORKBENCH_APP_LINKS", value: links }];
       return c.json({ revision: envVars.save(p, WORKBENCH, { base: latest.revision, values, note: "Deployer added to WORKBENCH_APP_LINKS (Setup)" }) });
     } catch (error) { return deployError(c, error); }
+  });
+
+  // Step 6 (L3, optional): what the AI features need, checked against OMA and Workbench; apart from /api/setup because
+  // it calls both and the pages ask for it only where it is shown.
+  api.get("/api/setup/ai", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    return c.json(await aiStatus({
+      store, workbench, basePath: config.basePath, ...(deps.omaFetcher ? { fetcher: deps.omaFetcher } : {}),
+      oma: {
+        ...(config.omaUrl ? { url: config.omaUrl } : {}), ...(config.omaApiKeyFile ? { keyFile: config.omaApiKeyFile } : {}), ...(config.omaApplicationId ? { applicationId: config.omaApplicationId } : {}),
+        ...(config.omaAgent ? { agent: config.omaAgent } : {}), ...(config.omaEnvironment ? { environment: config.omaEnvironment } : {}), vaults: config.omaVaults,
+        ...(config.omaAssessorAgent ? { assessorAgent: config.omaAssessorAgent } : {}), ...(config.omaAssessorEnvironment ? { assessorEnvironment: config.omaAssessorEnvironment } : {}), assessorVaults: config.omaAssessorVaults,
+      },
+    }));
+  });
+  // The Deployer's entry in Workbench's application list (chat.embed), visible to the deploy groups; an entry that is
+  // there already keeps its other fields.
+  api.post("/api/setup/workbench-entry", async (c) => {
+    const p = await setupAdmin(c);
+    if (p instanceof Response) return p;
+    let url: string;
+    try { url = new URL(String(((await c.req.json().catch(() => ({}))) as { deployerUrl?: unknown }).deployerUrl ?? "")).href; } catch { return reject(c, 400, "setup/deployer-url", "Give the Deployer's address, e.g. https://uat.example.internal:8495/deploy/."); }
+    if (!url.startsWith("https:") && !/^http:\/\/(localhost|127\.0\.0\.1)[:/]/.test(url)) return reject(c, 400, "setup/deployer-https", "Workbench embeds its chat only in https pages on its own domain: open the Deployer by its https address.");
+    try {
+      const plugins = await workbench.plugins();
+      const { dataTokenConfigured: _t, graphTokens: _g, visibility: _v, linkedAgents: _a, ...existing } = (plugins.find((x) => x.id === "deployer") ?? {}) as Record<string, unknown>;
+      await workbench.putPlugin("deployer", deployerEntry(url, Object.keys(existing).length ? existing : undefined));
+      const groups = (await workbench.groups()).filter((g) => DEPLOY_GROUPS.some(([name]) => name === g.name)).map((g) => g.id);
+      await workbench.setVisibility("deployer", groups);
+      store.audit(actorOf(p), "setup.workbench-entry", "deployer", { url, groups: groups.length });
+      return c.json({ url, groups: groups.length });
+    } catch (error) { return reject(c, 503, "setup/workbench", (error as Error).message); }
   });
 
   // D35: the hosts of this environment, their executors, and the tokens they call in with.

@@ -15,6 +15,12 @@ export interface WorkbenchApp {
 
 export interface BusinessAgent { id: string; name: string; agentId: string; enabled: boolean }
 
+export interface WorkbenchPlugin {
+  id: string; kind?: string; name?: string; url?: string; enabled?: boolean;
+  chat?: Record<string, unknown> & { embed?: boolean };
+  visibility?: { mode: string; groupIds?: string[] } | null;
+  linkedAgents?: { id: string; name: string; state: string; uses: string[] }[];
+}
 export interface WorkbenchGroup { id: string; name: string; enabled: boolean; memberCount?: number }
 
 export class WorkbenchAdmin {
@@ -67,6 +73,10 @@ export class WorkbenchAdmin {
   async createGroup(name: string, description: string): Promise<WorkbenchGroup> { return ((await this.request("POST", "/api/workbench/admin/roles", { name, description })) as { role: WorkbenchGroup }).role; }
 
   async apps(): Promise<WorkbenchApp[]> { return ((await this.request("GET", "/api/workbench/admin/apps")) as { apps: WorkbenchApp[] }).apps; }
+  /** §15.4 step 6: the plug-in manifest's entries (with visibility and linked agents), and the Deployer's own entry. */
+  async plugins(): Promise<WorkbenchPlugin[]> { return ((await this.request("GET", "/api/workbench/admin/plugins")) as { plugins: WorkbenchPlugin[] }).plugins; }
+  async putPlugin(id: string, entry: Record<string, unknown>) { return this.request("PUT", `/api/workbench/admin/plugins/${encodeURIComponent(id)}`, entry); }
+  async setVisibility(id: string, groupIds: string[]) { return this.request("PUT", `/api/workbench/admin/plugins/${encodeURIComponent(id)}/visibility`, { mode: "granted", groupIds }); }
 
   async install(bytes: Buffer, filename: string): Promise<{ app: { id: string; version: string }; bound: Record<string, string> }> {
     const form = new FormData();

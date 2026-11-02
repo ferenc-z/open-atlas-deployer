@@ -29,6 +29,19 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
 - When Workbench is behind nginx, the recommended nginx configuration is saved from the Workbench step, since the
   Ingress page is not open until setup is complete.
 
+**First setup (D41, phase 3)**
+- Once setup is complete, the Setup page lists what the AI features need (L3), each checked on the spot against OMA
+  and Workbench: OMA deployed by this Deployer and answering, the Deployer's OMA key and Application, the Deploy
+  Assistant and the Onboarding Assessor with its Environment, a service key in an OMA Vault for the Deployer's
+  `/mcp`, the "Deploy Assistant" Business Agent, and the Deployer's entry in Workbench (`chat.embed`).
+  `GET /api/setup/ai`; deploys do not depend on it.
+- The Overview's "Setup complete" line says how many AI items are open; the Deploy Assistant panel and the
+  Onboarding page say what they still miss.
+- The Deployer registers itself in Workbench's application list with one click (an application entry that embeds
+  the chat, visible to the deploy groups); an entry that is there keeps its other fields.
+- `examples/oma.manifest.json`: a starting point for registering OMA (no build, `oma-beta-v{version}` images, one
+  data directory for both services).
+
 ## 0.1.0
 
 The first release: the same code as 0.1.0-rc.5, with executor 0.7.2. What it does is under 0.1.0-rc.1; the release

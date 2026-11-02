@@ -53,11 +53,16 @@ export interface FakeState {
     maintenanceLog: string[];
     /** §15: what /api/workbench/version says. */
     version?: string;
+    /** §15.4 step 6: the plug-in manifest (the Deployer's own entry) and each entry's visibility. */
+    plugins: Record<string, unknown>[];
+    visibility: Record<string, { mode: string; groupIds: string[] }>;
   };
   studio: { draft: string; revision: number; uploaded?: string; queries: string[]; published: number; graph: string };
   oma: { packages: number; revision: number; agents: string[]; failPublish?: boolean;
     /** OMA's REST API (x-api-key oma_test): sessions the Deployer opens, and what the Agent answers in them. */
-    sessions: { id: string; body: Record<string, unknown>; messages: string[] }[]; reply: string };
+    sessions: { id: string; body: Record<string, unknown>; messages: string[] }[]; reply: string;
+    /** §15.4 step 6: what OMA's REST API knows (agents by id, Environments, Vault credentials), and whether it answers. */
+    down?: boolean; rest?: { agents: Record<string, { archived_at?: string }>; environments: string[]; credentials: Record<string, { auth: { mcp_server_url: string }; archived_at?: string | null }[]> } };
 }
 
 export function fakeState(): FakeState {
@@ -72,7 +77,7 @@ export function fakeState(): FakeState {
     workbench: { apps: [], agents: [], key: "wbk_test",
       users: [{ email: "u@x", displayName: "U", enabled: true, isAdmin: false, roleIds: ["r_uat"] }, { email: "p@x", enabled: true, isAdmin: false, roleIds: ["r_prod"] }, { email: "a@x", enabled: true, isAdmin: true, roleIds: [] }],
       roles: [{ id: "r_uat", name: "deploy-uat", enabled: true }, { id: "r_prod", name: "deploy-prod", enabled: true }],
-      maintenance: null, maintenanceLog: [] },
+      maintenance: null, maintenanceLog: [], plugins: [], visibility: {} },
     studio: { graph: "acme/book", draft: '{:contract {:contract/family "atlas-semantic"}\n :workspace {:workspace/id "ws-uat"}\n :graph {:graph/id "g-uat" :graph/label "Book"}}', revision: 3, queries: [], published: 0 },
     oma: { packages: 0, revision: 0, agents: [], sessions: [], reply: "" },
   };
@@ -167,6 +172,17 @@ export function fakeServices(s: FakeState): typeof fetch {
         return Response.json({ role }, { status: 201 });
       }
       if (url.pathname === "/api/workbench/admin/roles") return Response.json({ roles: wb.roles });
+      if (url.pathname === "/api/workbench/admin/plugins" && request.method === "GET") return Response.json({ plugins: wb.plugins.map((p) => ({ ...p, dataTokenConfigured: false, visibility: wb.visibility[String(p.id)] ?? null, linkedAgents: [] })) });
+      m = /^\/api\/workbench\/admin\/plugins\/([^/]+)\/visibility$/.exec(url.pathname);
+      if (m && request.method === "PUT") { wb.visibility[m[1]!] = await request.json() as { mode: string; groupIds: string[] }; return Response.json({ visibility: wb.visibility[m[1]!] }); }
+      m = /^\/api\/workbench\/admin\/plugins\/([^/]+)$/.exec(url.pathname);
+      if (m && request.method === "PUT") {
+        const entry = await request.json() as Record<string, unknown>;
+        if (entry.id !== m[1] || "visibility" in entry || "linkedAgents" in entry) return Response.json({ finding: { code: "plugin/entry-invalid" } }, { status: 400 });
+        const at = wb.plugins.findIndex((p) => p.id === m![1]);
+        if (at >= 0) wb.plugins[at] = entry; else wb.plugins.push(entry);
+        return Response.json({ plugin: entry }, { status: at >= 0 ? 200 : 201 });
+      }
       m = /^\/api\/workbench\/admin\/business-agents\/([^/]+)$/.exec(url.pathname);
       if (m && request.method === "PATCH") {
         const body = await request.json() as { agentId: string };
@@ -190,8 +206,18 @@ export function fakeServices(s: FakeState): typeof fetch {
         throw new Error(`unknown tool ${name}`);
       });
     }
+    if (url.host === "oma.test" && s.oma.down) throw new TypeError("fetch failed");
+    if (url.host === "oma.test" && url.pathname === "/health") return Response.json({ status: "ok" });
     if (url.host === "oma.test" && url.pathname.startsWith("/v1/")) {
       if (request.headers.get("x-api-key") !== "oma_test") return new Response("no", { status: 401 });
+      const rest = s.oma.rest ?? { agents: {}, environments: [], credentials: {} };
+      if (url.pathname === "/v1/agents" && request.method === "GET") return Response.json({ data: Object.keys(rest.agents).map((id) => ({ id })) });
+      let r = /^\/v1\/agents\/([^/]+)$/.exec(url.pathname);
+      if (r && request.method === "GET") { const a = rest.agents[r[1]!]; return a ? Response.json({ id: r[1], archived_at: a.archived_at ?? null }) : new Response("{}", { status: 404 }); }
+      r = /^\/v1\/environments\/([^/]+)$/.exec(url.pathname);
+      if (r && request.method === "GET") return rest.environments.includes(r[1]!) ? Response.json({ id: r[1] }) : new Response("{}", { status: 404 });
+      r = /^\/v1\/vaults\/([^/]+)\/credentials$/.exec(url.pathname);
+      if (r && request.method === "GET") { const c = rest.credentials[r[1]!]; return c ? Response.json({ data: c }) : new Response("{}", { status: 404 }); }
       if (url.pathname === "/v1/sessions" && request.method === "POST") {
         const id = `sess_${s.oma.sessions.length + 1}`;
         s.oma.sessions.push({ id, body: await request.json() as Record<string, unknown>, messages: [] });

@@ -6,8 +6,9 @@ import type { EnvironmentStatus } from "../server/observe.ts";
 import type { AuditEntry, RegisteredApp } from "../server/store.ts";
 import type { Manifest } from "../compose/generate.ts";
 import type { SetupStatus, SetupStep } from "../server/setup.ts";
+import type { AiItem, AiStatus, AiUse } from "../server/setup-ai.ts";
 
-export type { AuditEntry, EnvironmentStatus, Manifest, Principal, RegisteredApp, SetupStatus, SetupStep };
+export type { AiItem, AiStatus, AiUse, AuditEntry, EnvironmentStatus, Manifest, Principal, RegisteredApp, SetupStatus, SetupStep };
 
 export type Me =
   | { signedIn: true; principal: Principal; environment?: string; workbenchUrl: string; deployerVersion?: string }
@@ -56,6 +57,9 @@ export const generateWorkbenchEnv = (adminEmail: string, deployerUrl: string) =>
 export const setWorkbenchKey = (key: string) => call<{ source: string }>("PUT", "setup/workbench-key", { key });
 export const createWorkbenchGroups = () => call<{ created: string[] }>("POST", "setup/workbench-groups", {});
 export const addDeployerLink = (deployerUrl: string) => call<{ revision: number }>("POST", "setup/workbench-applinks", { deployerUrl });
+/** Step 6 (L3): what the AI features still need; the Deployer's entry in Workbench's application list. */
+export const setupAi = () => call<AiStatus>("GET", "setup/ai");
+export const registerInWorkbench = (deployerUrl: string) => call<{ url: string; groups: number }>("POST", "setup/workbench-entry", { deployerUrl });
 /** This page's own address, as Workbench's app menu should link it. */
 export const deployerUrl = () => new URL(BASE, location.href).href;
 export const apps = () => call<{ apps: RegisteredApp[] }>("GET", "apps");

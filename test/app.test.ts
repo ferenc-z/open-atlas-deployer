@@ -56,6 +56,8 @@ interface SetupOptions {
   noEnvironment?: boolean;
   /** §15.6 ③: no DEPLOYER_WORKBENCH_API_KEY_FILE; the key is pasted on the Setup page. */
   pasteKey?: boolean;
+  /** §15.4 step 6: the OMA settings of deployer.env (http://oma.test, key oma_test in oma.key). */
+  oma?: Partial<Config>;
 }
 
 function setup(options: SetupOptions = {}) {
@@ -89,6 +91,7 @@ function setup(options: SetupOptions = {}) {
     deployerRelease: { kind: "github", repo: "acme/open-atlas-deployer" }, deployerReleaseTag: "shop-{version}",
     ...(options.emergency ? { emergencyPasswordHash: hashPassword(options.emergency) } : {}),
     ...(options.services && !options.pasteKey ? { workbenchApiKeyFile: join(dir, "wb.key") } : {}),
+    ...(options.oma ? { omaApiKeyFile: join(dir, "oma.key"), ...options.oma } : {}),
   };
   let now = Date.parse("2026-10-30T10:00:00Z");
   const store = new Store(":memory:", () => new Date(now));
@@ -143,7 +146,7 @@ function setup(options: SetupOptions = {}) {
   if (onboarding) deployments.evaluated = (a, v) => onboarding.evaluated(a, v);
   if (phase5) deployments.maintenance = phase5.workbench;
   const workbenchAdmin = phase5?.workbench ?? new WorkbenchAdmin("http://workbench:8090", () => workbenchKey.value(), fetcher);
-  const app = createApp({ config, store, sessions, observer, deployments, versions, env, workbench: workbenchAdmin, workbenchKey, ...(peer ? { peer } : {}), ...(keys ? { keys } : {}), ...(onboarding ? { onboarding } : {}) });
+  const app = createApp({ config, store, sessions, observer, deployments, versions, env, workbench: workbenchAdmin, workbenchKey, ...(phase5 ? { omaFetcher: phase5.fetcher } : {}), ...(peer ? { peer } : {}), ...(keys ? { keys } : {}), ...(onboarding ? { onboarding } : {}) });
   const request = (path: string, init: RequestInit & { as?: string; cookie?: string } = {}) => {
     const headers = new Headers(init.headers);
     const cookies = [init.as ? `${SESSION}=${init.as}` : "", init.cookie ?? ""].filter(Boolean).join("; ");
@@ -401,6 +404,73 @@ test("§15: a Workbench the Deployer did not deploy is taken over; a key in the 
   t.store.removeApp("workbench", { id: "t", via: "cli" });
   assert.equal((await post(t, "/api/setup/workbench-manifest", "admin", {})).status, 403);
   assert.equal((await post(t, "/api/setup/environment", "admin", { name: "prod", project: "open-atlas" })).status, 409);
+});
+
+test("§15.4 step 6: the AI checklist is checked against OMA and Workbench; the Deployer registers itself in Workbench", async () => {
+  const services = fakeState();
+  const t = setup({ services, oma: { omaUrl: "http://oma.test", omaApplicationId: "app_deployer", omaAgent: "agent_assistant", omaEnvironment: "env_main", omaVaults: ["vlt_deployer"], omaAssessorAgent: "agent_assessor", omaAssessorEnvironment: "env_isolated" } });
+  const ai = async () => { const a = await (await t.request("/api/setup/ai", { as: "viewer" })).json(); return { ...a, state: Object.fromEntries(a.items.map((i: { id: string; state: string }) => [i.id, i.state])) }; };
+  const item = (a: { items: { id: string }[] }, id: string) => a.items.find((i) => i.id === id) as Record<string, any>;
+  assert.equal((await t.request("/api/setup/ai")).status, 401);
+
+  services.oma.down = true;
+  let a = await ai();
+  assert.deepEqual(a.state, { oma: "next", "oma-key": "waiting", "oma-assistant": "waiting", "oma-assessor": "waiting", "oma-vault": "waiting", "workbench-agent": "next", "workbench-entry": "next" });
+  assert.equal(a.left, 7);
+  assert.match(item(a, "oma").detail, /does not answer.*Register an app/);
+  assert.ok(a.missing.assistant.includes("OMA") && a.missing.assessments.includes("OMA"));
+
+  // OMA answers and knows both agents and the isolated Environment, but was not deployed by this Deployer.
+  services.oma.down = false;
+  services.oma.rest = { agents: { agent_assistant: {}, agent_assessor: {} }, environments: ["env_isolated"], credentials: { vlt_deployer: [] } };
+  a = await ai();
+  assert.deepEqual(a.state, { oma: "next", "oma-key": "done", "oma-assistant": "done", "oma-assessor": "done", "oma-vault": "next", "workbench-agent": "next", "workbench-entry": "next" });
+  assert.match(item(a, "oma").detail, /not deployed by this Deployer/);
+  assert.deepEqual(a.missing.assessments, ["OMA", "Read-only service key in an OMA Vault (O3)"]);
+
+  // Registered from the example manifest and deployed (§15.6 ④).
+  t.store.saveManifest(JSON.parse(readFileSync(new URL("../examples/oma.manifest.json", import.meta.url), "utf8")), { id: "t", via: "cli" });
+  t.store.addJob({ id: "deploy-oma", kind: "deploy", app: "oma", version: "0.1.0-beta.9", environment: "uat", fromVersion: null, manifest: null, pinFrom: null, request: {} }, { id: "t", via: "cli" });
+  t.store.finishJob("deploy-oma", "succeeded", "ok", { state: "succeeded", steps: [], result: {} } as never);
+  assert.equal((await ai()).state.oma, "done");
+
+  // O3: a credential for this Deployer's /mcp, and a live service key.
+  services.oma.rest.credentials.vlt_deployer = [{ auth: { mcp_server_url: "https://uat.example.internal/deploy/mcp" } }];
+  assert.equal((await ai()).state["oma-vault"], "blocked", "no service key yet");
+  assert.equal((await makeKey(t, "admin", { kind: "service", name: "deploy-assistant", days: 365 })).status, 201);
+  assert.equal((await ai()).state["oma-vault"], "done");
+
+  // The Business Agent has to point at the agent published last.
+  services.workbench.agents.push({ id: "ba_1", name: "Deploy Assistant", agentId: "agent_old", enabled: true });
+  a = await ai();
+  assert.equal(a.state["workbench-agent"], "next");
+  assert.match(item(a, "workbench-agent").detail, /agent_old, not at agent_assistant/);
+  services.workbench.agents[0]!.agentId = "agent_assistant";
+
+  // The Deployer's entry in Workbench: administrators, https, visible to the deploy groups; a second time keeps other fields.
+  assert.equal((await post(t, "/api/setup/workbench-entry", "uat", { deployerUrl: "https://uat.example.internal/deploy/" })).status, 403);
+  assert.equal((await post(t, "/api/setup/workbench-entry", "admin", { deployerUrl: "http://uat.example.internal/deploy/" })).status, 400);
+  assert.equal((await post(t, "/api/setup/workbench-entry", "admin", { deployerUrl: "https://uat.example.internal/deploy/" })).status, 200);
+  const entry = services.workbench.plugins[0] as Record<string, any>;
+  assert.equal(entry.kind, "application");
+  assert.equal(entry.chat.embed, true);
+  assert.deepEqual(entry.chat.agent, { name: "Deploy Assistant" });
+  assert.deepEqual(services.workbench.visibility.deployer, { mode: "granted", groupIds: ["r_uat", "r_prod"] });
+  entry.description = "kept";
+  entry.chat.embed = false;
+  a = await ai();
+  assert.match(item(a, "workbench-entry").detail, /does not embed the chat/);
+  assert.equal((await post(t, "/api/setup/workbench-entry", "admin", { deployerUrl: "https://uat.example.internal/deploy/" })).status, 200);
+  assert.equal((services.workbench.plugins[0] as Record<string, any>).description, "kept");
+  a = await ai();
+  assert.equal(a.left, 0);
+  assert.deepEqual(a.missing, { assistant: [], assessments: [], diagnosis: [], briefs: [] });
+
+  // An archived agent is not published any more.
+  services.oma.rest.agents.agent_assistant = { archived_at: "2026-10-30T00:00:00Z" };
+  a = await ai();
+  assert.equal(a.state["oma-assistant"], "blocked");
+  assert.deepEqual(a.missing.assessments, [], "the Assessor does not use the Deploy Assistant");
 });
 
 test("emergency logins are throttled after five failures", async () => {

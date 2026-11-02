@@ -11,7 +11,7 @@
 - 阶段 6：API key 与 `/mcp`、页面旁的 Deploy Assistant（Workbench 嵌入对话 + 卡片）、部署失败后经 OMA 自动诊断（见下面"阶段 6"一节）；
 - 阶段 7：接入评估（给一个仓库地址）和新版本的清单评估（D27）（见下面"阶段 7"一节）；
 - 阶段 8：部署前在 Workbench 通知用户（W3）、漂移检测、每日简报（见下面"阶段 8"一节）；
-- 首次初始化第一期、第二期（D41）：页面上的 Setup 流程、内置 Workbench 清单、服务器上的 `bootstrap.sh`，页面贴入 Workbench API key、生成 Workbench 的 env、接管已有的 Workbench、建 deploy Groups（见最后"首次初始化"一节）。
+- 首次初始化三期（D41）：页面上的 Setup 流程、内置 Workbench 清单、服务器上的 `bootstrap.sh`，页面贴入 Workbench API key、生成 Workbench 的 env、接管已有的 Workbench、建 deploy Groups；第三期：AI 那一层的检查清单、一键把 Deployer 登记进 Workbench、OMA 清单样例（见最后"首次初始化"一节）。
 
 阶段 5 起，Workbench 应用包、Agent、数据库迁移、Graph、人工步骤都有驱动，Logbook 这样由几种组件组成的应用也能一次部署。
 
@@ -647,12 +647,29 @@ npm test
 - 执行器：每台一行；"Upgrade outdated"（`POST /api/hosts/upgrade-outdated`）一台一台升，前一台成功才排下一台（Deployer 在任务结束时排），失败或退回就停，剩下的不动；进度存在设置里，页面显示。
 - `/api/platform` 给 Overview 用；`/api/me` 带 `deployerVersion`。
 
+### 页面上：AI（L3，第三期）
+
+初始化完成后，Setup 页下面多一块 "AI"，Overview 上的 "Setup complete" 一行写出 AI 还差几项，点开就是这里。没做完不影响部署；Deploy Assistant 面板和 Onboarding 页顶上写明"未配置"和还差哪几项。`GET /api/setup/ai` 单独算（要调 OMA 和 Workbench，每次超时 4 秒），和 `/api/setup` 分开，只在显示的地方请求：
+
+| 项 | 检查什么 | 用于 | 做法 |
+|---|---|---|---|
+| OMA | 注册表里有没有 `oma`、是不是这个 Deployer 部署的，`DEPLOYER_OMA_URL` 的 `/health` 通不通 | 全部 | Apps & manifests → Register an app，贴 OMA 的清单（以 [examples/oma.manifest.json](examples/oma.manifest.json) 为底稿，第一次部署前先在 UAT 上验证），部署；再设 `DEPLOYER_OMA_URL`（如 `http://oma-server:8787`）并重启 |
+| O1 | `DEPLOYER_OMA_API_KEY_FILE` 里的 key 能不能用（`GET /v1/agents`），有没有 `DEPLOYER_OMA_APPLICATION_ID` | 全部 | 在 OMA 里给 Deployer 建 Application 和 key |
+| O4 Deploy Assistant | `DEPLOYER_OMA_AGENT` 的 agent 在不在、有没有归档 | 助手、诊断、简报 | `bin/publish-assistant.ts` 发布后填 id |
+| O2、O4 Onboarding Assessor | `DEPLOYER_OMA_ASSESSOR_AGENT` 和 `DEPLOYER_OMA_ASSESSOR_ENVIRONMENT` 在不在 | 接入评估 | 建隔离 Environment，发布 Assessor |
+| O3 | `DEPLOYER_OMA_VAULTS`、`DEPLOYER_OMA_ASSESSOR_VAULTS` 里有没有一条凭据的 `mcp_server_url` 是这个 Deployer 的 `/mcp`；Deployer 有没有还有效的服务 key | 全部 | API keys 页建服务 key（只读），存进 OMA Vault |
+| Business Agent | Workbench 里有且只有一个启用的 "Deploy Assistant"，指向 `DEPLOYER_OMA_AGENT` | 助手 | Workbench Administration → Business Agents |
+| 外链应用登记 | Workbench 应用列表里 `deployer` 条目：`kind: application`、`chat.embed`、地址是这个 Deployer | 助手 | 一键登记（`POST /api/setup/workbench-entry`）：用 Workbench API key 写条目（`PUT /api/workbench/admin/plugins/deployer`，已有的其他字段保留），可见性设为三个 deploy Group；只接受 https 地址（本机 localhost 例外） |
+
+- OMA 的设置仍在 `deployer.env`，改后重启。§15.6 ③说"其他运行时凭据以后照同样的办法处理"，这一期没有改成页面贴入。
+- Workbench 的 Business Agent 没有做成一键：建它要选 Workbench 里的 OMA 连接，留给管理员在 Workbench 里建。
+
 ### 测试与验证（2026-11-02）
 
 - `npm test` 88 个，新增：环境设置的导入、base、patch、finding、校验不保存、文件不同的提示、部署记录带修订号；清单的分段、base、patch、不许在 patch 里改 appliesFrom、受影响版本、换来源提醒、另起一段、改仓库的确认；PROD 随晋级取 UAT 的清单修订、PROD 只读、同号修订不一致时拦住、从 UAT 取登记；管理工具的可见性、`destructiveHint`、save 的 finding、审计带 note、审计筛选；平台的版本列表和标注、升级计划、退回旧版要确认、执行器一台一台升、失败就停。
 - WSL：用这份代码构建 0.1.0-beta.4、beta.5，经执行器升级本地 Deployer 成功；新版本启动时把 `environment.json` 导入为修订 1。页面上的平台区、环境设置页和登记页的新流程没在浏览器里看过（Windows 没导入测试 CA、我不处理登录凭据）；MCP 管理工具只有单元测试，没用真实的管理员 key 跑过。
 
-## 首次初始化（D41，设计 §15，2026-11-02 第一期、第二期）
+## 首次初始化（D41，设计 §15，2026-11-02 三期）
 
 在全新的服务器上，从装好执行器和 Deployer，到 Workbench 能认人。Workbench 是必经的第一个应用；在这之前用紧急账号起步。初始化没完成时（还没到 L2），页面导航只有一页 Setup。
 
@@ -695,10 +712,12 @@ sudo ./bootstrap.sh --workbench-public-url https://uat.example.internal:8443/
 
 - 服务端测试：全新安装用紧急账号从 L0 走到 L1（表单校验、只能建一次修订、紧急账号签发令牌、心跳、导入清单、重复导入被拒），生成 Workbench 的 env（密码只出现一次、页面上看不到原值、只能生成一次），Workbench 通了以后紧急会话失效；admin 贴入 key（非 admin 被拒、错的 key 被拒、存的是密文）、建出缺的 Group，到 L2；可选的 appLinks 一步；删掉页面上的 key 后回到"下一步"。已有的 Workbench：版本太旧时拦住，≥ 1.24.0 时要求接管，文件里的 key 优先，部署记录有了以后完成；PROD 不导入内置清单。`sh bin/check.sh` 全部通过（91 个测试）。
 - 第二期在本地全新实例上重启后经接口试过生成 env：返回一次密码，并自动排了读取服务器 env 文件的任务。
+- 第三期：服务端测试走一遍 AI 清单（OMA 不通、通但不是本 Deployer 部署、从样例清单登记并部署、Vault 凭据和服务 key、Business Agent 指错 agent、一键登记及重复登记保留字段、agent 归档），共 92 个测试通过。本地实例上 `/api/setup/ai` 在什么都没配时列出 7 项未完成；初始化完成后的 AI 区块、助手和接入评估页的“未配置”提示要真实 Workbench，还没在页面上看过。
 - 本地起一个全新实例（没有 `environment.json`，Workbench 不通），经接口走完同样的流程，Workbench 1.25.1 的部署计划没有拦截项。提示里有一条：`ferenc-z/open-atlas-workbench` 是私有仓库，没有令牌时读不到 `release.json`，契约核对只能跳过。
 - `bin/package-setup.sh` 在 WSL 上打包成功；镜像里的 `hash-password.ts` 能从标准输入算出冒号格式的哈希。`bootstrap.sh` 本身还没在真实服务器上以 root 跑过。
 
 ### 还没做
 
-- 第三期：L3 AI 检查清单，登记和部署 OMA。
+- OMA 清单样例还没在真实 UAT 上部署过；AI 检查只在假的 OMA、Workbench 上测过。
+- OMA 设置改成页面贴入、加密保存（§15.6 ③的后续）。
 

@@ -5,6 +5,7 @@
 
 import { useEffect, useRef, useState, type CSSProperties, type FormEvent, type PointerEvent as ReactPointerEvent } from "react";
 import * as api from "./api.ts";
+import { AiMissing } from "./Setup.tsx";
 
 export const HOST_OPERATIONS = ["plan_deploy", "plan_rollback", "build_artifact", "set_env_value"] as const;
 
@@ -54,7 +55,7 @@ export async function runHostOperation(operation: string, payload: Payload, acti
   return { ok: false, outcome: "Not handled" };
 }
 
-export function AssistantPanel({ workbenchUrl, environment, page, app, actions, onClose }: { workbenchUrl: string; environment?: string; page: string; app?: string; actions: HostActions; onClose: () => void }) {
+export function AssistantPanel({ workbenchUrl, environment, page, app, actions, onClose, onSetup }: { workbenchUrl: string; environment?: string; page: string; app?: string; actions: HostActions; onClose: () => void; onSetup?: () => void }) {
   const frame = useRef<HTMLIFrameElement>(null);
   const base = new URL(workbenchUrl, window.location.href);
   const origin = base.origin;
@@ -121,6 +122,7 @@ export function AssistantPanel({ workbenchUrl, environment, page, app, actions, 
             </div>
           </>
         )}
+        {mode !== "collapsed" && <AiMissing use="assistant" what="The Deploy Assistant" {...(onSetup ? { onSetup } : {})} />}
         {!ready && slow && mode !== "collapsed" && (
           <div className="assistant-hint">
             <p>The assistant has not loaded from Workbench ({origin}). The frame stays blank when Workbench is unreachable or this browser does not trust its certificate.</p>

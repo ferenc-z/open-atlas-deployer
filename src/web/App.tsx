@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
 import * as api from "./api.ts";
-import type { AuditEntry, Manifest, ManifestCheck, Me, Principal, RegisteredApp, SetupStatus, StatusView } from "./api.ts";
+import type { AiStatus, AuditEntry, Manifest, ManifestCheck, Me, Principal, RegisteredApp, SetupStatus, StatusView } from "./api.ts";
 import { DeployPanel, History, JobPanel, JobState, KIND } from "./Deploy.tsx";
 import { EnvPage } from "./Env.tsx";
 import { Artifacts } from "./Artifacts.tsx";
@@ -77,7 +77,7 @@ export function App() {
         {p.stale && <div className="banner warn">Workbench is not responding; using the last confirmed sign-in (valid for 15 minutes).</div>}
         {p.actAs && <div className="banner info">{p.actAs.administrator} is using Workbench as {p.displayName}, so permissions here are also those of {p.displayName}.</div>}
         <main>
-          {shown === "setup" && <SetupPage workbenchUrl={me.workbenchUrl} onChanged={setupChanged} />}
+          {shown === "setup" && <SetupPage workbenchUrl={me.workbenchUrl} onChanged={setupChanged} onGo={go} />}
           {shown === "status" && <><SetupLine status={setup} onOpen={() => go("setup")} /><DriftBanner /><Status panel={panel} setPanel={setPanel} isAdmin={p.permissions.includes("admin")} canRegenerate={p.permissions.includes("deploy-uat") || p.permissions.includes("deploy-prod")} onAssessment={(id) => { setPanel(undefined); setAssessment(id); setTab("onboarding"); }} /></>}
           {shown === "history" && <HistoryPage onBack={(j) => { setPanel({ kind: "deploy", app: j.app, initial: { version: j.version, pinFrom: j.id } }); setTab("status"); }} />}
           {shown === "hosts" && <HostsPage isAdmin={p.permissions.includes("admin")} />}
@@ -85,12 +85,12 @@ export function App() {
           {shown === "env" && <EnvPage />}
           {shown === "ingress" && <IngressPage />}
           {shown === "registry" && <Registry principal={p} prod={me.environment?.toLowerCase() === "prod"} />}
-          {shown === "onboarding" && <OnboardingPage key={assessment ?? ""} {...(assessment ? { initialOpen: assessment } : {})} canStart={p.permissions.includes("deploy-uat") && p.via === "workbench"} isAdmin={p.permissions.includes("admin")} onJob={(id) => { setPanel({ kind: "job", id }); setTab("status"); }} />}
+          {shown === "onboarding" && <OnboardingPage key={assessment ?? ""} onSetup={() => go("setup")} {...(assessment ? { initialOpen: assessment } : {})} canStart={p.permissions.includes("deploy-uat") && p.via === "workbench"} isAdmin={p.permissions.includes("admin")} onJob={(id) => { setPanel({ kind: "job", id }); setTab("status"); }} />}
           {shown === "keys" && <KeysPage isAdmin={p.permissions.includes("admin")} />}
           {shown === "audit" && p.permissions.includes("admin") && <Audit />}
         </main>
       </div>
-      {assistant && <AssistantPanel workbenchUrl={me.workbenchUrl} {...(me.environment ? { environment: me.environment } : {})} page={shown} {...(panel?.kind === "deploy" ? { app: panel.app } : {})} actions={actions} onClose={() => setAssistant(false)} />}
+      {assistant && <AssistantPanel workbenchUrl={me.workbenchUrl} {...(me.environment ? { environment: me.environment } : {})} page={shown} {...(panel?.kind === "deploy" ? { app: panel.app } : {})} actions={actions} onClose={() => setAssistant(false)} onSetup={() => go("setup")} />}
     </div>
   );
 }
@@ -134,7 +134,16 @@ function Sidebar({ principal, environment, tab, setTab, setupOnly, onSignedOut, 
 /** §15.5: once setup is complete it folds into one line on the Overview. */
 function SetupLine({ status, onOpen }: { status: SetupStatus; onOpen: () => void }) {
   const left = status.steps.filter((s) => s.state !== "done").length;
-  return <p className="setup-line small muted"><span className="badge ok">Setup complete</span> Workbench signs people in ({status.level}){left ? `; ${left} step${left > 1 ? "s" : ""} still open` : ""}. <button className="link" onClick={onOpen}>Show the steps</button></p>;
+  // The AI steps (L3) are checked against OMA and Workbench, so they are asked for apart and may come later.
+  const [ai, setAi] = useState<AiStatus | undefined>();
+  useEffect(() => { api.setupAi().then(setAi, () => setAi(undefined)); }, []);
+  return (
+    <p className="setup-line small muted">
+      <span className="badge ok">Setup complete</span> Workbench signs people in ({status.level}){left ? `; ${left} step${left > 1 ? "s" : ""} still open` : ""}.
+      {ai && (ai.left ? ` AI: ${ai.left} of ${ai.items.length} items still open.` : " AI is set up.")}{" "}
+      <button className="link" onClick={onOpen}>Show the steps</button>
+    </p>
+  );
 }
 
 /** Deploy history and artifacts are two views of what ran here: by deploy, and by app@version + digest. */

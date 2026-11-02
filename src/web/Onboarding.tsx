@@ -4,6 +4,7 @@
 import { useEffect, useState, type FormEvent } from "react";
 import * as api from "./api.ts";
 import { Markdown } from "./Markdown.tsx";
+import { AiMissing } from "./Setup.tsx";
 import type { AssessmentView } from "./api.ts";
 
 const STATE: Record<string, { label: string; tone: string }> = {
@@ -13,7 +14,7 @@ const STATE: Record<string, { label: string; tone: string }> = {
 const LEVEL: Record<string, string> = { A: "A deployable as is", B: "B deployable with configuration", C: "C needs repository changes", D: "D not suitable", unchanged: "Manifest unchanged" };
 const when = (iso?: string | null) => (iso ? new Date(iso).toLocaleString("en-US", { hour12: false }) : "—");
 
-export function OnboardingPage({ canStart, isAdmin, onJob, initialOpen }: { canStart: boolean; isAdmin: boolean; onJob: (id: string) => void; initialOpen?: string }) {
+export function OnboardingPage({ canStart, isAdmin, onJob, initialOpen, onSetup }: { canStart: boolean; isAdmin: boolean; onJob: (id: string) => void; initialOpen?: string; onSetup?: () => void }) {
   const [list, setList] = useState<AssessmentView[] | undefined>();
   const [open, setOpen] = useState<string | undefined>(initialOpen);
   const [repo, setRepo] = useState("");
@@ -38,6 +39,7 @@ export function OnboardingPage({ canStart, isAdmin, onJob, initialOpen }: { canS
   return (
     <>
       <div className="toolbar"><h1>Onboarding</h1><span className="muted">Give a repository address; the Onboarding Assessor assesses it in an isolated sandbox and configures a draft. Trial deploys and registering are confirmed by a person.</span></div>
+      <AiMissing use="assessments" what="The Onboarding Assessor" {...(onSetup ? { onSetup } : {})} />
       {canStart && (
         <form className="card panel" onSubmit={start}>
           <div className="row">
