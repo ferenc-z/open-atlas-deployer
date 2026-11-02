@@ -51,6 +51,8 @@ export interface FakeState {
     /** W3: the maintenance notice, and every change to it. */
     maintenance: { message: string; startsAt: string; endsAt: string } | null;
     maintenanceLog: string[];
+    /** §15: what /api/workbench/version says. */
+    version?: string;
   };
   studio: { draft: string; revision: number; uploaded?: string; queries: string[]; published: number; graph: string };
   oma: { packages: number; revision: number; agents: string[]; failPublish?: boolean;
@@ -126,6 +128,7 @@ export function fakeServices(s: FakeState): typeof fetch {
       }
     }
     if (url.host === "workbench:8090") {
+      if (url.pathname === "/api/workbench/version") return Response.json({ serverBuild: "b", version: s.workbench.version ?? "1.25.1" });
       if (request.headers.get("authorization") !== `Bearer ${s.workbench.key}`) return Response.json({ finding: { code: "auth/admin-token-invalid" } }, { status: 401 });
       const wb = s.workbench;
       if (url.pathname === "/api/workbench/admin/apps" && request.method === "GET") return Response.json({ apps: wb.apps });
@@ -156,6 +159,13 @@ export function fakeServices(s: FakeState): typeof fetch {
       if (url.pathname === "/api/workbench/admin/users") return Response.json({ users: wb.users });
       if (url.pathname === "/api/workbench/admin/maintenance" && request.method === "PUT") { wb.maintenance = await request.json() as typeof wb.maintenance; wb.maintenanceLog.push(`set ${wb.maintenance!.message}`); return Response.json({ notice: wb.maintenance }); }
       if (url.pathname === "/api/workbench/admin/maintenance" && request.method === "DELETE") { wb.maintenance = null; wb.maintenanceLog.push("cleared"); return Response.json({ notice: null }); }
+      if (url.pathname === "/api/workbench/admin/roles" && request.method === "POST") {
+        const body = await request.json() as { name: string };
+        if (wb.roles.some((r) => r.name === body.name)) return Response.json({ finding: { code: "role/duplicate" } }, { status: 409 });
+        const role = { id: `r_${body.name}`, name: body.name, enabled: true };
+        wb.roles.push(role);
+        return Response.json({ role }, { status: 201 });
+      }
       if (url.pathname === "/api/workbench/admin/roles") return Response.json({ roles: wb.roles });
       m = /^\/api\/workbench\/admin\/business-agents\/([^/]+)$/.exec(url.pathname);
       if (m && request.method === "PATCH") {

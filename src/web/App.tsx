@@ -133,7 +133,8 @@ function Sidebar({ principal, environment, tab, setTab, setupOnly, onSignedOut, 
 
 /** §15.5: once setup is complete it folds into one line on the Overview. */
 function SetupLine({ status, onOpen }: { status: SetupStatus; onOpen: () => void }) {
-  return <p className="setup-line small muted"><span className="badge ok">Setup complete</span> Workbench signs people in ({status.level}). <button className="link" onClick={onOpen}>Show the steps</button></p>;
+  const left = status.steps.filter((s) => s.state !== "done").length;
+  return <p className="setup-line small muted"><span className="badge ok">Setup complete</span> Workbench signs people in ({status.level}){left ? `; ${left} step${left > 1 ? "s" : ""} still open` : ""}. <button className="link" onClick={onOpen}>Show the steps</button></p>;
 }
 
 /** Deploy history and artifacts are two views of what ran here: by deploy, and by app@version + digest. */

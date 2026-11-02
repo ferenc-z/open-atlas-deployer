@@ -25,6 +25,7 @@ import { Observer } from "./observe.ts";
 import { Peer } from "./peer.ts";
 import { SecretBox } from "./secretbox.ts";
 import { Store } from "./store.ts";
+import { WorkbenchKey } from "./workbench-key.ts";
 import { readToken, Versions } from "./versions.ts";
 
 const config = loadConfig();
@@ -34,7 +35,10 @@ const observer = new Observer(config.observeUrls);
 const versions = new Versions(config.githubTokenFile, fetch, Date.now, config.githubApi);
 const peer = new Peer(config.uatUrl, config.uatKeyFile);
 // Phase 5 drivers: Workbench through an Administration API key, Studio and OMA through their Builder MCPs.
-const workbench = new WorkbenchAdmin(config.workbenchUrl, config.workbenchApiKeyFile);
+// §15.6 ③: the key from DEPLOYER_WORKBENCH_API_KEY_FILE, or the one an administrator pasted on the Setup page.
+const box = config.credentialKey ? new SecretBox(config.credentialKey) : undefined;
+const workbenchKey = new WorkbenchKey(store, config.workbenchApiKeyFile, box);
+const workbench = new WorkbenchAdmin(config.workbenchUrl, () => workbenchKey.value());
 const bearer = (file: string | undefined) => () => ({ authorization: `Bearer ${readToken(file)}` });
 const studio = config.studioBuilderUrl && config.studioTokenFile ? new McpClient(config.studioBuilderUrl, bearer(config.studioTokenFile)) : undefined;
 const omaBuilder = config.omaBuilderUrl && config.omaBuilderKeyFile ? new McpClient(config.omaBuilderUrl, bearer(config.omaBuilderKeyFile)) : undefined;
@@ -56,9 +60,9 @@ try {
   console.error(`Cannot read the environment settings (${config.environmentFile}): ${(error as Error).message}`);
 }
 const keptTemplates = join(config.dataDir, "templates");
-const env = new EnvManager(store, deployments, new Schemas(config.githubTokenFile, config.templatesDir, fetch, keptTemplates, config.githubApi), config.credentialKey ? new SecretBox(config.credentialKey) : undefined, config.compareKey);
+const env = new EnvManager(store, deployments, new Schemas(config.githubTokenFile, config.templatesDir, fetch, keptTemplates, config.githubApi), box, config.compareKey);
 // Phase 6: personal and service API keys (need Workbench's API key to re-confirm owners), failure diagnosis through OMA.
-const keys = config.workbenchApiKeyFile ? new Keys(store, workbench) : undefined;
+const keys = new Keys(store, workbench);
 const diagnoser = config.omaUrl && config.omaApiKeyFile && config.omaAgent
   ? new Diagnoser(store, { url: config.omaUrl, keyFile: config.omaApiKeyFile, agent: config.omaAgent, ...(config.omaEnvironment ? { environment: config.omaEnvironment } : {}), vaults: config.omaVaults, ...(config.omaApplicationId ? { application: config.omaApplicationId } : {}) }, (id) => deployments.handoff.log(id))
   : undefined;
@@ -70,7 +74,7 @@ const assessor = config.omaUrl && config.omaApiKeyFile && config.omaAssessorAgen
 const onboarding = new Onboarding({ store, deployments, oma: assessor, githubApi: config.githubApi, githubTokenFile: config.githubTokenFile, issueRepo: config.issueRepo, issueTokenFile: config.issueTokenFile, templatesDir: keptTemplates, pageUrl: config.workbenchPublicUrl });
 deployments.evaluated = (app, version) => onboarding.evaluated(app, version);
 // Phase 8: the maintenance notice before a deploy (W3), drift, the daily brief.
-if (config.workbenchApiKeyFile) deployments.maintenance = workbench;
+deployments.maintenance = workbench;
 const statusOf = () => {
   const { env } = deployments.environment();
   return environmentStatus(env, store.listApps().map((a) => ({ id: a.id, name: a.name, manifests: store.manifests(a.id) })), hostStateOf(deployments.handoff.reports(hostIds(env))), observer);
@@ -80,7 +84,7 @@ const briefWriter = config.omaUrl && config.omaApiKeyFile && config.omaAgent
   ? new OmaSessions({ url: config.omaUrl, keyFile: config.omaApiKeyFile, agent: config.omaAgent, ...(config.omaEnvironment ? { environment: config.omaEnvironment } : {}), vaults: config.omaVaults, ...(config.omaApplicationId ? { application: config.omaApplicationId } : {}) })
   : undefined;
 const briefs = new Briefs(store, () => collectFacts({ store, deployments, status: statusOf, versions, ...(peer.configured ? { peer: () => peer.status() } : {}), drift: () => drift.check() }), briefWriter, { hour: config.briefHour });
-const app = createApp({ config, store, sessions: new WorkbenchSessions(config.workbenchUrl), observer, deployments, versions, env, peer, onboarding, drift, briefs, ...(keys ? { keys } : {}) });
+const app = createApp({ config, store, sessions: new WorkbenchSessions(config.workbenchUrl), observer, deployments, versions, env, peer, onboarding, drift, briefs, keys, workbench, workbenchKey });
 // Job records follow the executor's status files even while nobody has the page open.
 setInterval(() => {
   deployments.sync().catch((error) => console.error("sync:", error));

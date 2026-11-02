@@ -30,6 +30,7 @@ import { WorkbenchAdmin } from "../src/server/drivers/workbench.ts";
 import { WorkbenchAppDriver } from "../src/server/drivers/workbench-app.ts";
 import { McpClient } from "../src/server/mcp-client.ts";
 import { Keys } from "../src/server/keys.ts";
+import { WorkbenchKey } from "../src/server/workbench-key.ts";
 import { Diagnoser } from "../src/server/diagnose.ts";
 import { OmaSessions } from "../src/server/oma.ts";
 import { Onboarding } from "../src/server/onboarding.ts";
@@ -53,6 +54,8 @@ interface SetupOptions {
   services?: FakeState;
   /** §15: a new installation, without environment.json. */
   noEnvironment?: boolean;
+  /** §15.6 ③: no DEPLOYER_WORKBENCH_API_KEY_FILE; the key is pasted on the Setup page. */
+  pasteKey?: boolean;
 }
 
 function setup(options: SetupOptions = {}) {
@@ -85,13 +88,15 @@ function setup(options: SetupOptions = {}) {
     // D39: the fake GitHub lists shop-1.2.0, v9 and shop-1.10.0 for any repository.
     deployerRelease: { kind: "github", repo: "acme/open-atlas-deployer" }, deployerReleaseTag: "shop-{version}",
     ...(options.emergency ? { emergencyPasswordHash: hashPassword(options.emergency) } : {}),
-    ...(options.services ? { workbenchApiKeyFile: join(dir, "wb.key") } : {}),
+    ...(options.services && !options.pasteKey ? { workbenchApiKeyFile: join(dir, "wb.key") } : {}),
   };
   let now = Date.parse("2026-10-30T10:00:00Z");
   const store = new Store(":memory:", () => new Date(now));
   const sessions = new WorkbenchSessions(config.workbenchUrl, fetcher, () => now);
   const observer = new Observer({}, fetcher);
   const handoff = new Handoff(store, () => now);
+  const box = new SecretBox(Buffer.alloc(32, 7).toString("base64"));
+  const workbenchKey = new WorkbenchKey(store, config.workbenchApiKeyFile, box);
   let peer: Peer | undefined;
   if (options.uat) {
     writeFileSync(join(dir, "uat.key"), options.uat.key);
@@ -107,7 +112,7 @@ function setup(options: SetupOptions = {}) {
   if (options.services) {
     const f = fakeServices(options.services);
     writeFileSync(join(dir, "wb.key"), options.services.workbench.key);
-    const wb = new WorkbenchAdmin("http://workbench:8090", join(dir, "wb.key"), f);
+    const wb = new WorkbenchAdmin("http://workbench:8090", () => workbenchKey.value(), f);
     phase5 = {
       workbench: wb, fetcher: f,
       drivers: [
@@ -126,7 +131,7 @@ function setup(options: SetupOptions = {}) {
   const versions = new Versions(undefined, (async () => Response.json([{ name: "shop-1.2.0" }, { name: "v9" }, { name: "shop-1.10.0" }])) as typeof fetch);
   const example = { text: "" };
   const schemas = new Schemas(undefined, join(dir, "templates"), (async () => new Response(example.text)) as typeof fetch);
-  const env = new EnvManager(store, deployments, schemas, new SecretBox(Buffer.alloc(32, 7).toString("base64")), "shared-compare-key");
+  const env = new EnvManager(store, deployments, schemas, box, "shared-compare-key");
   const keys = phase5 ? new Keys(store, phase5.workbench, () => now) : undefined;
   writeFileSync(join(dir, "oma.key"), "oma_test");
   writeFileSync(join(dir, "issue.token"), "ghi_test");
@@ -137,7 +142,8 @@ function setup(options: SetupOptions = {}) {
   }) : undefined;
   if (onboarding) deployments.evaluated = (a, v) => onboarding.evaluated(a, v);
   if (phase5) deployments.maintenance = phase5.workbench;
-  const app = createApp({ config, store, sessions, observer, deployments, versions, env, ...(peer ? { peer } : {}), ...(keys ? { keys } : {}), ...(onboarding ? { onboarding } : {}) });
+  const workbenchAdmin = phase5?.workbench ?? new WorkbenchAdmin("http://workbench:8090", () => workbenchKey.value(), fetcher);
+  const app = createApp({ config, store, sessions, observer, deployments, versions, env, workbench: workbenchAdmin, workbenchKey, ...(peer ? { peer } : {}), ...(keys ? { keys } : {}), ...(onboarding ? { onboarding } : {}) });
   const request = (path: string, init: RequestInit & { as?: string; cookie?: string } = {}) => {
     const headers = new Headers(init.headers);
     const cookies = [init.as ? `${SESSION}=${init.as}` : "", init.cookie ?? ""].filter(Boolean).join("; ");
@@ -247,20 +253,30 @@ test("the emergency password hash has no $, which docker compose would read as a
   assert.ok(!verifyPassword("wrong", hash));
 });
 
-test("§15: a new installation is set up with the emergency account up to Workbench; setup completes with Workbench and its API key", async () => {
+/** §15: Workbench as if the Deployer had deployed it (a succeeded deploy record). */
+const deployedWorkbench = (t: ReturnType<typeof setup>, version = "1.25.1") => {
+  const id = `deploy-workbench-${version}`;
+  t.store.addJob({ id, kind: "deploy", app: "workbench", version, environment: "uat", fromVersion: null, manifest: null, pinFrom: null, request: {} }, { id: "t", via: "cli" });
+  t.store.finishJob(id, "succeeded", "ok", { state: "succeeded", steps: [], result: {} } as never);
+};
+const setupStates = (s: { steps: { id: string; state: string }[] }) => Object.fromEntries(s.steps.map((x) => [x.id, x.state]));
+const setupStep = (s: { steps: { id: string }[] }, id: string) => s.steps.find((x) => x.id === id) as Record<string, any>;
+
+test("§15: a new installation is set up with the emergency account up to Workbench, then with Workbench's admin up to its key and groups", async () => {
   const password = "correct horse battery staple";
-  const t = setup({ emergency: password, noEnvironment: true });
+  const services = fakeState();
+  const t = setup({ emergency: password, noEnvironment: true, services, pasteKey: true });
   t.workbench.up = false;
   const login = await t.request("/api/emergency/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ password }) });
   const cookie = login.headers.get("set-cookie")!.split(";")[0]!;
   const csrf = (await (await t.request("/api/me", { cookie })).json()).principal.csrfToken as string;
   const call = (method: string, path: string, body?: unknown) => t.request(path, { method, cookie, headers: { "content-type": "application/json", "x-csrf-token": csrf }, ...(body ? { body: JSON.stringify(body) } : {}) });
-  const steps = async () => { const s = await (await call("GET", "/api/setup")).json(); return { ...s, state: Object.fromEntries(s.steps.map((x: { id: string; state: string }) => [x.id, x.state])) }; };
+  const steps = async () => { const s = await (await call("GET", "/api/setup")).json(); return { ...s, state: setupStates(s) }; };
 
   let s = await steps();
   assert.equal(s.complete, false);
   assert.equal(s.level, "L0");
-  assert.deepEqual(s.state, { environment: "next", executor: "waiting", "workbench-manifest": "waiting", "workbench-deploy": "waiting", "workbench-signin": "waiting", "workbench-key": "waiting" });
+  assert.deepEqual(s.state, { environment: "next", executor: "waiting", "workbench-manifest": "waiting", "workbench-deploy": "waiting", "workbench-signin": "waiting", "workbench-key": "waiting", "workbench-groups": "waiting", "workbench-applinks": "waiting" });
   assert.equal((await call("POST", "/api/setup/workbench-manifest", {})).status, 409, "the environment comes first");
 
   const bad = await call("POST", "/api/setup/environment", { name: "uat", project: "Open Atlas" });
@@ -281,7 +297,7 @@ test("§15: a new installation is set up with the emergency account up to Workbe
   assert.equal(issued.status, 201);
   const token = (await issued.json()).token as string;
   assert.match(token, /^dpe_/);
-  await t.app.request("/deploy/executor/v1/heartbeat", { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ version: EXECUTOR_VERSION, protocols: [PROTOCOL], kinds: ["deploy"], project: "open-atlas", registries: [], databaseBackup: {}, busy: null }) });
+  await t.app.request("/deploy/executor/v1/heartbeat", { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ version: EXECUTOR_VERSION, protocols: [PROTOCOL], kinds: ["deploy", "env", "env-read"], project: "open-atlas", registries: [], databaseBackup: {}, busy: null }) });
   s = await steps();
   assert.equal(s.state.executor, "done");
   assert.equal(s.state["workbench-manifest"], "next");
@@ -294,25 +310,89 @@ test("§15: a new installation is set up with the emergency account up to Workbe
   s = await steps();
   assert.equal(s.level, "L1");
   assert.equal(s.state["workbench-deploy"], "next");
+  assert.deepEqual(setupStep(s, "workbench-deploy").workbench, { takeover: false, version: "1.25.1", envRevisions: 0, envWritten: false });
 
-  // Workbench answers: the emergency account is gone, an admin signs in with Workbench; the API key is still missing.
+  // Step 4: Workbench's env is generated; the initial admin's password comes back once, and the file is read first.
+  assert.equal((await call("POST", "/api/setup/workbench-env", { adminEmail: "not an email" })).status, 400);
+  const generated = await call("POST", "/api/setup/workbench-env", { adminEmail: "first@example.com", deployerUrl: "https://uat.example.internal:8495/deploy/" });
+  assert.equal(generated.status, 201);
+  const gen = await generated.json();
+  assert.ok(gen.password.length >= 20);
+  assert.match(gen.job, /^env-read/);
+  const shown = JSON.stringify(await (await call("GET", "/api/apps/workbench/env")).json());
+  assert.ok(!shown.includes(gen.password), "the password is not shown again");
+  assert.ok(shown.includes("first@example.com") && shown.includes("{{app:workbench.url}}"));
+  assert.equal((await call("POST", "/api/setup/workbench-env", { adminEmail: "first@example.com" })).status, 409, "only once");
+
+  // Deployed; Workbench answers: the emergency account is gone, an admin signs in with Workbench.
+  deployedWorkbench(t);
   t.workbench.up = true;
   t.advance(20_000);
   assert.equal((await call("GET", "/api/setup")).status, 401);
-  const asAdmin = await (await t.request("/api/setup", { as: "admin" })).json();
-  assert.deepEqual(asAdmin.steps.map((x: { state: string }) => x.state), ["done", "done", "done", "done", "done", "next"]);
+  let asAdmin = await (await t.request("/api/setup", { as: "admin" })).json();
+  assert.deepEqual(setupStates(asAdmin), { environment: "done", executor: "done", "workbench-manifest": "done", "workbench-deploy": "done", "workbench-signin": "done", "workbench-key": "next", "workbench-groups": "waiting", "workbench-applinks": "next" });
   assert.equal(asAdmin.complete, false);
-  assert.equal((await t.request("/api/setup", { as: "viewer" })).status, 200);
+  assert.deepEqual(setupStep(asAdmin, "workbench-key").key, { source: null, canSet: true });
+
+  // Step 6: the key is pasted, checked against Workbench, kept sealed.
+  const putKey = (key: string, as = "admin") => t.request("/api/setup/workbench-key", { method: "PUT", as, headers: { "content-type": "application/json", "x-csrf-token": `csrf-${as}` }, body: JSON.stringify({ key }) });
+  assert.equal((await putKey("wbk_test", "uat")).status, 403, "administrators only");
+  assert.equal((await putKey("wbk_wrong")).status, 400);
+  assert.equal((await putKey("wbk_test")).status, 200);
+  assert.ok(!t.store.setting("workbench-api-key")!.includes("wbk_test"), "kept sealed");
+  asAdmin = await (await t.request("/api/setup", { as: "admin" })).json();
+  assert.equal(setupStates(asAdmin)["workbench-key"], "done");
+  assert.deepEqual(setupStep(asAdmin, "workbench-groups").missingGroups, ["deploy-viewer"]);
+
+  // Step 7: the missing group is created in Workbench; setup is complete.
+  const groups = await post(t, "/api/setup/workbench-groups", "admin", {});
+  assert.deepEqual(await groups.json(), { created: ["deploy-viewer"] });
+  assert.ok(services.workbench.roles.some((r) => r.name === "deploy-viewer"));
+  asAdmin = await (await t.request("/api/setup", { as: "admin" })).json();
+  assert.equal(asAdmin.complete, true);
+  assert.equal(asAdmin.level, "L2");
+
+  // Step 8 (optional): the link is in the saved revision but not on the server yet; adding it again replaces it.
+  assert.match(setupStep(asAdmin, "workbench-applinks").detail, /not on the server yet/);
+  const linked = await post(t, "/api/setup/workbench-applinks", "admin", { deployerUrl: "https://uat.example.internal:9495/deploy/" });
+  assert.equal(linked.status, 200);
+  assert.match(JSON.stringify(await (await t.request("/api/apps/workbench/env", { as: "admin" })).json()), /9495\/deploy/);
+
+  assert.equal((await t.request("/api/setup/workbench-key", { method: "DELETE", as: "admin", headers: { "x-csrf-token": "csrf-admin" } })).status, 200);
+  assert.equal(setupStates(await (await t.request("/api/setup", { as: "admin" })).json())["workbench-key"], "next");
 });
 
-test("§15: an installation with Workbench and its API key is set up; PROD does not import the shipped manifest", async () => {
-  const t = setup({ services: fakeState() });
-  const s = await (await t.request("/api/setup", { as: "viewer" })).json();
-  assert.equal(s.complete, true);
-  assert.equal(s.level, "L2", "an executor that has not called in yet does not undo setup");
-  assert.equal(s.steps.find((x: { id: string }) => x.id === "executor").state, "next");
+test("§15: a Workbench the Deployer did not deploy is taken over; a key in the file wins; PROD does not import the shipped manifest", async () => {
+  const services = fakeState();
+  const t = setup({ services });
+  let s = await (await t.request("/api/setup", { as: "viewer" })).json();
+  assert.equal(s.complete, false);
   assert.equal(s.canAct, false);
+  assert.equal(setupStep(s, "workbench-deploy").title, "Take over Workbench");
+  assert.equal(setupStep(s, "workbench-deploy").state, "waiting", "waits for the executor and the manifest");
+  services.workbench.version = "1.23.1";
+  s = await (await t.request("/api/setup", { as: "admin" })).json();
+  assert.equal(setupStep(s, "workbench-deploy").state, "blocked");
+  assert.match(setupStep(s, "workbench-deploy").detail, /1\.24\.0 or newer/);
+
+  services.workbench.version = "1.24.0";
+  t.store.saveManifest(JSON.parse(readFileSync(new URL("../manifests/initial/workbench.json", import.meta.url), "utf8")), { id: "t", via: "cli" });
+  t.beat();
+  s = await (await t.request("/api/setup", { as: "admin" })).json();
+  assert.equal(setupStep(s, "workbench-deploy").state, "next");
+  assert.match(setupStep(s, "workbench-deploy").detail, /deploy 1\.25\.1 or newer/);
+  assert.deepEqual(setupStep(s, "workbench-deploy").workbench, { takeover: true, running: "1.24.0", version: "1.25.1", envRevisions: 0, envWritten: false });
+  assert.equal(setupStates(s)["workbench-key"], "done");
+  assert.equal((await t.request("/api/setup/workbench-key", { method: "PUT", as: "admin", headers: { "content-type": "application/json", "x-csrf-token": "csrf-admin" }, body: JSON.stringify({ key: "wbk_test" }) })).status, 409, "the file wins");
+
+  services.workbench.roles.push({ id: "r_view", name: "deploy-viewer", enabled: true });
+  deployedWorkbench(t);
+  s = await (await t.request("/api/setup", { as: "viewer" })).json();
+  assert.equal(s.complete, true);
+  assert.equal(s.level, "L2");
+
   setEnvironment(t, { name: "prod", project: "open-atlas", bindIp: "127.0.0.1", registries: {}, apps: {} });
+  t.store.removeApp("workbench", { id: "t", via: "cli" });
   assert.equal((await post(t, "/api/setup/workbench-manifest", "admin", {})).status, 403);
   assert.equal((await post(t, "/api/setup/environment", "admin", { name: "prod", project: "open-atlas" })).status, 409);
 });

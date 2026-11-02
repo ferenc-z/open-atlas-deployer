@@ -52,6 +52,12 @@ export const status = () => call<EnvironmentStatus>("GET", "status");
 export const setup = () => call<SetupStatus>("GET", "setup");
 export const createEnvironment = (form: Record<string, string>) => call<{ revision: number }>("POST", "setup/environment", form);
 export const importWorkbenchManifest = () => call<{ revision: number }>("POST", "setup/workbench-manifest", {});
+export const generateWorkbenchEnv = (adminEmail: string, deployerUrl: string) => call<{ revision: number; password: string; job: string | null }>("POST", "setup/workbench-env", { adminEmail, deployerUrl });
+export const setWorkbenchKey = (key: string) => call<{ source: string }>("PUT", "setup/workbench-key", { key });
+export const createWorkbenchGroups = () => call<{ created: string[] }>("POST", "setup/workbench-groups", {});
+export const addDeployerLink = (deployerUrl: string) => call<{ revision: number }>("POST", "setup/workbench-applinks", { deployerUrl });
+/** This page's own address, as Workbench's app menu should link it. */
+export const deployerUrl = () => new URL(BASE, location.href).href;
 export const apps = () => call<{ apps: RegisteredApp[] }>("GET", "apps");
 export const app = (id: string) => call<{ app: RegisteredApp; manifests: Manifest[] }>("GET", `apps/${encodeURIComponent(id)}`);
 export const revision = (id: string, from: string, rev: number) => call<Manifest>("GET", `apps/${encodeURIComponent(id)}/manifests/${encodeURIComponent(from)}/${rev}`);

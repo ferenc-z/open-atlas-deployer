@@ -31,7 +31,9 @@ import { DEPLOYER_VERSION } from "./version.ts";
 import { validateEnvironment } from "./environment.ts";
 import { applyPatch, changedPaths, PatchError } from "./jsonpatch.ts";
 import type { Versions } from "./versions.ts";
-import { environmentFromForm, initialWorkbenchManifest, setupStatus, WORKBENCH, type SetupEnvironmentForm } from "./setup.ts";
+import { DEPLOY_GROUPS, environmentFromForm, initialWorkbenchManifest, newWorkbenchEnv, setupStatus, WORKBENCH, withDeployerLink, type SetupEnvironmentForm } from "./setup.ts";
+import { WorkbenchAdmin } from "./drivers/workbench.ts";
+import { WorkbenchKey } from "./workbench-key.ts";
 
 export interface Dependencies {
   config: Config;
@@ -50,6 +52,9 @@ export interface Dependencies {
   /** Phase 8: drift between what should be and what is, and the daily brief. */
   drift?: Drift;
   briefs?: Briefs;
+  /** §15.6 ③: Workbench's Administration API with the Deployer's key, and where that key comes from. */
+  workbench?: WorkbenchAdmin;
+  workbenchKey?: WorkbenchKey;
 }
 
 const reject = (c: Context, status: 400 | 401 | 403 | 404 | 409 | 429 | 503, code: string, message: string, details: string[] = []) =>
@@ -59,7 +64,9 @@ const actorOf = (p: Principal): Actor => ({ id: p.id, via: p.via });
 
 const TYPES: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".json": "application/json", ".ico": "image/x-icon" };
 
-export function createApp({ config, store, sessions, observer, deployments, versions, env: envVars, peer, keys, onboarding, drift, briefs }: Dependencies): Hono {
+export function createApp({ config, store, sessions, observer, deployments, versions, env: envVars, peer, keys, onboarding, drift, briefs, ...deps }: Dependencies): Hono {
+  const workbenchKey = deps.workbenchKey ?? new WorkbenchKey(store, config.workbenchApiKeyFile, undefined);
+  const workbench = deps.workbench ?? new WorkbenchAdmin(config.workbenchUrl, () => workbenchKey.value());
   const throttle = new LoginThrottle();
   const api = new Hono();
   // /mcp calls the API in-process as the key's principal: a one-time nonce with this process's secret, never from outside.
@@ -263,9 +270,16 @@ export function createApp({ config, store, sessions, observer, deployments, vers
 
   // §15 (D41): the first setup, up to Workbench and its API key. The state is worked out on every call.
   const setupContext = () => ({
-    store, deployments, workbenchUrl: config.workbenchUrl, workbenchReachable: () => sessions.reachable(), initialManifestsDir: config.initialManifestsDir,
-    ...(config.workbenchApiKeyFile ? { workbenchApiKeyFile: config.workbenchApiKeyFile } : {}),
+    store, deployments, env: envVars, workbench, workbenchKey, workbenchUrl: config.workbenchUrl, workbenchReachable: () => sessions.reachable(),
+    basePath: config.basePath, initialManifestsDir: config.initialManifestsDir,
   });
+  /** Setup changes that touch Workbench or secrets: an administrator's browser session. */
+  const setupAdmin = async (c: Context): Promise<Principal | Response> => {
+    const p = await authenticate(c, "admin");
+    if (p instanceof Response) return p;
+    if (isKey(p)) return reject(c, 403, "auth/browser-only", "This setup step is done on the page, not with an API key.");
+    return p;
+  };
   api.get("/api/setup", async (c) => {
     const p = await authenticate(c, "view");
     if (p instanceof Response) return p;
@@ -302,6 +316,79 @@ export function createApp({ config, store, sessions, observer, deployments, vers
       if (error instanceof StoreError) return reject(c, 400, error.code, error.message, error.details);
       return reject(c, 503, "setup/no-manifest", (error as Error).message);
     }
+  });
+
+  // Step 4: a new Workbench's environment variables, generated; the initial admin's password is in this answer only.
+  api.post("/api/setup/workbench-env", async (c) => {
+    const p = await setupAdmin(c);
+    if (p instanceof Response) return p;
+    const body = await c.req.json().catch(() => ({})) as { adminEmail?: unknown; deployerUrl?: unknown };
+    const email = String(body.adminEmail ?? "").trim();
+    if (!/^[^\s@]+@[^\s@]+$/.test(email)) return reject(c, 400, "setup/admin-email", "Give the initial admin's email address.");
+    let deployerUrl: string | undefined;
+    if (body.deployerUrl !== undefined && body.deployerUrl !== "") {
+      try { deployerUrl = new URL(String(body.deployerUrl)).href; } catch { return reject(c, 400, "setup/deployer-url", "The Deployer's address is not a URL."); }
+    }
+    if (!store.app(WORKBENCH)) return reject(c, 409, "setup/workbench-unregistered", "Import the Workbench manifest first.");
+    if (envVars.latestValues(WORKBENCH)) return reject(c, 409, "setup/workbench-env-exists", "Workbench's environment variables exist already: change them under Environment variables.");
+    const url = deployments.endpointOf(WORKBENCH)?.url ?? "";
+    const { values, password } = newWorkbenchEnv(email, deployerUrl, url.startsWith("https:"));
+    try {
+      const revision = envVars.save(p, WORKBENCH, { base: null, values: Object.entries(values).map(([key, value]) => ({ key, value })), note: "Generated on the Setup page" });
+      // The file is read once, so the first write knows what it replaces (a new server has none).
+      let job: string | null = null;
+      try { job = envVars.importFromServer(p, WORKBENCH).id; } catch { job = null; }
+      return c.json({ revision, password, job }, 201);
+    } catch (error) { return deployError(c, error); }
+  });
+  // Step 6: the Deployer's Workbench API key, checked by using it before it is kept (§15.6 ③).
+  api.put("/api/setup/workbench-key", async (c) => {
+    const p = await setupAdmin(c);
+    if (p instanceof Response) return p;
+    const can = workbenchKey.canSet();
+    if (!can.ok) return reject(c, 409, "setup/key-not-settable", can.reason);
+    const key = String(((await c.req.json().catch(() => ({}))) as { key?: unknown }).key ?? "").trim();
+    if (!key || key.length > 4096 || /\s/.test(key)) return reject(c, 400, "setup/key", "Paste the key from Workbench Administration → API keys.");
+    try { await workbench.groups(key); } catch (error) { return reject(c, 400, "setup/key-refused", `Workbench does not accept the key: ${(error as Error).message}`); }
+    workbenchKey.save(key, actorOf(p));
+    return c.json({ source: "page" });
+  });
+  api.delete("/api/setup/workbench-key", async (c) => {
+    const p = await setupAdmin(c);
+    if (p instanceof Response) return p;
+    if (workbenchKey.source() !== "page") return reject(c, 409, "setup/key-not-on-page", "No key was pasted on this page.");
+    workbenchKey.clear(actorOf(p));
+    return c.json({ source: workbenchKey.source() });
+  });
+  // Step 7: the deploy Groups that are missing, created in Workbench with the Deployer's key.
+  api.post("/api/setup/workbench-groups", async (c) => {
+    const p = await setupAdmin(c);
+    if (p instanceof Response) return p;
+    try {
+      const have = await workbench.groups();
+      const created: string[] = [];
+      for (const [name, description] of DEPLOY_GROUPS) {
+        if (have.some((g) => g.name === name)) continue;
+        await workbench.createGroup(name, description);
+        created.push(name);
+      }
+      store.audit(actorOf(p), "setup.workbench-groups", WORKBENCH, { created });
+      return c.json({ created });
+    } catch (error) { return reject(c, 503, "setup/workbench", (error as Error).message); }
+  });
+  // Step 8: the Deployer added to WORKBENCH_APP_LINKS as a new revision of Workbench's environment variables.
+  api.post("/api/setup/workbench-applinks", async (c) => {
+    const p = await setupAdmin(c);
+    if (p instanceof Response) return p;
+    let url: string;
+    try { url = new URL(String(((await c.req.json().catch(() => ({}))) as { deployerUrl?: unknown }).deployerUrl ?? "")).href; } catch { return reject(c, 400, "setup/deployer-url", "Give the Deployer's address, e.g. https://uat.example.internal:8495/deploy/."); }
+    const latest = envVars.latestValues(WORKBENCH);
+    if (!latest) return reject(c, 409, "setup/workbench-env-missing", "The Deployer does not keep Workbench's environment variables yet.");
+    const links = withDeployerLink(latest.values.WORKBENCH_APP_LINKS, url);
+    try {
+      const values = [...Object.keys(latest.values).filter((k) => k !== "WORKBENCH_APP_LINKS").map((key) => ({ key, keep: true })), { key: "WORKBENCH_APP_LINKS", value: links }];
+      return c.json({ revision: envVars.save(p, WORKBENCH, { base: latest.revision, values, note: "Deployer added to WORKBENCH_APP_LINKS (Setup)" }) });
+    } catch (error) { return deployError(c, error); }
   });
 
   // D35: the hosts of this environment, their executors, and the tokens they call in with.

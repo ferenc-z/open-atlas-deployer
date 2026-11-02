@@ -1,6 +1,6 @@
-// §15 (D41) page: the first setup, step by step up to Workbench and its API key. Until it is complete this is the only
-// page in the navigation; each step says what was checked, what to do, and only the current step has the main button.
-// The state comes from /api/setup, worked out by the Deployer on every call.
+// §15 (D41) page: the first setup, step by step up to Workbench, its API key and the deploy groups. Until it is
+// complete this is the only page in the navigation; each step says what was checked, what to do, and only the current
+// step (and an optional one that is open) has buttons. The state comes from /api/setup, worked out on every call.
 
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import * as api from "./api.ts";
@@ -20,14 +20,14 @@ export function SetupPage({ workbenchUrl, onChanged }: { workbenchUrl: string; o
   useEffect(() => { refresh(); const t = setInterval(refresh, 10_000); return () => clearInterval(t); }, [refresh]);
 
   if (!status) return error ? <p className="error">{error}</p> : <p className="muted">Loading…</p>;
-  const current = status.steps.find((s) => s.state === "next" || s.state === "blocked")?.id;
+  const current = status.steps.find((s) => !s.optional && (s.state === "next" || s.state === "blocked"))?.id;
   return (
     <>
       <div className="toolbar">
         <h1>Setup</h1>
         <span className="muted">
           {status.complete
-            ? "Setup is complete: Workbench signs people in and the Deployer has its Workbench API key."
+            ? "Setup is complete: the Deployer runs Workbench, people sign in with it, and the deploy groups exist."
             : "Workbench is the first app (D41). Each step is checked on the spot, so a step done by hand is recognised too."}
         </span>
         <span className="badge info">{status.level}</span>
@@ -35,14 +35,21 @@ export function SetupPage({ workbenchUrl, onChanged }: { workbenchUrl: string; o
       </div>
       {error && <p className="error">{error}</p>}
       <ol className="setup-steps">
-        {status.steps.map((s) => (
-          <li key={s.id} className={`card setup-step ${s.state}${s.id === current ? " current" : ""}`}>
-            <div className="setup-head"><strong>{s.title}</strong><span className={`badge ${STATE[s.state].tone}`}>{STATE[s.state].label}</span></div>
-            <p className={s.state === "blocked" ? "error" : "muted"}>{s.detail}</p>
-            {s.id === current && status.canAct && <StepAction step={s} status={status} workbenchUrl={workbenchUrl} onDone={refresh} />}
-            {s.id === current && !status.canAct && <p className="small muted">An administrator does this step.</p>}
-          </li>
-        ))}
+        {status.steps.map((s) => {
+          const open = s.id === current || (s.optional && s.state === "next" && (!current || status.complete));
+          return (
+            <li key={s.id} className={`card setup-step ${s.state}${s.id === current ? " current" : ""}`}>
+              <div className="setup-head">
+                <strong>{s.title}</strong>
+                <span className={`badge ${STATE[s.state].tone}`}>{STATE[s.state].label}</span>
+                {s.optional && <span className="badge muted">Optional</span>}
+              </div>
+              <p className={s.state === "blocked" ? "error" : "muted"}>{s.detail}</p>
+              {open && status.canAct && <StepAction step={s} status={status} workbenchUrl={workbenchUrl} onDone={refresh} />}
+              {open && !status.canAct && <p className="small muted">An administrator does this step.</p>}
+            </li>
+          );
+        })}
       </ol>
     </>
   );
@@ -54,13 +61,16 @@ function StepAction({ step, status, workbenchUrl, onDone }: { step: SetupStep; s
   const body = (() => {
     switch (step.id) {
       case "environment": return step.state === "next" ? <EnvironmentForm onSaved={onDone} /> : null;
-      case "executor": return <HostsPage isAdmin />;
+      case "executor": return <HostsPage isAdmin compact />;
       case "workbench-manifest":
         return status.environment?.prod
           ? <button className="primary" onClick={() => api.takeRegistryFromUat().then(onDone, fail)}>Take the registry from UAT</button>
           : <button className="primary" onClick={() => api.importWorkbenchManifest().then(onDone, fail)}>Import the Workbench manifest</button>;
-      case "workbench-deploy": return step.state === "next" ? <DeployWorkbench onDone={onDone} /> : null;
+      case "workbench-deploy": return step.state === "next" && step.workbench ? <DeployWorkbench info={step.workbench} onDone={onDone} /> : null;
       case "workbench-signin": return <a className="button" href={workbenchUrl}>Open Workbench</a>;
+      case "workbench-key": return step.key?.canSet ? <KeyForm onSaved={onDone} /> : null;
+      case "workbench-groups": return <button className="primary" onClick={() => api.createWorkbenchGroups().then(onDone, fail)}>Create {step.missingGroups?.join(", ")}</button>;
+      case "workbench-applinks": return <AppLinks onDone={onDone} />;
       default: return null;
     }
   })();
@@ -96,18 +106,84 @@ function EnvironmentForm({ onSaved }: { onSaved: () => void }) {
   );
 }
 
-function DeployWorkbench({ onDone }: { onDone: () => void }) {
+/** Step 4: a new Workbench (generate its env, write it, deploy) or one to take over (import its env, deploy). */
+function DeployWorkbench({ info, onDone }: { info: NonNullable<SetupStep["workbench"]>; onDone: () => void }) {
   const [open, setOpen] = useState<"env" | "deploy" | undefined>();
   const [job, setJob] = useState<string | undefined>();
+  // A job still queued or running when the page was opened (the env read queued with the generated env, say) shows too.
+  const [closed, setClosed] = useState<string | undefined>();
+  const shown = job ?? (info.job && info.job.id !== closed ? info.job.id : undefined);
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const fail = (e: Error) => setError(e.message);
+  const generate = (e: FormEvent) => {
+    e.preventDefault();
+    setError("");
+    api.generateWorkbenchEnv(email.trim(), api.deployerUrl()).then((r) => { setPassword(r.password); if (r.job) setJob(r.job); onDone(); }, fail);
+  };
+  const importEnv = () => api.importEnv("workbench").then((r) => setJob(r.job.id), fail);
+  const done = () => { setClosed(shown); setJob(undefined); onDone(); };
+  return (
+    <>
+      {password && (
+        <div className="banner warn">
+          The initial admin's password, shown only once: <code className="mono">{password}</code>{" "}
+          <button className="link" onClick={() => navigator.clipboard?.writeText(password)}>Copy</button>
+          <div className="muted">Keep it now: once Workbench answers, you sign in with this account, and the emergency account stops working. Remove WORKBENCH_BOOTSTRAP_PASSWORD from the variables after the first sign-in.</div>
+        </div>
+      )}
+      {!info.takeover && !info.envRevisions && (
+        <form className="row" onSubmit={generate}>
+          <input type="email" placeholder="Initial admin's email" value={email} onChange={(e) => setEmail(e.target.value)} />
+          <button type="submit" className="primary" disabled={!email.trim()}>Generate Workbench's environment variables</button>
+        </form>
+      )}
+      {info.takeover && !info.envRevisions && <div className="row"><button className="primary" onClick={importEnv}>Import Workbench's env file from the server</button></div>}
+      {info.envRevisions > 0 && (
+        <div className="row">
+          <button className={open === "env" ? "active" : ""} onClick={() => setOpen(open === "env" ? undefined : "env")}>Environment variables{info.envWritten ? "" : " (not written yet)"}</button>
+          <button className={info.envWritten ? "primary" : ""} onClick={() => setOpen("deploy")}>{info.takeover ? "Take over: deploy Workbench…" : "Deploy Workbench…"}</button>
+        </div>
+      )}
+      {shown && <JobPanel key={shown} id={shown} onClose={done} />}
+      {open === "env" && <EnvApp app="workbench" onChanged={onDone} />}
+      {open === "deploy" && <DeployPanel app="workbench" label="Workbench" initial={{ version: info.version }} isAdmin onClose={() => setOpen(undefined)} onJob={(id) => { setOpen(undefined); setJob(id); }} onAssessment={() => undefined} />}
+      {error && <p className="error">{error}</p>}
+    </>
+  );
+}
+
+function KeyForm({ onSaved }: { onSaved: () => void }) {
+  const [key, setKey] = useState("");
+  const [error, setError] = useState("");
+  const submit = (e: FormEvent) => {
+    e.preventDefault();
+    setError("");
+    api.setWorkbenchKey(key.trim()).then(() => { setKey(""); onSaved(); }, (err: Error) => setError(err.message));
+  };
+  return (
+    <form className="row" onSubmit={submit}>
+      <input type="password" autoComplete="off" placeholder="Workbench API key" value={key} onChange={(e) => setKey(e.target.value)} />
+      <button type="submit" className="primary" disabled={!key.trim()}>Check and keep the key</button>
+      {error && <p className="error">{error}</p>}
+    </form>
+  );
+}
+
+function AppLinks({ onDone }: { onDone: () => void }) {
+  const [url, setUrl] = useState(api.deployerUrl());
+  const [env, setEnv] = useState(false);
+  const [error, setError] = useState("");
   return (
     <>
       <div className="row">
-        <button className={open === "env" ? "active" : ""} onClick={() => setOpen(open === "env" ? undefined : "env")}>Environment variables</button>
-        <button className="primary" onClick={() => setOpen("deploy")}>Deploy Workbench…</button>
+        <input value={url} onChange={(e) => setUrl(e.target.value)} />
+        <button onClick={() => { setError(""); api.addDeployerLink(url).then(() => { setEnv(true); onDone(); }, (e: Error) => setError(e.message)); }}>Add the Deployer to WORKBENCH_APP_LINKS</button>
+        <button className={env ? "active" : ""} onClick={() => setEnv(!env)}>Workbench's environment variables</button>
       </div>
-      {open === "env" && <EnvApp app="workbench" onChanged={onDone} />}
-      {open === "deploy" && !job && <DeployPanel app="workbench" isAdmin onClose={() => setOpen(undefined)} onJob={setJob} onAssessment={() => undefined} />}
-      {job && <JobPanel id={job} onClose={() => { setJob(undefined); setOpen(undefined); onDone(); }} />}
+      {env && <EnvApp app="workbench" onChanged={onDone} />}
+      {error && <p className="error">{error}</p>}
     </>
   );
 }

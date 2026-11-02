@@ -33,7 +33,7 @@ export function JobState({ state }: { state: string }) {
   return <span className={`badge ${s.tone}`}>{s.label}</span>;
 }
 
-export function DeployPanel({ app, initial, isAdmin, onClose, onJob, onAssessment }: { app: string; initial?: { version: string; pinFrom?: string }; isAdmin?: boolean; onClose: () => void; onJob: (id: string) => void; onAssessment: (id: string) => void }) {
+export function DeployPanel({ app, label = app, initial, isAdmin, onClose, onJob, onAssessment }: { app: string; label?: string; initial?: { version: string; pinFrom?: string }; isAdmin?: boolean; onClose: () => void; onJob: (id: string) => void; onAssessment: (id: string) => void }) {
   const [reason, setReason] = useState("");
   const [overridden, setOverridden] = useState<string | undefined>();
   const [list, setList] = useState<api.VersionList | undefined>();
@@ -72,7 +72,7 @@ export function DeployPanel({ app, initial, isAdmin, onClose, onJob, onAssessmen
   return (
     <section className="card panel">
       <div className="toolbar">
-        <h2>{pinFrom ? `Go back to ${app} ${initial?.version}` : `Deploy ${app}`}</h2>
+        <h2>{pinFrom ? `Go back to ${label} ${initial?.version}` : `Deploy ${label}`}</h2>
         <span className="muted">{list?.deployed ? `Now: ${list.deployed}` : "Not deployed by the Deployer yet"}</span>
         <button className="link" onClick={onClose}>Close</button>
       </div>

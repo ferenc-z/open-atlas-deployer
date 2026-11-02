@@ -152,6 +152,12 @@ export class EnvManager {
     return applied ? this.plain(applied.values) : undefined;
   }
 
+  /** §15: the newest saved values, decrypted, and the revision the server has; undefined before the first revision. */
+  latestValues(appId: string): { revision: number; applied: number | null; values: Record<string, string> } | undefined {
+    const latest = this.box ? this.store.envRevision(appId) : undefined;
+    return latest ? { revision: latest.meta.revision, applied: this.store.appliedEnv(appId)?.meta.revision ?? null, values: this.plain(latest.values) } : undefined;
+  }
+
   /** What deploy plans need: whether the Deployer keeps this env file, which keys the server's copy sets. */
   state(appId: string): { managed: boolean; keys: string[]; revision: number | null; pending: boolean } | undefined {
     if (!this.box) return undefined;

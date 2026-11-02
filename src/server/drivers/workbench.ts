@@ -15,22 +15,24 @@ export interface WorkbenchApp {
 
 export interface BusinessAgent { id: string; name: string; agentId: string; enabled: boolean }
 
+export interface WorkbenchGroup { id: string; name: string; enabled: boolean; memberCount?: number }
+
 export class WorkbenchAdmin {
   private url: string;
-  private keyFile: string | undefined;
+  private key: () => string;
   private fetcher: typeof fetch;
 
-  constructor(url: string, keyFile: string | undefined, fetcher: typeof fetch = fetch) {
+  /** key: the file holding it, or (§15.6 ③) a function giving the key in use, the file's or the one pasted on the page. */
+  constructor(url: string, key: string | undefined | (() => string), fetcher: typeof fetch = fetch) {
     this.url = url.replace(/\/+$/, "");
-    this.keyFile = keyFile;
+    this.key = typeof key === "function" ? key : () => readToken(key);
     this.fetcher = fetcher;
   }
 
-  get configured(): boolean { return Boolean(readToken(this.keyFile)); }
+  get configured(): boolean { return Boolean(this.key()); }
 
-  private async request(method: string, path: string, body?: unknown): Promise<any> {
-    const key = readToken(this.keyFile);
-    if (!key) throw new WorkbenchError("No Workbench API key is configured (DEPLOYER_WORKBENCH_API_KEY_FILE)");
+  private async request(method: string, path: string, body?: unknown, key = this.key()): Promise<any> {
+    if (!key) throw new WorkbenchError("No Workbench API key is configured (paste one on the Setup page, or DEPLOYER_WORKBENCH_API_KEY_FILE)");
     let response: Response;
     try {
       response = await this.fetcher(`${this.url}${path}`, {
@@ -49,6 +51,20 @@ export class WorkbenchAdmin {
     }
     return json;
   }
+
+  /** §15: the version Workbench runs (no sign-in needed), or undefined when it does not say. */
+  async version(): Promise<string | undefined> {
+    try {
+      const response = await this.fetcher(`${this.url}/api/workbench/version`, { signal: AbortSignal.timeout(5_000) });
+      if (!response.ok) return undefined;
+      const v = ((await response.json()) as { version?: unknown }).version;
+      return typeof v === "string" ? v : undefined;
+    } catch { return undefined; }
+  }
+
+  /** Groups (roles in Workbench's API). With key, checks a key before it is kept. */
+  async groups(key?: string): Promise<WorkbenchGroup[]> { return ((await this.request("GET", "/api/workbench/admin/roles", undefined, key)) as { roles: WorkbenchGroup[] }).roles; }
+  async createGroup(name: string, description: string): Promise<WorkbenchGroup> { return ((await this.request("POST", "/api/workbench/admin/roles", { name, description })) as { role: WorkbenchGroup }).role; }
 
   async apps(): Promise<WorkbenchApp[]> { return ((await this.request("GET", "/api/workbench/admin/apps")) as { apps: WorkbenchApp[] }).apps; }
 

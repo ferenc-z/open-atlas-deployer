@@ -17,6 +17,16 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   the Deployer's directory with its keys generated into `deployer.env` (the emergency password goes to a mode 600
   file, never printed), creates the apps' network as compose would, and starts the Deployer.
 
+**First setup (D41, phase 2)**
+- The Deployer's Workbench API key can be pasted on the Setup page: it is tried against Workbench, kept sealed with
+  the credential key and used at once. A key in `DEPLOYER_WORKBENCH_API_KEY_FILE` still wins. API keys and the
+  maintenance notice now work with either.
+- A new Workbench's environment variables are generated on the Setup page; the initial admin's password is in that
+  answer only. Workbench's app menu gets a link to the Deployer (`WORKBENCH_APP_LINKS`).
+- A Workbench the Deployer did not deploy (1.24.0 or newer) is taken over: import its env file, deploy it once.
+- Setup checks that the Workbench API key works and creates the missing deploy groups; it is complete once the
+  Deployer runs Workbench, the key works and the groups exist.
+
 ## 0.1.0
 
 The first release: the same code as 0.1.0-rc.5, with executor 0.7.2. What it does is under 0.1.0-rc.1; the release
