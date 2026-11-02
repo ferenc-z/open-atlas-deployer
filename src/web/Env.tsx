@@ -81,7 +81,7 @@ type Row = {
   example?: string;
 };
 
-function EnvApp({ app, onChanged }: { app: string; onChanged: () => void }) {
+export function EnvApp({ app, onChanged }: { app: string; onChanged: () => void }) {
   const [data, setData] = useState<EnvView | undefined>();
   const [revision, setRevision] = useState<number | undefined>();
   const [tab, setTab] = useState<"values" | "history" | "compare">("values");

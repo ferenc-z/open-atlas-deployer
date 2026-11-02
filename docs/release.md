@@ -6,7 +6,7 @@
 2. 从 CHANGELOG 取出这个版本的说明（取不到就停），再跑类型检查、服务端测试，以及 Python 3.9 下的执行器测试。
 3. 构建并推送镜像 `ghcr.io/ferenc-z/open-atlas-deployer:<版本>`。只有正式版另外推 `:latest`。
 4. 如果 GitHub release `executor-v<执行器版本>` 还不存在，就打包执行器建这个 release，附件是 `open-atlas-deployer-executor-<版本>.tar.gz` 和 `SHA256SUMS`。
-5. 建 GitHub release `v<版本>`，说明就是第 2 步从 [CHANGELOG.md](../CHANGELOG.md) 的 `## <版本>` 一节取出的内容。版本号带 `-` 的（比如 `0.1.0-rc.1`）标成 pre-release。
+5. 建 GitHub release `v<版本>`，说明就是第 2 步从 [CHANGELOG.md](../CHANGELOG.md) 的 `## <版本>` 一节取出的内容。版本号带 `-` 的（比如 `0.1.0-rc.1`）标成 pre-release。附件是新服务器用的安装包 `open-atlas-deployer-setup-<版本>.tar.gz` 和 `SHA256SUMS`（[bin/package-setup.sh](../bin/package-setup.sh)），里面有 `bootstrap.sh`、Deployer 的 compose 文件和执行器。
 
 推送分支不触发 GitHub 上的任何流程。平时的检查在本地跑：[bin/check.sh](../bin/check.sh) 依次跑类型检查、服务端测试、页面构建和执行器测试，只打印一行结果，完整输出在 `.check/<提交>.log`，最近一次的结果在 `.check/last`。Claude Code 会话里每次 `git commit` 之后，[.claude/settings.json](../.claude/settings.json) 的钩子在后台跑它：通过时不出声，失败时才把失败的步骤和日志末尾交回会话。[.github/workflows/ci.yml](../.github/workflows/ci.yml) 只能手动触发（Actions → ci → Run workflow），执行器测试在 Python 3.9 和 3.12 上各跑一遍。
 
@@ -50,7 +50,7 @@ git push origin v0.1.1
 
 ### 服务器上第一次安装
 
-自升级只能从已经装好的版本开始，所以第一次全部要手工装：
+自升级只能从已经装好的版本开始，所以第一次要在服务器上装一次。0.2.0 起用安装包：从 release `v<版本>` 下载 `open-atlas-deployer-setup-<版本>.tar.gz`，解压后 `sudo ./bootstrap.sh`。它装好执行器、布置 Deployer 目录、把密钥直接生成进 `deployer.env`、启动 Deployer；紧急密码在同目录的 `emergency-password` 里。之后用紧急账号打开页面，按 Setup 页做完初始化（README "首次初始化"一节）。下面是手工装的做法，安装包做的也是这几步：
 
 1. **执行器**：从 release `executor-v0.7.2` 下载包，解压后运行 `sudo ./install.sh`，再编辑 `/etc/open-atlas-deployer/executor.env`，参照 [executor.env.example](../executor/executor.env.example)。0.6.0 以前的执行器都要这样手工装一次，之后才能在页面上升级。
 2. **Deployer**：按 [examples/deployer](../examples/deployer) 布置目录。`.env` 里手写 `DEPLOYER_IMAGE=ghcr.io/ferenc-z/open-atlas-deployer:0.1.0`，写死版本，不要用 `latest`；之后执行器升级时会改写这一行。

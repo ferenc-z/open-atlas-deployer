@@ -10,7 +10,8 @@
 - 阶段 5：其余驱动（`workbench-app`、`studio-graph`、`oma-agent`、`db-migration`、`manual`）、Release 附件（bundle）、契约核对，一个应用的全部组件一次部署（见下面"阶段 5"一节）；
 - 阶段 6：API key 与 `/mcp`、页面旁的 Deploy Assistant（Workbench 嵌入对话 + 卡片）、部署失败后经 OMA 自动诊断（见下面"阶段 6"一节）；
 - 阶段 7：接入评估（给一个仓库地址）和新版本的清单评估（D27）（见下面"阶段 7"一节）；
-- 阶段 8：部署前在 Workbench 通知用户（W3）、漂移检测、每日简报（见下面"阶段 8"一节）。
+- 阶段 8：部署前在 Workbench 通知用户（W3）、漂移检测、每日简报（见下面"阶段 8"一节）；
+- 首次初始化第一期（D41）：页面上的 Setup 流程、内置 Workbench 清单、服务器上的 `bootstrap.sh`（见最后"首次初始化"一节）。
 
 阶段 5 起，Workbench 应用包、Agent、数据库迁移、Graph、人工步骤都有驱动，Logbook 这样由几种组件组成的应用也能一次部署。
 
@@ -19,9 +20,9 @@
 ```sh
 npm install
 npm run build:web                       # 页面 → dist/web
-node bin/import-manifests.ts data ../open-atlas-docs/docs/proposals/deploy-manifests   # 导入四份初始清单
-cp examples/uat.environment.json data/environment.json
-DEPLOYER_WORKBENCH_URL=http://workbench:8090 npm start   # http://<host>:8095/deploy/
+DEPLOYER_WORKBENCH_URL=http://workbench:8090 npm start   # http://<host>:8095/deploy/，用紧急账号登录后按 Setup 页初始化
+# 也可以照旧手工准备：cp examples/uat.environment.json data/environment.json（第一次启动时导入），
+# node bin/import-manifests.ts data <清单目录或文件>（命令行导入清单）
 sh bin/check.sh                        # 类型检查、测试、页面构建、执行器测试，只打印一行结果（日志在 .check/）
 ```
 
@@ -44,6 +45,7 @@ Node 22.18 起直接运行 `.ts`（类型剥离），服务端不需要构建；
 | `DEPLOYER_CREDENTIAL_ENCRYPTION_KEY` | 无 | 32 字节、base64（`openssl rand -base64 32`），加密 env 里的密钥；不设就不启用环境变量管理。丢了它，库里的密钥就解不开了，要和状态库分开备份 |
 | `DEPLOYER_COMPARE_KEY` | 无 | UAT 与 PROD 的 Deployer 设成同一个值，对比时密钥才能比出"相同 / 不同"；不设只能看出两边是否都设置了 |
 | `DEPLOYER_TEMPLATES_DIR` | `./templates` | Deployer 自己的 env 模板（清单 `env.template`） |
+| `DEPLOYER_INITIAL_MANIFESTS_DIR` | `./manifests/initial` | 首次初始化时可以一键导入的清单（§15.6 ②，只有 Workbench 的），镜像里自带 |
 | `DEPLOYER_PEER_KEY_SHA256` | 无 | UAT 设：PROD 的 Deployer 所持只读 key 的 SHA-256（可多个，空格分隔）；不设就没有 `/api/peer/*` |
 | `DEPLOYER_UAT_URL` / `DEPLOYER_UAT_KEY_FILE` | 无 | PROD 设：UAT 的 Deployer 地址（含 base path，如 `http://uat-host:8095/deploy`），以及存只读 key 的文件（600）。key 用 `node bin/peer-key.ts` 生成 |
 | `DEPLOYER_WORKBENCH_API_KEY_FILE` | 无 | Workbench Administration → API keys 里的一把 key（文件 600），`workbench-app`、`oma-agent` 用它装应用包、把 Business Agent 指向新 agent |
@@ -205,7 +207,7 @@ Deployer 自己的升级（D16，2026-11-02 已实现）：admin 在 Overview �
 sudo ./executor/install.sh          # /opt/open-atlas-deployer/executor/releases/<版本>，current 软链接，systemd 服务
 sudoedit /etc/open-atlas-deployer/executor.env   # 见 executor/executor.env.example（EXECUTOR_DEPLOYER_URL、EXECUTOR_TOKEN_FILE）
 # 这台机器的执行器凭据：在 Deployer 的 Hosts 页签发（只显示一次），存进 EXECUTOR_TOKEN_FILE（600）。
-# 第一次安装、还没法登录页面时，在 Deployer 所在机器上：node bin/executor-token.ts <DEPLOYER_DATA> <机器名> <文件>
+# 第一次安装时用紧急账号在 Setup 页签发即可（D41）；命令行也行：node bin/executor-token.ts <DEPLOYER_DATA> <机器名> <文件>
 sudo docker login ghcr.io           # 推送与拉取凭据只在宿主机 root 下
 sudo systemctl restart open-atlas-deployer-executor
 python3 /opt/open-atlas-deployer/executor/current/deployer_executor.py check
@@ -649,3 +651,51 @@ npm test
 
 - `npm test` 88 个，新增：环境设置的导入、base、patch、finding、校验不保存、文件不同的提示、部署记录带修订号；清单的分段、base、patch、不许在 patch 里改 appliesFrom、受影响版本、换来源提醒、另起一段、改仓库的确认；PROD 随晋级取 UAT 的清单修订、PROD 只读、同号修订不一致时拦住、从 UAT 取登记；管理工具的可见性、`destructiveHint`、save 的 finding、审计带 note、审计筛选；平台的版本列表和标注、升级计划、退回旧版要确认、执行器一台一台升、失败就停。
 - WSL：用这份代码构建 0.1.0-beta.4、beta.5，经执行器升级本地 Deployer 成功；新版本启动时把 `environment.json` 导入为修订 1。页面上的平台区、环境设置页和登记页的新流程没在浏览器里看过（Windows 没导入测试 CA、我不处理登录凭据）；MCP 管理工具只有单元测试，没用真实的管理员 key 跑过。
+
+## 首次初始化（D41，设计 §15，2026-11-02 第一期）
+
+在全新的服务器上，从装好执行器和 Deployer，到 Workbench 能认人。Workbench 是必经的第一个应用；在这之前用紧急账号起步。初始化没完成时（还没到 L2），页面导航只有一页 Setup。
+
+### 服务器上：`bootstrap.sh`（L0）
+
+每个版本的 release 附一个 `open-atlas-deployer-setup-<版本>.tar.gz`（[bin/package-setup.sh](bin/package-setup.sh) 打包），里面有 [bootstrap.sh](bin/bootstrap.sh)、Deployer 的 `compose.yaml` 和 `deployer.env.example`、执行器的全部文件。解压后以 root 运行：
+
+```sh
+sudo ./bootstrap.sh --workbench-public-url https://uat.example.internal:8443/
+```
+
+- 执行器还没装时，先运行 `executor/install.sh`（`--no-executor` 跳过）。
+- 布置 `/webapp/data/open-atlas/deployer/`（`--dir` 可改）：`compose.yaml`、`.env`（这个版本的镜像）、`data/`、`secrets/`（属 1000:1000）。
+- `deployer.env` 不存在时才生成：加密密钥、对比密钥、紧急密码的哈希直接写进文件，不打印。紧急密码另存为同目录的 `emergency-password`（600）。哈希用 Deployer 镜像里的 `bin/hash-password.ts` 算，宿主机不需要 Node。PROD 用 `--compare-key-file` 传入 UAT 的对比密钥，两边必须相同。
+- 应用的网络 `open-atlas_default` 不存在时，由 compose 用一个临时服务建出来再删掉服务。这样第一次部署应用时，compose 会把这个网络当成自己项目的，不会报"网络不是本项目建的"，也不会重建（2026-11-02 在 WSL 上验证：网络上已有别的容器时，应用项目照常沿用）。
+- 最后 `docker compose up -d`（`--no-start` 跳过），并打印接下来要做的三件事：nginx 转发、填 `executor.env`、打开页面。
+- 重复运行只补缺的，已有的文件不动。
+
+### 页面上：Setup（L1 → L2）
+
+`GET /api/setup` 每次都当场检查，不存进度，手工做过的步骤也认得出来：
+
+| 步骤 | 检查什么 | 做法 |
+|---|---|---|
+| Environment settings | 有没有环境修订 | 没有时填表单（环境名、项目、域名、Workbench 的 https 端口、证书路径、`ghcr` 镜像仓库，默认 `ghcr.io/ferenc-z`）保存为修订 1，同时写入 `apps.workbench`（1.25.1，有域名时走 nginx）。`POST /api/setup/environment`；已有修订或已有 `environment.json` 时拒绝 |
+| Executors | 每台机器的执行器在线 | 在 Setup 页里直接签发令牌（紧急账号也能签发，D41），放进 `EXECUTOR_TOKEN_FILE` 后重启执行器 |
+| Workbench manifest | 注册表里有没有 Workbench | 一键导入镜像自带的 [manifests/initial/workbench.json](manifests/initial/workbench.json)（`POST /api/setup/workbench-manifest`），只在没有 Workbench 时可用。PROD 不导入，从 UAT 取 |
+| Deploy Workbench | Workbench 的 `/health` 通不通 | 在 Setup 页里填 Workbench 的环境变量、部署。部署前提示：Workbench 一通，紧急账号就失效，要用初始管理员登录 |
+| Sign in with Workbench | 当前会话是不是 Workbench admin | 用初始管理员登录 Workbench，建三个 Group，把 Deployer 加进 `appLinks` |
+| Workbench API key | `DEPLOYER_WORKBENCH_API_KEY_FILE` 有没有内容 | 第一期：在 Workbench 建 key，写进文件，重启 Deployer。第二期改为在页面上贴入 |
+
+- 层级：有环境修订且所有执行器在线为 L1；Workbench 通、有 API key 为 L2，也就是初始化完成。完成之后，执行器暂时掉线不会把页面打回 Setup；Overview 顶部显示一行 "Setup complete"，点开能看到步骤。
+- 紧急账号的横幅在初始化期间改成说明：这是首次初始化，Workbench 通了以后这个账号自动失效。
+- 内置的 Workbench 清单以本地 UAT 注册表里的版本为底稿（2026-11-02），按 D42 去掉 `build`：来源是 `ghcr` 仓库里的 `open-atlas-workbench`，release 读 `ferenc-z/open-atlas-workbench`，从 1.25.1 起（1.25.1 修好了全新安装时的崩溃）。env 模板 [templates/workbench.env.example](templates/workbench.env.example) 核对过 1.25.1，没有新的变量。
+
+### 测试与验证（2026-11-02）
+
+- 服务端测试：全新安装用紧急账号从 L0 走到 L1（表单校验、只能建一次修订、紧急账号签发令牌、心跳、导入清单、重复导入被拒），Workbench 通了以后紧急会话失效、admin 看到只差 API key；已有 Workbench 和 API key 的安装直接完成；PROD 不导入内置清单。`sh bin/check.sh` 全部通过（91 个测试）。
+- 本地起一个全新实例（没有 `environment.json`，Workbench 不通），经接口走完同样的流程，Workbench 1.25.1 的部署计划没有拦截项。提示里有一条：`ferenc-z/open-atlas-workbench` 是私有仓库，没有令牌时读不到 `release.json`，契约核对只能跳过。
+- `bin/package-setup.sh` 在 WSL 上打包成功；镜像里的 `hash-password.ts` 能从标准输入算出冒号格式的哈希。`bootstrap.sh` 本身还没在真实服务器上以 root 跑过。
+
+### 还没做
+
+- 第二期：Workbench API key 在页面上贴入、加密保存；部署 Workbench 时由页面生成初始管理员密码等；接管已有的 Workbench；检查 Groups 和 `appLinks`。
+- 第三期：L3 AI 检查清单，登记和部署 OMA。
+

@@ -3,7 +3,8 @@
 #   - the GitHub release v<version>, whose list the Overview page reads through DEPLOYER_RELEASE_REPO (a version with a
 #     "-", such as 0.1.0-rc.1, becomes a pre-release: shown there, never announced);
 #   - the executor's release executor-v<executor version> with its archive and SHA256SUMS, unless it already exists
-#     (executors upgrade from it; its version moves only when the executor changes).
+#     (executors upgrade from it; its version moves only when the executor changes);
+#   - the setup archive for a new host (bin/package-setup.sh), attached to the Deployer's release.
 # The tag must match package.json, and the executor version the Deployer offers (handoff.ts) must match the executor.
 name: release
 on:
@@ -96,4 +97,6 @@ jobs:
         run: |
           flags=""
           [ "${{ steps.v.outputs.pre }}" = true ] && flags="--prerelease"
-          gh release create "$GITHUB_REF_NAME" --title "Open Atlas Deployer ${{ steps.v.outputs.version }}" --notes-file notes.md --verify-tag $flags
+          # §15.6 ⑦: the setup archive for a new host (bootstrap.sh, the Deployer's compose files, the executor).
+          sh bin/package-setup.sh dist/setup
+          gh release create "$GITHUB_REF_NAME" dist/setup/*.tar.gz dist/setup/SHA256SUMS --title "Open Atlas Deployer ${{ steps.v.outputs.version }}" --notes-file notes.md --verify-tag $flags

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
 import * as api from "./api.ts";
-import type { AuditEntry, Manifest, ManifestCheck, Me, Principal, RegisteredApp, StatusView } from "./api.ts";
+import type { AuditEntry, Manifest, ManifestCheck, Me, Principal, RegisteredApp, SetupStatus, StatusView } from "./api.ts";
 import { DeployPanel, History, JobPanel, JobState, KIND } from "./Deploy.tsx";
 import { EnvPage } from "./Env.tsx";
 import { Artifacts } from "./Artifacts.tsx";
@@ -11,8 +11,9 @@ import { HostsPage } from "./Hosts.tsx";
 import { IngressPage } from "./Ingress.tsx";
 import { Platform } from "./Platform.tsx";
 import { SettingsPage } from "./Settings.tsx";
+import { SetupPage } from "./Setup.tsx";
 
-type Tab = "status" | "history" | "hosts" | "settings" | "env" | "registry" | "onboarding" | "ingress" | "keys" | "audit";
+type Tab = "setup" | "status" | "history" | "hosts" | "settings" | "env" | "registry" | "onboarding" | "ingress" | "keys" | "audit";
 type Panel = { kind: "deploy"; app: string; initial?: { version: string; pinFrom?: string } } | { kind: "job"; id: string } | undefined;
 
 const VERDICT: Record<string, { label: string; tone: string }> = {
@@ -44,8 +45,13 @@ export function App() {
   const [assistant, setAssistant] = useState(false);
   const [assessment, setAssessment] = useState<string | undefined>();
   const actions =useMemo(() => ({ openPlan: (app: string, version: string, pinFrom?: string) => { setPanel({ kind: "deploy", app, initial: { version, ...(pinFrom ? { pinFrom } : {}) } }); setTab("status"); } }), []);
-  const load = useCallback(() => { api.me().then(setMe, () => setMe(undefined)); }, []);
+  // §15 (D41): until setup is complete, Setup is the only page.
+  const [setup, setSetup] = useState<SetupStatus | undefined>();
+  const load = useCallback(() => {
+    api.me().then((m) => { setMe(m); if (m.signedIn) api.setup().then(setSetup, () => setSetup(undefined)); }, () => setMe(undefined));
+  }, []);
   useEffect(load, [load]);
+  const setupChanged = useCallback((s: SetupStatus) => setSetup((was) => (was?.complete === s.complete ? was : s)), []);
   // D39: after the Deployer was upgraded, load the new version's page.
   const loaded = me?.signedIn ? me.deployerVersion : undefined;
   useEffect(() => {
@@ -57,36 +63,42 @@ export function App() {
   if (!me) return <main className="center"><p className="muted">Checking sign-in…</p></main>;
   if (!me.signedIn) return "forbidden" in me ? <Forbidden message={me.message} /> : <SignIn me={me} onSignedIn={load} />;
   const p = me.principal;
+  if (!setup) return <main className="center"><p className="muted">Checking setup…</p></main>;
+  const setupOnly = !setup.complete;
+  const shown: Tab = setupOnly ? "setup" : tab;
   const go = (t: Tab) => { setTab(t); if (t !== "onboarding") setAssessment(undefined); };
   return (
     <div className="shell">
-      <Sidebar principal={p} environment={me.environment} tab={tab} setTab={go} onSignedOut={load} assistant={assistant} toggleAssistant={() => setAssistant(!assistant)} />
+      <Sidebar principal={p} environment={me.environment} tab={shown} setTab={go} setupOnly={setupOnly} onSignedOut={load} assistant={assistant} toggleAssistant={() => setAssistant(!assistant)} />
       <div className="content">
-        {p.via === "emergency" && <div className="banner bad">Using the emergency account: Workbench is unreachable. Every action is audited; sign in with Workbench once it is back.</div>}
+        {p.via === "emergency" && (setupOnly
+          ? <div className="banner bad">First setup with the emergency account. Once Workbench is deployed and answers, this account stops working by itself: sign in with Workbench's initial admin then. Every action is audited.</div>
+          : <div className="banner bad">Using the emergency account: Workbench is unreachable. Every action is audited; sign in with Workbench once it is back.</div>)}
         {p.stale && <div className="banner warn">Workbench is not responding; using the last confirmed sign-in (valid for 15 minutes).</div>}
         {p.actAs && <div className="banner info">{p.actAs.administrator} is using Workbench as {p.displayName}, so permissions here are also those of {p.displayName}.</div>}
         <main>
-          {tab === "status" && <><DriftBanner /><Status panel={panel} setPanel={setPanel} isAdmin={p.permissions.includes("admin")} canRegenerate={p.permissions.includes("deploy-uat") || p.permissions.includes("deploy-prod")} onAssessment={(id) => { setPanel(undefined); setAssessment(id); setTab("onboarding"); }} /></>}
-          {tab === "history" && <HistoryPage onBack={(j) => { setPanel({ kind: "deploy", app: j.app, initial: { version: j.version, pinFrom: j.id } }); setTab("status"); }} />}
-          {tab === "hosts" && <HostsPage isAdmin={p.permissions.includes("admin") && p.via === "workbench"} />}
-          {tab === "settings" && <SettingsPage />}
-          {tab === "env" && <EnvPage />}
-          {tab === "ingress" && <IngressPage />}
-          {tab === "registry" && <Registry principal={p} prod={me.environment?.toLowerCase() === "prod"} />}
-          {tab === "onboarding" && <OnboardingPage key={assessment ?? ""} {...(assessment ? { initialOpen: assessment } : {})} canStart={p.permissions.includes("deploy-uat") && p.via === "workbench"} isAdmin={p.permissions.includes("admin")} onJob={(id) => { setPanel({ kind: "job", id }); setTab("status"); }} />}
-          {tab === "keys" && <KeysPage isAdmin={p.permissions.includes("admin")} />}
-          {tab === "audit" && p.permissions.includes("admin") && <Audit />}
+          {shown === "setup" && <SetupPage workbenchUrl={me.workbenchUrl} onChanged={setupChanged} />}
+          {shown === "status" && <><SetupLine status={setup} onOpen={() => go("setup")} /><DriftBanner /><Status panel={panel} setPanel={setPanel} isAdmin={p.permissions.includes("admin")} canRegenerate={p.permissions.includes("deploy-uat") || p.permissions.includes("deploy-prod")} onAssessment={(id) => { setPanel(undefined); setAssessment(id); setTab("onboarding"); }} /></>}
+          {shown === "history" && <HistoryPage onBack={(j) => { setPanel({ kind: "deploy", app: j.app, initial: { version: j.version, pinFrom: j.id } }); setTab("status"); }} />}
+          {shown === "hosts" && <HostsPage isAdmin={p.permissions.includes("admin")} />}
+          {shown === "settings" && <SettingsPage />}
+          {shown === "env" && <EnvPage />}
+          {shown === "ingress" && <IngressPage />}
+          {shown === "registry" && <Registry principal={p} prod={me.environment?.toLowerCase() === "prod"} />}
+          {shown === "onboarding" && <OnboardingPage key={assessment ?? ""} {...(assessment ? { initialOpen: assessment } : {})} canStart={p.permissions.includes("deploy-uat") && p.via === "workbench"} isAdmin={p.permissions.includes("admin")} onJob={(id) => { setPanel({ kind: "job", id }); setTab("status"); }} />}
+          {shown === "keys" && <KeysPage isAdmin={p.permissions.includes("admin")} />}
+          {shown === "audit" && p.permissions.includes("admin") && <Audit />}
         </main>
       </div>
-      {assistant && <AssistantPanel workbenchUrl={me.workbenchUrl} {...(me.environment ? { environment: me.environment } : {})} page={tab} {...(panel?.kind === "deploy" ? { app: panel.app } : {})} actions={actions} onClose={() => setAssistant(false)} />}
+      {assistant && <AssistantPanel workbenchUrl={me.workbenchUrl} {...(me.environment ? { environment: me.environment } : {})} page={shown} {...(panel?.kind === "deploy" ? { app: panel.app } : {})} actions={actions} onClose={() => setAssistant(false)} />}
     </div>
   );
 }
 
 /** D33: navigation down the left, in three groups; on a phone it folds into a menu button. */
-function Sidebar({ principal, environment, tab, setTab, onSignedOut, assistant, toggleAssistant }: { principal: Principal; environment?: string; tab: Tab; setTab: (t: Tab) => void; onSignedOut: () => void; assistant: boolean; toggleAssistant: () => void }) {
+function Sidebar({ principal, environment, tab, setTab, setupOnly, onSignedOut, assistant, toggleAssistant }: { principal: Principal; environment?: string; tab: Tab; setTab: (t: Tab) => void; setupOnly: boolean; onSignedOut: () => void; assistant: boolean; toggleAssistant: () => void }) {
   const [open, setOpen] = useState(false);
-  const groups: [string, [Tab, string][]][] = [
+  const groups: [string, [Tab, string][]][] = setupOnly ? [["First setup", [["setup", "Setup"]]]] : [
     ["Deploy", [["status", "Overview"], ["history", "Deploy history"], ["hosts", "Hosts"], ["settings", "Environment settings"]]],
     ["Apps", [["registry", "Apps & manifests"], ["onboarding", "Onboarding & assessments"], ["env", "Environment variables"], ["ingress", "Ingress"]]],
     ["Admin", [["keys", "API keys"], ...(principal.permissions.includes("admin") ? [["audit", "Audit"] as [Tab, string]] : [])]],
@@ -112,11 +124,16 @@ function Sidebar({ principal, environment, tab, setTab, onSignedOut, assistant, 
       <div className="who">
         <span title={principal.groups.join(", ") || "No groups"}>{principal.displayName}</span>
         <span className="muted">{principal.isAdmin ? "Admin" : principal.groups.filter((g) => g.startsWith("deploy-")).join(" · ")}</span>
-        {principal.via === "workbench" && <button className={assistant ? "active" : ""} onClick={toggleAssistant}>Ask the assistant</button>}
+        {principal.via === "workbench" && !setupOnly && <button className={assistant ? "active" : ""} onClick={toggleAssistant}>Ask the assistant</button>}
         {principal.via === "emergency" && <button className="link" onClick={() => api.emergencyLogout().then(onSignedOut)}>Sign out</button>}
       </div>
     </aside>
   );
+}
+
+/** §15.5: once setup is complete it folds into one line on the Overview. */
+function SetupLine({ status, onOpen }: { status: SetupStatus; onOpen: () => void }) {
+  return <p className="setup-line small muted"><span className="badge ok">Setup complete</span> Workbench signs people in ({status.level}). <button className="link" onClick={onOpen}>Show the steps</button></p>;
 }
 
 /** Deploy history and artifacts are two views of what ran here: by deploy, and by app@version + digest. */

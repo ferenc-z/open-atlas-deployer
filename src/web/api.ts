@@ -5,8 +5,9 @@ import type { Principal } from "../server/auth.ts";
 import type { EnvironmentStatus } from "../server/observe.ts";
 import type { AuditEntry, RegisteredApp } from "../server/store.ts";
 import type { Manifest } from "../compose/generate.ts";
+import type { SetupStatus, SetupStep } from "../server/setup.ts";
 
-export type { AuditEntry, EnvironmentStatus, Manifest, Principal, RegisteredApp };
+export type { AuditEntry, EnvironmentStatus, Manifest, Principal, RegisteredApp, SetupStatus, SetupStep };
 
 export type Me =
   | { signedIn: true; principal: Principal; environment?: string; workbenchUrl: string; deployerVersion?: string }
@@ -47,6 +48,10 @@ export async function me(): Promise<Me> {
 }
 
 export const status = () => call<EnvironmentStatus>("GET", "status");
+/** §15 (D41): the first setup. */
+export const setup = () => call<SetupStatus>("GET", "setup");
+export const createEnvironment = (form: Record<string, string>) => call<{ revision: number }>("POST", "setup/environment", form);
+export const importWorkbenchManifest = () => call<{ revision: number }>("POST", "setup/workbench-manifest", {});
 export const apps = () => call<{ apps: RegisteredApp[] }>("GET", "apps");
 export const app = (id: string) => call<{ app: RegisteredApp; manifests: Manifest[] }>("GET", `apps/${encodeURIComponent(id)}`);
 export const revision = (id: string, from: string, rev: number) => call<Manifest>("GET", `apps/${encodeURIComponent(id)}/manifests/${encodeURIComponent(from)}/${rev}`);

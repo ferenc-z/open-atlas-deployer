@@ -32,6 +32,7 @@ COPY src/env ./src/env
 COPY src/manifest ./src/manifest
 COPY schema ./schema
 COPY templates ./templates
+COPY manifests ./manifests
 COPY agents ./agents
 COPY bin ./bin
 # The state (deployer.db, environment.json, templates kept from assessments) lives in /data/deployer, a host

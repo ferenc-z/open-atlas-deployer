@@ -1,0 +1,21 @@
+#!/bin/sh
+# Builds the setup archive attached to the release v<version> (design §15.6 ⑦): one download for a new host, holding
+# bootstrap.sh, the Deployer's compose.yaml and deployer.env.example, and the executor's files with its install.sh.
+#   bin/package-setup.sh <out directory>        → <out>/open-atlas-deployer-setup-<version>.tar.gz and SHA256SUMS
+set -eu
+root=$(cd "$(dirname "$0")/.." && pwd)
+out=${1:?usage: package-setup.sh <out directory>}
+version=$(sed -n 's/^  "version": "\(.*\)",$/\1/p' "$root/package.json" | head -n 1)
+name=open-atlas-deployer-setup-$version
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+mkdir -p "$tmp/$name/deployer" "$tmp/$name/executor"
+printf '%s\n' "$version" > "$tmp/$name/VERSION"
+install -m 755 "$root/bin/bootstrap.sh" "$tmp/$name/bootstrap.sh"
+install -m 644 "$root/examples/deployer/compose.yaml" "$root/examples/deployer/deployer.env.example" "$tmp/$name/deployer/"
+for f in launch.sh switch install.sh; do install -m 755 "$root/executor/$f" "$tmp/$name/executor/"; done
+for f in deployer_executor.py open-atlas-deployer-executor.service executor.env.example; do install -m 644 "$root/executor/$f" "$tmp/$name/executor/"; done
+mkdir -p "$out"
+tar -C "$tmp" --owner=0 --group=0 -czf "$out/$name.tar.gz" "$name"
+(cd "$out" && sha256sum "$name.tar.gz" > SHA256SUMS)
+echo "$out/$name.tar.gz"

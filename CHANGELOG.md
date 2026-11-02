@@ -3,6 +3,20 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
+## Unreleased
+
+**First setup (D41, phase 1)**
+- A new installation opens on a Setup page, the only page until Workbench signs people in and the Deployer has its
+  Workbench API key. Each step is checked on the spot: environment settings, executors, the Workbench manifest,
+  deploying Workbench, signing in with Workbench, the API key.
+- The first environment settings can be made from a form on that page; `environment.json` is still imported when present.
+- The image ships Workbench's manifest (from 1.25.1, image from GHCR, no build) for a one-click import while the
+  registry has no Workbench. PROD still takes its manifests from UAT.
+- The emergency account can issue and revoke executor tokens, so a new host can be connected before Workbench exists.
+- Each release attaches `open-atlas-deployer-setup-<version>.tar.gz`: `bootstrap.sh` installs the executor, lays out
+  the Deployer's directory with its keys generated into `deployer.env` (the emergency password goes to a mode 600
+  file, never printed), creates the apps' network as compose would, and starts the Deployer.
+
 ## 0.1.0
 
 The first release: the same code as 0.1.0-rc.5, with executor 0.7.2. What it does is under 0.1.0-rc.1; the release

@@ -26,6 +26,8 @@ export interface Config {
   compareKey?: string;
   /** The Deployer's own env templates (env.template in a manifest). */
   templatesDir: string;
+  /** §15.6 ②: the manifests this Deployer ships for the first setup (only Workbench's). */
+  initialManifestsDir: string;
   /** GitHub's API (release bundles, release.json for contracts); a stand-in for tests and local runs. */
   githubApi: string;
   /** D39: where the Deployer's own versions are listed: "github:owner/name" (later "bitbucket:…"), tags as deployerReleaseTag. */
@@ -82,6 +84,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...(env.DEPLOYER_CREDENTIAL_ENCRYPTION_KEY ? { credentialKey: env.DEPLOYER_CREDENTIAL_ENCRYPTION_KEY } : {}),
     ...(env.DEPLOYER_COMPARE_KEY ? { compareKey: env.DEPLOYER_COMPARE_KEY } : {}),
     templatesDir: resolve(env.DEPLOYER_TEMPLATES_DIR ?? "templates"),
+    initialManifestsDir: resolve(env.DEPLOYER_INITIAL_MANIFESTS_DIR ?? "manifests/initial"),
     githubApi: env.DEPLOYER_GITHUB_API ?? "https://api.github.com",
     ...(env.DEPLOYER_RELEASE_REPO ? { deployerRelease: releaseSource(env.DEPLOYER_RELEASE_REPO) } : {}),
     deployerReleaseTag: env.DEPLOYER_RELEASE_TAG ?? "v{version}",

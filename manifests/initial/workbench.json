@@ -1,0 +1,50 @@
+{
+  "v": 1,
+  "app": "workbench",
+  "appliesFrom": "1.25.1",
+  "release": {
+    "repo": "ferenc-z/open-atlas-workbench",
+    "tag": "workbench-{version}",
+    "manifest": "release.json"
+  },
+  "components": [
+    {
+      "id": "workbench",
+      "type": "compose-service",
+      "service": "workbench",
+      "source": {
+        "kind": "company-registry",
+        "registry": "ghcr",
+        "image": "open-atlas-workbench"
+      },
+      "ports": [
+        {
+          "name": "http",
+          "container": 8090,
+          "host": 8090
+        }
+      ],
+      "volumes": [
+        {
+          "target": "/data/workbench",
+          "path": "data"
+        }
+      ],
+      "environment": {
+        "WORKBENCH_DATA_PLANE_URL": "http://studio:9632"
+      },
+      "envFile": true,
+      "health": "image",
+      "init": true,
+      "stopGracePeriod": "60s"
+    }
+  ],
+  "env": {
+    "file": "workbench.env",
+    "template": "templates/workbench.env.example",
+    "secrets": [
+      "OIDC_CLIENT_SECRET",
+      "WORKBENCH_BOOTSTRAP_PASSWORD"
+    ]
+  }
+}

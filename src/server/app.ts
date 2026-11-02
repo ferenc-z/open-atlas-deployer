@@ -31,6 +31,7 @@ import { DEPLOYER_VERSION } from "./version.ts";
 import { validateEnvironment } from "./environment.ts";
 import { applyPatch, changedPaths, PatchError } from "./jsonpatch.ts";
 import type { Versions } from "./versions.ts";
+import { environmentFromForm, initialWorkbenchManifest, setupStatus, WORKBENCH, type SetupEnvironmentForm } from "./setup.ts";
 
 export interface Dependencies {
   config: Config;
@@ -258,6 +259,49 @@ export function createApp({ config, store, sessions, observer, deployments, vers
       const saved = store.saveEnvironment(change.environment, change.base, actorOf(p), { ...(typeof body.note === "string" && body.note.trim() ? { note: body.note.trim() } : {}) });
       return c.json({ revision: saved.revision, changes: saved.changes, savedAt: saved.savedAt });
     } catch (error) { return environmentError(c, error); }
+  });
+
+  // §15 (D41): the first setup, up to Workbench and its API key. The state is worked out on every call.
+  const setupContext = () => ({
+    store, deployments, workbenchUrl: config.workbenchUrl, workbenchReachable: () => sessions.reachable(), initialManifestsDir: config.initialManifestsDir,
+    ...(config.workbenchApiKeyFile ? { workbenchApiKeyFile: config.workbenchApiKeyFile } : {}),
+  });
+  api.get("/api/setup", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    return c.json(await setupStatus(setupContext(), p));
+  });
+  // Step 1: the first environment settings from a form, instead of a hand-written environment.json.
+  api.post("/api/setup/environment", async (c) => {
+    const p = await authenticate(c, "admin");
+    if (p instanceof Response) return p;
+    if (store.environmentRevision()) return reject(c, 409, "setup/environment-exists", "The environment settings exist already: change them in Environment settings.");
+    if (existsSync(config.environmentFile)) return reject(c, 409, "setup/environment-file", `${config.environmentFile} exists and is imported as revision 1; remove it to use the form.`);
+    const { environment, findings } = environmentFromForm(await c.req.json().catch(() => ({})) as SetupEnvironmentForm);
+    if (findings.length) return reject(c, 400, "environment/invalid", "The environment settings are not valid.", findings.map((f) => `${f.at}: ${f.expected}`));
+    try {
+      const saved = store.saveEnvironment(environment, null, actorOf(p), { note: "Created on the Setup page" });
+      return c.json({ revision: saved.revision, environment: saved.environment }, 201);
+    } catch (error) {
+      if (error instanceof StoreError) return reject(c, 409, error.code, error.message);
+      throw error;
+    }
+  });
+  // Step 3: the Workbench manifest the image ships, only while the registry has none (§15.6 ②); PROD takes UAT's.
+  api.post("/api/setup/workbench-manifest", async (c) => {
+    const p = await authenticate(c, "admin");
+    if (p instanceof Response) return p;
+    let env: Environment;
+    try { env = deployments.environment().env; } catch { return reject(c, 409, "setup/no-environment", "Save the environment settings first."); }
+    if (isProd(env)) return reject(c, 403, "manifest/prod-read-only", "PROD takes its manifests from UAT (D38): take the registry from UAT.");
+    if (store.app(WORKBENCH)) return reject(c, 409, "setup/workbench-registered", "Workbench is in the registry already: change its manifest on its page.");
+    try {
+      const saved = store.saveManifest(initialWorkbenchManifest(config.initialManifestsDir), actorOf(p), { name: "Workbench", note: "Imported from the manifest this Deployer ships (Setup)" });
+      return c.json(saved, 201);
+    } catch (error) {
+      if (error instanceof StoreError) return reject(c, 400, error.code, error.message, error.details);
+      return reject(c, 503, "setup/no-manifest", (error as Error).message);
+    }
   });
 
   // D35: the hosts of this environment, their executors, and the tokens they call in with.

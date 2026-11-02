@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { createApp } from "../src/server/app.ts";
 import { hashPassword, permissionsFor, verifyPassword, WorkbenchSessions } from "../src/server/auth.ts";
@@ -50,6 +51,8 @@ interface SetupOptions {
   released?: { value: boolean };
   /** Phase 5: GitHub, Workbench's Administration API, Studio and OMA, faked. */
   services?: FakeState;
+  /** §15: a new installation, without environment.json. */
+  noEnvironment?: boolean;
 }
 
 function setup(options: SetupOptions = {}) {
@@ -75,13 +78,14 @@ function setup(options: SetupOptions = {}) {
 
   const dir = mkdtempSync(join(tmpdir(), "deployer-"));
   const environmentFile = join(dir, "environment.json");
-  writeFileSync(environmentFile, JSON.stringify({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", registries: {}, apps: { shop: { version: "1.2.0" } } }));
+  if (!options.noEnvironment) writeFileSync(environmentFile, JSON.stringify({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", registries: {}, apps: { shop: { version: "1.2.0" } } }));
   const config: Config = {
     bind: "127.0.0.1", port: 0, basePath: "/deploy", dataDir: dir, workbenchUrl: "http://workbench:8090", workbenchPublicUrl: "/",
-    environmentFile, observeUrls: {}, secureCookies: false, webDir: join(dir, "web"), templatesDir: join(dir, "templates"), peerKeySha256: options.peerKeys ?? [], githubApi: "https://api.github.com", omaVaults: [], omaAssessorVaults: [], briefHour: 8,
+    environmentFile, observeUrls: {}, secureCookies: false, webDir: join(dir, "web"), templatesDir: join(dir, "templates"), initialManifestsDir: fileURLToPath(new URL("../manifests/initial", import.meta.url)), peerKeySha256: options.peerKeys ?? [], githubApi: "https://api.github.com", omaVaults: [], omaAssessorVaults: [], briefHour: 8,
     // D39: the fake GitHub lists shop-1.2.0, v9 and shop-1.10.0 for any repository.
     deployerRelease: { kind: "github", repo: "acme/open-atlas-deployer" }, deployerReleaseTag: "shop-{version}",
     ...(options.emergency ? { emergencyPasswordHash: hashPassword(options.emergency) } : {}),
+    ...(options.services ? { workbenchApiKeyFile: join(dir, "wb.key") } : {}),
   };
   let now = Date.parse("2026-10-30T10:00:00Z");
   const store = new Store(":memory:", () => new Date(now));
@@ -241,6 +245,76 @@ test("the emergency password hash has no $, which docker compose would read as a
   assert.ok(verifyPassword("correct horse battery staple", hash));
   assert.ok(verifyPassword("correct horse battery staple", hash.replaceAll(":", "$")));
   assert.ok(!verifyPassword("wrong", hash));
+});
+
+test("§15: a new installation is set up with the emergency account up to Workbench; setup completes with Workbench and its API key", async () => {
+  const password = "correct horse battery staple";
+  const t = setup({ emergency: password, noEnvironment: true });
+  t.workbench.up = false;
+  const login = await t.request("/api/emergency/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ password }) });
+  const cookie = login.headers.get("set-cookie")!.split(";")[0]!;
+  const csrf = (await (await t.request("/api/me", { cookie })).json()).principal.csrfToken as string;
+  const call = (method: string, path: string, body?: unknown) => t.request(path, { method, cookie, headers: { "content-type": "application/json", "x-csrf-token": csrf }, ...(body ? { body: JSON.stringify(body) } : {}) });
+  const steps = async () => { const s = await (await call("GET", "/api/setup")).json(); return { ...s, state: Object.fromEntries(s.steps.map((x: { id: string; state: string }) => [x.id, x.state])) }; };
+
+  let s = await steps();
+  assert.equal(s.complete, false);
+  assert.equal(s.level, "L0");
+  assert.deepEqual(s.state, { environment: "next", executor: "waiting", "workbench-manifest": "waiting", "workbench-deploy": "waiting", "workbench-signin": "waiting", "workbench-key": "waiting" });
+  assert.equal((await call("POST", "/api/setup/workbench-manifest", {})).status, 409, "the environment comes first");
+
+  const bad = await call("POST", "/api/setup/environment", { name: "uat", project: "Open Atlas" });
+  assert.equal(bad.status, 400);
+  assert.ok((await bad.json()).details.some((d: string) => d.startsWith("project")));
+  const created = await call("POST", "/api/setup/environment", { name: "uat", project: "open-atlas", domain: "uat.example.internal" });
+  assert.equal(created.status, 201);
+  const env = (await created.json()).environment;
+  assert.equal(env.registries.ghcr, "ghcr.io/ferenc-z");
+  assert.deepEqual(env.apps.workbench, { version: "1.25.1", ingress: { kind: "nginx", port: 8443 } });
+  assert.equal((await call("POST", "/api/setup/environment", { name: "uat", project: "open-atlas" })).status, 409, "only the first revision");
+
+  s = await steps();
+  assert.equal(s.state.environment, "done");
+  assert.equal(s.state.executor, "next");
+  // The emergency account issues the host's token (§15.4 step 2).
+  const issued = await call("POST", "/api/hosts/local/token", {});
+  assert.equal(issued.status, 201);
+  const token = (await issued.json()).token as string;
+  assert.match(token, /^dpe_/);
+  await t.app.request("/deploy/executor/v1/heartbeat", { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ version: EXECUTOR_VERSION, protocols: [PROTOCOL], kinds: ["deploy"], project: "open-atlas", registries: [], databaseBackup: {}, busy: null }) });
+  s = await steps();
+  assert.equal(s.state.executor, "done");
+  assert.equal(s.state["workbench-manifest"], "next");
+
+  const imported = await call("POST", "/api/setup/workbench-manifest", {});
+  assert.equal(imported.status, 201);
+  assert.deepEqual(await imported.json(), { app: "workbench", appliesFrom: "1.25.1", revision: 1 });
+  assert.equal(t.store.app("workbench")!.repo, "ferenc-z/open-atlas-workbench");
+  assert.equal((await call("POST", "/api/setup/workbench-manifest", {})).status, 409, "only while the registry has no Workbench");
+  s = await steps();
+  assert.equal(s.level, "L1");
+  assert.equal(s.state["workbench-deploy"], "next");
+
+  // Workbench answers: the emergency account is gone, an admin signs in with Workbench; the API key is still missing.
+  t.workbench.up = true;
+  t.advance(20_000);
+  assert.equal((await call("GET", "/api/setup")).status, 401);
+  const asAdmin = await (await t.request("/api/setup", { as: "admin" })).json();
+  assert.deepEqual(asAdmin.steps.map((x: { state: string }) => x.state), ["done", "done", "done", "done", "done", "next"]);
+  assert.equal(asAdmin.complete, false);
+  assert.equal((await t.request("/api/setup", { as: "viewer" })).status, 200);
+});
+
+test("§15: an installation with Workbench and its API key is set up; PROD does not import the shipped manifest", async () => {
+  const t = setup({ services: fakeState() });
+  const s = await (await t.request("/api/setup", { as: "viewer" })).json();
+  assert.equal(s.complete, true);
+  assert.equal(s.level, "L2", "an executor that has not called in yet does not undo setup");
+  assert.equal(s.steps.find((x: { id: string }) => x.id === "executor").state, "next");
+  assert.equal(s.canAct, false);
+  setEnvironment(t, { name: "prod", project: "open-atlas", bindIp: "127.0.0.1", registries: {}, apps: {} });
+  assert.equal((await post(t, "/api/setup/workbench-manifest", "admin", {})).status, 403);
+  assert.equal((await post(t, "/api/setup/environment", "admin", { name: "prod", project: "open-atlas" })).status, 409);
 });
 
 test("emergency logins are throttled after five failures", async () => {
