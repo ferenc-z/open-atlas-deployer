@@ -287,3 +287,11 @@ textarea.settings { width: 100%; font-size: 12px; }
 .setup-field { display: grid; gap: 4px; }
 .setup-line { display: flex; align-items: center; gap: 8px; margin: 0 0 12px; }
 .setup-line .badge { margin-left: 0; }
+/* D45: the Deployer's own settings; long keys, paths and addresses wrap instead of widening the table. */
+table.deployer-settings { table-layout: fixed; }
+table.deployer-settings th:nth-child(1) { width: 38%; }
+table.deployer-settings th:nth-child(3) { width: 16%; }
+table.deployer-settings th:nth-child(4) { width: 12%; }
+table.deployer-settings td { overflow-wrap: anywhere; vertical-align: top; }
+table.deployer-settings td.actions { display: table-cell; }
+table.deployer-settings td.actions button.link { display: block; margin-bottom: 4px; white-space: nowrap; overflow-wrap: normal; }

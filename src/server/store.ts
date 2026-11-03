@@ -709,6 +709,11 @@ export class Store {
     return (this.db.prepare("SELECT value FROM settings WHERE key = ?").get(key) as Row | undefined)?.value;
   }
 
+  settingMeta(key: string): { updatedAt: string; updatedBy: string } | undefined {
+    const r = this.db.prepare("SELECT updated_at, updated_by FROM settings WHERE key = ?").get(key) as Row | undefined;
+    return r ? { updatedAt: r.updated_at, updatedBy: r.updated_by } : undefined;
+  }
+
   setSetting(key: string, value: string | null, actor: Actor) {
     if (value === null) this.db.prepare("DELETE FROM settings WHERE key = ?").run(key);
     else this.db.prepare("INSERT INTO settings (key, value, updated_at, updated_by) VALUES (?1, ?2, ?3, ?4) ON CONFLICT (key) DO UPDATE SET value = ?2, updated_at = ?3, updated_by = ?4").run(key, value, this.stamp(), actor.id);

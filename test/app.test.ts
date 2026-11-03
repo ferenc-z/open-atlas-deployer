@@ -31,6 +31,8 @@ import { WorkbenchAppDriver } from "../src/server/drivers/workbench-app.ts";
 import { McpClient } from "../src/server/mcp-client.ts";
 import { Keys } from "../src/server/keys.ts";
 import { WorkbenchKey } from "../src/server/workbench-key.ts";
+import { DeployerSettings } from "../src/server/deployer-settings.ts";
+import { loadConfig } from "../src/server/config.ts";
 import { Diagnoser } from "../src/server/diagnose.ts";
 import { OmaSessions } from "../src/server/oma.ts";
 import { Onboarding } from "../src/server/onboarding.ts";
@@ -58,6 +60,8 @@ interface SetupOptions {
   pasteKey?: boolean;
   /** §15.4 step 6: the OMA settings of deployer.env (http://oma.test, key oma_test in oma.key). */
   oma?: Partial<Config>;
+  /** D45: what deployer.env sets, for the Deployer's own settings. */
+  deployerEnv?: NodeJS.ProcessEnv;
 }
 
 function setup(options: SetupOptions = {}) {
@@ -146,7 +150,9 @@ function setup(options: SetupOptions = {}) {
   if (onboarding) deployments.evaluated = (a, v) => onboarding.evaluated(a, v);
   if (phase5) deployments.maintenance = phase5.workbench;
   const workbenchAdmin = phase5?.workbench ?? new WorkbenchAdmin("http://workbench:8090", () => workbenchKey.value(), fetcher);
-  const app = createApp({ config, store, sessions, observer, deployments, versions, env, workbench: workbenchAdmin, workbenchKey, ...(phase5 ? { omaFetcher: phase5.fetcher } : {}), ...(peer ? { peer } : {}), ...(keys ? { keys } : {}), ...(onboarding ? { onboarding } : {}) });
+  const deployerSettings = new DeployerSettings(store, box, options.deployerEnv ?? {});
+  const restarts = { count: 0 };
+  const app = createApp({ config, store, sessions, observer, deployments, versions, env, workbench: workbenchAdmin, workbenchKey, deployerSettings, restart: () => { restarts.count++; }, ...(phase5 ? { omaFetcher: phase5.fetcher } : {}), ...(peer ? { peer } : {}), ...(keys ? { keys } : {}), ...(onboarding ? { onboarding } : {}) });
   const request = (path: string, init: RequestInit & { as?: string; cookie?: string } = {}) => {
     const headers = new Headers(init.headers);
     const cookies = [init.as ? `${SESSION}=${init.as}` : "", init.cookie ?? ""].filter(Boolean).join("; ");
@@ -155,7 +161,7 @@ function setup(options: SetupOptions = {}) {
   };
   // D35: plays the executor of the one host ("local"), as it would call in over HTTPS.
   const beat = () => handoff.heartbeat("local", { version: "0.5.0", protocols: [2], kinds: ["build", "deploy", "env", "env-read", "bundle", "db-migration"], at: new Date(now).toISOString(), project: "open-atlas", registries: [], databaseBackup: {}, busy: null });
-  return { app, request, store, users, workbench, dir, beat, example, released, deployments, reach, advance: (ms: number) => { now += ms; } };
+  return { app, request, store, users, workbench, dir, beat, box, restarts, example, released, deployments, reach, advance: (ms: number) => { now += ms; } };
 }
 
 
@@ -1879,4 +1885,62 @@ test("D39: the Deployer's versions to choose from, a plan before an upgrade, and
   const stopped = (await (await t.request("/api/platform", { as: "viewer" })).json()).batch;
   assert.match(stopped.stopped, /^app2: failed/);
   assert.equal(stopped.current, null);
+});
+
+test("D45: the Deployer's own settings are set on the page, checked, sealed, and apply at the next start", async () => {
+  const t = setup({ deployerEnv: { DEPLOYER_WORKBENCH_URL: "http://workbench:8090", DEPLOYER_CREDENTIAL_ENCRYPTION_KEY: "x", DEPLOYER_OMA_URL: "http://oma-from-file:8080" } });
+  const put = (changes: unknown, as = "admin") => t.request("/api/deployer-settings", { method: "PUT", as, headers: { "content-type": "application/json", "x-csrf-token": `csrf-${as}` }, body: JSON.stringify({ changes }) });
+  const row = (view: { settings: { key: string }[] }, key: string) => view.settings.find((r) => r.key === key) as Record<string, unknown>;
+  assert.equal((await t.request("/api/deployer-settings", { as: "uat" })).status, 403);
+  let view = await (await t.request("/api/deployer-settings", { as: "admin" })).json();
+  assert.equal(row(view, "DEPLOYER_OMA_URL").source, "file");
+  assert.ok(row(view, "DEPLOYER_OMA_URL").locked);
+  assert.deepEqual([row(view, "DEPLOYER_CREDENTIAL_ENCRYPTION_KEY").set, row(view, "DEPLOYER_CREDENTIAL_ENCRYPTION_KEY").value], [true, undefined], "keys are never shown");
+  assert.equal(row(view, "DEPLOYER_BRIEF_HOUR").source, "default");
+  assert.equal(view.pending, false);
+
+  // Checked all together; nothing is kept when one is wrong. The file and the fixed ones are refused.
+  const bad = await put([{ key: "DEPLOYER_BRIEF_HOUR", value: "25" }, { key: "DEPLOYER_OMA_AGENT", value: "agent_1" }, { key: "DEPLOYER_OMA_URL", value: "http://x" }, { key: "DEPLOYER_COMPARE_KEY", value: "k" }, { key: "DEPLOYER_RELEASE_REPO", value: "gitlab:a/b" }]);
+  assert.equal(bad.status, 400);
+  assert.equal(((await bad.json()).details as string[]).length, 4);
+  assert.equal(t.store.setting("deployer-setting:DEPLOYER_OMA_AGENT"), undefined);
+  assert.equal((await put([{ key: "DEPLOYER_OMA_AGENT", value: "agent_1" }], "uat")).status, 403);
+
+  const ok = await put([{ key: "DEPLOYER_OMA_AGENT", value: " agent_1 " }, { key: "DEPLOYER_OMA_VAULTS", value: "v1 v2,v3" }, { key: "DEPLOYER_STUDIO_TOKEN_FILE", value: "oaw_v1.secret" }, { key: "DEPLOYER_BRIEF_HOUR", value: "7" }]);
+  assert.equal(ok.status, 200);
+  view = await ok.json();
+  assert.deepEqual(view.changed, ["DEPLOYER_OMA_AGENT", "DEPLOYER_OMA_VAULTS", "DEPLOYER_STUDIO_TOKEN_FILE", "DEPLOYER_BRIEF_HOUR"]);
+  assert.equal(view.pending, true);
+  assert.deepEqual(row(view, "DEPLOYER_OMA_AGENT").pending, { value: "agent_1" });
+  assert.deepEqual(row(view, "DEPLOYER_STUDIO_TOKEN_FILE").pending, { set: true });
+  assert.ok(!JSON.stringify(view).includes("oaw_v1.secret"), "a token never comes back");
+  assert.ok(t.store.setting("deployer-setting:DEPLOYER_STUDIO_TOKEN_FILE")!.startsWith("v1:"), "kept sealed");
+  assert.equal((await put([{ key: "DEPLOYER_OMA_AGENT", value: "agent_1" }])).status, 200);
+  assert.equal(t.store.listAudit(50, { action: "setting.changed", target: "deployer-setting:DEPLOYER_OMA_AGENT" }).length, 1, "an unchanged value is not saved again");
+
+  // The next start: the file still wins, the page fills in the rest, the token is read through the sealed value.
+  const next = new DeployerSettings(t.store, t.box, { DEPLOYER_WORKBENCH_URL: "http://workbench:8090", DEPLOYER_OMA_URL: "http://oma-from-file:8080" });
+  const config = loadConfig(next.env(), next.tokens());
+  assert.equal(config.omaUrl, "http://oma-from-file:8080");
+  assert.equal(config.omaAgent, "agent_1");
+  assert.deepEqual(config.omaVaults, ["v1", "v2", "v3"]);
+  assert.equal(config.briefHour, 7);
+  assert.equal(typeof config.studioTokenFile, "function");
+  assert.equal((config.studioTokenFile as () => string)(), "oaw_v1.secret");
+  assert.equal(next.pending(), false);
+
+  // Clearing goes back to the default at the next start; saving back what is in effect leaves nothing pending.
+  next.save([{ key: "DEPLOYER_BRIEF_HOUR", value: null }], { id: "a@x", via: "workbench" });
+  assert.deepEqual(next.rows().find((r) => r.key === "DEPLOYER_BRIEF_HOUR")!.pending, { cleared: true });
+  next.save([{ key: "DEPLOYER_BRIEF_HOUR", value: "7" }], { id: "a@x", via: "workbench" });
+  assert.equal(next.pending(), false);
+
+  // A restart waits for running jobs.
+  t.store.addJob({ id: "deploy-1", kind: "deploy", app: "shop", version: "1.2.0", environment: "uat", fromVersion: null, manifest: null, pinFrom: null, request: {} }, { id: "test", via: "cli" });
+  const restart = () => t.request("/api/deployer-settings/restart", { method: "POST", as: "admin", headers: { "x-csrf-token": "csrf-admin" } });
+  assert.equal((await restart()).status, 409);
+  assert.equal(t.restarts.count, 0);
+  t.store.updateJob("deploy-1", { state: "succeeded", steps: [], result: {} });
+  assert.equal((await restart()).status, 202);
+  assert.equal(t.restarts.count, 1);
 });

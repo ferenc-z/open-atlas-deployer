@@ -4,7 +4,7 @@
 import type { WorkbenchAdmin, WorkbenchPlugin } from "./drivers/workbench.ts";
 import type { StepState } from "./setup.ts";
 import type { Store } from "./store.ts";
-import { readToken } from "./versions.ts";
+import { readToken, type TokenSource } from "./versions.ts";
 
 export const OMA = "oma";
 /** The Deploy Assistant's name in Workbench: the Business Agent and the Deployer's entry's chat.agent. */
@@ -26,7 +26,7 @@ export interface AiContext {
   /** Where people open Workbench (DEPLOYER_WORKBENCH_PUBLIC_URL): the Deployer's entry has to be embeddable there. */
   workbenchPublicUrl?: string;
   oma: {
-    url?: string; keyFile?: string; applicationId?: string;
+    url?: string; keyFile?: TokenSource; applicationId?: string;
     agent?: string; environment?: string; vaults: string[];
     assessorAgent?: string; assessorEnvironment?: string; assessorVaults: string[];
   };

@@ -15,18 +15,22 @@ export function versionsFromTags(tags: string[], pattern: string): string[] {
   return [...new Set(out)].sort((a, b) => compareVersions(b, a));
 }
 
-export function readToken(file: string | undefined): string {
-  try { return file ? readFileSync(file, "utf8").trim() : ""; } catch { return ""; }
+/** A token file, or a token pasted on the page (D45) read on every use. */
+export type TokenSource = string | (() => string) | undefined;
+
+export function readToken(source: TokenSource): string {
+  if (typeof source === "function") return source().trim();
+  try { return source ? readFileSync(source, "utf8").trim() : ""; } catch { return ""; }
 }
 
 export class Versions {
   private cache = new Map<string, { at: number; versions: string[] }>();
-  private tokenFile: string | undefined;
+  private tokenFile: TokenSource;
   private fetcher: typeof fetch;
   private now: () => number;
   private api: string;
 
-  constructor(tokenFile: string | undefined, fetcher: typeof fetch = fetch, now: () => number = Date.now, api = "https://api.github.com") {
+  constructor(tokenFile: TokenSource, fetcher: typeof fetch = fetch, now: () => number = Date.now, api = "https://api.github.com") {
     this.tokenFile = tokenFile;
     this.fetcher = fetcher;
     this.now = now;

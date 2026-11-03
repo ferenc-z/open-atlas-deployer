@@ -7,7 +7,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { readTarGz, stripTop } from "./tar.ts";
-import { readToken } from "./versions.ts";
+import { readToken, type TokenSource } from "./versions.ts";
 
 export class BundleError extends Error {}
 
@@ -26,12 +26,12 @@ export interface Bundle {
 
 export class Bundles {
   private dir: string;
-  private tokenFile: string | undefined;
+  private tokenFile: TokenSource;
   private fetcher: typeof fetch;
   private api: string;
   private cache = new Map<string, Bundle>();
 
-  constructor(dir: string, tokenFile: string | undefined, fetcher: typeof fetch = fetch, api = "https://api.github.com") {
+  constructor(dir: string, tokenFile: TokenSource, fetcher: typeof fetch = fetch, api = "https://api.github.com") {
     this.dir = dir;
     this.tokenFile = tokenFile;
     this.fetcher = fetcher;

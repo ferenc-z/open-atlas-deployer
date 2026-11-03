@@ -2,7 +2,7 @@
 // package.json at its tag) against the versions the other apps actually run here. Both ways: what this version
 // requires must be provided, and what the others require must still be provided after it.
 
-import { readToken } from "./versions.ts";
+import { readToken, type TokenSource } from "./versions.ts";
 
 export interface ContractDoc { provides: Record<string, string>; requires: Record<string, string> }
 export interface Running { app: string; version: string; doc: ContractDoc | null; error?: string }
@@ -50,11 +50,11 @@ export function checkContracts(app: string, version: string, doc: ContractDoc, o
 /** release.json / package.json at a tag; tags do not move, so an answer is kept for good. */
 export class ContractDocs {
   private cache = new Map<string, ContractDoc>();
-  private tokenFile: string | undefined;
+  private tokenFile: TokenSource;
   private fetcher: typeof fetch;
   private api: string;
 
-  constructor(tokenFile: string | undefined, fetcher: typeof fetch = fetch, api = "https://api.github.com") {
+  constructor(tokenFile: TokenSource, fetcher: typeof fetch = fetch, api = "https://api.github.com") {
     this.tokenFile = tokenFile;
     this.fetcher = fetcher;
     this.api = api.replace(/\/+$/, "");

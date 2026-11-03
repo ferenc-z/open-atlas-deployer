@@ -20,7 +20,7 @@ import { isKey } from "./keys.ts";
 import { deployPermission, isProd } from "./plan.ts";
 import { fingerprint, type SecretBox } from "./secretbox.ts";
 import type { Actor, EnvRevision, ExecutorStatus, Job, Store, StoredEnv } from "./store.ts";
-import { readToken } from "./versions.ts";
+import { readToken, type TokenSource } from "./versions.ts";
 
 /** Keys treated as secrets even when the manifest does not list them: better masked once too often. */
 const LOOKS_SECRET = /(PASSWORD|PASSWD|PASS|SECRET|TOKEN|PRIVATE_KEY|API_KEY|_KEY)$/;
@@ -30,7 +30,7 @@ export interface Schema { version: string; source: string; keys: ExampleKey[] }
 /** An app's expected keys at a version: its .env.example at the release tag, or the Deployer's template. */
 export class Schemas {
   private cache = new Map<string, { at: number; text: string }>();
-  private tokenFile: string | undefined;
+  private tokenFile: TokenSource;
   private templatesDir: string;
   private fetcher: typeof fetch;
 
@@ -38,7 +38,7 @@ export class Schemas {
   private keptDir: string | undefined;
   private api: string;
 
-  constructor(tokenFile: string | undefined, templatesDir: string, fetcher: typeof fetch = fetch, keptDir?: string, api = "https://api.github.com") {
+  constructor(tokenFile: TokenSource, templatesDir: string, fetcher: typeof fetch = fetch, keptDir?: string, api = "https://api.github.com") {
     this.tokenFile = tokenFile;
     this.templatesDir = templatesDir;
     this.fetcher = fetcher;

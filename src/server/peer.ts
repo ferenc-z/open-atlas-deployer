@@ -5,7 +5,7 @@
 import { randomBytes } from "node:crypto";
 import type { Manifest } from "../compose/generate.ts";
 import type { DeployRecord } from "./store.ts";
-import { readToken } from "./versions.ts";
+import { readToken, type TokenSource } from "./versions.ts";
 
 export const PEER_KEY_PREFIX = "dpr_";
 
@@ -22,12 +22,12 @@ export interface PeerStatus {
 
 export class Peer {
   readonly url: string | undefined;
-  private keyFile: string | undefined;
+  private keyFile: TokenSource;
   private fetcher: typeof fetch;
   private cache = new Map<string, { at: number; value: unknown }>();
   private now: () => number;
 
-  constructor(url: string | undefined, keyFile: string | undefined, fetcher: typeof fetch = fetch, now: () => number = Date.now) {
+  constructor(url: string | undefined, keyFile: TokenSource, fetcher: typeof fetch = fetch, now: () => number = Date.now) {
     this.url = url?.replace(/\/+$/, "");
     this.keyFile = keyFile;
     this.fetcher = fetcher;

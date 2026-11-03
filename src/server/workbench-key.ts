@@ -4,16 +4,16 @@
 
 import type { SecretBox } from "./secretbox.ts";
 import type { Actor, Store } from "./store.ts";
-import { readToken } from "./versions.ts";
+import { readToken, type TokenSource } from "./versions.ts";
 
 const SETTING = "workbench-api-key";
 
 export class WorkbenchKey {
   private store: Store;
-  private file: string | undefined;
+  private file: TokenSource;
   private box: SecretBox | undefined;
 
-  constructor(store: Store, file: string | undefined, box: SecretBox | undefined) {
+  constructor(store: Store, file: TokenSource, box: SecretBox | undefined) {
     this.store = store;
     this.file = file;
     this.box = box;

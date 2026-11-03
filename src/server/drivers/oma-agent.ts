@@ -10,7 +10,7 @@ import { join, normalize } from "node:path";
 import type { Component } from "../../compose/generate.ts";
 import { bundleText } from "../bundle.ts";
 import type { McpClient } from "../mcp-client.ts";
-import { readToken } from "../versions.ts";
+import { readToken, type TokenSource } from "../versions.ts";
 import { block, fill, note, type DeployDriver, type StepContext, type StepResult, type Undo } from "./types.ts";
 import type { WorkbenchAdmin } from "./workbench.ts";
 
@@ -21,7 +21,7 @@ function fillDeep(value: unknown, values: Record<string, string>, missing: Set<s
   return value;
 }
 
-export interface OmaApi { url: string; keyFile: string | undefined }
+export interface OmaApi { url: string; keyFile: TokenSource }
 
 export class OmaAgentDriver implements DeployDriver {
   readonly type = "oma-agent";

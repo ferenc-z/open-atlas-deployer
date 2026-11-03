@@ -7,7 +7,9 @@ import type { AuditEntry, RegisteredApp } from "../server/store.ts";
 import type { Manifest } from "../compose/generate.ts";
 import type { SetupStatus, SetupStep } from "../server/setup.ts";
 import type { AiItem, AiStatus, AiUse } from "../server/setup-ai.ts";
+import type { SettingRow } from "../server/deployer-settings.ts";
 
+export type { SettingRow };
 export type { AiItem, AiStatus, AiUse, AuditEntry, EnvironmentStatus, Manifest, Principal, RegisteredApp, SetupStatus, SetupStep };
 
 export type Me =
@@ -61,6 +63,13 @@ export const addDeployerLink = (deployerUrl: string) => call<{ revision: number 
 export const setupAi = () => call<AiStatus>("GET", "setup/ai");
 export const registerInWorkbench = (deployerUrl: string) => call<{ url: string; groups: number }>("POST", "setup/workbench-entry", { deployerUrl });
 /** This page's own address, as Workbench's app menu should link it. */
+export type DeployerSettingsView = {
+  settings: SettingRow[]; pending: boolean; canRestart: boolean; startedAt: string;
+  workbenchKey: { source: "file" | "page" | null; canSet: { ok: true } | { ok: false; reason: string } };
+};
+export const deployerSettings = () => call<DeployerSettingsView>("GET", "deployer-settings");
+export const saveDeployerSettings = (changes: { key: string; value: string | null }[]) => call<DeployerSettingsView & { changed: string[] }>("PUT", "deployer-settings", { changes });
+export const restartDeployer = () => call<{ restarting: true }>("POST", "deployer-settings/restart", {});
 export const deployerUrl = () => new URL(BASE, location.href).href;
 export const apps = () => call<{ apps: RegisteredApp[] }>("GET", "apps");
 export const app = (id: string) => call<{ app: RegisteredApp; manifests: Manifest[] }>("GET", `apps/${encodeURIComponent(id)}`);

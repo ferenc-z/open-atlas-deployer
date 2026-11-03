@@ -2,12 +2,18 @@
 // says what is on the server, what the Deployer holds, and the one next step; the values grouped (needs attention,
 // set, optional and unset) with problems marked on their rows, counts that filter, a search, and editing in the same
 // table; history and the comparison with the other environment in their own tabs. Writing goes through a plan.
+// For administrators, the Deployer's own settings have a card first (D45).
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import * as api from "./api.ts";
 import type { EnvEdit, EnvPlan, EnvView, Fingerprint, RegisteredApp } from "./api.ts";
 import { JobPanel } from "./Deploy.tsx";
 import { ask } from "./Confirm.tsx";
+import { DeployerSettingsPanel, deployerCardState } from "./DeployerSettings.tsx";
+import type { DeployerSettingsView } from "./api.ts";
+
+/** The Deployer's card; not an app id (ids are lower-case words). */
+const DEPLOYER = ":deployer";
 
 const when = (iso: string | null | undefined) => (iso ? new Date(iso).toLocaleString("en-US", { hour12: false }) : "—");
 const SOURCE: Record<string, string> = { edit: "Edit", import: "Imported from the server", revert: "Back to an old revision" };
@@ -36,6 +42,8 @@ export function EnvPage() {
   const [views, setViews] = useState<Record<string, EnvView | { error: string }>>({});
   const [app, setApp] = useState("");
   const [error, setError] = useState("");
+  const [own, setOwn] = useState<DeployerSettingsView | undefined>();
+  useEffect(() => { api.deployerSettings().then(setOwn, () => setOwn(undefined)); }, []);
   const loadViews = useCallback((list: RegisteredApp[]) => Promise.all(list.map((a) => api.env(a.id).then((v) => [a.id, v] as const, (e: api.ApiError) => [a.id, { error: e.status === 404 ? "No env file" : "Cannot read" }] as const)))
     .then((pairs) => { const next = Object.fromEntries(pairs); setViews(next); return next; }), []);
   useEffect(() => {
@@ -50,9 +58,16 @@ export function EnvPage() {
     <>
       <div className="toolbar">
         <h1>Environment variables</h1>
-        <span className="muted">The Deployer is the only maintainer of env files: change them here, then write them to the server through a plan.</span>
+        <span className="muted">The Deployer is the only maintainer of env files: change them here, then write them to the server through a plan.{own ? " The Deployer's own settings are under its card." : ""}</span>
       </div>
       <div className="app-cards">
+        {own && (() => { const s = deployerCardState(own); return (
+          <button className={`app-card${app === DEPLOYER ? " selected" : ""}`} onClick={() => setApp(DEPLOYER)}>
+            <strong>Deployer</strong>
+            <span className="muted">Its own settings</span>
+            <span className={`badge ${s.tone}`}>{s.label}</span>
+          </button>
+        ); })()}
         {apps.map((a) => {
           const v = views[a.id];
           const s = v && "revisions" in v ? stateOf(v) : undefined;
@@ -66,7 +81,7 @@ export function EnvPage() {
           );
         })}
       </div>
-      {app && <EnvApp key={app} app={app} onChanged={() => loadViews(apps)} />}
+      {app === DEPLOYER ? <DeployerSettingsPanel onChanged={setOwn} /> : app && <EnvApp key={app} app={app} onChanged={() => loadViews(apps)} />}
     </>
   );
 }

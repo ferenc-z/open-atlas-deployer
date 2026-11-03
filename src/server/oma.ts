@@ -1,11 +1,11 @@
 // OMA sessions the Deployer opens itself (interface B, §10.2): its own Application and API key, an Agent, an
 // Environment and Vaults. Used for failure diagnosis (D24) and assessments (§10.5, D27).
 
-import { readToken } from "./versions.ts";
+import { readToken, type TokenSource } from "./versions.ts";
 
 export interface OmaSessionConfig {
   url: string;
-  keyFile: string | undefined;
+  keyFile: TokenSource;
   agent: string;
   environment?: string;
   vaults?: string[];

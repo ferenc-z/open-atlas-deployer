@@ -1,9 +1,10 @@
 import { mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { serve } from "@hono/node-server";
 import { createApp } from "./app.ts";
 import { WorkbenchSessions } from "./auth.ts";
 import { loadConfig } from "./config.ts";
+import { DeployerSettings } from "./deployer-settings.ts";
 import { Bundles } from "./bundle.ts";
 import { ContractDocs } from "./contracts.ts";
 import { Deployments } from "./deploy.ts";
@@ -26,20 +27,24 @@ import { Peer } from "./peer.ts";
 import { SecretBox } from "./secretbox.ts";
 import { Store } from "./store.ts";
 import { WorkbenchKey } from "./workbench-key.ts";
-import { readToken, Versions } from "./versions.ts";
+import { readToken, Versions, type TokenSource } from "./versions.ts";
 
-const config = loadConfig();
-mkdirSync(config.dataDir, { recursive: true });
-const store = new Store(join(config.dataDir, "deployer.db"));
+// D45: deployer.env first (the state directory and the credential key come only from there), then what an
+// administrator set on the page for the settings the file leaves unset.
+const dataDir = resolve(process.env.DEPLOYER_DATA ?? "data");
+mkdirSync(dataDir, { recursive: true });
+const store = new Store(join(dataDir, "deployer.db"));
+const box = process.env.DEPLOYER_CREDENTIAL_ENCRYPTION_KEY ? new SecretBox(process.env.DEPLOYER_CREDENTIAL_ENCRYPTION_KEY) : undefined;
+const deployerSettings = new DeployerSettings(store, box, process.env);
+const config = loadConfig(deployerSettings.env(), deployerSettings.tokens());
 const observer = new Observer(config.observeUrls);
 const versions = new Versions(config.githubTokenFile, fetch, Date.now, config.githubApi);
 const peer = new Peer(config.uatUrl, config.uatKeyFile);
 // Phase 5 drivers: Workbench through an Administration API key, Studio and OMA through their Builder MCPs.
 // §15.6 ③: the key from DEPLOYER_WORKBENCH_API_KEY_FILE, or the one an administrator pasted on the Setup page.
-const box = config.credentialKey ? new SecretBox(config.credentialKey) : undefined;
 const workbenchKey = new WorkbenchKey(store, config.workbenchApiKeyFile, box);
 const workbench = new WorkbenchAdmin(config.workbenchUrl, () => workbenchKey.value());
-const bearer = (file: string | undefined) => () => ({ authorization: `Bearer ${readToken(file)}` });
+const bearer = (file: TokenSource) => () => ({ authorization: `Bearer ${readToken(file)}` });
 const studio = config.studioBuilderUrl && config.studioTokenFile ? new McpClient(config.studioBuilderUrl, bearer(config.studioTokenFile)) : undefined;
 const omaBuilder = config.omaBuilderUrl && config.omaBuilderKeyFile ? new McpClient(config.omaBuilderUrl, bearer(config.omaBuilderKeyFile)) : undefined;
 const drivers = [
@@ -84,7 +89,9 @@ const briefWriter = config.omaUrl && config.omaApiKeyFile && config.omaAgent
   ? new OmaSessions({ url: config.omaUrl, keyFile: config.omaApiKeyFile, agent: config.omaAgent, ...(config.omaEnvironment ? { environment: config.omaEnvironment } : {}), vaults: config.omaVaults, ...(config.omaApplicationId ? { application: config.omaApplicationId } : {}) })
   : undefined;
 const briefs = new Briefs(store, () => collectFacts({ store, deployments, status: statusOf, versions, ...(peer.configured ? { peer: () => peer.status() } : {}), drift: () => drift.check() }), briefWriter, { hour: config.briefHour });
-const app = createApp({ config, store, sessions: new WorkbenchSessions(config.workbenchUrl), observer, deployments, versions, env, peer, onboarding, drift, briefs, keys, workbench, workbenchKey });
+const app = createApp({ config, store, sessions: new WorkbenchSessions(config.workbenchUrl), observer, deployments, versions, env, peer, onboarding, drift, briefs, keys, workbench, workbenchKey, deployerSettings,
+  // D45: the image sets DEPLOYER_RESTART_BY_EXIT; the container's restart policy starts it again with the new settings.
+  ...(process.env.DEPLOYER_RESTART_BY_EXIT === "true" ? { restart: () => setTimeout(() => { store.close(); process.exit(75); }, 300) } : {}) });
 // Job records follow the executor's status files even while nobody has the page open.
 setInterval(() => {
   deployments.sync().catch((error) => console.error("sync:", error));

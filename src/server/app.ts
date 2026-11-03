@@ -35,6 +35,7 @@ import { aiStatus, deployerEntry, embedProblem } from "./setup-ai.ts";
 import { DEPLOY_GROUPS, environmentFromForm, initialWorkbenchManifest, newWorkbenchEnv, setupStatus, WORKBENCH, withDeployerLink, type SetupEnvironmentForm } from "./setup.ts";
 import { WorkbenchAdmin } from "./drivers/workbench.ts";
 import { WorkbenchKey } from "./workbench-key.ts";
+import { DeployerSettings, SettingsError, STARTED_AT } from "./deployer-settings.ts";
 
 export interface Dependencies {
   config: Config;
@@ -56,6 +57,9 @@ export interface Dependencies {
   /** §15.6 ③: Workbench's Administration API with the Deployer's key, and where that key comes from. */
   workbench?: WorkbenchAdmin;
   workbenchKey?: WorkbenchKey;
+  /** D45: the Deployer's own settings, and how it restarts to apply them (only in the image). */
+  deployerSettings?: DeployerSettings;
+  restart?: () => void;
   /** §15.4 step 6: how the AI checks reach OMA (tests pass a fake). */
   omaFetcher?: typeof fetch;
 }
@@ -70,6 +74,7 @@ const TYPES: Record<string, string> = { ".html": "text/html; charset=utf-8", ".j
 export function createApp({ config, store, sessions, observer, deployments, versions, env: envVars, peer, keys, onboarding, drift, briefs, ...deps }: Dependencies): Hono {
   const workbenchKey = deps.workbenchKey ?? new WorkbenchKey(store, config.workbenchApiKeyFile, undefined);
   const workbench = deps.workbench ?? new WorkbenchAdmin(config.workbenchUrl, () => workbenchKey.value());
+  const deployerSettings = deps.deployerSettings ?? new DeployerSettings(store, undefined, {});
   const throttle = new LoginThrottle();
   const api = new Hono();
   // /mcp calls the API in-process as the key's principal: a one-time nonce with this process's secret, never from outside.
@@ -269,6 +274,41 @@ export function createApp({ config, store, sessions, observer, deployments, vers
       const saved = store.saveEnvironment(change.environment, change.base, actorOf(p), { ...(typeof body.note === "string" && body.note.trim() ? { note: body.note.trim() } : {}) });
       return c.json({ revision: saved.revision, changes: saved.changes, savedAt: saved.savedAt });
     } catch (error) { return environmentError(c, error); }
+  });
+
+  // D45: the Deployer's own settings. deployer.env wins; what the page saves applies at the next start.
+  const deployerSettingsView = () => ({
+    settings: deployerSettings.rows(), pending: deployerSettings.pending(), canRestart: !!deps.restart, startedAt: STARTED_AT,
+    workbenchKey: { source: workbenchKey.source(), canSet: workbenchKey.canSet() },
+  });
+  api.get("/api/deployer-settings", async (c) => {
+    const p = await authenticate(c, "admin");
+    if (p instanceof Response) return p;
+    return c.json(deployerSettingsView());
+  });
+  api.put("/api/deployer-settings", async (c) => {
+    const p = await setupAdmin(c);
+    if (p instanceof Response) return p;
+    const body = await c.req.json().catch(() => ({})) as { changes?: unknown };
+    const changes = Array.isArray(body.changes) ? body.changes as { key?: unknown; value?: unknown }[] : [];
+    if (!changes.length || changes.some((x) => typeof x?.key !== "string" || (x.value !== null && typeof x.value !== "string"))) return reject(c, 400, "settings/invalid", "Send changes as [{ key, value }], value a string or null.");
+    try {
+      const changed = deployerSettings.save(changes as { key: string; value: string | null }[], actorOf(p));
+      return c.json({ changed, ...deployerSettingsView() });
+    } catch (error) {
+      if (error instanceof SettingsError) return reject(c, 400, "settings/invalid", error.message, error.details);
+      throw error;
+    }
+  });
+  api.post("/api/deployer-settings/restart", async (c) => {
+    const p = await setupAdmin(c);
+    if (p instanceof Response) return p;
+    if (!deps.restart) return reject(c, 409, "settings/no-restart", "This Deployer does not run from its image, so it cannot restart itself: restart it where it runs.");
+    const active = store.activeJobs();
+    if (active.length) return reject(c, 409, "settings/busy", `Wait for the running jobs to end: ${active.map((j) => j.id).join(", ")}.`);
+    store.audit(actorOf(p), "deployer.restart", "deployer", { pending: deployerSettings.rows().filter((r) => r.pending).map((r) => r.key) });
+    deps.restart();
+    return c.json({ restarting: true }, 202);
   });
 
   // §15 (D41): the first setup, up to Workbench and its API key. The state is worked out on every call.

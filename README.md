@@ -59,6 +59,17 @@ Node 22.18 起直接运行 `.ts`（类型剥离），服务端不需要构建；
 | `DEPLOYER_RELEASE_REPO` / `DEPLOYER_RELEASE_TAG` | 无 / `v{version}` | D39：Overview 上 Deployer 版本下拉框的来源，写成 `github:owner/name`（以后加 `bitbucket:`）；不设就手填版本 |
 | `DEPLOYER_GITHUB_API` | `https://api.github.com` | Deployer 读的 GitHub API：列 tag、查 Release、下载附件、读 `release.json` 和 `.env.example`（测试或本地试用时换成替身）；执行器对应 `EXECUTOR_GITHUB_API` |
 
+**在页面上改（D45）**：admin 在 Environment variables 页的 "Deployer" 卡片里改 Deployer 自己的设置。分三类：
+
+- **只能在 `deployer.env` 里改**：加密密钥、对比密钥、紧急密码哈希、`DEPLOYER_PEER_KEY_SHA256`、`DEPLOYER_SECURE_COOKIES`，以及监听地址、端口、base path、状态目录、`environment.json`。Deployer 打开状态库、认人之前就要用到它们，所以页面上只显示，密钥类只显示有没有设。`DEPLOYER_OBSERVE_URLS`、`DEPLOYER_GITHUB_API`、两个目录只用于开发，页面上不列。
+- **页面上可以改**：Workbench 的两个地址、`RELEASE_REPO` / `RELEASE_TAG`、`ISSUE_REPO`、OMA 的地址和各个 id、两个 Builder 地址、`UAT_URL`、`BRIEF_HOUR`。值存在状态库里，每次修改都记进审计。
+- **令牌（各个 `*_FILE`）**：在页面上贴入，用 `DEPLOYER_CREDENTIAL_ENCRYPTION_KEY` 加密保存，之后不再显示。
+
+规则：
+- `deployer.env` 里设了值（非空）的，以文件为准，页面上不能改；要改到页面上，先从文件里删掉那一行，再重启。
+- Deployer 的各部分在启动时装配一次，所以页面上保存的值下次启动才生效。页面会标出"下次启动生效"，并提供 "Restart the Deployer" 按钮：Deployer 自己退出，由容器的重启策略（`restart: unless-stopped`）拉起来，页面等它回来后刷新。这个按钮只在镜像里可用（`DEPLOYER_RESTART_BY_EXIT=true`），有任务在跑时拒绝。
+- Workbench API key 照旧（§15.6 ③）：贴入时先拿 Workbench 校验，立即生效。
+
 ### 认人与授权（§9）
 
 - 每个请求都把浏览器带来的 Workbench cookie（只转发 `open_atlas_workbench_session` 与 `open_atlas_workbench_csrf`）发给 Workbench `GET /api/workbench/session`，用 W1 返回的 `groups` 授权。用户被停用、移出组，下一个请求就生效。

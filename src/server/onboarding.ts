@@ -19,7 +19,7 @@ import { isKey } from "./keys.ts";
 import { sessionOutcome, type OmaSessions } from "./oma.ts";
 import { isProd } from "./plan.ts";
 import type { Job, Store } from "./store.ts";
-import { readToken } from "./versions.ts";
+import { readToken, type TokenSource } from "./versions.ts";
 
 export class OnboardingError extends Error {
   readonly status: 400 | 403 | 404 | 409 | 503;
@@ -81,10 +81,10 @@ export interface OnboardingOptions {
   /** The Onboarding Assessor's sessions (isolated Environment); none: assessments cannot start. */
   oma: OmaSessions | undefined;
   githubApi: string;
-  githubTokenFile: string | undefined;
+  githubTokenFile: TokenSource;
   /** The Deployer's own repository and the token that may open issues there (D23). */
   issueRepo: string | undefined;
-  issueTokenFile: string | undefined;
+  issueTokenFile: TokenSource;
   /** Where env templates of registered apps are written (the Deployer keeps them, D28). */
   templatesDir: string;
   /** Workbench host where the page lives, for links in issues. */

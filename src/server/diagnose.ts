@@ -4,7 +4,7 @@
 // the deployment record shows it. The Agent may read more through the Deployer's read-only MCP tools (its service
 // key is in OMA's Vault). Without OMA configured there is no diagnosis; deploys work the same.
 
-import { readToken } from "./versions.ts";
+import { readToken, type TokenSource } from "./versions.ts";
 import type { Job, Store } from "./store.ts";
 
 export interface Diagnosis {
@@ -22,7 +22,7 @@ export interface Diagnosis {
 
 export interface OmaSessionConfig {
   url: string;
-  keyFile: string | undefined;
+  keyFile: TokenSource;
   agent: string;
   environment?: string;
   vaults?: string[];
