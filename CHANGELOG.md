@@ -3,6 +3,29 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
+## 0.2.4
+
+Executor 0.7.3, unchanged.
+
+- The Deployer's own settings on the page (D45): Environment variables has a "Deployer" card for administrators.
+  - What the Deployer needs before it opens its state database stays in `deployer.env` and is only shown there: the
+    credential and compare keys and the emergency password hash (shown only as set or not), the peer key hashes,
+    secure cookies, where it listens, its base path, data directory and `environment.json`.
+  - Workbench's addresses, the release and issue repositories, OMA's address and ids, the Builder addresses, UAT's
+    address and the daily brief's hour can be set there. They are kept in the state database, checked together before
+    any is kept, and each change goes to the audit.
+  - Tokens (the `*_FILE` settings) are pasted there, kept sealed with `DEPLOYER_CREDENTIAL_ENCRYPTION_KEY` and never
+    shown again. The Workbench API key works as before: checked against Workbench and in effect at once.
+  - A value set in `deployer.env` wins and the page cannot change it: remove the line there to set it on the page.
+  - A change applies at the next start. The page marks what is waiting and can restart the Deployer: it exits and the
+    container's restart policy (`restart: unless-stopped`) starts it again; refused while a job is running. Only in
+    the image (`DEPLOYER_RESTART_BY_EXIT=true`).
+
+**Tried before this release**
+- On a test container built from this version (no Workbench, the emergency account): a batch with a bad value is
+  refused as a whole, a token never comes back, the restart came back in 2 seconds through the restart policy, and
+  the saved values were in effect afterwards while the file's value still won.
+
 ## 0.2.3
 
 Executor 0.7.3, unchanged; only the page changed.
