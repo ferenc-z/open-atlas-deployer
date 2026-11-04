@@ -15,6 +15,11 @@ mkdir -p "$base/releases/$version"
 for f in deployer_executor.py launch.sh switch install.sh open-atlas-deployer-executor.service executor.env.example; do
   [ -f "$here/$f" ] && cp "$here/$f" "$base/releases/$version/"
 done
+# From the source (S18): the release file is deployer_executor.py with executor_core.py bundled in, as package.sh makes it.
+if grep -q "^from executor_core import" "$here/deployer_executor.py"; then
+  python3 "$here/bundle.py" "$here/deployer_executor.py" "$base/releases/$version/deployer_executor.py"
+  chmod 644 "$base/releases/$version/deployer_executor.py"
+fi
 install -m 755 "$here/launch.sh" "$base/launch.sh"
 install -m 755 "$here/switch" "$base/switch"
 ln -sfn "releases/$version" "$base/current.tmp" && mv -T "$base/current.tmp" "$base/current"

@@ -3,7 +3,9 @@
     python3 -m unittest executor/test_deployer_executor.py
 """
 import json
+import os
 import pathlib
+import shutil
 import sys
 import tempfile
 import unittest
@@ -672,6 +674,163 @@ class DeployerUpgradeTest(unittest.TestCase):
         self.ex.deliver_pending()
         self.assertEqual(self.api.status["deployer-upgrade-0010"]["state"], "succeeded")
         self.assertFalse(list(self.ex.pending_dir().glob("*.json")))
+
+
+HERE = pathlib.Path(__file__).resolve().parent
+# The executor that hosts run today, as released (executor-v0.7.3): it predates executor_core.py.
+OLD_RELEASE = HERE / "testdata" / "deployer_executor-0.7.3.py"
+# config() reads EXECUTOR_* from the process environment unless given another (non-empty) one.
+NO_ENV = {"HOME": "/nonexistent"}
+
+
+def load_module(path, name):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    before, sys.dont_write_bytecode = sys.dont_write_bytecode, True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = before
+    return module
+
+
+def ran(returncode=0, stdout=""):
+    return type("P", (), {"returncode": returncode, "stdout": stdout, "stderr": ""})()
+
+
+class BundledReleaseTest(unittest.TestCase):
+    """S18: the release file is the source with executor_core.py in place of its import block."""
+
+    def test_the_bundled_file_stands_alone_and_says_its_version_once(self):
+        import bundle
+        import re
+        code = bundle.bundle(HERE / "deployer_executor.py")
+        self.assertNotRegex(code, r"(?m)^\s*(from|import)\s+executor_core\b")
+        self.assertEqual(re.findall(r'(?m)^VERSION = "([^"]+)"', code), [dx.VERSION])
+        self.assertIn("class ProtocolExecutor", code)
+        with tempfile.TemporaryDirectory() as d:
+            (pathlib.Path(d) / "deployer_executor.py").write_text(code)
+            m = load_module(pathlib.Path(d) / "deployer_executor.py", "bundled_deployer_executor")
+        self.assertEqual(m.Executor(cfg(d)).version, dx.VERSION)
+        self.assertEqual(m.KINDS, dx.KINDS)
+
+
+@unittest.skipUnless(all(shutil.which(c) for c in ("sh", "tar", "sha256sum")) and hasattr(os, "symlink"), "needs sh, tar, sha256sum")
+class OldExecutorUpgradeTest(unittest.TestCase):
+    """S18: an installed 0.7.x takes the release package.sh makes now, and the new executor keeps its token and registration."""
+
+    def setUp(self):
+        import subprocess
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = root = pathlib.Path(self.tmp.name)
+        self.devnull = open(os.devnull, "w")
+        self.addCleanup(self.devnull.close)
+        self.old = load_module(OLD_RELEASE, "deployer_executor_0_7_3")
+        # This source, released as 0.8.0 by its own package.sh.
+        src = root / "src"
+        src.mkdir()
+        for f in ("deployer_executor.py", "executor_core.py", "bundle.py", "package.sh", *dx.PACKAGE_FILES[1:]):
+            shutil.copy2(HERE / f, src / f)
+        code = (src / "deployer_executor.py").read_text()
+        (src / "deployer_executor.py").write_text(code.replace(f'VERSION = "{dx.VERSION}"', 'VERSION = "0.8.0"', 1))
+        self.source = root / "source"
+        subprocess.run(["sh", str(src / "package.sh"), str(self.source / "executor-v0.8.0")], check=True, capture_output=True,
+                       env=dict(os.environ, PYTHON=sys.executable))
+        # The host as install.sh left it with 0.7.3.
+        self.base = root / "base"
+        (self.base / "releases" / "0.7.3").mkdir(parents=True)
+        shutil.copy2(OLD_RELEASE, self.base / "releases" / "0.7.3" / "deployer_executor.py")
+        shutil.copy2(HERE / "launch.sh", self.base / "launch.sh")
+        (self.base / "current").symlink_to("releases/0.7.3")
+        (root / "executor.token").write_text("dpe_host-token\n")
+        self.env_file = root / "executor.env"
+        self.env_file.write_text("\n".join([
+            f"EXECUTOR_ROOT={root / 'apps'}", "EXECUTOR_DEPLOYER_URL=https://deployer.test", f"EXECUTOR_TOKEN_FILE={root / 'executor.token'}",
+            f"EXECUTOR_WORK={root / 'work'}", f"EXECUTOR_BASE={self.base}", f"EXECUTOR_UPGRADE_FROM={self.source}",
+            "EXECUTOR_REGISTRIES=ghcr.io/acme localhost:5000", "EXECUTOR_DB_DUMP_SHOP=docker exec shop-db pg_dump",
+            "EXECUTOR_DEPLOYER_DIR=/srv/deployer", "EXECUTOR_DEPLOYER_IMAGE=localhost:5000/open-atlas-deployer", ""]))
+        self.api = FakeApi()
+        self.old_ex = self.old.Executor(self.old.config(self.env_file, environ=NO_ENV), out=self.devnull, api=self.api)
+        self.old_ex.sleep = lambda s: None
+        self.old_ex.sh = lambda args, **kw: ran(1)  # no Docker here: the state report is skipped
+
+    def upgrade_and_start(self):
+        """0.7.3 upgrades itself; then the release `current` points at starts as systemd would, through its self-check."""
+        self.api.queue.append({"protocol": 2, "id": "upgrade-0001", "kind": "executor-upgrade", "version": "0.8.0"})
+        with self.assertRaises(self.old.Restarting):
+            self.old_ex.run_once()
+        new = load_module(self.base / "current" / "deployer_executor.py", "deployer_executor_0_8_0")
+        new_ex = new.Executor(new.config(self.env_file, environ=NO_ENV), out=self.devnull, api=self.api)
+        new_ex.sleep = lambda s: None
+        new_ex.sh = lambda args, **kw: ran(0, "27.3.1\n")
+        new_ex.selfcheck()
+        new_ex.finish_upgrade()
+        return new, new_ex
+
+    def test_an_installed_0_7_3_takes_the_new_release_and_the_new_one_reports_success(self):
+        import subprocess
+        new, _ = self.upgrade_and_start()
+        self.assertEqual(os.readlink(self.base / "current"), "releases/0.8.0")
+        installed = self.base / "releases" / "0.8.0"
+        self.assertEqual(sorted(p.name for p in installed.iterdir()), sorted(self.old.PACKAGE_FILES), "the files 0.7.3 knows, no executor_core.py beside")
+        self.assertEqual(new.VERSION, "0.8.0")
+        self.assertTrue(issubclass(new.Executor, new.ProtocolExecutor))
+        status = self.api.status["upgrade-0001"]
+        self.assertEqual((status["state"], status["message"]), ("succeeded", "Executor upgraded from 0.7.3 to 0.8.0"))
+        self.assertNotIn("note", status["result"], "launch.sh did not change")
+        self.assertFalse((self.root / "work" / "upgrade-pending").exists(), "the new release passed its self-check")
+        # As launch.sh starts it: python3 <current>/deployer_executor.py, isolated from this directory.
+        p = subprocess.run([sys.executable, "-I", "-B", str(self.base / "current" / "deployer_executor.py"), "check", "--env-file", str(self.env_file)],
+                           capture_output=True, text=True, cwd=str(self.root), env={"PATH": os.environ.get("PATH", "")})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(json.loads(p.stdout)["deployer_url"], "https://deployer.test")
+
+    def test_the_new_executor_keeps_the_hosts_token_and_registers_as_before(self):
+        new, new_ex = self.upgrade_and_start()
+        old_cfg, new_cfg = self.old.config(self.env_file, environ=NO_ENV), new.config(self.env_file, environ=NO_ENV)
+        self.assertEqual({k: str(v) for k, v in new_cfg.items()}, {k: str(v) for k, v in old_cfg.items()}, "the same executor.env means the same")
+
+        # The first beat after the upgrade and an ordinary one say what 0.7.3 said, apart from the version.
+        def same(beat):
+            return {k: v for k, v in beat.items() if k not in ("version", "at", "pid")}
+        selfcheck_beat = next(b for b in reversed(self.api.beats) if b["version"] == "0.8.0")
+        self.assertEqual(same(selfcheck_beat), same(self.old_ex.beat_body(None, {})))
+        self.old_ex.heartbeat()
+        new_ex.heartbeat(busy=None)
+        old_beat, new_beat = self.api.beats[-2], self.api.beats[-1]
+        self.assertEqual((old_beat["version"], new_beat["version"]), ("0.7.3", "0.8.0"))
+        self.assertEqual(same(new_beat), same(old_beat))
+        self.assertEqual(new_beat["kinds"], old_beat["kinds"])
+        self.assertEqual(new_beat["protocols"], [2])
+        self.assertEqual(new_beat["databaseBackup"], {"shop": {"dump": True, "restore": False}})
+
+        # Over the wire: the same URL, method and dpe_ token; only the user agent's version moves.
+        from unittest import mock
+        sent = []
+
+        class Answer:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return b'{"ok": true}'
+
+        def urlopen(req, timeout=None, context=None):
+            sent.append((req.full_url, req.get_method(), req.get_header("Authorization"), req.get_header("User-agent"), json.loads(req.data)))
+            return Answer()
+        with mock.patch("urllib.request.urlopen", urlopen):
+            self.old.Executor(old_cfg, out=self.devnull).api.heartbeat({"beat": 1})
+            new.Executor(new_cfg, out=self.devnull).api.heartbeat({"beat": 1})
+        self.assertEqual(sent[0][:3], ("https://deployer.test/executor/v1/heartbeat", "POST", "Bearer dpe_host-token"))
+        self.assertEqual(sent[1][:3], sent[0][:3])
+        self.assertEqual((sent[0][3], sent[1][3]), ("open-atlas-deployer-executor/0.7.3", "open-atlas-deployer-executor/0.8.0"))
 
 
 class FragmentTest(unittest.TestCase):

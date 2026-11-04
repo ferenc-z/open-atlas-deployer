@@ -2,6 +2,8 @@
 # Builds the executor's release (design §8.6): <out>/open-atlas-deployer-executor-<version>.tar.gz and SHA256SUMS.
 # Attach both to the GitHub release executor-v<version>, or copy them to <directory>/executor-v<version>/ for hosts
 # whose EXECUTOR_UPGRADE_FROM is a directory. A first installation unpacks the same archive and runs its install.sh.
+# deployer_executor.py goes in bundled with executor_core.py (bundle.py, S18): the archive keeps the same files, so
+# installed executors of any version accept it. Needs python3 (or $PYTHON).
 #   executor/package.sh <out directory>
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
@@ -11,7 +13,8 @@ name=open-atlas-deployer-executor-$version
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 mkdir "$tmp/$name"
-for f in deployer_executor.py launch.sh switch install.sh open-atlas-deployer-executor.service executor.env.example; do
+"${PYTHON:-python3}" "$here/bundle.py" "$here/deployer_executor.py" "$tmp/$name/deployer_executor.py"
+for f in launch.sh switch install.sh open-atlas-deployer-executor.service executor.env.example; do
   cp "$here/$f" "$tmp/$name/"
 done
 chmod 755 "$tmp/$name/launch.sh" "$tmp/$name/switch" "$tmp/$name/install.sh"

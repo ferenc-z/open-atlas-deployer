@@ -39,12 +39,15 @@ Deployer, backs up its state directory, switches the image in the project's .env
 become healthy and answer the heartbeat as that version. Otherwise the previous image comes back with the state from
 before. The Deployer is down meanwhile, so statuses it could not take are kept and sent once it answers again.
 
+Protocol 2, registration and the executor's own upgrade live in executor_core.py, shared with the service executor
+(S18); this file adds the deploy jobs. The release holds one file: package.sh puts executor_core's code in place of
+the import block below (bundle.py).
+
 Standard library only; Python 3.9 (Rocky 9's python3).
 """
 import base64
 import datetime as dt
 import hashlib
-import io
 import json
 import os
 import pathlib
@@ -54,26 +57,28 @@ import shutil
 import subprocess
 import sys
 import tarfile
-import threading
 import time
 import urllib.error
 import urllib.request
 
+# >>> executor_core
+# The protocol, registration and self-upgrade every executor shares (executor_core.py, S18). package.sh (bundle.py) puts
+# that module's code in place of this block, so a release stays one file that launch.sh runs as it is.
+from executor_core import (  # noqa: F401
+    FINAL, ID_RE, KEEP_RELEASES, PROTOCOLS, REPO_RE, SHA256_RE, VERSION_RE, DeployerApi, Failed, ProtocolExecutor,
+    Refused, Restarting, load_env_file, now_iso, version_key, write_json)
+# <<< executor_core
+
 VERSION = "0.7.3"
-PROTOCOLS = [2]
 # Job kinds, plus what a deploy may ask for (bundle files, migrations): an older executor is not sent those.
 KINDS = ["build", "deploy", "env", "env-read", "bundle", "db-migration", "executor-upgrade", "deployer-upgrade"]
 ENV_FILE_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*\.env$")
 ENV_MAX_BYTES = 1024 * 1024
 BUILD_JSON_IN_IMAGE = "/opt/open-atlas/BUILD.json"
 APP_RE = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
-VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$")
-REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+$")
 SERVICE_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]*$")
-ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
 ASSET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 COMPONENT_RE = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
 CA_RE = re.compile(r"^(-----BEGIN CERTIFICATE-----[A-Za-z0-9+/=\s]+-----END CERTIFICATE-----\s*)+$")
 # Runs psql in the database container as the image's own superuser, on its local socket; arguments follow.
@@ -81,55 +86,9 @@ PSQL = 'exec psql -X -q -v ON_ERROR_STOP=1 -U "${POSTGRES_USER:-postgres}" -d "$
 MIGRATIONS_TABLE = ("CREATE SCHEMA IF NOT EXISTS deployer; CREATE TABLE IF NOT EXISTS deployer.migrations ("
                     "component text NOT NULL, name text NOT NULL, kind text NOT NULL, sha256 text NOT NULL, "
                     "applied_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (component, name));")
-FINAL = ("succeeded", "failed", "rolled-back", "refused")
 # The executor's release (§8.6): one directory in the archive, holding only these files.
 PACKAGE = "open-atlas-deployer-executor"
 PACKAGE_FILES = ("deployer_executor.py", "launch.sh", "switch", "install.sh", "open-atlas-deployer-executor.service", "executor.env.example")
-KEEP_RELEASES = 3
-
-
-class Refused(Exception):
-    """The request is not something this executor does; nothing was changed."""
-
-
-class Failed(Exception):
-    """A step failed after it started."""
-
-
-class Restarting(Exception):
-    """A new release is in place: the process exits so systemd starts it (§8.6)."""
-
-
-def version_key(v):
-    """Orders x.y.z[-pre]; a pre-release comes before its release."""
-    m = re.match(r"^(\d+)\.(\d+)\.(\d+)(?:-(.+))?$", v)
-    return (int(m.group(1)), int(m.group(2)), int(m.group(3)), 0 if m.group(4) else 1, m.group(4) or "")
-
-
-def now_iso():
-    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def write_json(path, value, mode=0o644):
-    path = pathlib.Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
-    os.chmod(tmp, mode)
-    os.replace(tmp, path)
-
-
-def load_env_file(path):
-    out = {}
-    if not path or not pathlib.Path(path).is_file():
-        return out
-    for line in pathlib.Path(path).read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        out[k.strip()] = v.strip().strip('"').strip("'")
-    return out
 
 
 def config(env_file=None, environ=None):
@@ -273,86 +232,31 @@ def ports_in_use(docker_ps_lines, exclude_services, project):
 
 # --- the executor -------------------------------------------------------------------------------------
 
-class DeployerApi:
-    """The executor's calls to the Deployer (protocol 2). Tests replace it."""
+class Executor(ProtocolExecutor):
+    """The deploy executor: build, deploy, env, env-read and the Deployer's own upgrade, besides executor-upgrade."""
 
-    def __init__(self, cfg):
-        self.cfg = cfg
-        self.context = None
-        if cfg["deployer_url"].startswith("https://") and cfg["ca_file"]:
-            import ssl
-            self.context = ssl.create_default_context(cafile=cfg["ca_file"])
+    PACKAGE = PACKAGE
+    PACKAGE_FILES = PACKAGE_FILES
+    MAIN = "deployer_executor.py"
+    KINDS = KINDS
+    JOBS = {**ProtocolExecutor.JOBS, "build": "build", "deploy": "deploy", "env": "env_write", "env-read": "env_read",
+            "deployer-upgrade": "deployer_upgrade"}
+    INTERRUPTED = "The executor stopped while this job ran; check the app before deploying again."
 
-    def token(self):
-        f = self.cfg["executor_token_file"]
-        return pathlib.Path(f).read_text().strip() if f and pathlib.Path(f).is_file() else ""
-
-    def call(self, method, path, body=None, text=None, timeout=30):
-        if not self.cfg["deployer_url"]:
-            raise Failed("EXECUTOR_DEPLOYER_URL is not set")
-        data, headers = None, {"authorization": f"Bearer {self.token()}", "user-agent": f"open-atlas-deployer-executor/{VERSION}"}
-        if body is not None:
-            data, headers["content-type"] = json.dumps(body).encode(), "application/json"
-        elif text is not None:
-            data, headers["content-type"] = text.encode(), "text/plain; charset=utf-8"
-        req = urllib.request.Request(self.cfg["deployer_url"] + path, data=data, method=method, headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=timeout, context=self.context) as r:
-                raw = r.read()
-                return json.loads(raw) if raw and r.status != 204 else None
-        except urllib.error.HTTPError as e:
-            raise Failed(f"the Deployer answered {method} {path.split('?')[0]} with HTTP {e.code}: {e.read()[:300].decode('utf-8', 'replace')}")
-        except (urllib.error.URLError, OSError) as e:
-            raise Failed(f"cannot reach the Deployer at {self.cfg['deployer_url']}: {getattr(e, 'reason', e)}")
-
-    def heartbeat(self, beat):
-        return self.call("POST", "/executor/v1/heartbeat", body=beat)
-
-    def next_job(self, wait):
-        r = self.call("GET", f"/executor/v1/jobs/next?wait={int(wait)}", timeout=wait + 30)
-        return r["job"] if r else None
-
-    def put_status(self, job_id, status):
-        self.call("PUT", f"/executor/v1/jobs/{job_id}/status", body=status)
-
-    def append_log(self, job_id, text):
-        self.call("POST", f"/executor/v1/jobs/{job_id}/log", text=text)
-
-    def put_env_content(self, job_id, text):
-        self.call("PUT", f"/executor/v1/jobs/{job_id}/env-content", text=text)
-
-    def report_state(self, containers, files):
-        self.call("POST", "/executor/v1/state", body={"containers": containers, "files": files})
-
-
-class Executor:
     def __init__(self, cfg, out=sys.stdout, api=None):
-        self.cfg = cfg
-        self.out = out
-        self.api = api or DeployerApi(cfg)
-        # The running job's id and its log lines not yet sent to the Deployer.
-        self.job_id = None
-        self.log_buffer = []
-        self.log_lock = threading.Lock()
+        super().__init__(cfg, out=out, api=api)
         self.last_state = 0.0
-        self.beat_lock = threading.Lock()
-        # How often a status is tried before it is kept for later (the Deployer's own upgrade tries once: it is down).
-        self.status_tries = 5
-        # A job can run for minutes (a build, a health wait); the heartbeat keeps going meanwhile.
-        self.beat_seconds = 10.0
 
-    # Host access. Tests replace these.
-    def sh(self, args, cwd=None, env=None, check=True, timeout=None, input=None, quiet=False):
-        full_env = dict(os.environ, **(env or {}))
-        if cwd:
-            full_env["PWD"] = str(cwd)
-        p = subprocess.run(args, cwd=cwd, env=full_env, capture_output=True, text=True, timeout=timeout, input=input)
-        if self.job_id:
-            output = f"[output not logged]\n" if quiet else f"{p.stdout}{p.stderr}"
-            self.log(f"$ {' '.join(shlex.quote(a) for a in args)}\n{output}[exit {p.returncode}]")
-        if check and p.returncode != 0:
-            raise Failed(f"{' '.join(args[:3])} failed (exit {p.returncode}): {(p.stderr or p.stdout).strip()[-600:]}")
-        return p
+    @property
+    def version(self):
+        # The module's VERSION, read each time: tests play a newer release by changing it.
+        return VERSION
+
+    def describe(self):
+        return f"executor {VERSION} for project {self.cfg['project']} at {self.cfg['root']}"
+
+    def check_host(self):
+        self.sh(["docker", "version", "--format", "{{.Server.Version}}"])
 
     def pipe(self, args, out=None, src=None, timeout=3600):
         """A database dump (stdout to `out`, mode 600) or restore (stdin from `src`); only messages are logged."""
@@ -368,35 +272,6 @@ class Executor:
         self.log(f"$ {' '.join(shlex.quote(a) for a in args)} {'>' if out else '<'} {out or src}\n{messages}[exit {p.returncode}]")
         if p.returncode != 0:
             raise Failed(f"{args[0]} failed (exit {p.returncode}): {messages.strip()[-400:]}")
-
-    def sleep(self, seconds):
-        time.sleep(seconds)
-
-    def log(self, text):
-        if self.job_id:
-            with self.log_lock:
-                self.log_buffer.append(text.rstrip("\n") + "\n")
-
-    def flush_log(self):
-        """Sends the buffered log lines; kept for the next try when the Deployer cannot be reached."""
-        with self.log_lock:
-            if not self.job_id or not self.log_buffer:
-                return
-            text, job_id = "".join(self.log_buffer), self.job_id
-            self.log_buffer = []
-        try:
-            self.api.append_log(job_id, text)
-        except Exception as e:
-            with self.log_lock:
-                self.log_buffer.insert(0, text)
-            self.say(f"cannot send the log of {job_id}: {e}")
-
-    def say(self, msg):
-        print(f"{now_iso()} {msg}", file=self.out, flush=True)
-
-    def token(self):
-        f = self.cfg["token_file"]
-        return pathlib.Path(f).read_text().strip() if f and pathlib.Path(f).is_file() else ""
 
     def git_env(self):
         """Authentication for git over HTTPS through the environment, never on the command line."""
@@ -417,44 +292,21 @@ class Executor:
     def compose(self, *args, check=True, quiet=False, file="compose.yaml", input=None):
         return self.sh(["docker", "compose", "-p", self.cfg["project"], "-f", file, *args], cwd=self.cfg["root"], check=check, quiet=quiet, input=input)
 
-    def http_get(self, url, accept, auth=True):
-        """GitHub's API. A redirect (an asset's download URL) is followed without the token."""
-        class NoRedirect(urllib.request.HTTPRedirectHandler):
-            def redirect_request(self, *args, **kwargs):
-                return None
-        token = self.token() if auth else ""
-        headers = {"Accept": accept, "User-Agent": "open-atlas-deployer-executor", **({"Authorization": f"Bearer {token}"} if token else {})}
-        opener = urllib.request.build_opener(NoRedirect)
-        try:
-            with opener.open(urllib.request.Request(url, headers=headers), timeout=300) as r:
-                return r.read()
-        except urllib.error.HTTPError as e:
-            if e.code in (301, 302, 303, 307, 308) and e.headers.get("Location"):
-                return self.http_get(e.headers["Location"], accept, auth=False)
-            raise Failed(f"GET {url.split('?')[0]} failed: HTTP {e.code}")
-        except urllib.error.URLError as e:
-            raise Failed(f"GET {url.split('?')[0]} failed: {e.reason}")
-
     # --- the loop -----------------------------------------------------------------------------------
 
     def heartbeat(self, busy=None):
         db = {app: {"dump": "dump" in v, "restore": "restore" in v} for app, v in self.cfg["db"].items()}
-        with self.beat_lock:
-            try:
-                self.api.heartbeat(self.beat_body(busy, db))
-            except Exception as e:  # the Deployer may be restarting; the next beat tries again
-                self.say(f"heartbeat failed: {e}")
+        self.send_beat(self.beat_body(busy, db))
 
-    def beat_body(self, busy, db):
-        source = self.cfg["upgrade_from"]
-        return {
-            "version": VERSION, "protocols": PROTOCOLS, "kinds": KINDS, "at": now_iso(), "pid": os.getpid(), "root": str(self.cfg["root"]),
-            "project": self.cfg["project"], "registries": self.cfg["registries"], "databaseBackup": db, "busy": busy,
-            # §8.6: whether this host can upgrade its executor, and from what kind of source (never the source itself).
-            "upgradeFrom": ("directory" if source.startswith("/") else "github") if source else None,
+    def beat_body(self, busy, db=None):
+        body = super().beat_body(busy)
+        body.update({
+            "root": str(self.cfg["root"]), "project": self.cfg["project"], "registries": self.cfg["registries"],
+            "databaseBackup": db if db is not None else {},
             # D16: this host runs the Deployer and can upgrade it.
             "deployer": {"image": self.cfg["deployer_image"]} if self.cfg["deployer_dir"] and self.cfg["deployer_image"] else None,
-        }
+        })
+        return body
 
     def report_state(self, force=False):
         """The project's containers on this host, for the status page."""
@@ -477,264 +329,6 @@ class Executor:
             if path.is_file() and path.parent.name != "deployer" and (path.suffix != ".env" or ENV_FILE_RE.match(path.name)):
                 out[str(path.relative_to(root)).replace(os.sep, "/")] = hashlib.sha256(path.read_bytes()).hexdigest()
         return out
-
-    def current_marker(self):
-        return self.cfg["work"] / "current-job.json"
-
-    def recover(self):
-        """A job left running by a previous process was interrupted: say so instead of leaving it running."""
-        marker = self.current_marker()
-        if not marker.is_file():
-            return
-        status = json.loads(marker.read_text())
-        if status.get("state") not in FINAL:
-            status.update(state="failed", finishedAt=now_iso(),
-                          message="The executor stopped while this job ran; check the app before deploying again.")
-            self.api.put_status(status["id"], status)
-        marker.unlink()
-
-    def pending_dir(self):
-        return self.cfg["work"] / "pending"
-
-    def keep_pending(self, status, log=""):
-        """A status (and log) the Deployer could not take: sent again once it answers (deliver_pending)."""
-        path = self.pending_dir() / f"{status['id']}.json"
-        kept = json.loads(path.read_text()) if path.is_file() else {"log": ""}
-        write_json(path, {"status": status, "log": kept.get("log", "") + log}, mode=0o600)
-
-    def deliver_pending(self):
-        d = self.pending_dir()
-        if not d.is_dir():
-            return
-        for path in sorted(d.glob("*.json")):
-            kept = json.loads(path.read_text())
-            try:
-                if kept.get("log"):
-                    self.api.append_log(kept["status"]["id"], kept["log"])
-                    kept["log"] = ""
-                    write_json(path, kept, mode=0o600)
-                self.api.put_status(kept["status"]["id"], kept["status"])
-            except Exception as e:
-                self.say(f"cannot send the kept status of {kept['status']['id']} yet: {e}")
-                return
-            path.unlink()
-            self.say(f"sent the kept status of {kept['status']['id']}: {kept['status'].get('state')}")
-
-    def run_once(self, wait=0):
-        self.deliver_pending()
-        self.heartbeat()
-        self.report_state()
-        request = self.api.next_job(wait)
-        if not request:
-            return False
-        self.handle(request)
-        self.report_state(force=True)
-        return True
-
-    def serve(self):
-        self.say(f"executor {VERSION} for project {self.cfg['project']} at {self.cfg['root']}")
-        self.cfg["work"].mkdir(parents=True, exist_ok=True)
-        self.recover()
-        self.selfcheck()
-        self.finish_upgrade()
-        self.deliver_pending()
-        while True:
-            try:
-                # The long poll waits at the Deployer; a heartbeat thread keeps the host online meanwhile.
-                self.run_once(wait=self.cfg["wait_seconds"])
-            except Restarting as e:
-                self.say(str(e))
-                return
-            except Exception as e:  # keep serving; the job itself already recorded its failure
-                self.say(f"error: {e}")
-                self.sleep(self.cfg["poll_seconds"])
-
-    def selfcheck(self):
-        """After an upgrade, launch.sh counts starts until this clears the marker (§8.6)."""
-        self.sh(["docker", "version", "--format", "{{.Server.Version}}"])
-        if not self.cfg["deployer_url"] or not self.api.token():
-            raise SystemExit("EXECUTOR_DEPLOYER_URL and EXECUTOR_TOKEN_FILE (this host's dpe_ token) are required")
-        # The Deployer may be starting or restarting: wait for it rather than exit. A refused token stops here.
-        waited = 0
-        while True:
-            try:
-                self.api.heartbeat(self.beat_body(None, {}))
-                break
-            except Failed as e:
-                if "HTTP 401" in str(e):
-                    raise SystemExit(f"the Deployer refused this host's token: {e}")
-                if waited % 30 == 0:
-                    self.say(f"waiting for the Deployer: {e}")
-                self.sleep(5)
-                waited += 5
-        marker = self.cfg["work"] / "upgrade-pending"
-        if marker.exists():
-            marker.unlink()
-            self.say("upgrade self-check passed")
-
-    # --- one job --------------------------------------------------------------------------------------
-
-    def handle(self, request):
-        job_id = str(request.get("id", ""))
-        if not ID_RE.match(job_id):
-            self.say(f"refused a job with the id {job_id[:80]!r}")
-            return
-        self.job_id = job_id
-        self.log_buffer = []
-        status = {"protocol": 2, "id": job_id, "state": "running", "startedAt": now_iso(), "steps": [], "result": {}}
-        done = threading.Event()
-        beating = threading.Thread(target=self.keep_beating, args=(done, job_id), daemon=True)
-        beating.start()
-        try:
-            status.update(kind=request.get("kind"), app=request.get("app"), version=request.get("version"))
-            self.write_status(status)
-            self.heartbeat(busy=job_id)
-            if request.get("protocol") not in PROTOCOLS:
-                raise Refused(f"protocol {request.get('protocol')} is not supported (this executor speaks {PROTOCOLS})")
-            if request.get("kind") == "build":
-                self.build(request, status)
-            elif request.get("kind") == "deploy":
-                self.deploy(request, status)
-            elif request.get("kind") == "env":
-                self.env_write(request, status)
-            elif request.get("kind") == "env-read":
-                self.env_read(request, status)
-            elif request.get("kind") == "executor-upgrade":
-                self.upgrade(request, status)
-            elif request.get("kind") == "deployer-upgrade":
-                self.deployer_upgrade(request, status)
-            else:
-                raise Refused(f"unknown job kind {request.get('kind')}")
-        except Restarting:
-            raise
-        except Refused as e:
-            self.finish(status, "refused", str(e))
-        except Exception as e:
-            if status["state"] not in FINAL:
-                self.finish(status, "failed", str(e))
-        finally:
-            done.set()
-            beating.join()
-            self.flush_log()
-            with self.log_lock:
-                unsent, self.log_buffer = "".join(self.log_buffer), []
-            if unsent:
-                self.keep_pending(status, unsent)
-            self.status_tries = 5
-            self.job_id = None
-            self.current_marker().unlink(missing_ok=True)
-            self.heartbeat()
-
-    def keep_beating(self, done, busy):
-        while not done.wait(self.beat_seconds):
-            self.heartbeat(busy=busy)
-            self.flush_log()
-
-    def write_status(self, status):
-        """To the Deployer, and to a local marker so a restart can say the job was interrupted."""
-        self.cfg["work"].mkdir(parents=True, exist_ok=True)
-        write_json(self.current_marker(), status, mode=0o600)
-        self.flush_log()
-        for attempt in range(self.status_tries):
-            try:
-                self.api.put_status(status["id"], status)
-                kept = self.pending_dir() / f"{status['id']}.json"
-                if kept.is_file():
-                    # Taken now; a log kept earlier still goes out with the next delivery.
-                    if json.loads(kept.read_text()).get("log"):
-                        self.keep_pending(status)
-                    else:
-                        kept.unlink()
-                return
-            except Exception as e:
-                if attempt == self.status_tries - 1:
-                    self.say(f"cannot send the status of {status['id']}, kept for later: {e}")
-                    self.keep_pending(status)
-                else:
-                    self.sleep(2)
-
-    def step(self, status, name, state="running", message=None):
-        steps = status["steps"]
-        if steps and steps[-1]["state"] == "running" and state == "running":
-            steps[-1]["state"] = "done"
-        if state == "running":
-            steps.append({"name": name, "state": "running", "at": now_iso()})
-        else:
-            for s in reversed(steps):
-                if s["name"] == name:
-                    s["state"] = state
-                    if message:
-                        s["message"] = message
-                    break
-        self.write_status(status)
-        self.log(f"--- {name} {state}{': ' + message if message else ''}")
-        self.say(f"{status['id']} {name} {state}")
-
-    def finish(self, status, state, message):
-        for s in status["steps"]:
-            if s["state"] == "running":
-                s["state"] = "done" if state == "succeeded" else "failed"
-        status.update(state=state, finishedAt=now_iso(), message=message)
-        self.write_status(status)
-        self.log(f"=== {state}: {message}")
-        self.say(f"{status['id']} {state}: {message}")
-
-    # --- executor-upgrade: a newer release of this executor (§8.6, D29) -----------------------------------------
-
-    def upgrade(self, req, status):
-        """Installs the release beside the running one, points `current` at it, and exits for systemd to start it.
-        The Deployer only names the version: the code comes from EXECUTOR_UPGRADE_FROM, checked against SHA256SUMS."""
-        version, source, base = req.get("version", ""), self.cfg["upgrade_from"], self.cfg["base"]
-        if not VERSION_RE.match(version):
-            raise Refused("version is malformed")
-        if version_key(version) <= version_key(VERSION):
-            raise Refused(f"executor {VERSION} is not older than {version}; going back is `switch <version>` on the host")
-        if not source:
-            raise Refused("EXECUTOR_UPGRADE_FROM is not set on this host")
-        current = base / "current"
-        if not current.is_symlink():
-            raise Refused(f"{current} is not a link to a release: install the executor with install.sh first")
-        previous = pathlib.PurePosixPath(os.readlink(current)).name
-        name = f"{PACKAGE}-{version}.tar.gz"
-
-        self.step(status, "download")
-        archive, sums = self.release_files(source, version, name)
-        want = next((line.split()[0] for line in sums.splitlines() if line.split()[1:] in ([name], [f"*{name}"])), "")
-        got = hashlib.sha256(archive).hexdigest()
-        if not SHA256_RE.match(want):
-            raise Failed(f"SHA256SUMS of executor-v{version} does not list {name}")
-        if got != want:
-            raise Failed(f"{name} is sha256:{got}, SHA256SUMS says sha256:{want}")
-        self.log(f"{name} sha256:{got}")
-
-        self.step(status, "install")
-        files = self.package_files(archive, version)
-        target, tmp = base / "releases" / version, base / "releases" / f".{version}.tmp"
-        shutil.rmtree(tmp, ignore_errors=True)
-        tmp.mkdir(parents=True)
-        for f, data in files.items():
-            (tmp / f).write_bytes(data)
-            os.chmod(tmp / f, 0o755 if f in ("launch.sh", "switch", "install.sh") else 0o644)
-        shutil.rmtree(target, ignore_errors=True)
-        os.replace(tmp, target)
-        status["result"] = {"from": VERSION, "to": version, "previous": previous, "sha256": got}
-        launch = base / "launch.sh"
-        if "launch.sh" in files and launch.is_file() and launch.read_bytes() != files["launch.sh"]:
-            # launch.sh is what takes a failed upgrade back, so an upgrade never replaces it (install.sh does).
-            status["result"]["note"] = f"launch.sh changed in {version}: run its install.sh on the host to take it"
-
-        self.step(status, "restart")
-        work = self.cfg["work"]
-        for f in ("upgrade-starts", "upgrade-failed.json"):
-            (work / f).unlink(missing_ok=True)
-        write_json(work / "upgrade-job.json", status, mode=0o600)
-        (work / "upgrade-pending").write_text(previous)
-        link = base / "current.tmp"
-        link.unlink(missing_ok=True)
-        os.symlink(f"releases/{version}", link)
-        os.replace(link, current)
-        self.write_status(status)
-        raise Restarting(f"executor {version} installed; exiting so that systemd starts it")
 
     # --- deployer-upgrade: the Deployer's own image (§8.6, D16) ----------------------------------------------------
 
@@ -856,86 +450,6 @@ class Executor:
         else:
             self.step(status, "rollback", "done")
             self.finish(status, "rolled-back", f"{why}; back on {previous or 'the previous image'} with the state from before the upgrade")
-
-    def release_files(self, source, version, name):
-        """The release archive and its SHA256SUMS, from a directory (<dir>/executor-v<version>/) or a GitHub release."""
-        tag = f"executor-v{version}"
-        if source.startswith("/"):
-            d = pathlib.Path(source) / tag
-            if not (d / name).is_file() or not (d / "SHA256SUMS").is_file():
-                raise Failed(f"{d} does not hold {name} and SHA256SUMS")
-            return (d / name).read_bytes(), (d / "SHA256SUMS").read_text()
-        if not REPO_RE.match(source):
-            raise Refused("EXECUTOR_UPGRADE_FROM is neither an absolute directory nor owner/name")
-        release = json.loads(self.http_get(f"{self.cfg['github_api']}/repos/{source}/releases/tags/{tag}", "application/vnd.github+json"))
-        found = {a.get("name"): a for a in release.get("assets") or []}
-        for wanted in (name, "SHA256SUMS"):
-            if wanted not in found:
-                raise Failed(f"{source} release {tag} has no asset {wanted}")
-        return self.http_get(found[name]["url"], "application/octet-stream"), self.http_get(found["SHA256SUMS"]["url"], "application/octet-stream").decode()
-
-    def package_files(self, archive, version):
-        """The release's files: one directory, only the known files, regular files only; the code must say its version."""
-        top, files = f"{PACKAGE}-{version}", {}
-        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
-            for m in tar.getmembers():
-                name = m.name[2:] if m.name.startswith("./") else m.name
-                if m.isdir() and name.rstrip("/") == top:
-                    continue
-                parts = name.split("/")
-                if not m.isfile() or len(parts) != 2 or parts[0] != top or parts[1] not in PACKAGE_FILES:
-                    raise Failed(f"the release holds {m.name}, which is not one of the executor's files")
-                with tar.extractfile(m) as f:
-                    files[parts[1]] = f.read()
-        code = files.get("deployer_executor.py")
-        if code is None:
-            raise Failed("the release has no deployer_executor.py")
-        said = re.search(rb'^VERSION = "([^"]+)"', code, re.M)
-        if not said or said.group(1).decode() != version:
-            raise Failed(f"the release's deployer_executor.py is not version {version}")
-        try:
-            compile(code, "deployer_executor.py", "exec")
-        except SyntaxError as e:
-            raise Failed(f"the release's deployer_executor.py does not compile: {e}")
-        return files
-
-    def finish_upgrade(self):
-        """After the restart an upgrade asked for: whichever version runs now says how the upgrade ended."""
-        work = self.cfg["work"]
-        path, failed = work / "upgrade-job.json", work / "upgrade-failed.json"
-        if not path.is_file():
-            return
-        status = json.loads(path.read_text())
-        to = status.get("result", {}).get("to")
-        if to == VERSION:
-            state, message = "succeeded", f"Executor upgraded from {status['result'].get('from')} to {VERSION}"
-            self.prune_releases(status["result"].get("previous"))
-        else:
-            gave_up = " after three failed starts" if failed.is_file() else ""
-            state, message = "failed", f"Executor {to} did not start{gave_up}; back on {VERSION}"
-        for s in status.get("steps", []):
-            if s.get("state") == "running":
-                s["state"] = "done" if state == "succeeded" else "failed"
-        status.update(state=state, finishedAt=now_iso(), message=message)
-        for attempt in range(5):
-            try:
-                self.api.put_status(status["id"], status)
-                break
-            except Exception as e:
-                self.say(f"cannot send the status of {status['id']}: {e}")
-                self.sleep(2)
-        self.say(f"{status['id']} {state}: {message}")
-        path.unlink()
-        failed.unlink(missing_ok=True)
-
-    def prune_releases(self, previous):
-        """Keeps the running release, the one before it, and the newest few."""
-        releases = self.cfg["base"] / "releases"
-        found = sorted((d.name for d in releases.iterdir() if d.is_dir() and VERSION_RE.match(d.name)), key=version_key)
-        keep = {VERSION, previous, *found[-KEEP_RELEASES:]}
-        for name in found:
-            if name not in keep:
-                shutil.rmtree(releases / name, ignore_errors=True)
 
     # --- build: the pinned release tools' build-images.sh (§5.2) ----------------------------------------
 
