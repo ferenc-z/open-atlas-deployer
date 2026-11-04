@@ -23,7 +23,7 @@ import { OnboardingError, type Onboarding } from "./onboarding.ts";
 import type { Briefs } from "./brief.ts";
 import type { Drift } from "./drift.ts";
 import { PeerError, type Peer, type PeerStatus } from "./peer.ts";
-import { EXECUTOR_VERSION, hostIds, hostOf, newJobId, tokenSha256 } from "./handoff.ts";
+import { EXECUTOR_KINDS, EXECUTOR_VERSION, hostIds, hostOf, newJobId, tokenSha256, type ExecutorKind, type Heartbeat } from "./handoff.ts";
 import { lineDiff } from "./ingress.ts";
 import { environmentStatus, hostStateOf, parseDockerPs, type Observer } from "./observe.ts";
 import { StoreError, type Actor, type Store } from "./store.ts";
@@ -121,34 +121,40 @@ export function createApp({ config, store, sessions, observer, deployments, vers
   }
 
   // D35: the executors. Each host's executor calls in with its own token (dpe_); the Deployer never calls a host.
+  // S18: the token also says which of the host's executors calls (deploy or service); each gets only its own jobs.
   const handoff = deployments.handoff;
-  const executorHost = (c: Context): string | undefined => {
+  const executorOf = (c: Context): { host: string; executor: ExecutorKind } | undefined => {
     const bearer = /^Bearer (dpe_\S+)$/.exec(c.req.header("authorization") ?? "")?.[1];
-    return bearer ? store.executorHost(tokenSha256(bearer)) : undefined;
+    return bearer ? store.executorOf(tokenSha256(bearer)) : undefined;
   };
-  const executorRoute = (handler: (c: Context, host: string) => Promise<Response> | Response) => async (c: Context) => {
-    const host = executorHost(c);
-    if (!host) return reject(c, 401, "executor/unauthenticated", "An executor token (dpe_) of a registered host is required.");
-    return handler(c, host);
+  const executorRoute = (handler: (c: Context, host: string, kind: ExecutorKind) => Promise<Response> | Response) => async (c: Context) => {
+    const who = executorOf(c);
+    if (!who) return reject(c, 401, "executor/unauthenticated", "An executor token (dpe_) of a registered host is required.");
+    return handler(c, who.host, who.executor);
   };
-  api.post("/executor/v1/heartbeat", executorRoute(async (c, host) => {
-    handoff.heartbeat(host, await c.req.json());
-    return c.json({ ok: true, host, deployer: DEPLOYER_VERSION });
+  api.post("/executor/v1/heartbeat", executorRoute(async (c, host, kind) => {
+    const beat = await c.req.json() as Heartbeat;
+    // A deploy executor from before S18 does not say which it is.
+    const says = beat?.executor ?? "deploy";
+    if (says !== kind) return reject(c, 409, "executor/kind-mismatch", `This token is for the ${kind} executor of ${host}, but a ${says} executor sent it: issue a ${says} executor token for ${host} on the Hosts page.`);
+    handoff.heartbeat(host, beat, kind);
+    return c.json({ ok: true, host, executor: kind, deployer: DEPLOYER_VERSION });
   }));
-  api.get("/executor/v1/jobs/next", executorRoute(async (c, host) => {
+  api.get("/executor/v1/jobs/next", executorRoute(async (c, host, kind) => {
     const wait = Math.min(30, Math.max(0, Number(c.req.query("wait") ?? 0))) * 1000;
-    const job = await handoff.next(host, wait, c.req.raw.signal);
+    const job = await handoff.next(host, wait, c.req.raw.signal, kind);
     return job ? c.json({ job }) : c.body(null, 204);
   }));
-  const ownJob = (handler: (c: Context, id: string) => Promise<Response>) => executorRoute(async (c, host) => {
+  const ownJob = (handler: (c: Context, id: string) => Promise<Response>) => executorRoute(async (c, host, kind) => {
     const id = c.req.param("id") ?? "";
-    if (!handoff.owns(host, id)) return reject(c, 404, "executor/job-unknown", `${id} is not a job of ${host}.`);
+    if (!handoff.owns(host, id, kind)) return reject(c, 404, "executor/job-unknown", `${id} is not a job of the ${kind} executor of ${host}.`);
     return handler(c, id);
   });
   api.put("/executor/v1/jobs/:id/status", ownJob(async (c, id) => { handoff.putStatus(id, await c.req.json()); return c.json({ ok: true }); }));
   api.post("/executor/v1/jobs/:id/log", ownJob(async (c, id) => { handoff.appendLog(id, await c.req.text()); return c.json({ ok: true }); }));
   api.put("/executor/v1/jobs/:id/env-content", ownJob(async (c, id) => { handoff.putEnvContent(id, await c.req.text()); return c.json({ ok: true }); }));
-  api.post("/executor/v1/state", executorRoute(async (c, host) => {
+  api.post("/executor/v1/state", executorRoute(async (c, host, kind) => {
+    if (kind !== "deploy") return reject(c, 409, "executor/deploy-only", "Only a deploy executor reports containers and managed files.");
     const body = await c.req.json() as { containers?: string; files?: Record<string, string> };
     handoff.putState(host, parseDockerPs(String(body.containers ?? "")), body.files ?? {});
     return c.json({ ok: true });
@@ -482,8 +488,10 @@ export function createApp({ config, store, sessions, observer, deployments, vers
         id, address: env.hosts?.[id]?.address ?? null, executor: handoff.executor(id),
         apps: Object.keys(env.apps).filter((a) => hostOf(env, a) === id),
         report: reports.find((r) => r.host === id) ? { at: reports.find((r) => r.host === id)!.at, stale: reports.find((r) => r.host === id)!.stale, containers: reports.find((r) => r.host === id)!.containers.length } : null,
-        tokens: tokens.filter((t) => t.host === id).map(({ prefix, createdAt, createdBy, revokedAt }) => ({ prefix, createdAt, createdBy, revokedAt })),
+        tokens: tokens.filter((t) => t.host === id).map(({ executor, prefix, createdAt, createdBy, revokedAt }) => ({ executor, prefix, createdAt, createdBy, revokedAt })),
         upgrade: upgradeOf(env, id),
+        // S18: the host's service executor, once it has a token or has called in; it takes no deploy jobs.
+        service: tokens.some((t) => t.host === id && t.executor === "service") || store.executorBeat(id, "service") ? handoff.executor(id, "service") : null,
       })),
     });
   });
@@ -591,14 +599,20 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     if (isKey(p)) return reject(c, 403, "auth/browser-only", "Executor tokens are issued only to browser sessions, not API keys.");
     const host = c.req.param("id");
     if (!hostIds(deployments.environment().env).includes(host)) return reject(c, 404, "host/unknown", `${host} is not a host of this environment (environment.json hosts).`);
+    // S18: which of the host's executors the token is for; deploy unless the body says service.
+    const executor = (await c.req.json().catch(() => ({})) as { executor?: unknown }).executor ?? "deploy";
+    if (!EXECUTOR_KINDS.includes(executor as ExecutorKind)) return reject(c, 400, "host/executor-kind", `executor is one of ${EXECUTOR_KINDS.join(", ")}.`);
     const token = `dpe_${randomBytes(24).toString("base64url")}`;
-    store.addExecutorToken(host, tokenSha256(token), token.slice(0, 10), { id: p.id, via: p.via });
-    return c.json({ host, token }, 201);
+    store.addExecutorToken(host, tokenSha256(token), token.slice(0, 10), { id: p.id, via: p.via }, executor as ExecutorKind);
+    return c.json({ host, executor, token }, 201);
   });
   api.post("/api/hosts/:id/revoke", async (c) => {
     const p = await authenticate(c, "admin");
     if (p instanceof Response) return p;
-    return c.json({ revoked: store.revokeExecutorTokens(c.req.param("id"), { id: p.id, via: p.via }) });
+    // S18: one executor's tokens when the body names it, otherwise every token of the host.
+    const executor = (await c.req.json().catch(() => ({})) as { executor?: unknown }).executor;
+    if (executor !== undefined && !EXECUTOR_KINDS.includes(executor as ExecutorKind)) return reject(c, 400, "host/executor-kind", `executor is one of ${EXECUTOR_KINDS.join(", ")}.`);
+    return c.json({ revoked: store.revokeExecutorTokens(c.req.param("id"), { id: p.id, via: p.via }, executor as ExecutorKind | undefined) });
   });
 
   // D36: how each app is reached, the recommended nginx configuration with its revisions, and the internal CA.

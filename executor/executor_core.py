@@ -8,8 +8,8 @@ down, a heartbeat thread during a long job, a job left running marked interrupte
 (executor-upgrade: a newer release from the host's own source, checked against SHA256SUMS, installed beside the
 running one; launch.sh goes back after three failed starts).
 
-An executor subclasses ProtocolExecutor and names its release (PACKAGE, PACKAGE_FILES, MAIN), its job kinds (KINDS,
-JOBS) and its version. A release stays one file: package.sh runs bundle.py, which puts this module's code in place of
+An executor subclasses ProtocolExecutor and names its release (PACKAGE, PACKAGE_FILES, MAIN), which executor it is
+(EXECUTOR: deploy or service, S18), its job kinds (KINDS, JOBS) and its version. A release stays one file: package.sh runs bundle.py, which puts this module's code in place of
 the executor's `from executor_core import` block, so launch.sh runs the file as it is and executors that predate this
 module accept the archive (it holds exactly the files they know).
 
@@ -148,6 +148,8 @@ class ProtocolExecutor:
     PACKAGE = ""
     PACKAGE_FILES = ()
     MAIN = ""
+    # Which executor this is (S18): "deploy" or "service"; the heartbeat says it, and the Deployer checks it against the token.
+    EXECUTOR = ""
     EXECUTABLES = ("launch.sh", "switch", "install.sh")
     # Job kinds the heartbeat names, and the method each job kind runs (looked up when the job comes).
     KINDS = ["executor-upgrade"]
@@ -239,6 +241,7 @@ class ProtocolExecutor:
         """What every heartbeat says; a subclass adds what its host has configured."""
         source = self.cfg["upgrade_from"]
         return {
+            **({"executor": self.EXECUTOR} if self.EXECUTOR else {}),
             "version": self.version, "protocols": PROTOCOLS, "kinds": self.KINDS, "at": now_iso(), "pid": os.getpid(), "busy": busy,
             # §8.6: whether this host can upgrade its executor, and from what kind of source (never the source itself).
             "upgradeFrom": ("directory" if source.startswith("/") else "github") if source else None,

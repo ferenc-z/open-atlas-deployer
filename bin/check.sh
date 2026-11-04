@@ -1,5 +1,5 @@
 #!/bin/sh
-# Runs what the release workflow checks, locally: types, the server tests, the page build and the executor's tests.
+# Runs what the release workflow checks, locally: types, the server tests, the page build and the executors' tests (deploy and service).
 # Output goes to .check/<commit>.log; only a one-line result is printed, plus the failing step's tail on failure.
 # .check/last holds "<commit> ok|failed <step>" for the last run.
 #   bin/check.sh          (exit 0 when everything passes, 1 otherwise)
@@ -15,11 +15,11 @@ start=$(date +%s)
 python_tests() (
   cd executor || return 1
   if python3 -c 'import sys' >/dev/null 2>&1; then
-    PYTHONDONTWRITEBYTECODE=1 python3 -m unittest test_deployer_executor
+    PYTHONDONTWRITEBYTECODE=1 python3 -m unittest test_deployer_executor test_service_executor
   else
     # The tests import from their own directory; bytecode stays out of the tracked executor/__pycache__.
     dir=$(pwd -W 2>/dev/null || pwd)
-    MSYS_NO_PATHCONV=1 wsl.exe -d "${CHECK_WSL_DISTRO:-Ubuntu}" --cd "$dir" -- env PYTHONDONTWRITEBYTECODE=1 python3 -m unittest test_deployer_executor
+    MSYS_NO_PATHCONV=1 wsl.exe -d "${CHECK_WSL_DISTRO:-Ubuntu}" --cd "$dir" -- env PYTHONDONTWRITEBYTECODE=1 python3 -m unittest test_deployer_executor test_service_executor
   fi
 )
 

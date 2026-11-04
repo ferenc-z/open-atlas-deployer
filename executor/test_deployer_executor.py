@@ -792,9 +792,10 @@ class OldExecutorUpgradeTest(unittest.TestCase):
         old_cfg, new_cfg = self.old.config(self.env_file, environ=NO_ENV), new.config(self.env_file, environ=NO_ENV)
         self.assertEqual({k: str(v) for k, v in new_cfg.items()}, {k: str(v) for k, v in old_cfg.items()}, "the same executor.env means the same")
 
-        # The first beat after the upgrade and an ordinary one say what 0.7.3 said, apart from the version.
+        # The first beat after the upgrade and an ordinary one say what 0.7.3 said, apart from the version and which
+        # executor it is (S18; the Deployer takes a beat without it as the deploy executor's).
         def same(beat):
-            return {k: v for k, v in beat.items() if k not in ("version", "at", "pid")}
+            return {k: v for k, v in beat.items() if k not in ("version", "at", "pid", "executor")}
         selfcheck_beat = next(b for b in reversed(self.api.beats) if b["version"] == "0.8.0")
         self.assertEqual(same(selfcheck_beat), same(self.old_ex.beat_body(None, {})))
         self.old_ex.heartbeat()
@@ -803,6 +804,7 @@ class OldExecutorUpgradeTest(unittest.TestCase):
         self.assertEqual((old_beat["version"], new_beat["version"]), ("0.7.3", "0.8.0"))
         self.assertEqual(same(new_beat), same(old_beat))
         self.assertEqual(new_beat["kinds"], old_beat["kinds"])
+        self.assertEqual((old_beat.get("executor"), new_beat["executor"]), (None, "deploy"))
         self.assertEqual(new_beat["protocols"], [2])
         self.assertEqual(new_beat["databaseBackup"], {"shop": {"dump": True, "restore": False}})
 

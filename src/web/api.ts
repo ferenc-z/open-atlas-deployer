@@ -110,7 +110,9 @@ export const statusView = () => call<StatusView>("GET", "status");
 
 // D35: the hosts of this environment and their executors' tokens.
 export type ExecutorUpgrade = { available: boolean; blocked?: string; from: "github" | "directory" | null; job: { id: string; state: Job["state"]; version: string; message: string | null; finishedAt: string | null } | null };
-export type HostView = { id: string; address: string | null; executor: ExecutorInfo; apps: string[]; report: { at: string; stale: boolean; containers: number } | null; tokens: { prefix: string; createdAt: string; createdBy: string; revokedAt: string | null }[]; upgrade: ExecutorUpgrade };
+/** S18: a host runs a deploy executor, a service executor, or both, each with its own tokens. */
+export type ExecutorKind = "deploy" | "service";
+export type HostView = { id: string; address: string | null; executor: ExecutorInfo; apps: string[]; report: { at: string; stale: boolean; containers: number } | null; tokens: { executor: ExecutorKind; prefix: string; createdAt: string; createdBy: string; revokedAt: string | null }[]; upgrade: ExecutorUpgrade; service: ExecutorInfo | null };
 export const hosts = () => call<{ executorVersion: string; hosts: HostView[] }>("GET", "hosts");
 export const upgradeExecutor = (id: string) => call<{ job: Job }>("POST", `hosts/${encodeURIComponent(id)}/upgrade-executor`, {});
 /** D39: the Overview's Platform area. */
@@ -128,8 +130,8 @@ export const platform = () => call<PlatformView>("GET", "platform");
 export const deployerPlan = (version: string) => call<DeployerPlan>("GET", `deployer/plan?version=${encodeURIComponent(version)}`);
 export const upgradeDeployer = (version: string, confirmOlder = false) => call<{ job: Job }>("POST", "deployer/upgrade", { version, ...(confirmOlder ? { confirmOlder: true } : {}) });
 export const upgradeOutdated = () => call<{ batch: PlatformView["batch"] }>("POST", "hosts/upgrade-outdated", {});
-export const issueHostToken = (id: string) => call<{ host: string; token: string }>("POST", `hosts/${encodeURIComponent(id)}/token`, {});
-export const revokeHost = (id: string) => call<{ revoked: number }>("POST", `hosts/${encodeURIComponent(id)}/revoke`, {});
+export const issueHostToken = (id: string, executor: ExecutorKind = "deploy") => call<{ host: string; executor: ExecutorKind; token: string }>("POST", `hosts/${encodeURIComponent(id)}/token`, { executor });
+export const revokeHost = (id: string, executor?: ExecutorKind) => call<{ revoked: number }>("POST", `hosts/${encodeURIComponent(id)}/revoke`, executor ? { executor } : {});
 
 // D36: addresses, the recommended nginx configuration and its revisions, the internal CA.
 export type IngressView = {

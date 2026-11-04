@@ -238,6 +238,7 @@ class Executor(ProtocolExecutor):
     PACKAGE = PACKAGE
     PACKAGE_FILES = PACKAGE_FILES
     MAIN = "deployer_executor.py"
+    EXECUTOR = "deploy"
     KINDS = KINDS
     JOBS = {**ProtocolExecutor.JOBS, "build": "build", "deploy": "deploy", "env": "env_write", "env-read": "env_read",
             "deployer-upgrade": "deployer_upgrade"}

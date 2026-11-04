@@ -1,64 +1,87 @@
 // D35 page: the hosts of this environment (environment.json hosts), each running an executor that calls the Deployer
 // over HTTPS with its own token. An administrator issues a host's token here (shown once) and can revoke it. Upgrades of
 // the executors and of the Deployer are on the Overview (D39); hosts are added in the environment settings (D38).
+// S18: a host runs a deploy executor, a service executor (managed services such as NiFi, no Docker), or both; each has
+// its own tokens, and the service executor takes no deploy jobs.
 
 import { useCallback, useEffect, useState } from "react";
 import * as api from "./api.ts";
-import type { HostView } from "./api.ts";
+import type { ExecutorInfo, ExecutorKind, HostView } from "./api.ts";
 import { ask } from "./Confirm.tsx";
 
 const when = (iso: string) => new Date(iso).toLocaleString("en-US", { hour12: false });
+const NAME: Record<ExecutorKind, string> = { deploy: "deploy executor", service: "service executor" };
+
+/** The deploy executor is listed unless the host only has a service executor (no deploy token, no heartbeat, no apps). */
+const hasDeploy = (h: HostView) => !h.service || h.apps.length > 0 || Boolean(h.executor.heartbeat) || h.tokens.some((t) => t.executor === "deploy");
+
+function ExecutorLine({ kind, info, labelled }: { kind: ExecutorKind; info: ExecutorInfo; labelled: boolean }) {
+  const beat = info.heartbeat;
+  return (
+    <div>
+      {labelled && <span className={`badge ${kind === "service" ? "info" : "muted"}`}>{kind === "service" ? "Service executor" : "Deploy executor"}</span>}{" "}
+      {info.online
+        ? <><span className="badge ok">Online</span> <span className="muted">{beat?.version}{beat?.busy ? ` · running ${beat.busy}` : ""}{beat?.reading?.length ? ` · reading ${beat.reading.length}` : ""}</span></>
+        : <><span className="badge bad">Offline</span> <span className="muted">{info.reason}</span></>}
+      {kind === "service" && beat && (beat.isRoot
+        ? <span className="muted"> · runs as root</span>
+        : <> <span className="badge warn" title="Not root: it sees and manages only the services this user runs">Not root</span> <span className="muted">runs as {beat.user ?? "an ordinary user"}: manages only {beat.user ?? "that user"}'s services</span></>)}
+      {kind === "service" && <div className="muted">Takes no deploy jobs.</div>}
+    </div>
+  );
+}
 
 /** `compact`: inside a setup step, only the host, its executor and its tokens. */
 export function HostsPage({ isAdmin, compact = false }: { isAdmin: boolean; compact?: boolean }) {
   const [list, setList] = useState<HostView[] | undefined>();
   const [error, setError] = useState("");
-  const [issued, setIssued] = useState<{ host: string; token: string } | undefined>();
+  const [issued, setIssued] = useState<{ host: string; executor: ExecutorKind; token: string } | undefined>();
   const refresh = useCallback(() => { api.hosts().then((r) => setList(r.hosts), (e: Error) => setError(e.message)); }, []);
   useEffect(() => { refresh(); const t = setInterval(refresh, 10_000); return () => clearInterval(t); }, [refresh]);
-  const issue = async (id: string) => {
-    if (!(await ask(`Issue a new executor token for ${id}? Earlier tokens of ${id} keep working until revoked.`, { confirm: "Issue token" }))) return;
-    api.issueHostToken(id).then((r) => { setIssued(r); refresh(); }, (e: Error) => setError(e.message));
+  const issue = async (id: string, kind: ExecutorKind) => {
+    if (!(await ask(`Issue a new ${NAME[kind]} token for ${id}? Earlier ${NAME[kind]} tokens of ${id} keep working until revoked.`, { confirm: "Issue token" }))) return;
+    api.issueHostToken(id, kind).then((r) => { setIssued(r); refresh(); }, (e: Error) => setError(e.message));
   };
-  const revoke = async (id: string) => {
-    if (!(await ask(`Revoke every executor token of ${id}? Its executor stops reaching the Deployer at once.`, { confirm: "Revoke", danger: true }))) return;
-    api.revokeHost(id).then(refresh, (e: Error) => setError(e.message));
+  const revoke = async (id: string, kind: ExecutorKind) => {
+    if (!(await ask(`Revoke every ${NAME[kind]} token of ${id}? That executor stops reaching the Deployer at once.`, { confirm: "Revoke", danger: true }))) return;
+    api.revokeHost(id, kind).then(refresh, (e: Error) => setError(e.message));
   };
   if (!list) return error ? <p className="error">{error}</p> : <p className="muted">Loading…</p>;
   return (
     <>
       {!compact && <div className="toolbar">
         <h1>Hosts</h1>
-        <span className="muted">Each host runs an executor that calls the Deployer with its own token; the Deployer never connects to a host. Hosts and where each app runs are set in Environment settings; upgrades are on the Overview.</span>
+        <span className="muted">Each host runs a deploy executor, a service executor (managed services such as NiFi; no Docker), or both. Each calls the Deployer with its own token; the Deployer never connects to a host. Hosts and where each app runs are set in Environment settings; upgrades are on the Overview.</span>
       </div>}
       {error && <p className="error">{error}</p>}
       {issued && (
         <div className="banner warn">
-          Token for <strong>{issued.host}</strong>, shown only once: <code className="mono">{issued.token}</code>{" "}
+          {issued.executor === "service" ? "Service executor token" : "Token"} for <strong>{issued.host}</strong>, shown only once: <code className="mono">{issued.token}</code>{" "}
           <button className="link" onClick={() => navigator.clipboard?.writeText(issued.token)}>Copy</button>
-          <div className="muted">Put it on {issued.host} in the file EXECUTOR_TOKEN_FILE names (mode 600), then restart the executor there.</div>
+          <div className="muted">Put it on {issued.host} in the file EXECUTOR_TOKEN_FILE names in {issued.executor === "service" ? "service-executor.env" : "executor.env"} (mode 600), then restart that executor there.</div>
         </div>
       )}
       <table>
-        <thead><tr><th>Host</th>{!compact && <th>Address</th>}<th>Executor</th>{!compact && <><th>Apps</th><th>Containers reported</th></>}<th>Tokens</th><th></th></tr></thead>
+        <thead><tr><th>Host</th>{!compact && <th>Address</th>}<th>Executors</th>{!compact && <><th>Apps</th><th>Containers reported</th></>}<th>Tokens</th><th></th></tr></thead>
         <tbody>
           {list.map((h) => {
             const live = h.tokens.filter((t) => !t.revokedAt);
+            const kinds: ExecutorKind[] = [...(hasDeploy(h) ? ["deploy" as const] : []), ...(h.service ? ["service" as const] : [])];
+            const labelled = Boolean(h.service);
             return (
               <tr key={h.id}>
                 <td className="mono">{h.id}</td>
                 {!compact && <td className="mono">{h.address ?? <span className="muted">—</span>}</td>}
-                <td>
-                  {h.executor.online
-                    ? <><span className="badge ok">Online</span> <span className="muted">{h.executor.heartbeat?.version}{h.executor.heartbeat?.busy ? ` · running ${h.executor.heartbeat.busy}` : ""}</span></>
-                    : <><span className="badge bad">Offline</span> <span className="muted">{h.executor.reason}</span></>}
-                </td>
+                <td>{kinds.map((k) => <ExecutorLine key={k} kind={k} info={k === "service" ? h.service! : h.executor} labelled={labelled} />)}</td>
                 {!compact && <td>{h.apps.length ? h.apps.join(", ") : <span className="muted">None</span>}</td>}
                 {!compact && <td>{h.report ? <>{h.report.containers} <span className="muted">at {when(h.report.at)}</span>{h.report.stale && <span className="badge warn">Stale</span>}</> : <span className="muted">Not yet</span>}</td>}
-                <td>{live.length ? live.map((t) => <span key={t.prefix} className="mono" title={`Issued by ${t.createdBy} at ${when(t.createdAt)}`}>{t.prefix}… </span>) : <span className="muted">None</span>}</td>
+                <td>{live.length ? live.map((t) => <span key={t.prefix} className="mono" title={`${NAME[t.executor]} token, issued by ${t.createdBy} at ${when(t.createdAt)}`}>{t.prefix}…{labelled ? ` (${t.executor})` : ""} </span>) : <span className="muted">None</span>}</td>
                 <td className="actions">
-                  {isAdmin && <button className="link" onClick={() => issue(h.id)}>Issue token</button>}
-                  {isAdmin && live.length > 0 && <button className="link danger" onClick={() => revoke(h.id)}>Revoke</button>}
+                  {isAdmin && <button className="link" onClick={() => issue(h.id, "deploy")}>{compact ? "Issue token" : "Issue deploy token"}</button>}
+                  {isAdmin && !compact && <button className="link" onClick={() => issue(h.id, "service")}>Issue service token</button>}
+                  {isAdmin && (["deploy", "service"] as const).filter((k) => live.some((t) => t.executor === k)).map((k) => (
+                    <button key={k} className="link danger" onClick={() => revoke(h.id, k)}>{labelled || k === "service" ? `Revoke ${k}` : "Revoke"}</button>
+                  ))}
                 </td>
               </tr>
             );
@@ -68,4 +91,3 @@ export function HostsPage({ isAdmin, compact = false }: { isAdmin: boolean; comp
     </>
   );
 }
-

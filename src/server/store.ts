@@ -78,6 +78,8 @@ CREATE TABLE IF NOT EXISTS executor_jobs (
 CREATE INDEX IF NOT EXISTS executor_jobs_host ON executor_jobs (host, picked_at, queued_at);
 CREATE TABLE IF NOT EXISTS executor_hosts (
   host TEXT PRIMARY KEY, heartbeat TEXT, beat_at TEXT, containers TEXT, files TEXT, state_at TEXT);
+CREATE TABLE IF NOT EXISTS executor_beats (
+  host TEXT NOT NULL, executor TEXT NOT NULL, heartbeat TEXT NOT NULL, beat_at TEXT NOT NULL, PRIMARY KEY (host, executor));
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS environment_revisions (
   revision INTEGER PRIMARY KEY, body TEXT NOT NULL, changes TEXT NOT NULL, source TEXT NOT NULL, saved_at TEXT NOT NULL,
@@ -89,6 +91,10 @@ CREATE TABLE IF NOT EXISTS nginx_revisions (
 /** queued: waiting for the host's executor to claim it; the rest are the executor's states. */
 export type JobState = "queued" | "running" | "succeeded" | "failed" | "rolled-back" | "refused";
 export const FINAL_STATES: JobState[] = ["succeeded", "failed", "rolled-back", "refused"];
+
+/** S18: the executors a host may run: deploy (builds, compose, env; needs Docker) and service (managed services such as NiFi). */
+export type ExecutorKind = "deploy" | "service";
+export const EXECUTOR_KINDS: readonly ExecutorKind[] = ["deploy", "service"];
 
 export interface ExecutorStatus {
   state: JobState;
@@ -214,6 +220,10 @@ export class Store {
     const columns = (this.db.prepare("PRAGMA table_info(jobs)").all() as Row[]).map((c) => c.name);
     for (const column of ["rollout", "diagnosis"]) if (!columns.includes(column)) this.db.exec(`ALTER TABLE jobs ADD COLUMN ${column} TEXT`);
     if (!(this.db.prepare("PRAGMA table_info(apps)").all() as Row[]).some((c) => c.name === "trial")) this.db.exec("ALTER TABLE apps ADD COLUMN trial TEXT");
+    // S18: which executor of a host a token and a job belong to (NULL, as before: the deploy executor).
+    for (const table of ["executor_tokens", "executor_jobs"]) {
+      if (!(this.db.prepare(`PRAGMA table_info(${table})`).all() as Row[]).some((c) => c.name === "executor")) this.db.exec(`ALTER TABLE ${table} ADD COLUMN executor TEXT`);
+    }
   }
 
   close() { this.db.close(); }
@@ -626,43 +636,52 @@ export class Store {
   }
 
   // D35: executors on each host reach the Deployer over HTTPS; their jobs, heartbeats and host state live here.
+  // S18: a host may run a deploy executor and a service executor, each with its own tokens, heartbeat and jobs.
+  // The deploy executor's rows keep executor NULL (as before S18) and its heartbeat stays in executor_hosts.
 
-  addExecutorToken(host: string, sha256: string, prefix: string, actor: Actor) {
-    this.db.prepare("INSERT INTO executor_tokens (sha256, host, prefix, created_at, created_by) VALUES (?, ?, ?, ?, ?)").run(sha256, host, prefix, this.stamp(), actor.id);
-    this.audit(actor, "host.token-created", host, { prefix });
+  addExecutorToken(host: string, sha256: string, prefix: string, actor: Actor, executor: ExecutorKind = "deploy") {
+    this.db.prepare("INSERT INTO executor_tokens (sha256, host, prefix, created_at, created_by, executor) VALUES (?, ?, ?, ?, ?, ?)").run(sha256, host, prefix, this.stamp(), actor.id, executor === "deploy" ? null : executor);
+    this.audit(actor, "host.token-created", host, { prefix, executor });
   }
 
-  revokeExecutorTokens(host: string, actor: Actor): number {
-    const n = Number(this.db.prepare("UPDATE executor_tokens SET revoked_at = ? WHERE host = ? AND revoked_at IS NULL").run(this.stamp(), host).changes);
-    this.audit(actor, "host.token-revoked", host, { tokens: n });
+  /** Revokes the host's tokens: one executor's, or (none named) every executor's. */
+  revokeExecutorTokens(host: string, actor: Actor, executor?: ExecutorKind): number {
+    const n = Number(this.db.prepare("UPDATE executor_tokens SET revoked_at = ?1 WHERE host = ?2 AND revoked_at IS NULL AND (?3 IS NULL OR COALESCE(executor, 'deploy') = ?3)").run(this.stamp(), host, executor ?? null).changes);
+    this.audit(actor, "host.token-revoked", host, { tokens: n, ...(executor ? { executor } : {}) });
     return n;
+  }
+
+  /** The host a live executor token belongs to, and which of its executors. */
+  executorOf(sha256: string): { host: string; executor: ExecutorKind } | undefined {
+    const r = this.db.prepare("SELECT host, executor FROM executor_tokens WHERE sha256 = ? AND revoked_at IS NULL").get(sha256) as Row | undefined;
+    return r && { host: r.host, executor: (r.executor ?? "deploy") as ExecutorKind };
   }
 
   /** The host a live executor token belongs to. */
   executorHost(sha256: string): string | undefined {
-    return (this.db.prepare("SELECT host FROM executor_tokens WHERE sha256 = ? AND revoked_at IS NULL").get(sha256) as Row | undefined)?.host;
+    return this.executorOf(sha256)?.host;
   }
 
-  executorTokens(): { host: string; prefix: string; createdAt: string; createdBy: string; revokedAt: string | null }[] {
-    return (this.db.prepare("SELECT * FROM executor_tokens ORDER BY created_at").all() as Row[]).map((r) => ({ host: r.host, prefix: r.prefix, createdAt: r.created_at, createdBy: r.created_by, revokedAt: r.revoked_at ?? null }));
+  executorTokens(): { host: string; executor: ExecutorKind; prefix: string; createdAt: string; createdBy: string; revokedAt: string | null }[] {
+    return (this.db.prepare("SELECT * FROM executor_tokens ORDER BY created_at").all() as Row[]).map((r) => ({ host: r.host, executor: (r.executor ?? "deploy") as ExecutorKind, prefix: r.prefix, createdAt: r.created_at, createdBy: r.created_by, revokedAt: r.revoked_at ?? null }));
   }
 
-  queueExecutorJob(id: string, host: string, request: Record<string, unknown>, content?: string) {
-    this.db.prepare("INSERT INTO executor_jobs (id, host, request, content, queued_at) VALUES (?, ?, ?, ?, ?)").run(id, host, JSON.stringify(request), content ?? null, this.stamp());
+  queueExecutorJob(id: string, host: string, request: Record<string, unknown>, content?: string, executor: ExecutorKind = "deploy") {
+    this.db.prepare("INSERT INTO executor_jobs (id, host, request, content, queued_at, executor) VALUES (?, ?, ?, ?, ?, ?)").run(id, host, JSON.stringify(request), content ?? null, this.stamp(), executor === "deploy" ? null : executor);
   }
 
-  /** Claims the oldest job queued for a host; an env job's content leaves the queue with it. */
-  claimExecutorJob(host: string): Record<string, unknown> | undefined {
-    const r = this.db.prepare("SELECT id, request, content FROM executor_jobs WHERE host = ? AND picked_at IS NULL ORDER BY queued_at, rowid LIMIT 1").get(host) as Row | undefined;
+  /** Claims the oldest job queued for one executor of a host; an env job's content leaves the queue with it. */
+  claimExecutorJob(host: string, executor: ExecutorKind = "deploy"): Record<string, unknown> | undefined {
+    const r = this.db.prepare("SELECT id, request, content FROM executor_jobs WHERE host = ? AND COALESCE(executor, 'deploy') = ? AND picked_at IS NULL ORDER BY queued_at, rowid LIMIT 1").get(host, executor) as Row | undefined;
     if (!r) return undefined;
     this.db.prepare("UPDATE executor_jobs SET picked_at = ?, content = NULL WHERE id = ?").run(this.stamp(), r.id);
     const request = JSON.parse(r.request) as Record<string, unknown>;
     return r.content === null ? request : { ...request, content: r.content };
   }
 
-  executorJob(id: string): { host: string; request: Record<string, unknown>; pickedAt: string | null; status: ExecutorStatus | null; log: string } | undefined {
-    const r = this.db.prepare("SELECT host, request, picked_at, status, log FROM executor_jobs WHERE id = ?").get(id) as Row | undefined;
-    return r && { host: r.host, request: JSON.parse(r.request), pickedAt: r.picked_at ?? null, status: parse(r.status), log: r.log };
+  executorJob(id: string): { host: string; executor: ExecutorKind; request: Record<string, unknown>; pickedAt: string | null; status: ExecutorStatus | null; log: string } | undefined {
+    const r = this.db.prepare("SELECT host, executor, request, picked_at, status, log FROM executor_jobs WHERE id = ?").get(id) as Row | undefined;
+    return r && { host: r.host, executor: (r.executor ?? "deploy") as ExecutorKind, request: JSON.parse(r.request), pickedAt: r.picked_at ?? null, status: parse(r.status), log: r.log };
   }
 
   executorJobs(host?: string): { id: string; host: string; pickedAt: string | null }[] {
@@ -691,12 +710,22 @@ export class Store {
     return r.env_content;
   }
 
-  setHeartbeat(host: string, heartbeat: unknown) {
+  setHeartbeat(host: string, heartbeat: unknown, executor: ExecutorKind = "deploy") {
+    if (executor !== "deploy") {
+      this.db.prepare("INSERT INTO executor_beats (host, executor, heartbeat, beat_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT (host, executor) DO UPDATE SET heartbeat = ?3, beat_at = ?4").run(host, executor, JSON.stringify(heartbeat), this.stamp());
+      return;
+    }
     this.db.prepare("INSERT INTO executor_hosts (host, heartbeat, beat_at) VALUES (?1, ?2, ?3) ON CONFLICT (host) DO UPDATE SET heartbeat = ?2, beat_at = ?3").run(host, JSON.stringify(heartbeat), this.stamp());
   }
 
   setHostState(host: string, containers: unknown[], files: Record<string, string>) {
     this.db.prepare("INSERT INTO executor_hosts (host, containers, files, state_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT (host) DO UPDATE SET containers = ?2, files = ?3, state_at = ?4").run(host, JSON.stringify(containers), JSON.stringify(files), this.stamp());
+  }
+
+  /** The last heartbeat of a host's service executor (S18); the deploy executor's is in executorHosts(). */
+  executorBeat(host: string, executor: ExecutorKind): { heartbeat: unknown; beatAt: string } | undefined {
+    const r = this.db.prepare("SELECT heartbeat, beat_at FROM executor_beats WHERE host = ? AND executor = ?").get(host, executor) as Row | undefined;
+    return r && { heartbeat: parse(r.heartbeat), beatAt: r.beat_at };
   }
 
   executorHosts(): { host: string; heartbeat: unknown; beatAt: string | null; containers: unknown[] | null; files: Record<string, string> | null; stateAt: string | null }[] {

@@ -27,9 +27,12 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           package=$(node -p 'require("./package.json").version')
           executor=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' executor/deployer_executor.py)
+          service=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' executor/service_executor.py)
           offered=$(sed -n 's/^export const EXECUTOR_VERSION = "\(.*\)";/\1/p' src/server/handoff.ts)
           [ "$version" = "$package" ] || { echo "::error::tag $GITHUB_REF_NAME does not match package.json $package"; exit 1; }
           [ "$executor" = "$offered" ] || { echo "::error::handoff.ts offers executor $offered, executor/deployer_executor.py is $executor"; exit 1; }
+          # S18: both executors go out in the same release executor-v<version>.
+          [ "$service" = "$executor" ] || { echo "::error::executor/service_executor.py is $service, executor/deployer_executor.py is $executor"; exit 1; }
           case "$version" in *-*) pre=true ;; *) pre=false ;; esac
           owner=$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -54,7 +57,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.9"
-      - run: python -m unittest test_deployer_executor
+      - run: python -m unittest test_deployer_executor test_service_executor
         working-directory: executor
 
       - uses: docker/setup-buildx-action@v3
@@ -86,9 +89,10 @@ jobs:
             echo "$tag already exists"
           else
             sh executor/package.sh dist/executor
+            sh executor/service/package.sh dist/executor
             gh release create "$tag" dist/executor/*.tar.gz dist/executor/SHA256SUMS \
               --title "Executor ${{ steps.v.outputs.executor }}" --latest=false \
-              --notes "Executor for Open Atlas Deployer ${{ steps.v.outputs.version }}. A first installation unpacks the archive and runs install.sh; installed executors upgrade from this release (design §8.6)."
+              --notes "Executor for Open Atlas Deployer ${{ steps.v.outputs.version }}. Two archives: open-atlas-deployer-executor (deploys, needs Docker) and open-atlas-service-executor (managed services such as NiFi, no Docker). A first installation unpacks the archive and runs its install.sh; installed executors upgrade from this release (design §8.6)."
           fi
 
       - name: Deployer release

@@ -21,6 +21,7 @@ chmod 755 "$tmp/$name/launch.sh" "$tmp/$name/switch" "$tmp/$name/install.sh"
 chmod 644 "$tmp/$name/deployer_executor.py" "$tmp/$name/open-atlas-deployer-executor.service" "$tmp/$name/executor.env.example"
 mkdir -p "$out"
 tar -C "$tmp" --owner=0 --group=0 -czf "$out/$name.tar.gz" "$name"
-(cd "$out" && sha256sum "$name.tar.gz" > SHA256SUMS)
+# SHA256SUMS lists every executor archive here: the service executor's (service/package.sh) goes in the same release.
+(cd "$out" && sha256sum open-atlas-*executor-*.tar.gz > SHA256SUMS)
 echo "$out/$name.tar.gz"
 echo "attach it and SHA256SUMS to the release executor-v$version"

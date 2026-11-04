@@ -1,4 +1,4 @@
-# Types, the server tests, the page build, and the executor's tests on the oldest Python the hosts may have (3.9) and a
+# Types, the server tests, the page build, and the executors' tests (deploy and service) on the oldest Python the hosts may have (3.9) and a
 # current one. Run by hand only (Actions → ci → Run workflow): a release tag runs the same checks in release.yml before
 # publishing, and commits are checked locally (bin/check.sh).
 name: ci
@@ -29,5 +29,5 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: python -m unittest -v test_deployer_executor
+      - run: python -m unittest -v test_deployer_executor test_service_executor
         working-directory: executor

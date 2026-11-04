@@ -85,7 +85,7 @@ export async function setupStatus(ctx: SetupContext, principal: Principal): Prom
 
   const hosts = env ? hostIds(env).map((id) => {
     const e = deployments.handoff.executor(id);
-    return { id, online: e.online, ...(e.reason ? { reason: e.reason } : {}), tokens: store.executorTokens().filter((t) => t.host === id && !t.revokedAt).length };
+    return { id, online: e.online, ...(e.reason ? { reason: e.reason } : {}), tokens: store.executorTokens().filter((t) => t.host === id && t.executor === "deploy" && !t.revokedAt).length };
   }) : [];
   const offline = hosts.filter((h) => !h.online);
   steps.push(!env

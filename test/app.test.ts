@@ -3,7 +3,8 @@
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -749,6 +750,73 @@ test("D35: an executor calls in with its host's token, gets only its host's jobs
   setEnvironment(t, ({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", hosts: { app1: hosts.app1 }, registries: { ghcr: "ghcr.io/acme" }, apps: { shop: { version: "1.2.0", host: "app1" } } }));
   const without = await (await t.request("/api/status", { as: "viewer" })).json();
   assert.ok(!JSON.stringify(without).includes("open-atlas-shop-1"));
+});
+
+test("S18: a host's service executor has its own token and heartbeat, shows on the Hosts page, and gets no deploy jobs", async () => {
+  const t = withBuiltApp();
+  setEnvironment(t, ({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", hosts, registries: { ghcr: "ghcr.io/acme" }, apps: { shop: { version: "1.2.0", host: "app2" } } }));
+  const call = (path: string, token: string, init: RequestInit = {}) => t.app.request(`/deploy${path}`, { ...init, headers: { authorization: `Bearer ${token}`, ...(typeof init.body === "string" && init.body.startsWith("{") ? { "content-type": "application/json" } : {}) } });
+  assert.equal((await post(t, "/api/hosts/app2/token", "admin", { executor: "docker" })).status, 400);
+  const deploy = (await (await post(t, "/api/hosts/app2/token", "admin", {})).json()).token;
+  const issued = await (await post(t, "/api/hosts/app2/token", "admin", { executor: "service" })).json();
+  assert.equal(issued.executor, "service");
+  const service = issued.token as string;
+  const beat = (token: string, body: Record<string, unknown>) => call("/executor/v1/heartbeat", token, { method: "POST", body: JSON.stringify({ version: EXECUTOR_VERSION, protocols: [2], kinds: ["executor-upgrade"], busy: null, ...body }) });
+  assert.equal((await beat(service, {})).status, 409, "a service token is not the deploy executor's");
+  assert.equal((await beat(deploy, { executor: "service" })).status, 409, "nor the other way round");
+  const ok = await beat(service, { executor: "service", user: "ferenc", isRoot: false, reading: [], readSlots: 4 });
+  assert.equal(ok.status, 200);
+  assert.equal((await ok.json()).executor, "service");
+
+  let view = (await (await t.request("/api/hosts", { as: "viewer" })).json()).hosts.find((h: { id: string }) => h.id === "app2");
+  assert.equal(view.service.online, true);
+  assert.equal(view.service.executor, "service");
+  assert.deepEqual([view.service.heartbeat.user, view.service.heartbeat.isRoot], ["ferenc", false]);
+  assert.equal(view.executor.online, false, "the deploy executor has not called in: its heartbeat is apart");
+  assert.deepEqual(view.tokens.map((x: { executor: string }) => x.executor), ["deploy", "service"]);
+  assert.equal((await (await t.request("/api/hosts", { as: "viewer" })).json()).hosts.find((h: { id: string }) => h.id === "app1").service, null, "no service executor on app1");
+
+  // A deploy job for app2 waits for its deploy executor; the service executor's poll never takes it.
+  await beat(deploy, { project: "open-atlas", registries: [], databaseBackup: {} });
+  const build = await (await post(t, "/api/apps/shop/build", "uat", { version: "1.2.0" })).json();
+  const id = build.jobs[0].id;
+  assert.equal((await call("/executor/v1/jobs/next", service)).status, 204);
+  assert.equal((await call(`/executor/v1/jobs/${id}/status`, service, { method: "PUT", body: JSON.stringify({ state: "running", steps: [], result: {} }) })).status, 404);
+  assert.equal((await call("/executor/v1/state", service, { method: "POST", body: JSON.stringify({ containers: "", files: {} }) })).status, 409);
+  assert.equal((await (await call("/executor/v1/jobs/next", deploy)).json()).job.id, id);
+
+  // Jobs for the service executor go to it alone, and wake its long poll.
+  const waiting = call("/executor/v1/jobs/next?wait=5", service);
+  t.deployments.handoff.submit("svc-read-20261104-0001", { kind: "svc-read" }, "app2", "service");
+  assert.equal((await (await waiting).json()).job.id, "svc-read-20261104-0001");
+  t.deployments.handoff.submit("svc-read-20261104-0002", { kind: "svc-read" }, "app2", "service");
+  assert.equal((await call("/executor/v1/jobs/next", deploy)).status, 204);
+  assert.equal((await call("/executor/v1/jobs/svc-read-20261104-0002/log", deploy, { method: "POST", body: "x" })).status, 404);
+
+  // Revoking the service executor's tokens leaves the deploy executor's.
+  assert.equal((await (await post(t, "/api/hosts/app2/revoke", "admin", { executor: "service" })).json()).revoked, 1);
+  assert.equal((await beat(service, { executor: "service" })).status, 401);
+  assert.equal((await beat(deploy, {})).status, 200);
+  view = (await (await t.request("/api/hosts", { as: "viewer" })).json()).hosts.find((h: { id: string }) => h.id === "app2");
+  assert.ok(view.service, "still listed: it had a token");
+  assert.ok(t.store.listAudit().some((e) => e.action === "host.token-created" && e.target === "app2" && JSON.stringify(e).includes("service")));
+});
+
+test("S18: a state database from before keeps its executor tokens and jobs as the deploy executor's", () => {
+  const dir = mkdtempSync(join(tmpdir(), "s18-"));
+  const file = join(dir, "state.db");
+  const old = new DatabaseSync(file);
+  old.exec(`CREATE TABLE executor_tokens (sha256 TEXT PRIMARY KEY, host TEXT NOT NULL, prefix TEXT NOT NULL, created_at TEXT NOT NULL, created_by TEXT NOT NULL, revoked_at TEXT);
+CREATE TABLE executor_jobs (id TEXT PRIMARY KEY, host TEXT NOT NULL, request TEXT NOT NULL, content TEXT, queued_at TEXT NOT NULL, picked_at TEXT, status TEXT, log TEXT NOT NULL DEFAULT '', env_content TEXT, env_content_at TEXT);
+INSERT INTO executor_tokens VALUES ('abc', 'local', 'dpe_abc', '2026-11-01T00:00:00Z', 'admin', NULL);
+INSERT INTO executor_jobs (id, host, request, queued_at) VALUES ('build-1', 'local', '{"id":"build-1"}', '2026-11-01T00:00:00Z');`);
+  old.close();
+  const store = new Store(file);
+  assert.deepEqual(store.executorOf("abc"), { host: "local", executor: "deploy" });
+  assert.equal(store.claimExecutorJob("local", "service"), undefined);
+  assert.equal(store.claimExecutorJob("local")?.id, "build-1");
+  store.close();
+  rmSync(dir, { recursive: true, force: true });
 });
 
 test("§8.6: an administrator upgrades a host's executor to the version the Deployer ships; the host says how it ended", async () => {
