@@ -615,6 +615,42 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     return c.json({ revoked: store.revokeExecutorTokens(c.req.param("id"), { id: p.id, via: p.via }, executor as ExecutorKind | undefined) });
   });
 
+  // Service ops §6 step 2: discovery on a host's service executor (svc-discover). It only reads: the NiFi running there
+  // (from their processes) and the installations named in dirs (ones not running, or unpacked somewhere uncommon). The
+  // result stays with its job; the newest one is what GET returns. Taking over (the model, the draft) builds on it.
+  api.post("/api/hosts/:id/discover", async (c) => {
+    const p = await authenticate(c, "admin");
+    if (p instanceof Response) return p;
+    const host = c.req.param("id");
+    if (!hostIds(deployments.environment().env).includes(host)) return reject(c, 404, "host/unknown", `${host} is not a host of this environment (environment settings hosts).`);
+    const body = await c.req.json().catch(() => ({})) as { dirs?: unknown };
+    const dirs = body.dirs ?? [];
+    if (!Array.isArray(dirs) || dirs.length > 32 || !dirs.every((d) => typeof d === "string" && d.startsWith("/") && !d.includes("\0") && d.length <= 1024))
+      return reject(c, 400, "discover/dirs", "dirs is a list of at most 32 absolute paths of NiFi installations.");
+    const executor = handoff.executor(host, "service");
+    if (!executor.online) return reject(c, 409, "discover/executor-offline", executor.reason ?? `The service executor on ${host} is offline.`);
+    if (!executor.heartbeat?.kinds?.includes("svc-discover")) return reject(c, 409, "discover/executor-old", `Service executor ${executor.heartbeat?.version} on ${host} cannot discover services; upgrade it first.`);
+    const id = newJobId("svc-discover");
+    handoff.submit(id, { kind: "svc-discover", dirs, timeoutSeconds: 60, requestedBy: p.id }, host, "service");
+    store.audit(actorOf(p), "service.discover", host, { job: id, dirs });
+    return c.json({ id, host, dirs, state: "queued" }, 201);
+  });
+  api.get("/api/hosts/:id/discover", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    const host = c.req.param("id");
+    const id = c.req.query("job") ?? store.latestExecutorJob(host, "service", "svc-discover");
+    const job = id ? store.executorJob(id) : undefined;
+    if (!id || !job || job.host !== host || job.executor !== "service" || job.request.kind !== "svc-discover")
+      return reject(c, 404, "discover/none", `No discovery on ${host}${c.req.query("job") ? ` with id ${c.req.query("job")}` : " yet"}.`);
+    const s = job.status;
+    return c.json({
+      id, host, dirs: job.request.dirs ?? [], state: s?.state ?? (job.pickedAt ? "running" : "queued"),
+      message: s?.message ?? null, startedAt: s?.startedAt ?? null, finishedAt: s?.finishedAt ?? null,
+      result: s?.state === "succeeded" ? s.result : null, log: handoff.log(id, 16 * 1024),
+    });
+  });
+
   // D36: how each app is reached, the recommended nginx configuration with its revisions, and the internal CA.
   const caInfo = () => {
     const pem = store.setting("ca.pem");

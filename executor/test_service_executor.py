@@ -92,7 +92,7 @@ class RegistrationTest(Base):
         beat = self.api.beats[-1]
         self.assertEqual(beat["executor"], "service")
         self.assertEqual(beat["protocols"], [2])
-        self.assertEqual(beat["kinds"], ["executor-upgrade"], "no service job kinds yet; never the deploy ones")
+        self.assertEqual(beat["kinds"], ["svc-discover", "executor-upgrade"], "the service jobs; never the deploy ones")
         name, root = sx.ServiceExecutor.user()
         self.assertEqual((beat["user"], beat["isRoot"]), (name, root))
         self.assertEqual(beat["isRoot"], os.geteuid() == 0)
@@ -201,6 +201,177 @@ class ReadChannelTest(Base):
         self.ex.deliver_pending()
         self.assertEqual(self.api.status["read-job-down"]["state"], "succeeded")
         self.assertIn("reading for read-job-down", self.api.logs["read-job-down"])
+
+
+def nifi_home(root, name, version, props, boot=None, two=True):
+    """An unpacked NiFi as the lab has them: lib/ with the runtime jar, conf/ with its files, bin/nifi.sh."""
+    home = pathlib.Path(root) / name
+    (home / "lib" / "bootstrap").mkdir(parents=True)
+    (home / "conf").mkdir()
+    (home / "bin").mkdir()
+    (home / "bin" / "nifi.sh").write_text("#!/bin/sh\n")
+    (home / "lib" / f"nifi-runtime-{version}.jar").write_text("")
+    # 2.5.0 ships nifi-api 2.2.0: the version comes from the runtime jar, not the API's.
+    (home / "lib" / ("nifi-api-2.2.0.jar" if two else f"nifi-api-{version}.jar")).write_text("")
+    (home / "conf" / "nifi.properties").write_text("# NiFi\n" + "".join(f"{k}={v}\n" for k, v in props.items()))
+    (home / "conf" / "bootstrap.conf").write_text("".join(f"{k}={v}\n" for k, v in (boot or {}).items()))
+    (home / "conf" / "logback.xml").write_text("<configuration/>\n")
+    return home
+
+
+class FakeProc:
+    """A /proc with the processes the tests need: cmdline, environ, status, stat, cwd/exe links, sockets."""
+
+    def __init__(self, root):
+        self.root = pathlib.Path(root)
+        self.root.mkdir(parents=True)
+        (self.root / "stat").write_text("cpu  1 2 3\nbtime 1700000000\n")
+        (self.root / "self").mkdir()  # not a pid
+
+    def add(self, pid, args, uid=None, ppid=1, env=None, cwd="/", exe="/usr/bin/java", listen=()):
+        d = self.root / str(pid)
+        (d / "fd").mkdir(parents=True)
+        (d / "net").mkdir()
+        (d / "cmdline").write_bytes(b"\0".join(a.encode() for a in args) + b"\0")
+        (d / "environ").write_bytes(b"\0".join(f"{k}={v}".encode() for k, v in (env or {}).items()) + b"\0")
+        uid = os.geteuid() if uid is None else uid
+        (d / "status").write_text(f"Name:\tjava\nPPid:\t{ppid}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n")
+        (d / "stat").write_text(f"{pid} (java) S {ppid} " + " ".join(["0"] * 17) + " 250 0 0\n")
+        os.symlink(cwd, d / "cwd")
+        os.symlink(exe, d / "exe")
+        rows = ["  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"]
+        for i, port in enumerate(listen):
+            inode = str(9000 + pid % 1000 * 10 + i)
+            os.symlink(f"socket:[{inode}]", d / "fd" / str(10 + i))
+            rows.append(f"   {i}: 0100007F:{port:04X} 00000000:0000 0A 00000000:00000000 00:00000000 00000000  {uid}        0 {inode} 1")
+        # A connection (not listening) and a socket of another process: neither counts.
+        rows.append(f"   9: 0100007F:1F90 0100007F:D431 01 00000000:00000000 00:00000000 00000000  {uid}        0 {9000 + pid % 1000 * 10} 1")
+        rows.append(f"  10: 0100007F:2222 00000000:0000 0A 00000000:00000000 00:00000000 00000000  {uid}        0 1 1")
+        (d / "net" / "tcp").write_text("\n".join(rows) + "\n")
+        os.symlink("pipe:[5]", d / "fd" / "1")
+
+
+def lab_processes(proc, home, two=True, env=None, uid=None, base=4000, listen=()):
+    """A NiFi's two processes as nifi.sh leaves them: the bootstrap, and the NiFi JVM it started."""
+    boot_main = "org.apache.nifi.bootstrap.BootstrapProcess" if two else "org.apache.nifi.bootstrap.RunNiFi"
+    proc.add(base, ["java", "-cp", f"{home}/conf:{home}/lib/bootstrap/*", f"-Dorg.apache.nifi.bootstrap.config.file={home}/conf/bootstrap.conf", boot_main, "start"],
+             uid=uid, env=env, cwd=str(home))
+    proc.add(base + 1, ["java", "-classpath", f"{home}/./lib/nifi-runtime.jar", f"-Dnifi.properties.file.path={home}/./conf/nifi.properties", "-Xmx1g", "org.apache.nifi.NiFi"],
+             uid=uid, ppid=base, env=env, cwd=str(home), exe="/jdk/21/bin/java", listen=listen)
+
+
+@unittest.skipUnless(hasattr(os, "geteuid") and hasattr(os, "symlink"), "needs a POSIX system")
+class DiscoverTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.proc = FakeProc(self.root / "proc")
+        self.lab = self.root / "lab"
+        cluster = {"nifi.cluster.is.node": "true", "nifi.cluster.node.address": "node1.lab", "nifi.cluster.node.protocol.port": "11445",
+                   "nifi.cluster.load.balance.port": "16345", "nifi.zookeeper.connect.string": "127.0.0.1:12181", "nifi.zookeeper.root.node": "/nifi-lab-c250"}
+        self.c250 = nifi_home(self.lab, "c250-1", "2.5.0", {
+            "nifi.web.https.host": "localhost", "nifi.web.https.port": "18445", "nifi.web.http.port": "",
+            "nifi.sensitive.props.key": "a-real-secret", "nifi.security.keystorePasswd": "kspw", "nifi.security.keystore": "./conf/keystore.p12",
+            "nifi.security.truststorePasswd": "", **cluster},
+            boot={"java.arg.2": "-Xms1g", "java.arg.3": "-Xmx1g", "management.server.address": "http://127.0.0.1:52445"})
+        self.n112 = nifi_home(self.lab, "n112", "1.12.1", {"nifi.web.https.port": "18443", "nifi.cluster.is.node": "false", "nifi.cluster.load.balance.port": "6342"},
+                              boot={"java": "java", "java.arg.3": "-Xmx512m"}, two=False)
+        self.stopped = nifi_home(self.lab, "n200", "2.0.0", {"nifi.web.https.port": "18444"})
+        env = {"JAVA_HOME": "/jdk/21", "PATH": "/jdk/21/bin:/usr/bin", "NIFI_HOME": str(self.c250), "AWS_SECRET_ACCESS_KEY": "abc", "DB_PASSWORD": "x", "EMPTY_TOKEN": ""}
+        lab_processes(self.proc, self.c250, env=env, listen=(18445, 11445, 16345))
+        lab_processes(self.proc, self.n112, two=False, env={"JAVA_HOME": "/jdk/11"}, base=5000, listen=(18443,))
+        # Someone else's NiFi: not looked at when the executor is not root.
+        lab_processes(self.proc, self.lab / "other", uid=os.geteuid() + 1, base=6000)
+        # Not NiFi at all.
+        self.proc.add(7000, ["python3", "-m", "http.server"])
+
+    def discovery(self, **kw):
+        return sx.Discovery(self.proc.root, uid=os.geteuid(), common=(), **kw)
+
+    def by_dir(self, result):
+        return {pathlib.Path(i["installDir"]).name: i for i in result["instances"]}
+
+    def test_finds_the_running_instances_from_their_processes(self):
+        r = self.discovery().run()
+        found = self.by_dir(r)
+        self.assertEqual(sorted(found), ["c250-1", "n112"])
+        c = found["c250-1"]
+        self.assertEqual((c["installDir"], c["source"], c["running"], c["version"]), (str(self.c250), "process", True, "2.5.0"))
+        self.assertEqual((c["process"]["pid"], c["process"]["bootstrapPid"], c["process"]["java"]), (4001, 4000, "/jdk/21/bin/java"))
+        self.assertEqual(c["process"]["listening"], [11445, 16345, 18445])
+        self.assertRegex(c["process"]["startedAt"], r"^2023-11-14T22:13:2\dZ$")
+        me = sx.user_name(os.geteuid())
+        self.assertEqual((c["serviceUser"], c["owner"]), (me, me))
+        self.assertEqual(c["ports"], {"https": 18445, "http": None, "clusterProtocol": 11445, "loadBalance": 16345, "remoteInput": None, "management": 52445})
+        self.assertEqual(c["webUrl"], "https://localhost:18445/nifi")
+        self.assertEqual(c["cluster"], {"isNode": True, "nodeAddress": "node1.lab", "zookeeper": "127.0.0.1:12181", "zookeeperRoot": "/nifi-lab-c250"})
+        self.assertEqual((c["heap"], c["javaHome"]), ({"Xms": "1g", "Xmx": "1g"}, "/jdk/21"))
+        self.assertEqual(c["problems"], [])
+        n = found["n112"]
+        self.assertEqual((n["version"], n["ports"]["https"], n["ports"]["loadBalance"], n["cluster"]["isNode"]), ("1.12.1", 18443, None, False),
+                         "1.x by RunNiFi; a standalone's cluster ports do not count")
+        self.assertEqual(n["heap"], {"Xms": None, "Xmx": "512m"})
+        self.assertEqual(r["skipped"], [{"pid": 6000, "user": sx.user_name(os.geteuid() + 1)}, {"pid": 6001, "user": sx.user_name(os.geteuid() + 1)}])
+
+    def test_the_start_environment_and_properties_keep_no_secrets(self):
+        c = self.by_dir(self.discovery().run())["c250-1"]
+        env = c["startEnvironment"]
+        self.assertEqual((env["JAVA_HOME"], env["PATH"], env["NIFI_HOME"]), ("/jdk/21", "/jdk/21/bin:/usr/bin", str(self.c250)))
+        self.assertEqual((env["AWS_SECRET_ACCESS_KEY"], env["DB_PASSWORD"], env["EMPTY_TOKEN"]), ("(hidden)", "(hidden)", ""))
+        p = c["properties"]
+        self.assertEqual((p["nifi.sensitive.props.key"], p["nifi.security.keystorePasswd"]), ("(hidden)", "(hidden)"))
+        self.assertEqual(p["nifi.security.truststorePasswd"], "", "an empty secret shows it is empty")
+        self.assertEqual(p["nifi.security.keystore"], "./conf/keystore.p12")
+        self.assertNotIn("a-real-secret", json.dumps(c))
+
+    def test_fingerprints_the_configuration_files(self):
+        c = self.by_dir(self.discovery().run())["c250-1"]
+        files = {f["name"]: f for f in c["files"]}
+        self.assertEqual(sorted(files), ["bootstrap.conf", "logback.xml", "nifi.properties"])
+        import hashlib
+        props = self.c250 / "conf" / "nifi.properties"
+        self.assertEqual(files["nifi.properties"]["sha256"], hashlib.sha256(props.read_bytes()).hexdigest())
+        self.assertEqual((files["nifi.properties"]["path"], files["nifi.properties"]["size"]), (str(props), props.stat().st_size))
+
+    def test_an_installation_not_running_is_read_from_the_directory_asked(self):
+        r = self.discovery().run([str(self.stopped), str(self.c250) + "/", str(self.lab), str(self.lab / "missing")])
+        s = self.by_dir(r)["n200"]
+        self.assertEqual((s["source"], s["running"], s["version"], s["process"], s["startEnvironment"]), ("dir", False, "2.0.0", None, None))
+        self.assertEqual((s["ports"]["https"], s["serviceUser"]), (18444, s["owner"]))
+        self.assertEqual([(d["found"], d.get("running")) for d in r["dirs"]], [(True, False), (True, True), (False, None), (False, None)])
+        self.assertIn("not a NiFi installation", r["dirs"][2]["error"])
+        self.assertIn("no such directory", r["dirs"][3]["error"])
+        self.assertEqual(len(r["instances"]), 3, "an asked directory that runs is not listed twice")
+
+    def test_common_directories_are_looked_at(self):
+        r = sx.Discovery(self.proc.root, uid=os.geteuid(), common=(str(self.lab / "n2*"),)).run()
+        self.assertEqual(self.by_dir(r)["n200"]["source"], "common-dir")
+
+    def test_as_root_every_users_processes_count(self):
+        found = self.by_dir(sx.Discovery(self.proc.root, uid=None, common=()).run())
+        self.assertEqual(sorted(found), ["c250-1", "n112", "other"])
+        self.assertEqual(found["other"]["serviceUser"], sx.user_name(os.geteuid() + 1))
+        self.assertIn("cannot read", " ".join(found["other"]["problems"]), "the other installation does not exist here")
+
+    def test_the_job_on_the_read_channel(self):
+        ex = self.executor()
+        ex.PROC, ex.COMMON_DIRS = str(self.proc.root), ()
+        self.api.queue.append({"protocol": 2, "id": "svc-discover-0001", "kind": "svc-discover", "dirs": [str(self.stopped)]})
+        self.api.queue.append({"protocol": 2, "id": "svc-discover-0002", "kind": "svc-discover", "dirs": ["relative/dir"]})
+        ex.run_once()
+        ex.run_once()
+        ex.wait_reads()
+        status = self.api.status["svc-discover-0001"]
+        self.assertEqual(status["state"], "succeeded", status.get("message"))
+        self.assertEqual(len(status["result"]["instances"]), 3 + (os.geteuid() == 0))
+        self.assertEqual((status["result"]["user"], status["result"]["isRoot"]), sx.ServiceExecutor.user())
+        self.assertIn("found 3 NiFi", self.api.logs["svc-discover-0001"])
+        self.assertEqual(self.api.status["svc-discover-0002"]["state"], "refused")
+
+    def test_properties_files(self):
+        f = self.root / "x.properties"
+        f.write_text("# c\n! c\na=1\nb = two words \nc:3\nd=\nlong=x\\\n   y\n")
+        self.assertEqual(sx.read_properties(f), {"a": "1", "b": "two words", "c": "3", "d": "", "long": "xy"})
+        self.assertEqual([sx.as_port(v) for v in ("8443", "http://127.0.0.1:52020", "", "x", "70000")], [8443, 52020, None, None, None])
 
 
 @unittest.skipUnless(all(shutil.which(c) for c in ("sh", "tar", "sha256sum")) and hasattr(os, "symlink"), "needs sh, tar, sha256sum")

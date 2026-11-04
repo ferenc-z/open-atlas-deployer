@@ -688,6 +688,13 @@ export class Store {
     return (this.db.prepare("SELECT id, host, picked_at FROM executor_jobs WHERE (?1 IS NULL OR host = ?1) ORDER BY queued_at, rowid").all(host ?? null) as Row[]).map((r) => ({ id: r.id, host: r.host, pickedAt: r.picked_at ?? null }));
   }
 
+  /** The newest job of one kind queued for one executor of a host (job ids start with their kind, newJobId). */
+  latestExecutorJob(host: string, executor: ExecutorKind, kind: string): string | undefined {
+    const r = this.db.prepare("SELECT id FROM executor_jobs WHERE host = ? AND COALESCE(executor, 'deploy') = ? AND substr(id, 1, ?) = ? ORDER BY queued_at DESC, rowid DESC LIMIT 1")
+      .get(host, executor, kind.length + 1, `${kind}-`) as Row | undefined;
+    return r?.id;
+  }
+
   setExecutorStatus(id: string, status: ExecutorStatus) {
     this.db.prepare("UPDATE executor_jobs SET status = ? WHERE id = ?").run(JSON.stringify(status), id);
   }

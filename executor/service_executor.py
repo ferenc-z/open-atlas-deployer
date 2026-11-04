@@ -11,17 +11,20 @@ Jobs come on two channels (§12). The read channel runs jobs that only look (dis
 by side, at most EXECUTOR_READ_SLOTS at a time, each within its timeout (the request's timeoutSeconds, at most
 EXECUTOR_READ_TIMEOUT); a job that runs over is reported failed and its late result dropped. The change channel runs one
 job at a time, after the reads in flight have ended; for now it only has executor-upgrade (the executor's own release,
-§8.6). The service jobs themselves (svc-discover and the rest) come in later steps; until then the executor refuses
-any kind it does not know, deploy jobs included.
+§8.6). The read jobs so far: svc-discover (§6 step 2), which finds the NiFi on the machine from their processes and
+from the directories it is given. The executor refuses any kind it does not know, deploy jobs included.
 
 The release holds one file: package.sh puts executor_core's code in place of the import block below (bundle.py).
 
 Standard library only; Python 3.9.
 """
+import glob
+import hashlib
 import json
 import os
 import pathlib
 import pwd
+import re
 import sys
 import threading
 import time
@@ -85,6 +88,311 @@ class ReadJob:
         return max(0.0, self.deadline - time.monotonic())
 
 
+# --- discovery (svc-discover, §6 step 2): which NiFi run here, and what they are -------------------------------------
+
+# NiFi's processes: the bootstrap that nifi.sh starts (RunNiFi in 1.x, BootstrapProcess in 2.x) and the NiFi JVM it runs.
+# 2.x keeps no run/nifi.pid, so instances are found by their command lines, never by pid files.
+NIFI_BOOTSTRAP = ("org.apache.nifi.bootstrap.RunNiFi", "org.apache.nifi.bootstrap.BootstrapProcess")
+NIFI_MAIN = "org.apache.nifi.NiFi"
+# The configuration files fingerprinted (the profile's files, §5.1, and the ones beside them in conf/).
+NIFI_CONF_FILES = ("nifi.properties", "bootstrap.conf", "state-management.xml", "authorizers.xml", "login-identity-providers.xml",
+                   "logback.xml", "zookeeper.properties", "bootstrap-notification-services.xml")
+# Where NiFi is often unpacked; an instance there is found even when it does not run.
+COMMON_DIRS = ("/opt/nifi*", "/opt/*/nifi*", "/usr/local/nifi*", "/srv/nifi*")
+# Values never sent to the Deployer: passwords and keys in the properties, and secrets in the start environment.
+SECRET_PROPERTY = re.compile(r"pass(word|wd|phrase)?|secret|token|credential|sensitive\.props\.key|\.key$|private", re.I)
+SECRET_ENV = re.compile(r"PASS|SECRET|TOKEN|CREDENTIAL|_KEY$|^KEY$|PRIVATE|COOKIE", re.I)
+HIDDEN = "(hidden)"
+MAX_DIRS = 32
+
+
+def read_properties(path):
+    """A Java properties file as a dict (NiFi's files: key=value, # and ! comments, \\ continues a line)."""
+    out, pending = {}, ""
+    for raw in pathlib.Path(path).read_text(errors="replace").splitlines():
+        line = pending + raw.strip() if pending else raw.lstrip()
+        pending = ""
+        if line.endswith("\\") and not line.endswith("\\\\"):
+            pending = line[:-1]
+            continue
+        if not line or line[0] in "#!":
+            continue
+        m = re.match(r"([^=:\s]+)\s*[=:]?\s*(.*)$", line)
+        if m:
+            out[m.group(1)] = m.group(2).rstrip()
+    return out
+
+
+def hide_secrets(props, pattern=SECRET_PROPERTY):
+    """Secret-looking values replaced by "(hidden)"; an empty one stays empty, so a missing key shows."""
+    return {k: (HIDDEN if v and pattern.search(k) else v) for k, v in props.items()}
+
+
+def as_port(value):
+    try:
+        port = int(str(value).strip().rsplit(":", 1)[-1].rstrip("/"))
+    except (TypeError, ValueError):
+        return None
+    return port if 0 < port < 65536 else None
+
+
+def user_name(uid):
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return str(uid)
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def iso_at(seconds):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(seconds))
+
+
+class Discovery:
+    """One svc-discover pass over /proc and the given directories. Only reads.
+
+    proc: the /proc to read (tests give a fake one); uid: whose processes count (None: everyone's, as root)."""
+
+    def __init__(self, proc="/proc", uid=None, common=COMMON_DIRS, log=lambda text: None):
+        self.proc = pathlib.Path(proc)
+        self.uid = uid
+        self.common = common
+        self.log = log
+
+    # --- processes ---
+
+    def processes(self):
+        """pid -> {cmdline, uid, ppid}: the NiFi processes this executor may look at; others' go to self.skipped."""
+        found, self.skipped = {}, []
+        for d in sorted((d for d in self.proc.iterdir() if d.name.isdigit()), key=lambda d: int(d.name)):
+            try:
+                args = [a for a in (d / "cmdline").read_bytes().split(b"\0") if a]
+            except OSError:
+                continue
+            args = [a.decode(errors="replace") for a in args]
+            if not any(a in NIFI_BOOTSTRAP or a == NIFI_MAIN for a in args):
+                continue
+            try:
+                status = dict(line.split(":", 1) for line in (d / "status").read_text().splitlines() if ":" in line)
+                uid, ppid = int(status["Uid"].split()[0]), int(status["PPid"].strip())
+            except (OSError, KeyError, ValueError):
+                continue
+            if self.uid is not None and uid != self.uid:
+                self.skipped.append({"pid": int(d.name), "user": user_name(uid)})
+                continue
+            found[int(d.name)] = {"args": args, "uid": uid, "ppid": ppid}
+        return found
+
+    @staticmethod
+    def define(args, name):
+        prefix = f"-D{name}="
+        return next((a[len(prefix):] for a in args if a.startswith(prefix)), None)
+
+    def home_of(self, pid, args):
+        """The installation a NiFi process belongs to: two levels above its bootstrap.conf or nifi.properties, else its cwd."""
+        for name in ("org.apache.nifi.bootstrap.config.file", "nifi.properties.file.path"):
+            value = self.define(args, name)
+            if value:
+                return os.path.normpath(os.path.dirname(os.path.dirname(value)))
+        try:
+            return os.path.normpath(os.readlink(self.proc / str(pid) / "cwd"))
+        except OSError:
+            return None
+
+    def environ(self, pid):
+        try:
+            raw = (self.proc / str(pid) / "environ").read_bytes()
+        except OSError as e:
+            return None, f"cannot read the start environment of {pid}: {e.strerror or e}"
+        env = dict(p.decode(errors="replace").split("=", 1) for p in raw.split(b"\0") if b"=" in p)
+        return hide_secrets(env, SECRET_ENV), None
+
+    def started_at(self, pid):
+        try:
+            fields = (self.proc / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()
+            btime = next(int(line.split()[1]) for line in (self.proc / "stat").read_text().splitlines() if line.startswith("btime "))
+            return iso_at(btime + int(fields[19]) / os.sysconf("SC_CLK_TCK"))
+        except (OSError, IndexError, ValueError, StopIteration):
+            return None
+
+    def listening(self, pid):
+        """The TCP ports the process listens on: its socket inodes against its network namespace's tcp tables."""
+        inodes = set()
+        try:
+            for fd in (self.proc / str(pid) / "fd").iterdir():
+                try:
+                    target = os.readlink(fd)
+                except OSError:
+                    continue
+                m = re.match(r"socket:\[(\d+)\]$", target)
+                if m:
+                    inodes.add(m.group(1))
+        except OSError:
+            return None
+        ports = set()
+        for table in ("tcp", "tcp6"):
+            try:
+                lines = (self.proc / str(pid) / "net" / table).read_text().splitlines()[1:]
+            except OSError:
+                continue
+            for line in lines:
+                f = line.split()
+                if len(f) > 9 and f[3] == "0A" and f[9] in inodes:
+                    ports.add(int(f[1].rsplit(":", 1)[1], 16))
+        return sorted(ports)
+
+    def running(self):
+        """installDir -> what its processes say (bootstrap and NiFi JVM pids, user, java, start environment, ports)."""
+        procs = self.processes()
+        out = {}
+        for pid, p in sorted(procs.items()):
+            home = self.home_of(pid, p["args"])
+            if not home:
+                continue
+            entry = out.setdefault(home, {"uid": p["uid"]})
+            role = "pid" if NIFI_MAIN in p["args"] else "bootstrapPid"
+            entry.setdefault(role, pid)
+            if role == "pid":
+                entry["propertiesFile"] = self.define(p["args"], "nifi.properties.file.path")
+        for home, entry in out.items():
+            main, boot = entry.get("pid"), entry.get("bootstrapPid")
+            # The environment nifi.sh started with is the bootstrap's (S10); the JVM inherits it.
+            env, problem = self.environ(boot or main)
+            entry["environment"] = env
+            entry["problems"] = [problem] if problem else []
+            try:
+                entry["java"] = os.readlink(self.proc / str(main or boot) / "exe")
+            except OSError:
+                entry["java"] = None
+            entry["startedAt"] = self.started_at(main or boot)
+            entry["listening"] = self.listening(main) if main else []
+        return out
+
+    # --- installations ---
+
+    @staticmethod
+    def is_nifi(home):
+        return (home / "conf" / "nifi.properties").is_file() or (home / "bin" / "nifi.sh").is_file()
+
+    @staticmethod
+    def version(home):
+        lib = home / "lib"
+        for pattern in ("nifi-runtime-*.jar", "bootstrap/nifi-bootstrap-*.jar", "nifi-framework-api-*.jar"):
+            for jar in sorted(lib.glob(pattern)):
+                m = re.search(r"-(\d+\.\d+\.\d+[0-9A-Za-z.-]*?)\.jar$", jar.name)
+                if m:
+                    return m.group(1)
+        return None
+
+    def instance(self, home, proc=None, source="process"):
+        """What one installation is: version, users, start environment, ports, the cluster settings, file fingerprints."""
+        home = pathlib.Path(home)
+        problems = list((proc or {}).get("problems", []))
+        props_file = pathlib.Path(os.path.normpath((proc or {}).get("propertiesFile") or home / "conf" / "nifi.properties"))
+        conf = props_file.parent
+        props, boot = {}, {}
+        try:
+            props = read_properties(props_file)
+        except OSError as e:
+            problems.append(f"cannot read {props_file}: {e.strerror or e}")
+        try:
+            boot = read_properties(conf / "bootstrap.conf")
+        except OSError as e:
+            problems.append(f"cannot read {conf / 'bootstrap.conf'}: {e.strerror or e}")
+        try:
+            owner = user_name(home.stat().st_uid)
+        except OSError:
+            owner = None
+        files = []
+        for name in NIFI_CONF_FILES:
+            path = props_file if name == "nifi.properties" else conf / name
+            try:
+                st = path.stat()
+                files.append({"name": name, "path": str(path), "sha256": sha256_file(path), "size": st.st_size, "modifiedAt": iso_at(st.st_mtime)})
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                problems.append(f"cannot read {path}: {e.strerror or e}")
+        args = [v for k, v in sorted(boot.items()) if k.startswith("java.arg")]
+        heap = {flag: next((a[4:] for a in args if a.startswith(f"-{flag}")), None) for flag in ("Xms", "Xmx")}
+        https, http = as_port(props.get("nifi.web.https.port")), as_port(props.get("nifi.web.http.port"))
+        web_host = props.get("nifi.web.https.host") if https else props.get("nifi.web.http.host")
+        running = bool(proc and proc.get("pid"))
+        node = props.get("nifi.cluster.is.node", "false").strip().lower() == "true"
+        return {
+            "service": "nifi",
+            "installDir": str(home),
+            "source": source,
+            "running": running,
+            "version": self.version(home),
+            "owner": owner,
+            # The user it runs as; one not running is started as the installation's owner (S10).
+            "serviceUser": user_name(proc["uid"]) if proc else owner,
+            "process": {k: proc.get(k) for k in ("pid", "bootstrapPid", "java", "startedAt", "listening")} if proc else None,
+            "startEnvironment": proc.get("environment") if proc else None,
+            "ports": {
+                "https": https, "http": http,
+                # The cluster's ports only count on a node (standalone ones keep the defaults but do not listen).
+                "clusterProtocol": as_port(props.get("nifi.cluster.node.protocol.port")) if node else None,
+                "loadBalance": as_port(props.get("nifi.cluster.load.balance.port")) if node else None,
+                "remoteInput": as_port(props.get("nifi.remote.input.socket.port")),
+                # 2.x: the bootstrap's management server (bootstrap.conf); 1.x picks a random one each start.
+                "management": as_port(boot.get("management.server.address")),
+            },
+            "webUrl": f"{'https' if https else 'http'}://{web_host or 'localhost'}:{https or http}/nifi" if (https or http) else None,
+            "cluster": {
+                "isNode": node,
+                "nodeAddress": props.get("nifi.cluster.node.address") or None,
+                "zookeeper": props.get("nifi.zookeeper.connect.string") or None,
+                "zookeeperRoot": props.get("nifi.zookeeper.root.node") or None,
+            },
+            "heap": heap,
+            # The JDK it runs on: the process's JAVA_HOME; not running, bootstrap.conf's java= when it names one.
+            "javaHome": (proc.get("environment") or {}).get("JAVA_HOME") if proc else None,
+            "bootstrapJava": boot.get("java") or None,
+            "properties": hide_secrets(props),
+            "bootstrap": hide_secrets(boot),
+            "files": files,
+            "problems": problems,
+        }
+
+    def run(self, dirs=()):
+        """Every NiFi found: running ones from their processes, then the asked and the common directories."""
+        procs = self.running()
+        instances = {home: self.instance(home, p) for home, p in procs.items()}
+        for home in instances:
+            self.log(f"running: {home} (pid {procs[home].get('pid') or '-'}, version {instances[home]['version']})")
+        asked = []
+        for d in dirs:
+            home = os.path.normpath(d)
+            if home in instances:
+                asked.append({"dir": d, "found": True, "running": instances[home]["running"]})
+                continue
+            if not os.path.isdir(home):
+                asked.append({"dir": d, "found": False, "error": "no such directory (or not readable by this executor)"})
+                continue
+            if not self.is_nifi(pathlib.Path(home)):
+                asked.append({"dir": d, "found": False, "error": "no conf/nifi.properties or bin/nifi.sh here: not a NiFi installation"})
+                continue
+            instances[home] = self.instance(home, None, source="dir")
+            asked.append({"dir": d, "found": True, "running": False})
+            self.log(f"asked: {home} (not running, version {instances[home]['version']})")
+        for pattern in self.common:
+            for home in sorted(glob.glob(pattern)):
+                home = os.path.normpath(home)
+                if home not in instances and os.path.isdir(home) and self.is_nifi(pathlib.Path(home)):
+                    instances[home] = self.instance(home, None, source="common-dir")
+                    self.log(f"common directory: {home} (not running)")
+        return {"instances": [instances[h] for h in sorted(instances)], "dirs": asked, "skipped": self.skipped}
+
+
 class ServiceExecutor(ProtocolExecutor):
     """The service executor: the read channel, and executor-upgrade on the change channel."""
 
@@ -92,8 +400,11 @@ class ServiceExecutor(ProtocolExecutor):
     PACKAGE_FILES = PACKAGE_FILES
     MAIN = "service_executor.py"
     EXECUTOR = "service"
-    # Read jobs: kind -> method(job) returning the job's result (a dict). None yet; svc-discover comes next (step 3).
-    READ_JOBS = {}
+    # Read jobs: kind -> method(job) returning the job's result (a dict).
+    READ_JOBS = {"svc-discover": "discover"}
+    # Where discovery looks (tests point these elsewhere).
+    PROC = "/proc"
+    COMMON_DIRS = COMMON_DIRS
     INTERRUPTED = "The service executor stopped while this job ran."
 
     def __init__(self, cfg, out=sys.stdout, api=None):
@@ -123,6 +434,19 @@ class ServiceExecutor(ProtocolExecutor):
     def describe(self):
         name, root = self.user()
         return f"service executor {VERSION} as {name}{'' if root else ' (not root: only its own services)'}"
+
+    def discover(self, job):
+        """svc-discover (§6 step 2): the NiFi on this machine, read only. request.dirs: installations to read as well,
+        for instances not running or unpacked somewhere uncommon. Not root, only this user's processes are looked at."""
+        dirs = job.request.get("dirs") or []
+        if not isinstance(dirs, list) or len(dirs) > MAX_DIRS or not all(isinstance(d, str) and d.startswith("/") and "\0" not in d for d in dirs):
+            raise Refused(f"dirs is a list of at most {MAX_DIRS} absolute paths")
+        if not pathlib.Path(self.PROC).is_dir():
+            raise Failed(f"{self.PROC} is not readable here: svc-discover needs Linux")
+        name, root = self.user()
+        found = Discovery(self.PROC, uid=None if root else os.geteuid(), common=self.COMMON_DIRS, log=job.log).run(dirs)
+        job.log(f"found {len(found['instances'])} NiFi" + (f"; {len(found['skipped'])} process(es) of other users not looked at (not root)" if found["skipped"] else ""))
+        return {"scannedAt": now_iso(), "user": name, "isRoot": root, **found}
 
     def beat_body(self, busy):
         body = super().beat_body(busy)

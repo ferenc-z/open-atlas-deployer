@@ -802,6 +802,48 @@ test("S18: a host's service executor has its own token and heartbeat, shows on t
   assert.ok(t.store.listAudit().some((e) => e.action === "host.token-created" && e.target === "app2" && JSON.stringify(e).includes("service")));
 });
 
+test("service ops step 3: discovery runs on the host's service executor, and its newest result is kept", async () => {
+  const t = withBuiltApp();
+  setEnvironment(t, ({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", hosts, registries: { ghcr: "ghcr.io/acme" }, apps: { shop: { version: "1.2.0", host: "app2" } } }));
+  const call = (path: string, token: string, init: RequestInit = {}) => t.app.request(`/deploy${path}`, { ...init, headers: { authorization: `Bearer ${token}`, ...(typeof init.body === "string" && init.body.startsWith("{") ? { "content-type": "application/json" } : {}) } });
+  const service = (await (await post(t, "/api/hosts/app2/token", "admin", { executor: "service" })).json()).token as string;
+  const beat = (kinds: string[]) => call("/executor/v1/heartbeat", service, { method: "POST", body: JSON.stringify({ executor: "service", version: EXECUTOR_VERSION, protocols: [2], kinds, busy: null, user: "ferenc", isRoot: false, reading: [], readSlots: 4 }) });
+  const latest = async (query = "") => t.request(`/api/hosts/app2/discover${query}`, { as: "viewer" });
+
+  assert.equal((await post(t, "/api/hosts/app2/discover", "admin", {})).status, 409, "no service executor online");
+  await beat(["executor-upgrade"]);
+  const old = await post(t, "/api/hosts/app2/discover", "admin", {});
+  assert.equal(old.status, 409);
+  assert.equal((await old.json()).error, "discover/executor-old");
+  await beat(["svc-discover", "executor-upgrade"]);
+  assert.equal((await post(t, "/api/hosts/app2/discover", "uat", {})).status, 403, "taking over is for administrators");
+  assert.equal((await post(t, "/api/hosts/nowhere/discover", "admin", {})).status, 404);
+  assert.equal((await post(t, "/api/hosts/app2/discover", "admin", { dirs: ["relative"] })).status, 400);
+  assert.equal((await latest()).status, 404, "none yet");
+
+  const started = await post(t, "/api/hosts/app2/discover", "admin", { dirs: ["/opt/nifi-2.0.0"] });
+  assert.equal(started.status, 201);
+  const { id } = await started.json();
+  assert.match(id, /^svc-discover-/);
+  assert.equal((await (await latest()).json()).state, "queued");
+  const job = (await (await call("/executor/v1/jobs/next", service)).json()).job;
+  assert.deepEqual([job.id, job.kind, job.dirs], [id, "svc-discover", ["/opt/nifi-2.0.0"]]);
+  assert.equal((await (await latest()).json()).state, "running");
+  const result = { user: "ferenc", isRoot: false, instances: [{ service: "nifi", installDir: "/opt/nifi-2.0.0", running: false, version: "2.0.0" }], dirs: [{ dir: "/opt/nifi-2.0.0", found: true }], skipped: [] };
+  await call(`/executor/v1/jobs/${id}/log`, service, { method: "POST", body: "found 1 NiFi\n" });
+  await call(`/executor/v1/jobs/${id}/status`, service, { method: "PUT", body: JSON.stringify({ protocol: 2, id, kind: "svc-discover", state: "succeeded", startedAt: "2026-11-04T00:00:00Z", finishedAt: "2026-11-04T00:00:01Z", steps: [], result }) });
+  const done = await (await latest()).json();
+  assert.deepEqual([done.id, done.state, done.result, done.dirs], [id, "succeeded", result, ["/opt/nifi-2.0.0"]]);
+  assert.match(done.log, /found 1 NiFi/);
+
+  // A newer one is what GET returns; an older one is still there by its id. Other hosts' ids are not served.
+  const second = (await (await post(t, "/api/hosts/app2/discover", "admin", {})).json()).id;
+  assert.equal((await (await latest()).json()).id, second);
+  assert.equal((await (await latest(`?job=${id}`)).json()).state, "succeeded");
+  assert.equal((await t.request(`/api/hosts/app1/discover?job=${id}`, { as: "viewer" })).status, 404);
+  assert.ok(t.store.listAudit().some((e) => e.action === "service.discover" && e.target === "app2"));
+});
+
 test("S18: a state database from before keeps its executor tokens and jobs as the deploy executor's", () => {
   const dir = mkdtempSync(join(tmpdir(), "s18-"));
   const file = join(dir, "state.db");
