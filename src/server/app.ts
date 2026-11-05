@@ -28,6 +28,7 @@ import { lineDiff } from "./ingress.ts";
 import { environmentStatus, hostStateOf, parseDockerPs, type Observer } from "./observe.ts";
 import { StoreError, type Actor, type Store } from "./store.ts";
 import { withoutSealed } from "./services/config.ts";
+import { configView } from "./services/configview.ts";
 import type { DraftItem } from "./services/draft.ts";
 import { serviceStatus } from "./services/status.ts";
 import { TakeoverError, type Takeover } from "./services/takeover.ts";
@@ -682,10 +683,11 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     if (p instanceof Response) return p;
     const configured = (id: string) => store.serviceConfigRevisions(id)[0]?.revision ?? null;
     // Step 6: with each its members' status in short (running at the newest discovery, executors online).
-    const summary = (id: string) => serviceStatus(store, (h) => handoff.executor(h, "service"), id)?.summary ?? null;
+    // S23: and each member's state in the members' order, for the table view's node rows.
+    const status = (id: string) => { const st = serviceStatus(store, (h) => handoff.executor(h, "service"), id); return { status: st?.summary ?? null, states: st?.members.map((m) => m.state) ?? [] }; };
     return c.json({
-      standalones: store.standalones().map((s) => ({ ...s, configRevision: configured(s.id), status: summary(s.id) })),
-      clusters: store.clusters().map((s) => ({ ...s, configRevision: configured(s.id), status: summary(s.id) })),
+      standalones: store.standalones().map((s) => ({ ...s, configRevision: configured(s.id), ...status(s.id) })),
+      clusters: store.clusters().map((s) => ({ ...s, configRevision: configured(s.id), ...status(s.id) })),
     });
   });
   api.get("/api/services/:id/config", async (c) => {
@@ -694,7 +696,11 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     const revision = c.req.query("revision");
     const cfg = store.serviceConfig(c.req.param("id"), revision === undefined ? undefined : Number(revision));
     if (!cfg) return reject(c, 404, "service-config/none", `No configuration${revision ? ` revision ${revision}` : ""} for ${c.req.param("id")}.`);
-    return c.json({ ...cfg, body: withoutSealed(cfg.body), revisions: store.serviceConfigRevisions(cfg.service) });
+    // S24: parsed rows with each key's catalog section and default status, and for a cluster the node comparison
+    // (secrets compared on the sealed values, shown only as labels).
+    const registered = store.standalones().find((s) => s.id === cfg.service) ?? store.clusters().find((s) => s.id === cfg.service);
+    const view = registered ? configView(cfg.body, registered.profile, registered.version, registered.kind, takeover?.unsealer()) : null;
+    return c.json({ ...cfg, body: withoutSealed(cfg.body), revisions: store.serviceConfigRevisions(cfg.service), view });
   });
   api.get("/api/services/drafts", async (c) => {
     const p = await authenticate(c, "view");

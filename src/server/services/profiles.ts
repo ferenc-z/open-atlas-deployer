@@ -24,6 +24,25 @@ export interface CatalogEntry {
   since?: string;
   until?: string;
   note?: string;
+  /** Where the pages list it (the grouped property table, S24): SECTIONS, by the key. */
+  section: Section;
+  /** One line on what the key does, shown on hover. */
+  description: string;
+}
+
+/** The grouped property table's sections, in order (S24); a key the catalog does not have goes under Other. */
+export const SECTIONS = ["Web and HTTPS", "Cluster", "ZooKeeper and state", "Security", "Site-to-site", "Repositories", "Flow", "Python", "JVM and bootstrap", "Other"] as const;
+export type Section = (typeof SECTIONS)[number];
+
+/** The section of a catalog key, by its prefix. */
+export function sectionOf(key: string, file: string): Section {
+  if (file === "bootstrap.conf") return "JVM and bootstrap";
+  const rules: [RegExp, Section][] = [
+    [/^nifi\.web\./, "Web and HTTPS"], [/^nifi\.cluster\./, "Cluster"], [/^nifi\.(zookeeper|state)\./, "ZooKeeper and state"],
+    [/^nifi\.(security|sensitive)\./, "Security"], [/^nifi\.remote\./, "Site-to-site"],
+    [/^nifi\.(flowfile|content|provenance|database|status|swap)\./, "Repositories"], [/^nifi\.(flow|templates|variable)\./, "Flow"], [/^nifi\.python\./, "Python"],
+  ];
+  return rules.find(([r]) => r.test(key))?.[1] ?? "Other";
 }
 
 export interface ServiceProfile {
@@ -41,8 +60,62 @@ export interface ServiceProfile {
   catalog: CatalogEntry[];
 }
 
-const p = (key: string, type: CatalogEntry["type"], def: string | null, scope: CatalogEntry["scope"], more: Partial<CatalogEntry> = {}): CatalogEntry =>
-  ({ key, file: "nifi.properties", type, default: def, scope, restart: true, sensitive: false, ...more });
+/** What each catalog key does, in a line (the pages show it on hover). */
+const DESCRIPTIONS: Record<string, string> = {
+  "nifi.cluster.is.node": "Whether this NiFi is a node of a cluster.",
+  "nifi.cluster.protocol.is.secure": "Whether the cluster protocol between nodes uses TLS.",
+  "nifi.cluster.node.address": "The address other nodes reach this node's cluster protocol on.",
+  "nifi.cluster.node.protocol.port": "The port of this node's cluster protocol.",
+  "nifi.cluster.load.balance.host": "The address other nodes send load-balanced connections' data to.",
+  "nifi.cluster.load.balance.port": "The port load-balanced connections' data comes in on.",
+  "nifi.cluster.flow.election.max.wait.time": "How long the nodes wait to elect the cluster's flow at start-up.",
+  "nifi.cluster.flow.election.max.candidates": "How many nodes must take part before the flow election ends early.",
+  "nifi.cluster.node.connection.timeout": "How long a node waits to connect to another node.",
+  "nifi.cluster.node.read.timeout": "How long a node waits for another node's answer.",
+  "nifi.cluster.load.balance.comms.timeout": "How long load balancing waits on a silent connection.",
+  "nifi.zookeeper.connect.string": "The ZooKeeper servers the cluster elects its coordinator and primary node with.",
+  "nifi.zookeeper.root.node": "The ZooKeeper path the cluster keeps its state under; one per cluster.",
+  "nifi.zookeeper.connect.timeout": "How long NiFi waits to connect to ZooKeeper.",
+  "nifi.zookeeper.session.timeout": "How long a ZooKeeper session lives without heartbeats.",
+  "nifi.state.management.provider.cluster": "The state-management.xml provider for cluster-wide state.",
+  "nifi.web.http.host": "The address the plain HTTP UI and API listen on.",
+  "nifi.web.http.port": "The port of the plain HTTP UI and API; empty when only HTTPS is on.",
+  "nifi.web.https.host": "The address the HTTPS UI and API listen on.",
+  "nifi.web.https.port": "The port of the HTTPS UI and API.",
+  "nifi.remote.input.host": "The address site-to-site clients are told to connect to.",
+  "nifi.remote.input.socket.port": "The port of raw-socket site-to-site.",
+  "nifi.remote.input.secure": "Whether site-to-site uses TLS.",
+  "nifi.sensitive.props.key": "The key the flow's sensitive properties are encrypted with.",
+  "nifi.sensitive.props.algorithm": "The algorithm the flow's sensitive properties are encrypted with.",
+  "nifi.security.keystore": "The keystore with this NiFi's server certificate.",
+  "nifi.security.keystoreType": "The keystore's type (JKS, PKCS12).",
+  "nifi.security.keystorePasswd": "The keystore's password.",
+  "nifi.security.keyPasswd": "The password of the key in the keystore.",
+  "nifi.security.truststore": "The truststore with the CAs client and node certificates are trusted by.",
+  "nifi.security.truststoreType": "The truststore's type (JKS, PKCS12).",
+  "nifi.security.truststorePasswd": "The truststore's password.",
+  "nifi.flowfile.repository.directory": "Where the FlowFile repository is.",
+  "nifi.content.repository.directory.default": "Where the content repository is.",
+  "nifi.provenance.repository.directory.default": "Where the provenance repository is.",
+  "nifi.database.directory": "Where NiFi's own H2 databases are.",
+  "nifi.flow.configuration.file": "The file the flow is kept in.",
+  "nifi.flow.configuration.json.file": "The flow kept as JSON beside flow.xml.gz.",
+  "nifi.templates.directory": "Where 1.x keeps templates.",
+  "nifi.variable.registry.properties": "Files of variables 1.x's variable registry reads.",
+  "nifi.python.command": "The Python NiFi runs Python processors with.",
+  "nifi.python.framework.source.directory": "Where the Python framework is.",
+  "nifi.python.extensions.source.directory.default": "Where Python processors are looked for.",
+  "run.as": "The user bin/nifi.sh switches to.",
+  "java.arg.2": "The JVM's initial heap.",
+  "java.arg.3": "The JVM's maximum heap.",
+  "java": "The java command the bootstrap starts NiFi with.",
+  "management.server.address": "Where the bootstrap talks to NiFi (status, stop).",
+};
+
+const p = (key: string, type: CatalogEntry["type"], def: string | null, scope: CatalogEntry["scope"], more: Partial<CatalogEntry> = {}): CatalogEntry => {
+  const file = more.file ?? "nifi.properties";
+  return { key, file, type, default: def, scope, restart: true, sensitive: false, section: sectionOf(key, file), description: DESCRIPTIONS[key] ?? "", ...more };
+};
 const b = (key: string, type: CatalogEntry["type"], def: string | null, scope: CatalogEntry["scope"], more: Partial<CatalogEntry> = {}): CatalogEntry =>
   p(key, type, def, scope, { file: "bootstrap.conf", ...more });
 

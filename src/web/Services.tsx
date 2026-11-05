@@ -1,17 +1,18 @@
 // Service ops pages (phase 1, §11): the managed services (NiFi) of this environment, and taking them over.
-// Services: clusters and standalone instances as registered, each with its members' status: the host's service
-// executor and whether the installation's NiFi was running at that host's newest discovery (phase 1 has no live
-// probes; discovering again brings it up to date). Takeover: discover on each host's service executor, make a draft
-// from the newest discoveries (grouped and assessed by rules, P1), edit it, confirm it (which imports each
+// Services (S23): grouped by environment, a card per cluster or standalone instance (or a table, where a cluster opens
+// into its node rows); a card opens the service's detail page (ServiceDetail.tsx). Whether a member runs is as of its
+// host's newest discovery (phase 1 has no live probes). Takeover: discover on each host's service executor, make a
+// draft from the newest discoveries (grouped and assessed by rules, P1), edit it, confirm it (which imports each
 // installation's configuration files as revision 1). Nothing here changes anything on the hosts.
 
-import { useCallback, useEffect, useState } from "react";
+import { Fragment, useCallback, useEffect, useState } from "react";
 import * as api from "./api.ts";
-import type { DiscoveryView, DraftItem, DraftSummary, Finding, HostView, MemberStatus, RegisteredService, ServiceConfigView, ServiceDraft, ServiceStatus, ServiceSummary, Skipped } from "./api.ts";
+import type { DiscoveryView, DraftItem, DraftSummary, Finding, HostView, RegisteredService, ServiceDraft, Skipped } from "./api.ts";
 import { ask } from "./Confirm.tsx";
 import { Markdown } from "./Markdown.tsx";
+import { ServiceDetail } from "./ServiceDetail.tsx";
+import { ConfCell, confElsewhere, DifferenceBadge, memberKey, membersOf, serviceName, SEVERITY, STATE, StatusNotes, UpBadge, webPort, when } from "./svc.tsx";
 
-const when = (iso?: string | null) => (iso ? new Date(iso).toLocaleString("en-US", { hour12: false }) : "—");
 type Problem = { message: string; details: string[] };
 const problemOf = (e: unknown): Problem => ({ message: (e as Error).message, details: (e as api.ApiError).details ?? [] });
 
@@ -20,143 +21,124 @@ function ProblemLine({ problem }: { problem: Problem | undefined }) {
   return <div className="error">{problem.message}{problem.details.length > 0 && <ul>{problem.details.map((d) => <li key={d}>{d}</li>)}</ul>}</div>;
 }
 
-const STATE: Record<MemberStatus["state"], { label: string; tone: string; title: string }> = {
-  running: { label: "Running", tone: "ok", title: "Running at the host's newest discovery" },
-  stopped: { label: "Stopped", tone: "bad", title: "Found but not running at the host's newest discovery" },
-  "not-found": { label: "Not found", tone: "warn", title: "The host's newest discovery did not see this installation (not running, or not in a scanned directory)" },
-  unknown: { label: "Not discovered", tone: "muted", title: "No finished discovery on this host yet" },
-};
+// The environments a service can be in (S14: each environment's Deployer has its own); others found are added after.
+const ENVIRONMENTS = ["UAT", "PROD"];
+type Layout = "cards" | "table";
+const LAYOUT_KEY = "oa.services.layout";
+const savedLayout = (): Layout => { try { return localStorage.getItem(LAYOUT_KEY) === "table" ? "table" : "cards"; } catch { return "cards"; } };
 
-function SummaryBadge({ s }: { s: ServiceSummary | null }) {
-  if (!s) return <span className="muted">—</span>;
-  const tone = s.running === s.members ? "ok" : s.running === 0 ? "bad" : "warn";
-  return <>
-    <span className={`badge ${tone}`}>{s.running}/{s.members} running</span>
-    {s.executorsOnline < s.members && <span className="badge warn" title="A member's service executor is offline: its state is as of the last discovery">{s.members - s.executorsOnline} executor offline</span>}
-    {s.versionsSeen.length > 0 && <span className="badge warn" title="Discovery saw a version different from the registered one">seen {s.versionsSeen.join(", ")}</span>}
-  </>;
-}
-
-const membersOf = (s: RegisteredService) => (s.kind === "cluster" ? s.nodes : [s.member]);
-const trimDir = (d: string) => d.replace(/\/+$/, "") || "/";
-/** The conf directory (nifi.properties): the one recorded, else <install>/conf. */
-const confOf = (m: { installDir: string; confDir?: string | null }) => trimDir(m.confDir || `${trimDir(m.installDir)}/conf`);
-/** The conf directory when it is not <install>/conf: what to show beside the install directory. */
-const confElsewhere = (m: { installDir: string; confDir?: string | null }) => (confOf(m) === `${trimDir(m.installDir)}/conf` ? null : confOf(m));
-const memberKey = (m: { host: string; installDir: string; confDir?: string | null }) => `${m.host}:${m.installDir}:${confOf(m)}`;
-const ConfCell = ({ m }: { m: { installDir: string; confDir?: string | null } }) =>
-  <td className="mono">{confElsewhere(m) ?? <span className="muted" title="NiFi's default, <install>/conf">{confOf(m)}</span>}</td>;
+const kindLabel = (s: RegisteredService) => (s.kind === "cluster" ? `Cluster · ${s.nodes.length} nodes` : "Standalone");
+const where = (m: { host: string; ports: { https?: number | null; http?: number | null } }) => `${m.host}${webPort(m.ports) ? `:${webPort(m.ports)}` : ""}`;
 
 export function ServicesPage({ onTakeover }: { onTakeover: () => void }) {
   const [list, setList] = useState<{ standalones: RegisteredService[]; clusters: RegisteredService[] } | undefined>();
   const [open, setOpen] = useState<string | undefined>();
+  const [layout, setLayoutState] = useState<Layout>(savedLayout);
   const [error, setError] = useState("");
   const refresh = useCallback(() => { api.services().then(setList, (e: Error) => setError(e.message)); }, []);
   useEffect(() => { refresh(); const t = setInterval(refresh, 15_000); return () => clearInterval(t); }, [refresh]);
+  const setLayout = (l: Layout) => { setLayoutState(l); try { localStorage.setItem(LAYOUT_KEY, l); } catch { /* per-viewer convenience only */ } };
+  if (open) return <ServiceDetail key={open} id={open} onBack={() => { setOpen(undefined); refresh(); }} />;
   if (!list) return error ? <p className="error">{error}</p> : <p className="muted">Loading…</p>;
-  const empty = !list.clusters.length && !list.standalones.length;
-  const row = (s: RegisteredService) => (
-    <tr key={s.id} className="app" onClick={() => setOpen(s.id)}>
-      <td className="mono">{s.id}</td>
-      <td>{s.service === "nifi" ? "NiFi" : s.service} <span className="mono">{s.version}</span> <span className="muted">{s.profile}</span></td>
-      <td>{s.kind === "cluster" ? `${s.nodes.length} nodes` : "Standalone"}</td>
-      <td className="mono small">{membersOf(s).map((m) => <div key={memberKey(m)}>{m.host}:{m.installDir}{confElsewhere(m) && <span className="muted"> · conf {confElsewhere(m)}</span>}</div>)}</td>
-      <td><SummaryBadge s={s.status} /></td>
-      <td>{s.configRevision ? `Revision ${s.configRevision}` : <span className="muted">None</span>}</td>
-      <td className="muted">{when(s.createdAt)} · {s.createdBy}</td>
-    </tr>
-  );
+  const all = [...list.clusters, ...list.standalones];
+  const envs = [...ENVIRONMENTS, ...new Set(all.map((s) => s.environment.toUpperCase()).filter((e) => !ENVIRONMENTS.includes(e)))];
   return (
     <>
       <div className="toolbar">
         <h1>Services</h1>
-        <span className="muted">The NiFi of this environment taken over by the Deployer: clusters and standalone instances. Whether a member runs is as of its host's newest discovery; phase 1 has no live probes.</span>
+        <span className="spacer" />
+        <div className="subtabs inline" role="tablist" aria-label="Layout">
+          <button className={layout === "cards" ? "active" : ""} onClick={() => setLayout("cards")} aria-selected={layout === "cards"}>Cards</button>
+          <button className={layout === "table" ? "active" : ""} onClick={() => setLayout("table")} aria-selected={layout === "table"}>Table</button>
+        </div>
         <button className="link" onClick={onTakeover}>Take over more…</button>
       </div>
+      <p className="muted page-note">NiFi taken over by the Deployer, by environment. Whether a member runs is as of its host's newest discovery; phase 1 has no live probes.</p>
       {error && <p className="error">{error}</p>}
-      {open && <ServiceDetail key={open} id={open} onClose={() => setOpen(undefined)} />}
-      {empty ? <section className="card"><p className="muted">Nothing is registered yet. Discover on the hosts and confirm a takeover draft first.</p><button className="primary" onClick={onTakeover}>Open Takeover</button></section> : (
-        <table>
-          <thead><tr><th>Id</th><th>Service</th><th>Kind</th><th>Installations</th><th>Status</th><th>Configuration</th><th>Taken over</th></tr></thead>
-          <tbody>
-            {list.clusters.map(row)}
-            {list.standalones.map(row)}
-          </tbody>
-        </table>
-      )}
+      {!all.length && <section className="card"><p className="muted">Nothing is registered yet. Discover on the hosts and confirm a takeover draft first.</p><button className="primary" onClick={onTakeover}>Open Takeover</button></section>}
+      {all.length > 0 && envs.map((env) => {
+        const here = all.filter((s) => s.environment.toUpperCase() === env);
+        const installs = here.reduce((n, s) => n + membersOf(s).length, 0);
+        if (!here.length) return (
+          <details key={env} className="env-group empty">
+            <summary><span className={`env ${env === "PROD" ? "prod" : ""}`}>{env}</span> <span className="muted">No services</span></summary>
+            <p className="muted small">Each environment's Deployer registers its own services (S14); {env}'s are on its Deployer.</p>
+          </details>
+        );
+        return (
+          <section key={env} className="env-group">
+            <div className="env-head"><span className={`env ${env === "PROD" ? "prod" : ""}`}>{env}</span> <span className="muted">{here.length} service{here.length > 1 ? "s" : ""} · {installs} installation{installs > 1 ? "s" : ""}</span></div>
+            {layout === "cards"
+              ? <div className="svc-cards">{here.map((s) => <ServiceCard key={s.id} s={s} onOpen={() => setOpen(s.id)} />)}</div>
+              : <ServiceTable services={here} onOpen={setOpen} />}
+          </section>
+        );
+      })}
     </>
   );
 }
 
-function ServiceDetail({ id, onClose }: { id: string; onClose: () => void }) {
-  const [s, setS] = useState<ServiceStatus | undefined>();
-  const [cfg, setCfg] = useState<ServiceConfigView | null | undefined>();
-  const [error, setError] = useState("");
-  const load = useCallback(() => { api.serviceStatus(id).then(setS, (e: Error) => setError(e.message)); }, [id]);
-  useEffect(() => { load(); const t = setInterval(load, 10_000); return () => clearInterval(t); }, [load]);
-  useEffect(() => { api.serviceConfig(id).then(setCfg, () => setCfg(null)); }, [id]);
-  if (!s) return <section className="card panel">{error ? <p className="error">{error}</p> : <p className="muted">Loading…</p>}</section>;
-  const cluster = s.kind === "cluster";
+function ServiceCard({ s, onOpen }: { s: RegisteredService; onOpen: () => void }) {
+  const members = membersOf(s);
   return (
-    <section className="card panel">
-      <div className="toolbar">
-        <h2>{cluster ? "Cluster" : "Standalone instance"} <span className="mono">{s.id}</span></h2>
-        <SummaryBadge s={s.summary} />
-        <button className="link" onClick={onClose}>Close</button>
+    <button className="svc-card" onClick={onOpen} title={`Open ${s.id}`}>
+      <div className="svc-card-head"><strong className="mono">{s.id}</strong><UpBadge s={s.status} /></div>
+      <div className="muted small">{kindLabel(s)} · {serviceName(s.service)} <span className="mono">{s.version}</span> <span className="muted">({s.profile})</span></div>
+      <ul className="svc-members mono small">{members.map((m, i) => (
+        <li key={memberKey(m)}><span className={`dot ${STATE[s.states[i] ?? "unknown"].tone}`} title={STATE[s.states[i] ?? "unknown"].label} />{where(m)}{s.kind === "cluster" && m.nodeAddress ? <span className="muted"> · {m.nodeAddress}</span> : null}</li>
+      ))}</ul>
+      <div className="svc-card-foot">
+        <span className="small">{s.configRevision ? <>Config <span className="mono">r{s.configRevision}</span></> : <span className="muted">No configuration</span>}</span>
+        <DifferenceBadge s={s.status} cluster={s.kind === "cluster"} />
+        <StatusNotes s={s.status} />
       </div>
-      <table>
-        <tbody>
-          <tr><th>Service</th><td>{s.service === "nifi" ? "NiFi" : s.service} <span className="mono">{s.version}</span> · profile <span className="mono">{s.profile}</span></td></tr>
-          {s.webUrl && <tr><th>NiFi UI</th><td className="mono">{s.webUrl}</td></tr>}
-          {cluster && <tr><th>ZooKeeper</th><td className="mono">{s.zookeeper ?? "—"} <span className="muted">root</span> {s.zookeeperRoot ?? "—"} <span className="muted">(external, not managed)</span></td></tr>}
-          <tr><th>Configuration</th><td>{s.configRevision ? `Revision ${s.configRevision}` : "None"}</td></tr>
-          <tr><th>Taken over</th><td>{when(s.createdAt)} by {s.createdBy}{s.draft && <span className="muted"> · draft <span className="mono">{s.draft}</span></span>}</td></tr>
-        </tbody>
-      </table>
-      <h3>{cluster ? "Nodes" : "Installation"}</h3>
-      <table>
-        <thead><tr><th>Host</th><th>Install directory</th><th>Conf directory</th>{cluster && <th>Node address</th>}<th>User</th><th>Ports</th><th>Service executor</th><th>State</th><th>Seen</th></tr></thead>
-        <tbody>
-          {s.members.map((m) => (
-            <tr key={memberKey(m)}>
-              <td className="mono">{m.host}</td>
-              <td className="mono">{m.installDir}</td>
-              <ConfCell m={m} />
-              {cluster && <td className="mono">{m.nodeAddress ?? "—"}</td>}
-              <td className="mono">{m.serviceUser ?? "—"}</td>
-              <td className="mono small">{Object.entries(m.ports).filter(([, v]) => v).map(([k, v]) => `${k} ${v}`).join(" · ") || "—"}</td>
-              <td>{m.executor.online ? <span className="badge ok">Online</span> : <span className="badge bad" title={m.executor.reason}>Offline</span>} <span className="muted">{m.executor.version ?? ""}</span></td>
-              <td><span className={`badge ${STATE[m.state].tone}`} title={STATE[m.state].title}>{STATE[m.state].label}</span></td>
-              <td className="muted small">{m.seen ? <>{when(m.seen.at)}{m.seen.version && <> · <span className={m.seen.version === s.version ? "" : "error"}>{m.seen.version}</span></>}{m.seen.pid ? ` · pid ${m.seen.pid}` : ""}</> : "—"}</td>
+    </button>
+  );
+}
+
+function ServiceTable({ services, onOpen }: { services: RegisteredService[]; onOpen: (id: string) => void }) {
+  // Clusters open into their node rows in place; folded ones are remembered while the page is open.
+  const [folded, setFolded] = useState<Set<string>>(new Set());
+  const toggle = (id: string) => setFolded((was) => { const next = new Set(was); if (next.has(id)) next.delete(id); else next.add(id); return next; });
+  return (
+    <table className="svc-table">
+      <thead><tr><th>Name</th><th>Kind</th><th>Version</th><th>Host and port</th><th>Up</th><th>Configuration</th><th>Differences</th></tr></thead>
+      <tbody>{services.map((s) => {
+        const cluster = s.kind === "cluster";
+        const shut = folded.has(s.id);
+        const members = membersOf(s);
+        return (
+          <Fragment key={s.id}>
+            <tr className="app" onClick={() => onOpen(s.id)}>
+              <td>{cluster
+                ? <button className="link caret" onClick={(e) => { e.stopPropagation(); toggle(s.id); }} aria-expanded={!shut} title={shut ? "Show the nodes" : "Hide the nodes"}>{shut ? "▸" : "▾"}</button>
+                : <span className="caret" />}<span className="mono">{s.id}</span></td>
+              <td>{kindLabel(s)}</td>
+              <td>{serviceName(s.service)} <span className="mono">{s.version}</span></td>
+              <td className="mono small">{cluster ? <span className="muted">{members.length} nodes</span> : where(members[0]!)}</td>
+              <td><UpBadge s={s.status} /> <StatusNotes s={s.status} /></td>
+              <td>{s.configRevision ? <span className="mono">r{s.configRevision}</span> : <span className="muted">None</span>}</td>
+              <td>{cluster ? <DifferenceBadge s={s.status} cluster /> : <span className="muted">—</span>}</td>
             </tr>
-          ))}
-        </tbody>
-      </table>
-      {cfg && (
-        <details>
-          <summary>Configuration revision {cfg.revision} ({cfg.source}, {when(cfg.savedAt)} by {cfg.savedBy}); secret values hidden</summary>
-          {cfg.body.members.map((m) => (
-            <div key={memberKey(m)} className="panel">
-              <h3 className="mono">{m.host}:{m.installDir}{confElsewhere(m) && <span className="muted"> · conf {confElsewhere(m)}</span>}</h3>
-              {m.missing.length > 0 && <p className="muted">Not there: {m.missing.join(", ")}</p>}
-              {m.files.map((f) => (
-                <details key={f.name}>
-                  <summary><span className="mono">{f.name}</span> <span className="muted small">{f.size} bytes · sha256 {f.sha256.slice(0, 12)}… · modified {when(f.modifiedAt)}{f.secrets.length ? ` · ${f.secrets.length} hidden` : ""}</span></summary>
-                  <pre className="json">{f.redacted}</pre>
-                </details>
-              ))}
-            </div>
-          ))}
-        </details>
-      )}
-    </section>
+            {cluster && !shut && members.map((m, i) => (
+              <tr key={memberKey(m)} className="node-row app" onClick={() => onOpen(s.id)}>
+                <td className="mono small"><span className="caret" /><span className="muted">└</span> Node {i + 1}{m.nodeAddress ? <span className="muted"> · {m.nodeAddress}</span> : null}</td>
+                <td className="muted small">Node</td>
+                <td></td>
+                <td className="mono small">{where(m)}</td>
+                <td><span className={`badge ${STATE[s.states[i] ?? "unknown"].tone}`} title={STATE[s.states[i] ?? "unknown"].title}>{STATE[s.states[i] ?? "unknown"].label}</span></td>
+                <td className="mono small muted" colSpan={2}>{m.installDir}{confElsewhere(m) && <> · conf {confElsewhere(m)}</>}</td>
+              </tr>
+            ))}
+          </Fragment>
+        );
+      })}</tbody>
+    </table>
   );
 }
 
 // Takeover.
-
 const FINAL = new Set(["succeeded", "failed", "refused", "rolled-back"]);
-const SEVERITY: Record<Finding["severity"], { tone: string; mark: string }> = { error: { tone: "bad", mark: "✕" }, warning: { tone: "warn", mark: "!" }, info: { tone: "info", mark: "i" } };
 
 export function TakeoverPage({ isAdmin, onRegistered }: { isAdmin: boolean; onRegistered: () => void }) {
   const [hosts, setHosts] = useState<HostView[] | undefined>();

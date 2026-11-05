@@ -226,15 +226,19 @@ import type { DraftItem, ServiceDraft } from "../server/services/draft.ts";
 import type { Finding, Skipped } from "../server/services/assess.ts";
 import type { MemberStatus, ServiceStatus } from "../server/services/status.ts";
 import type { ConfigFileRecord } from "../server/services/config.ts";
+import type { CatalogView, CompareRow, ConfigView, FileCompare, PropertyRow } from "../server/services/configview.ts";
+export type { CatalogView, CompareRow, ConfigView, FileCompare, PropertyRow };
 export type { DraftItem, Finding, MemberStatus, ServiceDraft, ServiceStatus, Skipped };
 export type ServiceSummary = ServiceStatus["summary"];
-type Registered = { environment: string; draft: string | null; createdAt: string; createdBy: string; configRevision: number | null; status: ServiceSummary | null };
+type Registered = { environment: string; draft: string | null; createdAt: string; createdBy: string; configRevision: number | null; status: ServiceSummary | null; states: MemberStatus["state"][] };
 export type RegisteredService = (Extract<DraftItem, { kind: "standalone" }> | Extract<DraftItem, { kind: "cluster" }>) & Registered;
 export const services = () => call<{ standalones: RegisteredService[]; clusters: RegisteredService[] }>("GET", "services");
 export const serviceStatus = (id: string) => call<ServiceStatus>("GET", `services/${encodeURIComponent(id)}/status`);
 export type ServiceConfigView = { service: string; revision: number; source: string; savedAt: string; savedBy: string; via: string; note: string | null;
   body: { members: { host: string; installDir: string; confDir?: string; files: Omit<ConfigFileRecord, "sealed">[]; missing: string[] }[] };
-  revisions: { revision: number; source: string; savedAt: string; savedBy: string; note: string | null }[] };
+  revisions: { revision: number; source: string; savedAt: string; savedBy: string; note: string | null }[];
+  /** S24: parsed rows, the catalog, and a cluster's node comparison (null when the service is not registered). */
+  view: ConfigView | null };
 export const serviceConfig = (id: string, revision?: number) => call<ServiceConfigView>("GET", `services/${encodeURIComponent(id)}/config${revision ? `?revision=${revision}` : ""}`);
 /** svc-discover on a host's service executor; the newest one. */
 /** One asked installation: its path, or with its conf directory when that is elsewhere (and conf.dir does not say so). */

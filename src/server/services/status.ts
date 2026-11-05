@@ -6,7 +6,7 @@
 import type { ExecutorInfo } from "../handoff.ts";
 import type { Store } from "../store.ts";
 import { confDirOf, installKey, type DraftItem, type ServiceMember, type ServicePorts } from "./draft.ts";
-import { discoveredKey } from "./assess.ts";
+import { discoveredKey, type Finding } from "./assess.ts";
 
 export type MemberState = "running" | "stopped" | "not-found" | "unknown";
 
@@ -39,8 +39,20 @@ export interface ServiceStatus {
   createdBy: string;
   configRevision: number | null;
   members: MemberStatus[];
-  /** How many members were running at their host's newest discovery, of how many; versions seen that differ from the registered one. */
-  summary: { members: number; running: number; executorsOnline: number; versionsSeen: string[] };
+  /** How many members were running at their host's newest discovery, of how many; versions seen that differ from the registered one;
+   *  differences: the takeover's node-difference findings; findings: the takeover's findings by severity (phase 1 has no alerts). */
+  summary: { members: number; running: number; executorsOnline: number; versionsSeen: string[]; differences: number; findings: Record<Finding["severity"], number> };
+  /** What the takeover draft found for this item (rules, §6 step 3), errors first. */
+  findings: Finding[];
+  /** What happened to it, newest first: phase 1 has the registration and the configuration revisions (S23 timeline). */
+  events: { at: string; kind: "registered" | "config"; text: string; by: string }[];
+}
+
+/** The takeover findings of a registered item: those of the draft item it was confirmed from. */
+export function takeoverFindings(store: Store, draft: string | null, id: string): Finding[] {
+  if (!draft) return [];
+  const item = store.serviceDraft(draft)?.items.find((i) => i.id === id);
+  return (item?.findings ?? []) as Finding[];
 }
 
 
@@ -73,13 +85,25 @@ export function serviceStatus(store: Store, executor: (host: string) => Executor
       seen: d ? { job: d.job, at: d.at, version: found?.version ?? null, pid: found?.process?.pid ?? null, webUrl: found?.webUrl ?? null } : null,
     };
   });
-  const versionsSeen = [...new Set(statuses.map((m) => m.seen?.version).filter((v): v is string => Boolean(v) && v !== item.version))];
+  const findings = takeoverFindings(store, item.draft, item.id);
+  const count = (s: Finding["severity"]) => findings.filter((f) => f.severity === s).length;
+  const revisions = store.serviceConfigRevisions(item.id);
+  const versionsSeen =[...new Set(statuses.map((m) => m.seen?.version).filter((v): v is string => Boolean(v) && v !== item.version))];
   return {
     id: item.id, kind: item.kind, service: item.service, profile: item.profile, version: item.version, webUrl: item.webUrl,
     ...(c ? { zookeeper: c.zookeeper, zookeeperRoot: c.zookeeperRoot } : {}),
     environment: item.environment, draft: item.draft, createdAt: item.createdAt, createdBy: item.createdBy,
-    configRevision: store.serviceConfigRevisions(item.id)[0]?.revision ?? null,
+    configRevision: revisions[0]?.revision ?? null,
     members: statuses,
-    summary: { members: statuses.length, running: statuses.filter((m) => m.state === "running").length, executorsOnline: statuses.filter((m) => m.executor.online).length, versionsSeen },
+    summary: {
+      members: statuses.length, running: statuses.filter((m) => m.state === "running").length, executorsOnline: statuses.filter((m) => m.executor.online).length, versionsSeen,
+      differences: findings.filter((f) => f.code === "cluster/differs" || f.code === "cluster/version-differs").length,
+      findings: { error: count("error"), warning: count("warning"), info: count("info") },
+    },
+    findings,
+    events: [
+      ...revisions.map((r) => ({ at: r.savedAt, kind: "config" as const, text: `Configuration revision ${r.revision}${r.source === "import" ? ", imported from the hosts" : ` (${r.source})`}${r.note ? `: ${r.note}` : ""}`, by: r.savedBy })),
+      { at: item.createdAt, kind: "registered" as const, text: `Taken over${item.draft ? ` from draft ${item.draft}` : ""}`, by: item.createdBy },
+    ].sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : a.kind === "config" ? -1 : 1)),
   };
 }

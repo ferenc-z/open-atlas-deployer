@@ -53,6 +53,12 @@ export class Takeover {
   }
 
   /** The key the service executors fingerprint secret values with; made on first use, never shown. */
+  /** Opens a sealed configuration file, for comparing secrets between nodes server-side (S24); undefined without the key. */
+  unsealer(): ((sealed: string) => string) | undefined {
+    const box = this.o.box;
+    return box ? (sealed) => box.open(sealed) : undefined;
+  }
+
   fingerprintKey(): string {
     const kept = this.o.store.setting(FINGERPRINT_KEY);
     if (kept) return kept;

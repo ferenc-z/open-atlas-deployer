@@ -905,6 +905,10 @@ test("service ops step 5: a takeover draft from discovery, confirmed with each i
   assert.equal(cfg.revision, 1);
   const shown = JSON.stringify(cfg);
   assert.ok(shown.includes("nifi.sensitive.props.key=(hidden)") && !shown.includes("=one") && !shown.includes("v1:"), "the page gets the redacted copy, never the sealed one");
+  // S24: the parsed rows and the node comparison come with it; secrets in the comparison are labels.
+  assert.equal(cfg.view.rows.length, 2);
+  assert.ok(cfg.view.rows[0].files["nifi.properties"].some((r: { key: string; status: string }) => r.key === "nifi.sensitive.props.key" && r.status === "hidden"));
+  assert.ok(Array.isArray(cfg.view.compare) && cfg.view.catalog.length > 0);
   assert.equal(t.box.open(t.store.serviceConfig("prod-flow")!.body.members[0]!.files[0]!.sealed), files["/opt/a"]);
   assert.equal((await post(t, `/api/services/drafts/${draft.id}/confirm`, "admin", {})).status, 409, "confirmed once");
 });
@@ -2149,7 +2153,8 @@ test("service ops step 6: a registered service's status is its members' executor
   await discover("failed", []);
   flow = (await status("flow")).body;
   assert.deepEqual(flow.members.map((m: { state: string; seen: { version: string; pid: number | null } }) => [m.state, m.seen.version, m.seen.pid]), [["running", "2.5.0", 11], ["stopped", "2.5.1", null]]);
-  assert.deepEqual(flow.summary, { members: 2, running: 1, executorsOnline: 2, versionsSeen: ["2.5.1"] });
+  assert.deepEqual(flow.summary, { members: 2, running: 1, executorsOnline: 2, versionsSeen: ["2.5.1"], differences: 0, findings: { error: 0, warning: 0, info: 0 } });
+  assert.deepEqual([flow.findings, flow.events.map((e: { kind: string }) => e.kind)], [[], ["registered"]], "registered without a draft or a configuration");
   assert.equal(flow.zookeeperRoot, "/flow");
   await discover("succeeded", [{ installDir: "/opt/a", running: true, version: "2.5.0", process: { pid: 12 } }]);
   assert.deepEqual((await status("flow")).body.members.map((m: { state: string }) => m.state), ["running", "not-found"], "the newest discovery did not see /opt/b");
