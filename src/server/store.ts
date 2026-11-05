@@ -11,6 +11,8 @@ import type { Environment, Manifest } from "../compose/generate.ts";
 import { changedPaths } from "./jsonpatch.ts";
 import { crossAppConflicts, validateManifest } from "../manifest/validate.ts";
 import { compareVersions } from "../manifest/version.ts";
+import { checkDraftItem, type DraftCluster, type DraftItem, type DraftStandalone, type DraftState, type ServiceDraft, type ServiceMember } from "./services/draft.ts";
+import { randomBytes } from "node:crypto";
 
 export interface Actor { id: string; via: "workbench" | "emergency" | "cli" | "key" | "service" }
 
@@ -86,6 +88,24 @@ CREATE TABLE IF NOT EXISTS environment_revisions (
   saved_by TEXT NOT NULL, via TEXT NOT NULL, note TEXT);
 CREATE TABLE IF NOT EXISTS nginx_revisions (
   revision INTEGER PRIMARY KEY, body TEXT NOT NULL, sha256 TEXT NOT NULL, saved_at TEXT NOT NULL, saved_by TEXT NOT NULL, note TEXT);
+CREATE TABLE IF NOT EXISTS service_standalones (
+  id TEXT PRIMARY KEY, service TEXT NOT NULL, profile TEXT NOT NULL, version TEXT NOT NULL, environment TEXT NOT NULL,
+  host TEXT NOT NULL, install_dir TEXT NOT NULL, service_user TEXT, start_env TEXT, ports TEXT NOT NULL, web_url TEXT,
+  thresholds TEXT, draft TEXT, discovery TEXT, created_at TEXT NOT NULL, created_by TEXT NOT NULL, removed_at TEXT, removed_by TEXT);
+CREATE TABLE IF NOT EXISTS service_clusters (
+  id TEXT PRIMARY KEY, service TEXT NOT NULL, profile TEXT NOT NULL, version TEXT NOT NULL, environment TEXT NOT NULL,
+  zookeeper TEXT, zookeeper_root TEXT, web_url TEXT, thresholds TEXT, draft TEXT,
+  created_at TEXT NOT NULL, created_by TEXT NOT NULL, removed_at TEXT, removed_by TEXT);
+CREATE TABLE IF NOT EXISTS service_nodes (
+  cluster TEXT NOT NULL REFERENCES service_clusters(id), host TEXT NOT NULL, install_dir TEXT NOT NULL, service_user TEXT,
+  start_env TEXT, control TEXT NOT NULL, ports TEXT NOT NULL, node_address TEXT, discovery TEXT,
+  added_at TEXT NOT NULL, removed_at TEXT, PRIMARY KEY (cluster, host, install_dir));
+CREATE TABLE IF NOT EXISTS service_drafts (
+  id TEXT PRIMARY KEY, state TEXT NOT NULL, environment TEXT NOT NULL, sources TEXT NOT NULL,
+  created_at TEXT NOT NULL, created_by TEXT NOT NULL, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS service_draft_items (
+  draft TEXT NOT NULL REFERENCES service_drafts(id), id TEXT NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL,
+  updated_at TEXT NOT NULL, updated_by TEXT NOT NULL, PRIMARY KEY (draft, id));
 `;
 
 /** queued: waiting for the host's executor to claim it; the rest are the executor's states. */
@@ -772,5 +792,157 @@ export class Store {
   nginxRevision(revision?: number): { revision: number; body: string; sha256: string; savedAt: string; savedBy: string; note: string | null } | undefined {
     const r = (revision === undefined ? this.db.prepare("SELECT * FROM nginx_revisions ORDER BY revision DESC LIMIT 1").get() : this.db.prepare("SELECT * FROM nginx_revisions WHERE revision = ?").get(revision)) as Row | undefined;
     return r && { revision: r.revision, body: r.body, sha256: r.sha256, savedAt: r.saved_at, savedBy: r.saved_by, note: r.note ?? null };
+  }
+
+  // Service ops §5.2, §6 (S4): takeover drafts, and the standalone instances and clusters they become when confirmed.
+  // A draft is edited item by item while open; confirming (step 5) registers its items and closes it.
+
+  private inTransaction<T>(work: () => T): T {
+    this.db.exec("BEGIN IMMEDIATE");
+    try { const result = work(); this.db.exec("COMMIT"); return result; } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
+
+  private draftItems(draft: string): DraftItem[] {
+    return (this.db.prepare("SELECT body FROM service_draft_items WHERE draft = ? ORDER BY rowid").all(draft) as Row[]).map((r) => JSON.parse(r.body));
+  }
+
+  private openDraft(id: string): Row {
+    const d = this.db.prepare("SELECT * FROM service_drafts WHERE id = ?").get(id) as Row | undefined;
+    if (!d) throw new StoreError("draft/unknown", `No takeover draft ${id}.`);
+    if (d.state !== "open") throw new StoreError("draft/closed", `Takeover draft ${id} is ${d.state}.`);
+    return d;
+  }
+
+  private checkItem(item: DraftItem, others: DraftItem[]) {
+    const errors = checkDraftItem(item, others);
+    if (errors.length) throw new StoreError("draft/item-invalid", `Draft item ${item?.id ?? "?"} is not valid.`, errors);
+  }
+
+  /** A new open draft from discoveries (sources: one job per host), with the items proposed from them. */
+  createServiceDraft(environment: string, sources: { job: string; host: string }[], items: DraftItem[], actor: Actor): ServiceDraft {
+    const id = `draft-${randomBytes(6).toString("hex")}`;
+    items.forEach((item, i) => this.checkItem(item, items.filter((_, j) => j !== i)));
+    if (new Set(items.map((x) => x.id)).size !== items.length) throw new StoreError("draft/item-invalid", "Two draft items have the same id.");
+    const at = this.stamp();
+    this.inTransaction(() => {
+      this.db.prepare("INSERT INTO service_drafts (id, state, environment, sources, created_at, created_by, updated_at, updated_by) VALUES (?, 'open', ?, ?, ?, ?, ?, ?)")
+        .run(id, environment, JSON.stringify(sources), at, actor.id, at, actor.id);
+      for (const item of items) this.db.prepare("INSERT INTO service_draft_items (draft, id, kind, body, updated_at, updated_by) VALUES (?, ?, ?, ?, ?, ?)").run(id, item.id, item.kind, JSON.stringify(item), at, actor.id);
+      this.insertAudit(actor, "service.draft-created", id, { sources, items: items.map((x) => x.id) });
+    });
+    return this.serviceDraft(id)!;
+  }
+
+  serviceDraft(id: string): ServiceDraft | undefined {
+    const d = this.db.prepare("SELECT * FROM service_drafts WHERE id = ?").get(id) as Row | undefined;
+    if (!d) return undefined;
+    const items = (this.db.prepare("SELECT body, updated_at, updated_by FROM service_draft_items WHERE draft = ? ORDER BY rowid").all(id) as Row[])
+      .map((r) => ({ ...JSON.parse(r.body), updatedAt: r.updated_at, updatedBy: r.updated_by }));
+    return { id: d.id, state: d.state, environment: d.environment, sources: JSON.parse(d.sources), items, createdAt: d.created_at, createdBy: d.created_by, updatedAt: d.updated_at, updatedBy: d.updated_by };
+  }
+
+  /** Drafts newest first, without their items. */
+  serviceDrafts(state?: DraftState): Omit<ServiceDraft, "items">[] {
+    return (this.db.prepare("SELECT * FROM service_drafts WHERE (?1 IS NULL OR state = ?1) ORDER BY created_at DESC, rowid DESC").all(state ?? null) as Row[])
+      .map((d) => ({ id: d.id, state: d.state, environment: d.environment, sources: JSON.parse(d.sources), createdAt: d.created_at, createdBy: d.created_by, updatedAt: d.updated_at, updatedBy: d.updated_by }));
+  }
+
+  /** Adds an item to an open draft, or replaces the one with its id. */
+  putServiceDraftItem(draft: string, given: DraftItem, actor: Actor): "added" | "changed" {
+    // An item read back from serviceDraft() carries its updatedAt/updatedBy; they are the row's, not the item's.
+    const { updatedAt: _a, updatedBy: _b, ...item } = given as DraftItem & { updatedAt?: string; updatedBy?: string };
+    return this.inTransaction(() => {
+      this.openDraft(draft);
+      const others = this.draftItems(draft);
+      this.checkItem(item as DraftItem, others);
+      const exists = others.some((o) => o.id === item.id);
+      const at = this.stamp();
+      if (exists) this.db.prepare("UPDATE service_draft_items SET kind = ?, body = ?, updated_at = ?, updated_by = ? WHERE draft = ? AND id = ?").run(item.kind, JSON.stringify(item), at, actor.id, draft, item.id);
+      else this.db.prepare("INSERT INTO service_draft_items (draft, id, kind, body, updated_at, updated_by) VALUES (?, ?, ?, ?, ?, ?)").run(draft, item.id, item.kind, JSON.stringify(item), at, actor.id);
+      this.db.prepare("UPDATE service_drafts SET updated_at = ?, updated_by = ? WHERE id = ?").run(at, actor.id, draft);
+      this.insertAudit(actor, exists ? "service.draft-item-changed" : "service.draft-item-added", `${draft}/${item.id}`, { kind: item.kind });
+      return exists ? "changed" : "added";
+    });
+  }
+
+  removeServiceDraftItem(draft: string, itemId: string, actor: Actor) {
+    this.inTransaction(() => {
+      this.openDraft(draft);
+      if (!Number(this.db.prepare("DELETE FROM service_draft_items WHERE draft = ? AND id = ?").run(draft, itemId).changes)) throw new StoreError("draft/item-unknown", `Draft ${draft} has no item ${itemId}.`);
+      this.db.prepare("UPDATE service_drafts SET updated_at = ?, updated_by = ? WHERE id = ?").run(this.stamp(), actor.id, draft);
+      this.insertAudit(actor, "service.draft-item-removed", `${draft}/${itemId}`, null);
+    });
+  }
+
+  /** Closes an open draft without registering anything; its items stay for the record. */
+  discardServiceDraft(draft: string, actor: Actor) {
+    this.inTransaction(() => {
+      this.openDraft(draft);
+      this.db.prepare("UPDATE service_drafts SET state = 'discarded', updated_at = ?, updated_by = ? WHERE id = ?").run(this.stamp(), actor.id, draft);
+      this.insertAudit(actor, "service.draft-discarded", draft, null);
+    });
+  }
+
+  /** The registered standalone instance or cluster node using an installation, if any. */
+  serviceUsing(host: string, installDir: string): string | undefined {
+    const dir = installDir.replace(/\/+$/, "");
+    const s = this.db.prepare("SELECT id FROM service_standalones WHERE host = ? AND install_dir = ? AND removed_at IS NULL").get(host, dir) as Row | undefined;
+    if (s) return s.id;
+    const n = this.db.prepare("SELECT n.cluster FROM service_nodes n JOIN service_clusters c ON c.id = n.cluster WHERE n.host = ? AND n.install_dir = ? AND n.removed_at IS NULL AND c.removed_at IS NULL").get(host, dir) as Row | undefined;
+    return n?.cluster;
+  }
+
+  private checkRegistration(item: DraftItem, members: ServiceMember[]) {
+    this.checkItem(item, []);
+    if (this.db.prepare("SELECT 1 FROM service_standalones WHERE id = ?1 UNION SELECT 1 FROM service_clusters WHERE id = ?1").get(item.id))
+      throw new StoreError("service/exists", `A service ${item.id} is already registered.`);
+    const used = members.map((m) => [m, this.serviceUsing(m.host, m.installDir)] as const).filter(([, s]) => s);
+    if (used.length) throw new StoreError("service/install-used", "An installation is already registered.", used.map(([m, s]) => `${m.host}:${m.installDir} is in ${s}`));
+  }
+
+  /** Registers a standalone instance (step 5 does it when a draft is confirmed). */
+  addStandalone(s: DraftStandalone, environment: string, actor: Actor, draft: string | null = null) {
+    this.inTransaction(() => {
+      this.checkRegistration(s, [s.member]);
+      const m = s.member;
+      this.db.prepare(`INSERT INTO service_standalones (id, service, profile, version, environment, host, install_dir, service_user, start_env, ports, web_url, draft, discovery, created_at, created_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(s.id, s.service, s.profile, s.version, environment, m.host, m.installDir.replace(/\/+$/, ""), m.serviceUser,
+        m.startEnvironment && JSON.stringify(m.startEnvironment), JSON.stringify(m.ports), s.webUrl, draft, m.discovery ? JSON.stringify(m.discovery) : null, this.stamp(), actor.id);
+      this.insertAudit(actor, "service.standalone-added", s.id, { host: m.host, installDir: m.installDir, version: s.version, draft });
+    });
+  }
+
+  /** Registers a cluster with its nodes. */
+  addCluster(c: DraftCluster, environment: string, actor: Actor, draft: string | null = null) {
+    this.inTransaction(() => {
+      this.checkRegistration(c, c.nodes);
+      const at = this.stamp();
+      this.db.prepare(`INSERT INTO service_clusters (id, service, profile, version, environment, zookeeper, zookeeper_root, web_url, draft, created_at, created_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(c.id, c.service, c.profile, c.version, environment, c.zookeeper, c.zookeeperRoot, c.webUrl, draft, at, actor.id);
+      for (const n of c.nodes) {
+        this.db.prepare(`INSERT INTO service_nodes (cluster, host, install_dir, service_user, start_env, control, ports, node_address, discovery, added_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+          .run(c.id, n.host, n.installDir.replace(/\/+$/, ""), n.serviceUser, n.startEnvironment && JSON.stringify(n.startEnvironment), "nifi.sh", JSON.stringify(n.ports), n.nodeAddress ?? null, n.discovery ? JSON.stringify(n.discovery) : null, at);
+      }
+      this.insertAudit(actor, "service.cluster-added", c.id, { nodes: c.nodes.map((n) => `${n.host}:${n.installDir}`), version: c.version, draft });
+    });
+  }
+
+  private toMember(r: Row): ServiceMember & { control?: string } {
+    return { host: r.host, installDir: r.install_dir, serviceUser: r.service_user ?? null, startEnvironment: parse(r.start_env), ports: JSON.parse(r.ports), ...(r.node_address !== undefined ? { nodeAddress: r.node_address ?? null } : {}), discovery: parse(r.discovery), ...(r.control ? { control: r.control } : {}) };
+  }
+
+  standalones(): (DraftStandalone & { environment: string; draft: string | null; createdAt: string; createdBy: string })[] {
+    return (this.db.prepare("SELECT * FROM service_standalones WHERE removed_at IS NULL ORDER BY id").all() as Row[]).map((r) => ({
+      kind: "standalone", id: r.id, service: r.service, profile: r.profile, version: r.version, webUrl: r.web_url ?? null, member: this.toMember(r),
+      environment: r.environment, draft: r.draft ?? null, createdAt: r.created_at, createdBy: r.created_by,
+    }));
+  }
+
+  clusters(): (DraftCluster & { environment: string; draft: string | null; createdAt: string; createdBy: string })[] {
+    return (this.db.prepare("SELECT * FROM service_clusters WHERE removed_at IS NULL ORDER BY id").all() as Row[]).map((r) => ({
+      kind: "cluster", id: r.id, service: r.service, profile: r.profile, version: r.version, webUrl: r.web_url ?? null, zookeeper: r.zookeeper ?? null, zookeeperRoot: r.zookeeper_root ?? null,
+      nodes: (this.db.prepare("SELECT * FROM service_nodes WHERE cluster = ? AND removed_at IS NULL ORDER BY host, install_dir").all(r.id) as Row[]).map((n) => this.toMember(n)),
+      environment: r.environment, draft: r.draft ?? null, createdAt: r.created_at, createdBy: r.created_by,
+    }));
   }
 }
