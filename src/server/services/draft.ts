@@ -10,12 +10,15 @@ import { profileFor, type ProfileId, type ServiceType } from "./profiles.ts";
 export interface ServicePorts { https?: number | null; http?: number | null; clusterProtocol?: number | null; loadBalance?: number | null; remoteInput?: number | null; management?: number | null }
 
 /** Where a member came from: the discovery job and the installation it found. */
-export interface DiscoveryRef { job: string; host: string; installDir: string }
+export interface DiscoveryRef { job: string; host: string; installDir: string; confDir?: string | null }
 
 /** One installation as the model keeps it: a standalone instance, or a node of a cluster. */
 export interface ServiceMember {
   host: string;
+  /** Where NiFi is unpacked (bin/, lib/). */
   installDir: string;
+  /** Where nifi.properties and the files beside it are: <installDir>/conf unless bootstrap.conf's conf.dir moves them. Absent or null: <installDir>/conf. */
+  confDir?: string | null;
   serviceUser: string | null;
   /** The filtered start environment (filterStartEnvironment): what bin/nifi.sh is run with (S10). */
   startEnvironment: Record<string, string> | null;
@@ -80,6 +83,18 @@ export function filterStartEnvironment(env: Record<string, unknown> | null | und
   return { kept, dropped: dropped.sort() };
 }
 
+const trimDir = (d: string) => d.replace(/\/+$/, "") || "/";
+/** An installation's conf directory: the one recorded, else <installDir>/conf (NiFi's default). */
+export const confDirOf = (m: { installDir: string; confDir?: string | null }): string => trimDir(m.confDir || `${trimDir(m.installDir)}/conf`);
+/**
+ * One installation on a host, as a key: host, installation and conf directory (one unpacked NiFi may run several
+ * instances, each with its own conf directory). With the default conf directory it is "host:installDir", as before.
+ */
+export function installKey(m: { host: string; installDir: string; confDir?: string | null }): string {
+  const dir = trimDir(m.installDir), conf = confDirOf(m);
+  return conf === `${dir}/conf` ? `${m.host}:${dir}` : `${m.host}:${dir} (conf ${conf})`;
+}
+
 const isPort = (v: unknown) => v === null || v === undefined || (Number.isInteger(v) && (v as number) > 0 && (v as number) < 65536);
 
 function checkMember(m: ServiceMember | undefined, where: string): string[] {
@@ -87,6 +102,7 @@ function checkMember(m: ServiceMember | undefined, where: string): string[] {
   const errors: string[] = [];
   if (typeof m.host !== "string" || !ID.test(m.host)) errors.push(`${where}.host: a host id`);
   if (typeof m.installDir !== "string" || !m.installDir.startsWith("/") || m.installDir.includes("\0") || m.installDir.length > 1024) errors.push(`${where}.installDir: an absolute path`);
+  if (m.confDir !== undefined && m.confDir !== null && (typeof m.confDir !== "string" || !m.confDir.startsWith("/") || m.confDir.includes("\0") || m.confDir.length > 1024)) errors.push(`${where}.confDir: an absolute path or null`);
   if (m.serviceUser !== null && typeof m.serviceUser !== "string") errors.push(`${where}.serviceUser: a user name or null`);
   if (m.startEnvironment !== null && (typeof m.startEnvironment !== "object" || Object.values(m.startEnvironment).some((v) => typeof v !== "string"))) errors.push(`${where}.startEnvironment: names to strings, or null`);
   if (!m.ports || typeof m.ports !== "object" || !Object.values(m.ports).every(isPort)) errors.push(`${where}.ports: port numbers`);
@@ -111,9 +127,12 @@ export function checkDraftItem(item: DraftItem, others: DraftItem[] = []): strin
     if (item.zookeeper !== null && typeof item.zookeeper !== "string") errors.push("zookeeper: a connect string or null");
   }
   if (errors.length) return errors;
-  const installs = (ms: ServiceMember[]) => ms.map((m) => `${m.host}:${m.installDir.replace(/\/+$/, "")}`);
+  const installs = (ms: ServiceMember[]) => ms.map(installKey);
   const mine = installs(members);
   if (new Set(mine).size !== mine.length) errors.push("an installation appears twice");
+  // A cluster's nodes are kept by host and installation: two of its nodes from one unpacked NiFi are not supported.
+  else if (item.kind === "cluster" && new Set(members.map((m) => `${m.host}:${trimDir(m.installDir)}`)).size !== members.length)
+    errors.push("two nodes of the cluster run from one installation on one host (with different conf directories): not supported");
   for (const o of others) {
     if (o.id === item.id) continue;
     const theirs = new Set(installs(o.kind === "cluster" ? o.nodes : [o.member]));
@@ -129,11 +148,13 @@ export function memberFromDiscovery(job: string, host: string, instance: Record<
   for (const [k, v] of Object.entries(instance.ports ?? {})) if (Number.isInteger(v)) ports[k as keyof ServicePorts] = v as number;
   const version = typeof instance.version === "string" ? instance.version : null;
   const matched = version ? profileFor(instance.service ?? "nifi", version) : undefined;
+  // Older service executors did not say (their conf directory was always <installDir>/conf).
+  const conf = typeof instance.confDir === "string" ? { confDir: instance.confDir } : {};
   return {
     member: {
-      host, installDir: String(instance.installDir), serviceUser: instance.serviceUser ?? instance.owner ?? null, startEnvironment: kept, ports,
+      host, installDir: String(instance.installDir), ...conf, serviceUser: instance.serviceUser ?? instance.owner ?? null, startEnvironment: kept, ports,
       ...(instance.cluster?.isNode ? { nodeAddress: instance.cluster.nodeAddress ?? null } : {}),
-      discovery: { job, host, installDir: String(instance.installDir) },
+      discovery: { job, host, installDir: String(instance.installDir), ...conf },
     },
     version, profile: matched?.profile.id ?? null, webUrl: typeof instance.webUrl === "string" ? instance.webUrl : null, dropped,
   };

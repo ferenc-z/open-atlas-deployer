@@ -125,7 +125,7 @@ write_authorizers() { # file node-identities...
     <userGroupProvider>
         <identifier>file-user-group-provider</identifier>
         <class>org.apache.nifi.authorization.FileUserGroupProvider</class>
-        <property name="Users File">./conf/users.xml</property>
+        <property name="Users File">$CREF/users.xml</property>
         <property name="Initial User Identity 1">$CLIENT_OPERATOR</property>
         <property name="Initial User Identity 2">$CLIENT_MONITOR</property>
         <property name="Initial User Identity 3">$CLIENT_NGINX</property>
@@ -137,7 +137,7 @@ EOF
         <identifier>file-access-policy-provider</identifier>
         <class>org.apache.nifi.authorization.FileAccessPolicyProvider</class>
         <property name="User Group Provider">file-user-group-provider</property>
-        <property name="Authorizations File">./conf/authorizations.xml</property>
+        <property name="Authorizations File">$CREF/authorizations.xml</property>
         <property name="Initial Admin Identity">$CLIENT_OPERATOR</property>
 EOF
     i=1; for id in "$@"; do echo "        <property name=\"Node Identity $i\">$id</property>"; i=$((i+1)); done
@@ -162,7 +162,22 @@ for n in $ONLY; do
     cp -a "$LAB/dist/nifi-$ver" "$dir"
   fi
   log "configure $n (NiFi $ver, JDK $jdk, https $port)"
-  conf="$dir/conf"
+  conf=$(inst_conf "$n"); data=$(inst_data "$n"); boot="$dir/conf/bootstrap.conf"
+  # Paths written into the configuration: relative to the installation (NiFi's working directory) as shipped, or
+  # absolute for a split instance (lab.conf SPLIT_INSTANCES).
+  CREF=./conf
+  if is_split "$n"; then
+    CREF="$conf"
+    mkdir -p "$conf" "$data"
+    if [ ! -f "$conf/nifi.properties" ]; then
+      log "move $n's configuration to $conf (bootstrap.conf stays in $dir/conf, where nifi.sh reads it)"
+      for f in "$dir/conf"/*; do [ "$(basename "$f")" = bootstrap.conf ] || mv "$f" "$conf/"; done
+    fi
+    for r in flowfile_repository content_repository provenance_repository database_repository state; do
+      if [ -e "$dir/$r" ] && [ ! -e "$data/$r" ]; then log "move $dir/$r to $data"; mv "$dir/$r" "$data/"; fi
+    done
+    $PY "$HERE/props.py" "$boot" "conf.dir=$conf" "notification.services.file=$conf/bootstrap-notification-services.xml"
+  fi
   ks=$(ls "$CERTS/$cn"/keystore.* | head -1); ts=$(ls "$CERTS/$cn"/truststore.* | head -1)
   cp "$ks" "$conf/"; cp "$ts" "$conf/"
   kst=$(case "$ks" in *.p12|*.pkcs12) echo PKCS12;; *) echo JKS;; esac)
@@ -174,15 +189,15 @@ for n in $ONLY; do
     || echo "export JAVA_HOME=$LAB/jdk/$jdk" >> "$dir/bin/nifi-env.sh"
 
   # heap
-  sed -i -E "s|^java\.arg\.2=-Xms.*|java.arg.2=-Xms$HEAP|; s|^java\.arg\.3=-Xmx.*|java.arg.3=-Xmx$HEAP|" "$conf/bootstrap.conf"
+  sed -i -E "s|^java\.arg\.2=-Xms.*|java.arg.2=-Xms$HEAP|; s|^java\.arg\.3=-Xmx.*|java.arg.3=-Xmx$HEAP|" "$boot"
 
   common=(
     nifi.web.http.host= nifi.web.http.port=
     nifi.web.https.host=localhost nifi.web.https.port=$port
     nifi.remote.input.secure=true nifi.remote.input.socket.port= nifi.remote.input.host=localhost
-    "nifi.security.keystore=./conf/$(basename "$ks")" nifi.security.keystoreType=$kst
+    "nifi.security.keystore=$CREF/$(basename "$ks")" nifi.security.keystoreType=$kst
     nifi.security.keystorePasswd=$KEYSTORE_PASS nifi.security.keyPasswd=$KEYSTORE_PASS
-    "nifi.security.truststore=./conf/$(basename "$ts")" nifi.security.truststoreType=$tst
+    "nifi.security.truststore=$CREF/$(basename "$ts")" nifi.security.truststoreType=$tst
     nifi.security.truststorePasswd=$TRUSTSTORE_PASS
     nifi.security.user.authorizer=managed-authorizer
     nifi.security.user.login.identity.provider=
@@ -192,7 +207,7 @@ for n in $ONLY; do
   # No Python extensions: an absent key disables the bridge (blank fails to start).
   case "$ver" in 2.*) common+=(-nifi.python.command)
     # 2.x bootstrap management server defaults to 127.0.0.1:52020 for every instance.
-    $PY "$HERE/props.py" "$conf/bootstrap.conf" "management.server.address=http://127.0.0.1:$((port + 34000))";;
+    $PY "$HERE/props.py" "$boot" "management.server.address=http://127.0.0.1:$((port + 34000))";;
   esac
   if [ "$proto" != "-" ]; then
     common+=(
@@ -211,6 +226,12 @@ for n in $ONLY; do
     write_authorizers "$conf/authorizers.xml"
   fi
   $PY "$HERE/props.py" "$conf/nifi.properties" "${common[@]}"
+  if is_split "$n"; then
+    # What nifi.properties names under ./conf (flow, archive, authorizers, state management, ...) is in the conf
+    # directory now; the repositories and the local state are in the data directory.
+    sed -i -E "s#^([a-z0-9.]+)=\./conf/#\1=$conf/#; s#^([a-z0-9.]+)=\./(flowfile|content|provenance|database)_repository#\1=$data/\2_repository#" "$conf/nifi.properties"
+    sed -i -E "s#(<property name=\"Directory\">)\./state/local(</property>)#\1$data/state/local\2#" "$conf/state-management.xml"
+  fi
 done
 
 # lab.sh needs these next to it.

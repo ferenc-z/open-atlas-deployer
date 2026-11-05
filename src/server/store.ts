@@ -11,7 +11,7 @@ import type { Environment, Manifest } from "../compose/generate.ts";
 import { changedPaths } from "./jsonpatch.ts";
 import { crossAppConflicts, validateManifest } from "../manifest/validate.ts";
 import { compareVersions } from "../manifest/version.ts";
-import { checkDraftItem, type DraftCluster, type DraftItem, type DraftReview, type DraftStandalone, type DraftState, type ServiceDraft, type ServiceMember } from "./services/draft.ts";
+import { checkDraftItem, confDirOf, installKey, type DraftCluster, type DraftItem, type DraftReview, type DraftStandalone, type DraftState, type ServiceDraft, type ServiceMember } from "./services/draft.ts";
 import type { ServiceConfigBody } from "./services/config.ts";
 import { randomBytes } from "node:crypto";
 
@@ -92,7 +92,7 @@ CREATE TABLE IF NOT EXISTS nginx_revisions (
 CREATE TABLE IF NOT EXISTS service_standalones (
   id TEXT PRIMARY KEY, service TEXT NOT NULL, profile TEXT NOT NULL, version TEXT NOT NULL, environment TEXT NOT NULL,
   host TEXT NOT NULL, install_dir TEXT NOT NULL, service_user TEXT, start_env TEXT, ports TEXT NOT NULL, web_url TEXT,
-  thresholds TEXT, draft TEXT, discovery TEXT, created_at TEXT NOT NULL, created_by TEXT NOT NULL, removed_at TEXT, removed_by TEXT);
+  thresholds TEXT, draft TEXT, discovery TEXT, created_at TEXT NOT NULL, created_by TEXT NOT NULL, removed_at TEXT, removed_by TEXT, conf_dir TEXT);
 CREATE TABLE IF NOT EXISTS service_clusters (
   id TEXT PRIMARY KEY, service TEXT NOT NULL, profile TEXT NOT NULL, version TEXT NOT NULL, environment TEXT NOT NULL,
   zookeeper TEXT, zookeeper_root TEXT, web_url TEXT, thresholds TEXT, draft TEXT,
@@ -100,7 +100,7 @@ CREATE TABLE IF NOT EXISTS service_clusters (
 CREATE TABLE IF NOT EXISTS service_nodes (
   cluster TEXT NOT NULL REFERENCES service_clusters(id), host TEXT NOT NULL, install_dir TEXT NOT NULL, service_user TEXT,
   start_env TEXT, control TEXT NOT NULL, ports TEXT NOT NULL, node_address TEXT, discovery TEXT,
-  added_at TEXT NOT NULL, removed_at TEXT, PRIMARY KEY (cluster, host, install_dir));
+  added_at TEXT NOT NULL, removed_at TEXT, conf_dir TEXT, PRIMARY KEY (cluster, host, install_dir));
 CREATE TABLE IF NOT EXISTS service_drafts (
   id TEXT PRIMARY KEY, state TEXT NOT NULL, environment TEXT NOT NULL, sources TEXT NOT NULL,
   created_at TEXT NOT NULL, created_by TEXT NOT NULL, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL, review TEXT);
@@ -250,6 +250,10 @@ export class Store {
     }
     // Service ops step 5: a takeover draft's AI review (step 4's tables had no such column).
     if (!(this.db.prepare("PRAGMA table_info(service_drafts)").all() as Row[]).some((c) => c.name === "review")) this.db.exec("ALTER TABLE service_drafts ADD COLUMN review TEXT");
+    // An installation's conf directory when bootstrap.conf's conf.dir moves it (NULL, as before: <install_dir>/conf).
+    for (const table of ["service_standalones", "service_nodes"]) {
+      if (!(this.db.prepare(`PRAGMA table_info(${table})`).all() as Row[]).some((c) => c.name === "conf_dir")) this.db.exec(`ALTER TABLE ${table} ADD COLUMN conf_dir TEXT`);
+    }
   }
 
   close() { this.db.close(); }
@@ -947,12 +951,17 @@ export class Store {
     });
   }
 
-  /** The registered standalone instance or cluster node using an installation, if any. */
-  serviceUsing(host: string, installDir: string): string | undefined {
+  /**
+   * The registered standalone instance or cluster node using an installation (host, installation, conf directory:
+   * one unpacked NiFi may run several instances, each with its own conf directory), if any.
+   */
+  serviceUsing(host: string, installDir: string, confDir?: string | null): string | undefined {
     const dir = installDir.replace(/\/+$/, "");
-    const s = this.db.prepare("SELECT id FROM service_standalones WHERE host = ? AND install_dir = ? AND removed_at IS NULL").get(host, dir) as Row | undefined;
+    const conf = confDirOf({ installDir: dir, confDir });
+    const same = "host = ? AND install_dir = ? AND COALESCE(conf_dir, install_dir || '/conf') = ?";
+    const s = this.db.prepare(`SELECT id FROM service_standalones WHERE ${same} AND removed_at IS NULL`).get(host, dir, conf) as Row | undefined;
     if (s) return s.id;
-    const n = this.db.prepare("SELECT n.cluster FROM service_nodes n JOIN service_clusters c ON c.id = n.cluster WHERE n.host = ? AND n.install_dir = ? AND n.removed_at IS NULL AND c.removed_at IS NULL").get(host, dir) as Row | undefined;
+    const n = this.db.prepare(`SELECT n.cluster FROM service_nodes n JOIN service_clusters c ON c.id = n.cluster WHERE ${same.replace(/(host|install_dir|conf_dir)\b/g, "n.$1")} AND n.removed_at IS NULL AND c.removed_at IS NULL`).get(host, dir, conf) as Row | undefined;
     return n?.cluster;
   }
 
@@ -960,8 +969,8 @@ export class Store {
     this.checkItem(item, []);
     if (this.db.prepare("SELECT 1 FROM service_standalones WHERE id = ?1 UNION SELECT 1 FROM service_clusters WHERE id = ?1").get(item.id))
       throw new StoreError("service/exists", `A service ${item.id} is already registered.`);
-    const used = members.map((m) => [m, this.serviceUsing(m.host, m.installDir)] as const).filter(([, s]) => s);
-    if (used.length) throw new StoreError("service/install-used", "An installation is already registered.", used.map(([m, s]) => `${m.host}:${m.installDir} is in ${s}`));
+    const used = members.map((m) => [m, this.serviceUsing(m.host, m.installDir, m.confDir)] as const).filter(([, s]) => s);
+    if (used.length) throw new StoreError("service/install-used", "An installation is already registered.", used.map(([m, s]) => `${installKey(m)} is in ${s}`));
   }
 
   /** Registers a standalone instance (step 5 does it when a draft is confirmed). */
@@ -978,10 +987,10 @@ export class Store {
   private insertStandalone(s: DraftStandalone, environment: string, actor: Actor, draft: string | null) {
     this.checkRegistration(s, [s.member]);
     const m = s.member;
-    this.db.prepare(`INSERT INTO service_standalones (id, service, profile, version, environment, host, install_dir, service_user, start_env, ports, web_url, draft, discovery, created_at, created_by)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(s.id, s.service, s.profile, s.version, environment, m.host, m.installDir.replace(/\/+$/, ""), m.serviceUser,
+    this.db.prepare(`INSERT INTO service_standalones (id, service, profile, version, environment, host, install_dir, conf_dir, service_user, start_env, ports, web_url, draft, discovery, created_at, created_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(s.id, s.service, s.profile, s.version, environment, m.host, m.installDir.replace(/\/+$/, ""), confDirOf(m), m.serviceUser,
       m.startEnvironment && JSON.stringify(m.startEnvironment), JSON.stringify(m.ports), s.webUrl, draft, m.discovery ? JSON.stringify(m.discovery) : null, this.stamp(), actor.id);
-    this.insertAudit(actor, "service.standalone-added", s.id, { host: m.host, installDir: m.installDir, version: s.version, draft });
+    this.insertAudit(actor, "service.standalone-added", s.id, { host: m.host, installDir: m.installDir, confDir: confDirOf(m), version: s.version, draft });
   }
 
   private insertCluster(c: DraftCluster, environment: string, actor: Actor, draft: string | null) {
@@ -990,14 +999,14 @@ export class Store {
     this.db.prepare(`INSERT INTO service_clusters (id, service, profile, version, environment, zookeeper, zookeeper_root, web_url, draft, created_at, created_by)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(c.id, c.service, c.profile, c.version, environment, c.zookeeper, c.zookeeperRoot, c.webUrl, draft, at, actor.id);
     for (const n of c.nodes) {
-      this.db.prepare(`INSERT INTO service_nodes (cluster, host, install_dir, service_user, start_env, control, ports, node_address, discovery, added_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-        .run(c.id, n.host, n.installDir.replace(/\/+$/, ""), n.serviceUser, n.startEnvironment && JSON.stringify(n.startEnvironment), "nifi.sh", JSON.stringify(n.ports), n.nodeAddress ?? null, n.discovery ? JSON.stringify(n.discovery) : null, at);
+      this.db.prepare(`INSERT INTO service_nodes (cluster, host, install_dir, conf_dir, service_user, start_env, control, ports, node_address, discovery, added_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(c.id, n.host, n.installDir.replace(/\/+$/, ""), confDirOf(n), n.serviceUser, n.startEnvironment && JSON.stringify(n.startEnvironment), "nifi.sh", JSON.stringify(n.ports), n.nodeAddress ?? null, n.discovery ? JSON.stringify(n.discovery) : null, at);
     }
-    this.insertAudit(actor, "service.cluster-added", c.id, { nodes: c.nodes.map((n) => `${n.host}:${n.installDir}`), version: c.version, draft });
+    this.insertAudit(actor, "service.cluster-added", c.id, { nodes: c.nodes.map(installKey), version: c.version, draft });
   }
 
   private toMember(r: Row): ServiceMember & { control?: string } {
-    return { host: r.host, installDir: r.install_dir, serviceUser: r.service_user ?? null, startEnvironment: parse(r.start_env), ports: JSON.parse(r.ports), ...(r.node_address !== undefined ? { nodeAddress: r.node_address ?? null } : {}), discovery: parse(r.discovery), ...(r.control ? { control: r.control } : {}) };
+    return { host: r.host, installDir: r.install_dir, confDir: r.conf_dir ?? confDirOf({ installDir: r.install_dir }), serviceUser: r.service_user ?? null, startEnvironment: parse(r.start_env), ports: JSON.parse(r.ports), ...(r.node_address !== undefined ? { nodeAddress: r.node_address ?? null } : {}), discovery: parse(r.discovery), ...(r.control ? { control: r.control } : {}) };
   }
 
   standalones(): (DraftStandalone & { environment: string; draft: string | null; createdAt: string; createdBy: string })[] {

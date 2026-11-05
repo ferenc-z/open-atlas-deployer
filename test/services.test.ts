@@ -93,6 +93,11 @@ test("draft items are checked", () => {
   assert.match(checkDraftItem(cluster("c250", { nodes: [] })).join(), /at least one/);
   assert.match(checkDraftItem(cluster("c250", { nodes: [member("n1", "/opt/nifi"), member("n1", "/opt/nifi/")] })).join(), /appears twice/);
   assert.match(checkDraftItem(standalone("dup", { member: member("n1", "/opt/nifi") }), [cluster("c250")]).join(), /n1:\/opt\/nifi is already in c250/);
+  // The conf directory: <install>/conf when absent; one installation with another conf directory is another instance.
+  assert.match(checkDraftItem(standalone("n112", { member: member("local", "/x", { confDir: "conf" }) })).join(), /confDir: an absolute path/);
+  assert.deepEqual(checkDraftItem(standalone("dup", { member: member("n1", "/opt/nifi", { confDir: "/opt/nifi/conf/" }) }), [cluster("c250")]).length, 1, "the default spelled out is the same installation");
+  assert.deepEqual(checkDraftItem(standalone("two", { member: member("n1", "/opt/nifi", { confDir: "/etc/nifi-two" }) }), [cluster("c250")]), []);
+  assert.match(checkDraftItem(cluster("c250", { nodes: [member("n1", "/opt/nifi"), member("n1", "/opt/nifi", { confDir: "/etc/nifi-two" })] })).join(), /one installation on one host/);
 });
 
 test("a draft is created, edited item by item, and discarded", () => {
@@ -163,6 +168,26 @@ test("an older state database gets the service tables, and opening again changes
     store.close();
     store = new Store(file);
     assert.deepEqual(store.standalones().map((s) => s.id), ["n112"]);
+    store.close();
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a state database from before conf directories gets the column, its installations counting as <install>/conf", () => {
+  const dir = mkdtempSync(join(tmpdir(), "deployer-services-"));
+  try {
+    const file = join(dir, "state.db");
+    let store = new Store(file);
+    store.addStandalone(standalone("n112"), "UAT", admin);
+    store.close();
+    // As the first phase left it: no conf_dir columns, the row without one.
+    const old = new DatabaseSync(file);
+    for (const t of ["service_standalones", "service_nodes"]) old.exec(`ALTER TABLE ${t} DROP COLUMN conf_dir`);
+    old.close();
+    store = new Store(file);
+    assert.deepEqual(store.standalones().map((s) => [s.id, s.member.confDir]), [["n112", "/srv/n112/conf"]]);
+    assert.equal(store.serviceUsing("local", "/srv/n112", "/srv/n112/conf"), "n112");
+    store.addCluster(cluster("c250", { nodes: [member("n1", "/opt/nifi", { nodeAddress: "node1", confDir: "/etc/nifi" })] }), "UAT", admin);
+    assert.deepEqual([store.clusters()[0]!.nodes[0]!.confDir, store.serviceUsing("n1", "/opt/nifi"), store.serviceUsing("n1", "/opt/nifi", "/etc/nifi")], ["/etc/nifi", undefined, "c250"]);
     store.close();
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

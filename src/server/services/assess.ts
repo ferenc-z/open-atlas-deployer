@@ -4,7 +4,7 @@
 // (1.x no longer maintained, an empty sensitive properties key, repositories and logs on one disk, no autostart). The
 // rules are stable and testable and need no OMA; the AI review (reviewPrompt) only writes explanations and advice on top.
 
-import { memberFromDiscovery, type DraftCluster, type DraftItem, type DraftStandalone, type ServiceMember, type ServicePorts } from "./draft.ts";
+import { confDirOf, installKey, memberFromDiscovery, type DraftCluster, type DraftItem, type DraftStandalone, type ServiceMember, type ServicePorts } from "./draft.ts";
 import { catalogFor, profile, profileFor, type CatalogEntry, type ConfigFile, type ProfileId } from "./profiles.ts";
 
 /** One instance of a discovery result (svc-discover), with the job and host it came from. */
@@ -27,7 +27,10 @@ export interface Finding {
 export interface Skipped { host: string; installDir: string; reason: string }
 
 const HIDDEN = "(hidden)";
-const install = (host: string, dir: string) => `${host}:${dir.replace(/\/+$/, "")}`;
+const install = (host: string, dir: string, conf?: string | null) => installKey({ host, installDir: dir, confDir: conf });
+/** A discovered instance's installation key (installKey): host, installation, conf directory. */
+export const discoveredKey = (d: { host: string; instance: Record<string, any> }) =>
+  install(d.host, String(d.instance.installDir ?? ""), typeof d.instance.confDir === "string" ? d.instance.confDir : null);
 const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 50);
 
 /** The ZooKeeper servers of a connect string ("a:2181,b:2181/chroot"), normalised for comparing. */
@@ -58,7 +61,7 @@ const mostCommon = <T>(values: T[]): T => {
  * connect string forms a cluster of its own (and the assessment says so). Installations already registered, and versions
  * without a profile, are left out with the reason.
  */
-export function groupDiscoveries(found: Discovered[], options: { registered?: (host: string, installDir: string) => string | undefined; takenIds?: Iterable<string> } = {}): { items: DraftItem[]; skipped: Skipped[] } {
+export function groupDiscoveries(found: Discovered[], options: { registered?: (host: string, installDir: string, confDir?: string | null) => string | undefined; takenIds?: Iterable<string> } = {}): { items: DraftItem[]; skipped: Skipped[] } {
   const skipped: Skipped[] = [];
   const ids = new Set(options.takenIds ?? []);
   const seen = new Set<string>();
@@ -66,10 +69,11 @@ export function groupDiscoveries(found: Discovered[], options: { registered?: (h
   const nodes: { d: Discovered; m: ReturnType<typeof memberFromDiscovery> }[] = [];
   for (const d of found) {
     const dir = String(d.instance.installDir ?? "");
-    const key = install(d.host, dir);
+    const conf = typeof d.instance.confDir === "string" ? d.instance.confDir : null;
+    const key = install(d.host, dir, conf);
     if (seen.has(key)) continue;
     seen.add(key);
-    const used = options.registered?.(d.host, dir);
+    const used = options.registered?.(d.host, dir, conf);
     if (used) { skipped.push({ host: d.host, installDir: dir, reason: `already registered as ${used}` }); continue; }
     const m = memberFromDiscovery(d.job, d.host, d.instance);
     if (!m.version || !m.profile) { skipped.push({ host: d.host, installDir: dir, reason: m.version ? `no profile for NiFi ${m.version}` : "the version could not be read" }); continue; }
@@ -91,7 +95,7 @@ export function groupDiscoveries(found: Discovered[], options: { registered?: (h
 
   const items: DraftItem[] = [];
   for (const g of groups.values()) {
-    g.sort((a, b) => (a.m.member.nodeAddress ?? "").localeCompare(b.m.member.nodeAddress ?? "") || install(a.d.host, a.m.member.installDir).localeCompare(install(b.d.host, b.m.member.installDir)));
+    g.sort((a, b) => (a.m.member.nodeAddress ?? "").localeCompare(b.m.member.nodeAddress ?? "") || installKey(a.m.member).localeCompare(installKey(b.m.member)));
     const root = rootOf(g[0]!.d.instance);
     const version = mostCommon(g.map((n) => n.m.version!));
     const c: DraftCluster = {
@@ -102,7 +106,9 @@ export function groupDiscoveries(found: Discovered[], options: { registered?: (h
     items.push(c);
   }
   for (const { d, m } of standalones) {
-    const base = slug(String(d.instance.installDir).split("/").filter(Boolean).pop() ?? "nifi");
+    // Named after the installation, or after what holds its conf directory when that is elsewhere (/webapp/deploy/nifi/conf: nifi).
+    const conf = confDirOf(m.member), named = conf === confDirOf({ installDir: m.member.installDir }) ? m.member.installDir : conf.replace(/\/conf$/, "");
+    const base = slug(named.split("/").filter(Boolean).pop() ?? "nifi") || "nifi";
     const s: DraftStandalone = { kind: "standalone", id: unique(ids.has(base) ? slug(`${d.host}-${base}`) : base, ids), service: "nifi", profile: m.profile!, version: m.version!, webUrl: m.webUrl, member: m.member };
     items.push(s);
   }
@@ -110,7 +116,7 @@ export function groupDiscoveries(found: Discovered[], options: { registered?: (h
 }
 
 /** A registered installation, for the port check across what is already managed. */
-export interface RegisteredMember { service: string; profile: string; member: Pick<ServiceMember, "host" | "installDir" | "ports"> }
+export interface RegisteredMember { service: string; profile: string; member: Pick<ServiceMember, "host" | "installDir" | "confDir" | "ports"> }
 
 const PORT_NAMES: (keyof ServicePorts)[] = ["https", "http", "clusterProtocol", "loadBalance", "remoteInput", "management"];
 
@@ -127,19 +133,19 @@ export function portsTaken(profileId: string, ports: ServicePorts): { name: keyo
 
 /** Ports two installations of one machine both use (§5.2): within the draft and against what is registered. */
 export function portConflicts(items: DraftItem[], registered: RegisteredMember[] = []): Map<string, Finding[]> {
-  const byHost = new Map<string, Map<number, { owner: string | null; host: string; installDir: string; name: string }[]>>();
-  const add = (owner: string | null, profileId: string, m: Pick<ServiceMember, "host" | "installDir" | "ports">) => {
+  const byHost = new Map<string, Map<number, { owner: string | null; host: string; installDir: string; confDir: string | null; name: string }[]>>();
+  const add = (owner: string | null, profileId: string, m: Pick<ServiceMember, "host" | "installDir" | "confDir" | "ports">) => {
     const ports = byHost.get(m.host) ?? new Map();
     byHost.set(m.host, ports);
     for (const { name, port } of portsTaken(profileId, m.ports ?? {})) {
       const users = ports.get(port) ?? [];
-      if (!users.some((u: { host: string; installDir: string }) => install(u.host, u.installDir) === install(m.host, m.installDir))) users.push({ owner, host: m.host, installDir: m.installDir, name });
+      if (!users.some((u: { host: string; installDir: string; confDir: string | null }) => installKey(u) === installKey(m))) users.push({ owner, host: m.host, installDir: m.installDir, confDir: m.confDir ?? null, name });
       ports.set(port, users);
     }
   };
-  const draftInstalls = new Set(items.flatMap((i) => (i.kind === "cluster" ? i.nodes : [i.member]).map((m) => install(m.host, m.installDir))));
+  const draftInstalls = new Set(items.flatMap((i) => (i.kind === "cluster" ? i.nodes : [i.member]).map(installKey)));
   for (const i of items) for (const m of i.kind === "cluster" ? i.nodes : [i.member]) add(i.id, i.profile, m);
-  for (const r of registered) if (!draftInstalls.has(install(r.member.host, r.member.installDir))) add(null, r.profile, r.member);
+  for (const r of registered) if (!draftInstalls.has(installKey(r.member))) add(null, r.profile, r.member);
   const out = new Map<string, Finding[]>();
   for (const [host, ports] of byHost) {
     for (const [port, users] of ports) {
@@ -171,7 +177,7 @@ function compareNodes(c: DraftCluster, byInstall: Map<string, Discovered>): Find
   const prof = profile(c.profile);
   if (!prof) return [];
   const found: Finding[] = [];
-  const nodes = c.nodes.map((m) => ({ m, d: byInstall.get(install(m.host, m.installDir)) })).filter((n): n is { m: ServiceMember; d: Discovered } => Boolean(n.d));
+  const nodes = c.nodes.map((m) => ({ m, d: byInstall.get(installKey(m)) })).filter((n): n is { m: ServiceMember; d: Discovered } => Boolean(n.d));
   if (nodes.length < 2) return found;
   const versions = [...new Set(nodes.map((n) => String(n.d.instance.version)))];
   if (versions.length > 1) found.push({ severity: "error", code: "cluster/version-differs", message: `The nodes run different versions: ${versions.join(", ")}.`, values: nodes.map((n) => ({ host: n.m.host, installDir: n.m.installDir, value: String(n.d.instance.version) })) });
@@ -196,7 +202,7 @@ function compareNodes(c: DraftCluster, byInstall: Map<string, Discovered>): Find
 
 function memberRisks(m: ServiceMember, d: Discovered | undefined, prof: ProfileId): Finding[] {
   const where = { host: m.host, installDir: m.installDir };
-  const at = `${m.host}:${m.installDir}`;
+  const at = installKey(m);
   if (!d) return [{ severity: "warning", code: "discovery/missing", message: `No discovery result for ${at}: discover the host again.` }];
   const i = d.instance, out: Finding[] = [];
   for (const p of i.problems ?? []) out.push({ severity: "warning", code: "discovery/problem", message: `${at}: ${p}` });
@@ -228,7 +234,7 @@ export function assessItem(item: DraftItem, byInstall: Map<string, Discovered>, 
     if (!item.zookeeper) out.push({ severity: "warning", code: "cluster/no-zookeeper", message: "A cluster node without nifi.zookeeper.connect.string: it cannot be grouped with its other nodes." });
     out.push(...compareNodes(item, byInstall));
   }
-  for (const m of members) out.push(...memberRisks(m, byInstall.get(install(m.host, m.installDir)), item.profile));
+  for (const m of members) out.push(...memberRisks(m, byInstall.get(installKey(m)), item.profile));
   out.push(...conflicts);
   const order: Record<Severity, number> = { error: 0, warning: 1, info: 2 };
   return out.sort((a, b) => order[a.severity] - order[b.severity]);
@@ -236,7 +242,7 @@ export function assessItem(item: DraftItem, byInstall: Map<string, Discovered>, 
 
 /** Every item with its findings (rules only), replacing what they had. */
 export function assessItems(items: DraftItem[], found: Discovered[], registered: RegisteredMember[] = []): DraftItem[] {
-  const byInstall = new Map(found.map((d) => [install(d.host, String(d.instance.installDir)), d]));
+  const byInstall = new Map(found.map((d) => [discoveredKey(d), d]));
   const conflicts = portConflicts(items, registered);
   return items.map((item) => ({ ...item, findings: assessItem(item, byInstall, conflicts.get(item.id)) }));
 }
@@ -246,7 +252,7 @@ export function assessItems(items: DraftItem[], found: Discovered[], registered:
 export function reviewPrompt(draftId: string, environment: string, items: DraftItem[]): string {
   const brief = items.map((i) => ({
     id: i.id, kind: i.kind, version: i.version, profile: i.profile,
-    installations: (i.kind === "cluster" ? i.nodes : [i.member]).map((m) => `${m.host}:${m.installDir}`),
+    installations: (i.kind === "cluster" ? i.nodes : [i.member]).map(installKey),
     ...(i.kind === "cluster" ? { zookeeper: i.zookeeper, zookeeperRoot: i.zookeeperRoot } : {}),
     findings: (i.findings ?? []) as Finding[],
   }));

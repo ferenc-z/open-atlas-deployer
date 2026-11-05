@@ -354,7 +354,7 @@ class DiscoverTest(Base):
 
     def test_the_job_on_the_read_channel(self):
         ex = self.executor()
-        ex.PROC, ex.COMMON_DIRS = str(self.proc.root), ()
+        ex.PROC, ex.cfg["scan_dirs"] = str(self.proc.root), ()
         self.api.queue.append({"protocol": 2, "id": "svc-discover-0001", "kind": "svc-discover", "dirs": [str(self.stopped)]})
         self.api.queue.append({"protocol": 2, "id": "svc-discover-0002", "kind": "svc-discover", "dirs": ["relative/dir"]})
         ex.run_once()
@@ -418,6 +418,150 @@ class DiscoverTest(Base):
         self.assertEqual(sorted(f["name"] for f in self.api.status["svc-read-0002"]["result"]["files"]), ["bootstrap.conf", "logback.xml", "nifi.properties"])
         self.assertEqual(self.api.status["svc-read-0003"]["state"], "refused", "only the configuration files by name")
         self.assertEqual(self.api.status["svc-read-0004"]["state"], "refused", "not a NiFi installation")
+
+
+def split_home(root, install, conf, version, props, conf_dir_value=None, data=None):
+    """An installation with its configuration elsewhere, the official way: bootstrap.conf stays in <install>/conf (where
+    nifi.sh reads it) and its conf.dir names the conf directory; the repositories go to `data`."""
+    home = pathlib.Path(root) / install
+    (home / "lib" / "bootstrap").mkdir(parents=True)
+    (home / "bin").mkdir()
+    (home / "conf").mkdir()
+    (home / "bin" / "nifi.sh").write_text("#!/bin/sh\n")
+    (home / "lib" / f"nifi-runtime-{version}.jar").write_text("")
+    conf = pathlib.Path(root) / conf
+    conf.mkdir(parents=True)
+    if data:
+        props = {**props, "nifi.content.repository.directory.default": f"{data}/content_repository", "nifi.flowfile.repository.directory": f"{data}/flowfile_repository"}
+    (conf / "nifi.properties").write_text("".join(f"{k}={v}\n" for k, v in props.items()))
+    (conf / "logback.xml").write_text("<configuration/>\n")
+    (conf / "authorizers.xml").write_text("<authorizers/>\n")
+    lines = "java.arg.3=-Xmx2g\n" + (f"conf.dir={conf_dir_value}\n" if conf_dir_value is not None else "")
+    (home / "conf" / "bootstrap.conf").write_text(lines)
+    return home, conf
+
+
+@unittest.skipUnless(hasattr(os, "geteuid") and hasattr(os, "symlink"), "needs a POSIX system")
+class SplitLayoutTest(Base):
+    """The installation (bin/, lib/), its conf directory and its repositories in three places (/webapp/install,
+    /webapp/deploy/nifi/conf, /data): found running and not."""
+
+    def setUp(self):
+        super().setUp()
+        self.proc = FakeProc(self.root / "proc")
+        self.w = self.root / "webapp"
+        self.data = self.root / "data"
+        self.home, self.conf = split_home(self.w, "install", "deploy/nifi/conf", "2.5.0", {"nifi.web.https.port": "18447"},
+                                          conf_dir_value=str(self.w / "deploy/nifi/conf"), data=self.data)
+
+    def discovery(self, common=()):
+        return sx.Discovery(self.proc.root, uid=os.geteuid(), common=common)
+
+    def start(self, home, conf, base, cwd=None, jvm_conf=True):
+        """nifi.sh's two processes: the bootstrap reads <install>/conf/bootstrap.conf; the JVM gets the conf directory."""
+        proc = self.proc
+        proc.add(base, ["java", "-cp", f"{home}/conf:{home}/lib/bootstrap/*", f"-Dorg.apache.nifi.bootstrap.config.file={home}/conf/bootstrap.conf",
+                        "org.apache.nifi.bootstrap.BootstrapProcess", "start"], cwd=str(cwd or home))
+        if jvm_conf:
+            proc.add(base + 1, ["java", "--class-path", f"{conf}:{home}/./lib/nifi-runtime-2.5.0.jar:{home}/./lib/nifi-api.jar",
+                                f"-Dnifi.properties.file.path={conf}/nifi.properties", "org.apache.nifi.NiFi"], ppid=base, cwd=str(cwd or home), listen=(18447,))
+
+    def test_a_running_instance_with_its_conf_elsewhere(self):
+        self.start(self.home, self.conf, 4000, cwd="/")
+        r = self.discovery().run()
+        self.assertEqual(len(r["instances"]), 1)
+        i = r["instances"][0]
+        self.assertEqual((i["installDir"], i["confDir"], i["version"], i["running"]), (str(self.home), str(self.conf), "2.5.0", True),
+                         "the installation from the class path's lib/, not above nifi.properties or the working directory")
+        self.assertEqual((i["process"]["pid"], i["process"]["bootstrapPid"], i["ports"]["https"], i["heap"]["Xmx"]), (4001, 4000, 18447, "2g"))
+        files = {f["name"]: f["path"] for f in i["files"]}
+        self.assertEqual(files, {"nifi.properties": str(self.conf / "nifi.properties"), "bootstrap.conf": str(self.home / "conf/bootstrap.conf"),
+                                 "logback.xml": str(self.conf / "logback.xml"), "authorizers.xml": str(self.conf / "authorizers.xml")})
+        self.assertEqual(i["storage"]["content"]["path"], str(self.data / "content_repository"))
+        self.assertEqual(i["problems"], [])
+
+    def test_the_bootstrap_alone_reads_conf_dir_and_the_working_directory_comes_second(self):
+        # The JVM not up yet: only the bootstrap, whose bootstrap.conf says where the conf directory is.
+        self.start(self.home, self.conf, 4000, jvm_conf=False)
+        i = self.discovery().run()["instances"][0]
+        self.assertEqual((i["installDir"], i["confDir"], i["running"]), (str(self.home), str(self.conf), False))
+        d = sx.Discovery(self.proc.root)
+        jvm = ["java", f"-Dnifi.properties.file.path={self.conf}/nifi.properties", "org.apache.nifi.NiFi"]
+        self.proc.add(4500, jvm, cwd=str(self.home))
+        self.assertEqual(d.layout_of({"pid": 4500, "args": jvm}, None)["installDir"], str(self.home), "no class path: the working directory")
+        self.assertEqual(d.layout_of({"pid": 99999, "args": jvm}, None)["installDir"], str(self.conf.parent), "last: above the conf directory")
+        self.assertEqual(d.install_from_classpath(["java", "-cp", "/var/lib/nifi/conf:/var/lib/nifi/lib/bootstrap/*"]), "/var/lib/nifi",
+                         "a conf directory under /var/lib does not count, the jars' lib/ does")
+
+    def test_two_instances_of_one_installation(self):
+        _, other = split_home(self.root / "x", "unused", "deploy/b/conf", "2.5.0", {"nifi.web.https.port": "18448"})
+        self.start(self.home, self.conf, 4000)
+        self.start(self.home, other, 4100)
+        r = self.discovery().run()
+        self.assertEqual(sorted((i["installDir"], i["confDir"]) for i in r["instances"]), sorted([(str(self.home), str(other)), (str(self.home), str(self.conf))]))
+
+    def test_not_running_found_from_the_installation_asked(self):
+        r = self.discovery().run([str(self.home)])
+        i = r["instances"][0]
+        self.assertEqual((i["installDir"], i["confDir"], i["source"], i["version"], i["ports"]["https"]), (str(self.home), str(self.conf), "dir", "2.5.0", 18447),
+                         "conf.dir in <install>/conf/bootstrap.conf says where the conf directory is")
+        self.assertEqual(r["dirs"], [{"dir": str(self.home), "found": True, "running": False}])
+
+    def test_conf_dir_relative_to_the_installation(self):
+        home, conf = split_home(self.root / "rel", "install", "deploy/c/conf", "1.12.1", {"nifi.web.https.port": "18449"}, conf_dir_value="../deploy/c/conf")
+        i = self.discovery().run([str(home)])["instances"][0]
+        self.assertEqual((i["confDir"], i["version"]), (str(conf), "1.12.1"))
+
+    def test_the_conf_directory_given_with_the_installation(self):
+        home, conf = split_home(self.root / "given", "install", "deploy/d/conf", "2.0.0", {"nifi.web.https.port": "18450"})
+        r = self.discovery().run([str(home), {"install": str(home), "conf": str(conf)}, {"install": str(home), "conf": str(self.root / "nowhere")}, str(conf.parent)])
+        self.assertEqual(sorted(i["confDir"] for i in r["instances"]), sorted([str(home / "conf"), str(conf)]), "without conf.dir, <install>/conf; given, the one given")
+        given = next(i for i in r["instances"] if i["confDir"] == str(conf))
+        self.assertEqual((given["ports"]["https"], given["files"][0]["path"]), (18450, str(conf / "nifi.properties")))
+        self.assertEqual([d["found"] for d in r["dirs"]], [True, True, False, False])
+        self.assertEqual(r["dirs"][1]["conf"], str(conf))
+        self.assertIn("no nifi.properties", r["dirs"][2]["error"])
+        self.assertIn("give the installation directory", r["dirs"][3]["error"], "the parent of a conf directory is not an installation")
+
+    def test_scanned_directories_follow_conf_dir(self):
+        r = self.discovery(common=(str(self.w / "inst*"),)).run()
+        self.assertEqual([(i["installDir"], i["confDir"], i["source"]) for i in r["instances"]], [(str(self.home), str(self.conf), "common-dir")])
+
+    def test_the_directories_scanned_are_configurable(self):
+        self.assertEqual(cfg(self.root)["scan_dirs"], sx.COMMON_DIRS)
+        self.assertEqual(sx.config(environ={"EXECUTOR_SCAN_DIRS": "/webapp/install*, /data/nifi-*  /opt/nifi*"})["scan_dirs"], ("/webapp/install*", "/data/nifi-*", "/opt/nifi*"))
+        self.assertEqual(sx.config(environ={"EXECUTOR_SCAN_DIRS": ""})["scan_dirs"], ())
+        ex = self.executor(scan_dirs=(str(self.w / "inst*"),))
+        ex.PROC = str(self.proc.root)
+        self.api.queue.append({"protocol": 2, "id": "svc-discover-0001", "kind": "svc-discover"})
+        self.api.queue.append({"protocol": 2, "id": "svc-discover-0002", "kind": "svc-discover", "dirs": [{"install": "relative", "conf": "/x"}]})
+        self.api.queue.append({"protocol": 2, "id": "svc-discover-0003", "kind": "svc-discover", "dirs": [{"install": "/x", "other": "/y"}]})
+        for _ in range(3):
+            ex.run_once()
+        ex.wait_reads()
+        s = self.api.status["svc-discover-0001"]
+        self.assertEqual(s["state"], "succeeded", s.get("message"))
+        self.assertEqual([i["confDir"] for i in s["result"]["instances"]], [str(self.conf)])
+        self.assertEqual((self.api.status["svc-discover-0002"]["state"], self.api.status["svc-discover-0003"]["state"]), ("refused", "refused"))
+
+    def test_svc_read_reads_where_discovery_fingerprinted(self):
+        ex = self.executor()
+        boot = str(self.home / "conf/bootstrap.conf")
+        self.api.queue.append({"protocol": 2, "id": "svc-read-0001", "kind": "svc-read", "installDir": str(self.home), "confDir": str(self.conf), "bootstrapFile": boot})
+        self.api.queue.append({"protocol": 2, "id": "svc-read-0002", "kind": "svc-read", "installDir": str(self.home)})
+        self.api.queue.append({"protocol": 2, "id": "svc-read-0003", "kind": "svc-read", "installDir": str(self.home), "confDir": str(self.root)})
+        self.api.queue.append({"protocol": 2, "id": "svc-read-0004", "kind": "svc-read", "installDir": str(self.home), "bootstrapFile": "/etc/passwd"})
+        for _ in range(4):
+            ex.run_once()
+        ex.wait_reads()
+        found = {f["name"]: f for f in self.discovery().run([str(self.home)])["instances"][0]["files"]}
+        for job in ("svc-read-0001", "svc-read-0002"):
+            s = self.api.status[job]
+            self.assertEqual(s["state"], "succeeded", s.get("message"))
+            self.assertEqual(s["result"]["confDir"], str(self.conf))
+            self.assertEqual({f["name"]: (f["path"], f["sha256"]) for f in s["result"]["files"]}, {n: (f["path"], f["sha256"]) for n, f in found.items()})
+        self.assertEqual(json.loads(self.api.env["svc-read-0001"])["confDir"], str(self.conf))
+        self.assertEqual((self.api.status["svc-read-0003"]["state"], self.api.status["svc-read-0004"]["state"]), ("refused", "refused"))
 
 
 @unittest.skipUnless(all(shutil.which(c) for c in ("sh", "tar", "sha256sum")) and hasattr(os, "symlink"), "needs sh, tar, sha256sum")

@@ -630,9 +630,19 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     const host = c.req.param("id");
     if (!hostIds(deployments.environment().env).includes(host)) return reject(c, 404, "host/unknown", `${host} is not a host of this environment (environment settings hosts).`);
     const body = await c.req.json().catch(() => ({})) as { dirs?: unknown };
-    const dirs = body.dirs ?? [];
-    if (!Array.isArray(dirs) || dirs.length > 32 || !dirs.every((d) => typeof d === "string" && d.startsWith("/") && !d.includes("\0") && d.length <= 1024))
-      return reject(c, 400, "discover/dirs", "dirs is a list of at most 32 absolute paths of NiFi installations.");
+    // Each entry: an installation's path, or {install, conf} when its conf directory is elsewhere and bootstrap.conf's
+    // conf.dir does not say so. {install} alone goes on as the plain path (what older service executors understand).
+    const path = (v: unknown): v is string => typeof v === "string" && v.startsWith("/") && !v.includes("\0") && v.length <= 1024;
+    const raw = body.dirs ?? [];
+    const dirs = Array.isArray(raw) && raw.length <= 32 ? raw.map((d): string | { install: string; conf: string } | undefined => {
+      if (path(d)) return d;
+      if (!d || typeof d !== "object" || Array.isArray(d) || Object.keys(d).some((k) => k !== "install" && k !== "conf")) return undefined;
+      const { install, conf } = d as { install?: unknown; conf?: unknown };
+      if (!path(install) || (conf !== undefined && conf !== null && conf !== "" && !path(conf))) return undefined;
+      return path(conf) ? { install, conf } : install;
+    }) : undefined;
+    if (!dirs || dirs.some((d) => d === undefined))
+      return reject(c, 400, "discover/dirs", "dirs is a list of at most 32 NiFi installations: absolute paths, or {install, conf} with the installation's conf directory as well.");
     const executor = handoff.executor(host, "service");
     if (!executor.online) return reject(c, 409, "discover/executor-offline", executor.reason ?? `The service executor on ${host} is offline.`);
     if (!executor.heartbeat?.kinds?.includes("svc-discover")) return reject(c, 409, "discover/executor-old", `Service executor ${executor.heartbeat?.version} on ${host} cannot discover services; upgrade it first.`);

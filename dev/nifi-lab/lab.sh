@@ -30,7 +30,9 @@ zk() {
 }
 
 app_pid() { # name -> pid of the NiFi JVM (not the bootstrap), empty if none
-  pgrep -u "$(id -u)" -f "nifi.properties.file.path=$LAB/instances/$1/(\./)?conf/nifi.properties .*org.apache.nifi.NiFi" | head -1
+  local props="$LAB/instances/$1/(\./)?conf/nifi.properties"
+  is_split "$1" && props="$(inst_conf "$1")/nifi.properties"
+  pgrep -u "$(id -u)" -f "nifi.properties.file.path=$props .*org.apache.nifi.NiFi" | head -1
 }
 
 api() { # name path [cert]

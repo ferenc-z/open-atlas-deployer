@@ -38,6 +38,14 @@ function SummaryBadge({ s }: { s: ServiceSummary | null }) {
 }
 
 const membersOf = (s: RegisteredService) => (s.kind === "cluster" ? s.nodes : [s.member]);
+const trimDir = (d: string) => d.replace(/\/+$/, "") || "/";
+/** The conf directory (nifi.properties): the one recorded, else <install>/conf. */
+const confOf = (m: { installDir: string; confDir?: string | null }) => trimDir(m.confDir || `${trimDir(m.installDir)}/conf`);
+/** The conf directory when it is not <install>/conf: what to show beside the install directory. */
+const confElsewhere = (m: { installDir: string; confDir?: string | null }) => (confOf(m) === `${trimDir(m.installDir)}/conf` ? null : confOf(m));
+const memberKey = (m: { host: string; installDir: string; confDir?: string | null }) => `${m.host}:${m.installDir}:${confOf(m)}`;
+const ConfCell = ({ m }: { m: { installDir: string; confDir?: string | null } }) =>
+  <td className="mono">{confElsewhere(m) ?? <span className="muted" title="NiFi's default, <install>/conf">{confOf(m)}</span>}</td>;
 
 export function ServicesPage({ onTakeover }: { onTakeover: () => void }) {
   const [list, setList] = useState<{ standalones: RegisteredService[]; clusters: RegisteredService[] } | undefined>();
@@ -52,7 +60,7 @@ export function ServicesPage({ onTakeover }: { onTakeover: () => void }) {
       <td className="mono">{s.id}</td>
       <td>{s.service === "nifi" ? "NiFi" : s.service} <span className="mono">{s.version}</span> <span className="muted">{s.profile}</span></td>
       <td>{s.kind === "cluster" ? `${s.nodes.length} nodes` : "Standalone"}</td>
-      <td className="mono small">{membersOf(s).map((m) => <div key={`${m.host}:${m.installDir}`}>{m.host}:{m.installDir}</div>)}</td>
+      <td className="mono small">{membersOf(s).map((m) => <div key={memberKey(m)}>{m.host}:{m.installDir}{confElsewhere(m) && <span className="muted"> · conf {confElsewhere(m)}</span>}</div>)}</td>
       <td><SummaryBadge s={s.status} /></td>
       <td>{s.configRevision ? `Revision ${s.configRevision}` : <span className="muted">None</span>}</td>
       <td className="muted">{when(s.createdAt)} · {s.createdBy}</td>
@@ -107,12 +115,13 @@ function ServiceDetail({ id, onClose }: { id: string; onClose: () => void }) {
       </table>
       <h3>{cluster ? "Nodes" : "Installation"}</h3>
       <table>
-        <thead><tr><th>Host</th><th>Install directory</th>{cluster && <th>Node address</th>}<th>User</th><th>Ports</th><th>Service executor</th><th>State</th><th>Seen</th></tr></thead>
+        <thead><tr><th>Host</th><th>Install directory</th><th>Conf directory</th>{cluster && <th>Node address</th>}<th>User</th><th>Ports</th><th>Service executor</th><th>State</th><th>Seen</th></tr></thead>
         <tbody>
           {s.members.map((m) => (
-            <tr key={`${m.host}:${m.installDir}`}>
+            <tr key={memberKey(m)}>
               <td className="mono">{m.host}</td>
               <td className="mono">{m.installDir}</td>
+              <ConfCell m={m} />
               {cluster && <td className="mono">{m.nodeAddress ?? "—"}</td>}
               <td className="mono">{m.serviceUser ?? "—"}</td>
               <td className="mono small">{Object.entries(m.ports).filter(([, v]) => v).map(([k, v]) => `${k} ${v}`).join(" · ") || "—"}</td>
@@ -127,8 +136,8 @@ function ServiceDetail({ id, onClose }: { id: string; onClose: () => void }) {
         <details>
           <summary>Configuration revision {cfg.revision} ({cfg.source}, {when(cfg.savedAt)} by {cfg.savedBy}); secret values hidden</summary>
           {cfg.body.members.map((m) => (
-            <div key={`${m.host}:${m.installDir}`} className="panel">
-              <h3 className="mono">{m.host}:{m.installDir}</h3>
+            <div key={memberKey(m)} className="panel">
+              <h3 className="mono">{m.host}:{m.installDir}{confElsewhere(m) && <span className="muted"> · conf {confElsewhere(m)}</span>}</h3>
               {m.missing.length > 0 && <p className="muted">Not there: {m.missing.join(", ")}</p>}
               {m.files.map((f) => (
                 <details key={f.name}>
@@ -219,12 +228,16 @@ export function TakeoverPage({ isAdmin, onRegistered }: { isAdmin: boolean; onRe
 }
 
 function DiscoveryRow({ host, discovery, isAdmin, onStarted, onProblem }: { host: HostView; discovery: DiscoveryView | null | undefined; isAdmin: boolean; onStarted: () => void; onProblem: (p: Problem | undefined) => void }) {
-  const [dirs, setDirs] = useState("");
+  // Installations to read as well (not running, or not in a scanned directory): each an install directory, with its
+  // conf directory when that is elsewhere and bootstrap.conf's conf.dir does not say so.
+  const [dirs, setDirs] = useState<{ install: string; conf: string }[]>([{ install: "", conf: "" }]);
   const e = host.service!;
   const busy = discovery ? !FINAL.has(discovery.state) : false;
+  const setDir = (i: number, field: "install" | "conf", value: string) => setDirs(dirs.map((d, j) => (j === i ? { ...d, [field]: value } : d)));
   const start = () => {
     onProblem(undefined);
-    const list = dirs.split(/[\s,]+/).map((d) => d.trim()).filter(Boolean);
+    const list: api.DiscoverDir[] = dirs.map((d) => ({ install: d.install.trim(), conf: d.conf.trim() })).filter((d) => d.install)
+      .map((d) => (d.conf ? { install: d.install, conf: d.conf } : d.install));
     api.discover(host.id, list).then(onStarted, (err) => onProblem(problemOf(err)));
   };
   const r = discovery?.result;
@@ -237,14 +250,23 @@ function DiscoveryRow({ host, discovery, isAdmin, onStarted, onProblem }: { host
         {discovery.message && discovery.state !== "succeeded" && <div className="error small">{discovery.message}</div>}
       </>}</td>
       <td className="small">{r ? <>
-        {r.instances.map((i) => <div key={String(i.installDir)}><span className="mono">{String(i.installDir)}</span> NiFi {String(i.version ?? "?")} {i.running ? <span className="badge ok">running</span> : <span className="badge muted">stopped</span>}{i.cluster?.isNode ? <span className="badge info">node</span> : null}</div>)}
+        {r.instances.map((i) => <div key={`${String(i.installDir)}:${String(i.confDir ?? "")}`}><span className="mono">{String(i.installDir)}</span>{typeof i.confDir === "string" && confElsewhere({ installDir: String(i.installDir), confDir: i.confDir }) && <span className="mono muted"> · conf {i.confDir}</span>} NiFi {String(i.version ?? "?")} {i.running ? <span className="badge ok">running</span> : <span className="badge muted">stopped</span>}{i.cluster?.isNode ? <span className="badge info">node</span> : null}</div>)}
         {!r.instances.length && <span className="muted">No NiFi found</span>}
-        {r.dirs.filter((d) => !d.found).map((d) => <div key={d.dir} className="error">{d.dir}: {d.error ?? "no NiFi there"}</div>)}
+        {r.dirs.filter((d) => !d.found).map((d) => <div key={`${d.dir}:${d.conf ?? ""}`} className="error">{d.dir}{d.conf ? ` (conf ${d.conf})` : ""}: {d.error ?? "no NiFi there"}</div>)}
         {r.skipped.length > 0 && <div className="muted">{r.skipped.length} process(es) of other users not read</div>}
       </> : <span className="muted">—</span>}</td>
       {isAdmin && <td>
+        {dirs.map((d, i) => (
+          <div className="row" key={i}>
+            <input value={d.install} onChange={(ev) => setDir(i, "install", ev.target.value)} placeholder="Install directory (optional)"
+              title="Absolute path of a NiFi installation (bin/, lib/) that is not running or not in a scanned directory" />
+            <input value={d.conf} onChange={(ev) => setDir(i, "conf", ev.target.value)} placeholder="Conf directory (if elsewhere)"
+              title="Where its nifi.properties is, when not <install>/conf and not named by conf.dir in <install>/conf/bootstrap.conf" />
+            {dirs.length > 1 && <button className="link" onClick={() => setDirs(dirs.filter((_, j) => j !== i))} title="Remove this row">Remove</button>}
+          </div>
+        ))}
         <div className="row">
-          <input value={dirs} onChange={(ev) => setDirs(ev.target.value)} placeholder="Extra install directories (optional)" title="Absolute paths of NiFi installations that are not running or not in a common directory, separated by spaces" />
+          {dirs.length < 32 && <button className="link" onClick={() => setDirs([...dirs, { install: "", conf: "" }])}>Add another</button>}
           <button onClick={start} disabled={busy || !e.online}>{busy ? "Discovering…" : "Discover"}</button>
         </div>
       </td>}
@@ -337,10 +359,10 @@ function DraftItemCard({ item, editable, busy, onRemove, onSave }: { item: Servi
         {editable && <button className="link danger" onClick={onRemove} disabled={busy}>Remove from draft</button>}
       </div>
       <table>
-        <thead><tr><th>Host</th><th>Install directory</th>{item.kind === "cluster" && <th>Node address</th>}<th>User</th><th>Ports</th></tr></thead>
+        <thead><tr><th>Host</th><th>Install directory</th><th>Conf directory</th>{item.kind === "cluster" && <th>Node address</th>}<th>User</th><th>Ports</th></tr></thead>
         <tbody>{members.map((m) => (
-          <tr key={`${m.host}:${m.installDir}`}>
-            <td className="mono">{m.host}</td><td className="mono">{m.installDir}</td>{item.kind === "cluster" && <td className="mono">{m.nodeAddress ?? "—"}</td>}
+          <tr key={memberKey(m)}>
+            <td className="mono">{m.host}</td><td className="mono">{m.installDir}</td><ConfCell m={m} />{item.kind === "cluster" && <td className="mono">{m.nodeAddress ?? "—"}</td>}
             <td className="mono">{m.serviceUser ?? "—"}</td>
             <td className="mono small">{Object.entries(m.ports).filter(([, v]) => v).map(([k, v]) => `${k} ${v}`).join(" · ") || "—"}</td>
           </tr>

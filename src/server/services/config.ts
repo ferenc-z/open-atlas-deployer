@@ -25,7 +25,8 @@ export interface ConfigFileRecord {
   secrets: string[];
 }
 
-export interface ConfigMember { host: string; installDir: string; files: ConfigFileRecord[]; missing: string[] }
+/** confDir: where the files were read (each file also carries its own path); absent in revisions imported before it was kept. */
+export interface ConfigMember { host: string; installDir: string; confDir?: string; files: ConfigFileRecord[]; missing: string[] }
 /** A configuration revision's body: one entry per installation (a standalone's one, each node of a cluster). */
 export interface ServiceConfigBody { members: ConfigMember[] }
 

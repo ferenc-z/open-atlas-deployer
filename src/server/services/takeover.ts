@@ -10,9 +10,9 @@ import { newJobId } from "../handoff.ts";
 import { sessionOutcome, type OmaSessions } from "../oma.ts";
 import type { SecretBox } from "../secretbox.ts";
 import { StoreError, type Actor, type Store } from "../store.ts";
-import { assessItems, groupDiscoveries, reviewPrompt, type Discovered, type RegisteredMember, type Skipped } from "./assess.ts";
+import { assessItems, discoveredKey, groupDiscoveries, reviewPrompt, type Discovered, type RegisteredMember, type Skipped } from "./assess.ts";
 import { importFile, type ConfigMember, type ReadFile, type ServiceConfigBody } from "./config.ts";
-import type { DraftItem, ServiceDraft, ServiceMember } from "./draft.ts";
+import { confDirOf, installKey, type DraftItem, type ServiceDraft, type ServiceMember } from "./draft.ts";
 
 export class TakeoverError extends Error {
   readonly status: 400 | 404 | 409 | 503;
@@ -39,7 +39,7 @@ export interface TakeoverOptions {
 /** The settings key of the HMAC key discovery fingerprints secrets with (so nodes can be compared, P1). */
 export const FINGERPRINT_KEY = "service.fingerprint-key";
 const SYSTEM: Actor = { id: "deployer", via: "cli" };
-const install = (m: Pick<ServiceMember, "host" | "installDir">) => `${m.host}:${m.installDir.replace(/\/+$/, "")}`;
+const install = (m: Pick<ServiceMember, "host" | "installDir" | "confDir">) => installKey(m);
 
 export class Takeover {
   private o: TakeoverOptions;
@@ -87,7 +87,8 @@ export class Takeover {
           const job = this.o.store.executorJob(ref.job);
           jobs.set(ref.job, job?.status?.state === "succeeded" ? ((job.status.result as unknown as { instances?: Record<string, any>[] }).instances ?? []) : []);
         }
-        const instance = jobs.get(ref.job)!.find((i) => String(i.installDir).replace(/\/+$/, "") === ref.installDir.replace(/\/+$/, ""));
+        const want = installKey({ host: ref.host, installDir: ref.installDir, confDir: ref.confDir ?? m.confDir });
+        const instance = jobs.get(ref.job)!.find((i) => discoveredKey({ host: ref.host, instance: i }) === want);
         if (instance) out.push({ job: ref.job, host: ref.host, instance });
       }
     }
@@ -113,8 +114,8 @@ export class Takeover {
     if (unknown.length) throw new TakeoverError(404, "host/unknown", `Not hosts of this environment: ${unknown.join(", ")}.`);
     const { found, sources, missing } = this.discoveries(hosts);
     if (!sources.length) throw new TakeoverError(409, "draft/no-discovery", "No host has a finished discovery yet: discover first.", missing);
-    const { items, skipped } = groupDiscoveries(found, { registered: (h, d) => this.o.store.serviceUsing(h, d), takenIds: this.registeredIds() });
-    if (!items.length) throw new TakeoverError(409, "draft/nothing-new", "Discovery found nothing that is not registered already.", skipped.map((s) => `${s.host}:${s.installDir}: ${s.reason}`));
+    const { items, skipped } = groupDiscoveries(found, { registered: (h, d, conf) => this.o.store.serviceUsing(h, d, conf), takenIds: this.registeredIds() });
+    if (!items.length) throw new TakeoverError(409, "draft/nothing-new", "Discovery found nothing that is not registered already.", skipped.map((s) => `${installKey(s)}: ${s.reason}`));
     const draft = this.o.store.createServiceDraft(this.o.environment(), sources, assessItems(items, found, this.registered()), actor);
     return { draft, skipped, missing };
   }
@@ -156,16 +157,24 @@ export class Takeover {
     if (!draft.items.length) throw new TakeoverError(409, "draft/empty", `Takeover draft ${draftId} has no items.`);
     if (this.confirming.has(draftId)) throw new TakeoverError(409, "confirm/running", `Takeover draft ${draftId} is being confirmed already.`);
     const members = draft.items.flatMap((item) => (item.kind === "cluster" ? item.nodes : [item.member]).map((m) => ({ item: item.id, m })));
-    const used = members.map(({ m }) => [m, this.o.store.serviceUsing(m.host, m.installDir)] as const).filter(([, s]) => s);
+    const used = members.map(({ m }) => [m, this.o.store.serviceUsing(m.host, m.installDir, m.confDir)] as const).filter(([, s]) => s);
     if (used.length) throw new TakeoverError(409, "service/install-used", "An installation is already registered.", used.map(([m, s]) => `${install(m)} is in ${s}`));
     const offline = [...new Set(members.map(({ m }) => m.host))].map((h) => this.o.handoff.executor(h, "service")).filter((e) => !e.online || !e.heartbeat?.kinds?.includes("svc-read"));
     if (offline.length) throw new TakeoverError(409, "confirm/executor", "The service executor of a host is offline or cannot read files (upgrade it).", offline.map((e) => `${e.host}: ${e.online ? `version ${e.heartbeat?.version} has no svc-read` : e.reason}`));
 
     this.confirming.add(draftId);
     try {
+      const found = new Map(this.foundFor(draft.items).map((d) => [discoveredKey(d), d]));
       const reads = members.map(({ item, m }) => {
         const id = newJobId("svc-read");
-        this.o.handoff.submit(id, { kind: "svc-read", installDir: m.installDir, timeoutSeconds: 30, requestedBy: actor.id, draft: draftId }, m.host, "service");
+        // Read where discovery saw the files: the conf directory, and bootstrap.conf where the bootstrap read it (an
+        // older service executor ignores both and reads <installDir>/conf, all it could discover).
+        const files = (found.get(install(m))?.instance.files ?? []) as { name: string; path?: string }[];
+        const bootstrapFile = files.find((f) => f.name === "bootstrap.conf")?.path;
+        this.o.handoff.submit(id, {
+          kind: "svc-read", installDir: m.installDir, ...(m.confDir ? { confDir: m.confDir } : {}), ...(typeof bootstrapFile === "string" ? { bootstrapFile } : {}),
+          timeoutSeconds: 30, requestedBy: actor.id, draft: draftId,
+        }, m.host, "service");
         return { id, item, m };
       });
       this.o.store.audit(actor, "service.draft-reading", draftId, { reads: reads.map((r) => ({ job: r.id, installation: install(r.m) })) });
@@ -174,7 +183,6 @@ export class Takeover {
 
       const problems: string[] = [];
       const byItem = new Map<string, ConfigMember[]>();
-      const found = new Map(this.foundFor(draft.items).map((d) => [`${d.host}:${String(d.instance.installDir).replace(/\/+$/, "")}`, d]));
       for (const r of reads) {
         const status = this.o.handoff.status(r.id);
         const content = this.o.handoff.envContent(r.id);
@@ -183,13 +191,17 @@ export class Takeover {
         let sent: { files: ReadFile[] };
         try { sent = JSON.parse(content); } catch { problems.push(`${install(r.m)}: unreadable answer`); continue; }
         // The assessment was made on what discovery saw: a file changed since then needs a new discovery and draft.
-        const seen = new Map(((found.get(install(r.m))?.instance.files ?? []) as { name: string; sha256: string }[]).map((f) => [f.name, f.sha256]));
+        const discovered = (found.get(install(r.m))?.instance.files ?? []) as { name: string; sha256: string; path?: string }[];
+        // Read somewhere else than discovery saw it (a service executor too old for confDir): not the same file.
+        const elsewhere = sent.files.filter((f) => discovered.some((d) => d.name === f.name && d.path && f.path && d.path !== f.path)).map((f) => f.name);
+        if (elsewhere.length) { problems.push(`${install(r.m)}: read ${elsewhere.join(", ")} elsewhere than discovery found them (upgrade the service executor)`); continue; }
+        const seen = new Map(discovered.map((f) => [f.name, f.sha256]));
         const changed = sent.files.filter((f) => seen.has(f.name) && seen.get(f.name) !== f.sha256).map((f) => f.name);
         if (changed.length) { problems.push(`${install(r.m)}: changed since discovery: ${changed.join(", ")}; discover again and make a new draft`); continue; }
         try {
           const files = sent.files.map((f) => importFile(f, this.o.box!));
           const missing = ((status.result as unknown as { missing?: string[] }).missing ?? []);
-          byItem.set(r.item, [...(byItem.get(r.item) ?? []), { host: r.m.host, installDir: r.m.installDir, files, missing }]);
+          byItem.set(r.item, [...(byItem.get(r.item) ?? []), { host: r.m.host, installDir: r.m.installDir, confDir: confDirOf(r.m), files, missing }]);
         } catch (error) { problems.push(`${install(r.m)}: ${(error as Error).message}`); }
       }
       if (problems.length) throw new TakeoverError(409, "confirm/read", "The configuration could not be imported from every installation; nothing was registered.", problems);

@@ -22,6 +22,11 @@ is still 0.7.3 in the code; it is raised together with `EXECUTOR_VERSION` before
   devices, autostart units, the configuration's keys and file hashes. Secret values come back hidden, with a keyed
   fingerprint so nodes can still be compared.
 - `svc-read` reads an installation's configuration files (size limits), sent to the Deployer outside the job state.
+- An installation and its conf directory are kept apart (`installDir`, `confDir`): the installation comes from the
+  class path's `lib/` jars (then the working directory), the conf directory from `-Dnifi.properties.file.path` or
+  `conf.dir` in bootstrap.conf, so NiFi unpacked in one place with its configuration and repositories elsewhere is
+  read right. One installation may run several instances, each with its own conf directory. Directories to read can
+  be given as `{install, conf}`; the directories scanned are set with `EXECUTOR_SCAN_DIRS`.
 
 **Services in the Deployer**
 - Service profiles `nifi-1.x` and `nifi-2.x`: the configuration files and a catalog of keys (cluster or node scope,

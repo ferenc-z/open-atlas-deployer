@@ -200,30 +200,69 @@ test("confirming registers every item and its revision 1 in one transaction (tra
 });
 
 /** A Takeover over a real store and handoff; the "executor" answers svc-read jobs whenever the confirmation waits. */
-function harness(o: { box?: boolean; oma?: OmaSessions; alter?: (path: string, text: string) => string; kinds?: string[] } = {}) {
+function harness(o: { box?: boolean; oma?: OmaSessions; alter?: (path: string, text: string) => string; kinds?: string[]; found?: Discovered[]; ignoreConf?: boolean } = {}) {
   const store = new Store(":memory:");
   const handoff = new Handoff(store);
   const box = o.box === false ? undefined : new SecretBox(randomBytes(32).toString("base64"));
   store.setHeartbeat("local", { executor: "service", version: "0.7.3", protocols: [2], kinds: o.kinds ?? ["svc-discover", "svc-read", "executor-upgrade"] }, "service");
-  const found = lab();
+  const found = o.found ?? lab();
   // The discovery as the executor would have stored it, with each nifi.properties hash matching what the read sends.
-  const text = (dir: string) => `nifi.sensitive.props.key=s3cret-${dir.length}\nnifi.web.https.port=1\n`;
-  for (const d of found) d.instance.files = [{ name: "nifi.properties", path: `${d.instance.installDir}/conf/nifi.properties`, sha256: createHash("sha256").update(text(d.instance.installDir)).digest("hex"), size: 1, modifiedAt: "t" }];
+  const text = (conf: string) => `nifi.sensitive.props.key=s3cret-${conf.length}\nnifi.web.https.port=1\n`;
+  const confOf = (i: Record<string, any>) => String(i.confDir ?? `${i.installDir}/conf`);
+  for (const d of found) d.instance.files = [{ name: "nifi.properties", path: `${confOf(d.instance)}/nifi.properties`, sha256: createHash("sha256").update(text(confOf(d.instance))).digest("hex"), size: 1, modifiedAt: "t" }];
   store.queueExecutorJob("svc-discover-1", "local", { protocol: 2, id: "svc-discover-1", kind: "svc-discover" }, undefined, "service");
   store.claimExecutorJob("local", "service");
   store.setExecutorStatus("svc-discover-1", { state: "succeeded", steps: [], result: { instances: found.map((d) => d.instance) } as never });
+  const requests: Record<string, unknown>[] = [];
   const answer = async () => {
     for (let job = store.claimExecutorJob("local", "service"); job; job = store.claimExecutorJob("local", "service")) {
+      requests.push(job);
       const dir = String(job.installDir);
-      const content = (o.alter ?? ((_p, t) => t))(dir, text(dir));
-      const meta = { name: "nifi.properties", path: `${dir}/conf/nifi.properties`, sha256: createHash("sha256").update(content).digest("hex"), size: content.length, modifiedAt: "t" };
+      // An older service executor knows no confDir: it reads <installDir>/conf.
+      const conf = !o.ignoreConf && typeof job.confDir === "string" ? job.confDir : `${dir}/conf`;
+      const content = (o.alter ?? ((_p, t) => t))(dir, text(conf));
+      const meta = { name: "nifi.properties", path: `${conf}/nifi.properties`, sha256: createHash("sha256").update(content).digest("hex"), size: content.length, modifiedAt: "t" };
       handoff.putEnvContent(String(job.id), JSON.stringify({ installDir: dir, files: [{ ...meta, content: Buffer.from(content).toString("base64") }] }));
       handoff.putStatus(String(job.id), { state: "succeeded", steps: [], result: { installDir: dir, files: [meta], missing: ["authorizers.xml"] } as never });
     }
   };
   const takeover = new Takeover({ store, handoff, ...(box ? { box } : {}), ...(o.oma ? { oma: o.oma } : {}), environment: () => "UAT", hosts: () => ["local"], sleep: answer, readTimeoutMs: 2000, pollMs: 1 });
-  return { store, handoff, takeover, box };
+  return { store, handoff, takeover, box, requests };
 }
+
+/** The owner's layout: one NiFi unpacked in /webapp/install, run twice with conf directories under /webapp/deploy. */
+function split(): Discovered[] {
+  const one = (conf: string, https: number) => {
+    const i = nifi("x", "2.5.0", { ports: { https, management: https + 34000 } });
+    Object.assign(i, { installDir: "/webapp/install", confDir: conf });
+    return { job: "svc-discover-1", host: "local", instance: i };
+  };
+  return [one("/webapp/deploy/nifi/conf", 18447), one("/webapp/deploy/other/conf", 18448)];
+}
+
+test("an installation with its conf directory elsewhere: drafted, read where discovered, registered by host, installation and conf", async () => {
+  const { store, takeover, requests } = harness({ found: split() });
+  const { draft } = takeover.createDraft(admin);
+  assert.deepEqual(draft.items.map((i) => [i.id, (i as DraftStandalone).member.confDir]), [["nifi", "/webapp/deploy/nifi/conf"], ["other", "/webapp/deploy/other/conf"]],
+    "two instances of one installation; named after what holds the conf directory");
+  assert.ok(!draft.items.some((i) => (i.findings as Finding[]).some((f) => f.code === "discovery/missing")), "each found its discovery by its conf directory");
+  const done = await takeover.confirm(draft.id, admin);
+  assert.deepEqual(done.registered, ["nifi", "other"]);
+  assert.deepEqual(requests.map((r) => [r.installDir, r.confDir]), [["/webapp/install", "/webapp/deploy/nifi/conf"], ["/webapp/install", "/webapp/deploy/other/conf"]]);
+  assert.deepEqual(store.standalones().map((s) => [s.id, s.member.installDir, s.member.confDir]), [["nifi", "/webapp/install", "/webapp/deploy/nifi/conf"], ["other", "/webapp/install", "/webapp/deploy/other/conf"]]);
+  assert.equal(store.serviceConfig("other")!.body.members[0]!.confDir, "/webapp/deploy/other/conf");
+  assert.deepEqual([store.serviceUsing("local", "/webapp/install/", "/webapp/deploy/nifi/conf/"), store.serviceUsing("local", "/webapp/install"), store.serviceUsing("local", "/webapp/install", "/elsewhere")],
+    ["nifi", undefined, undefined]);
+  // An installation registered before conf directories were kept counts as <install>/conf.
+  store.addStandalone({ kind: "standalone", id: "old", service: "nifi", profile: "nifi-2.x", version: "2.5.0", webUrl: null, member: { host: "local", installDir: "/opt/nifi", serviceUser: null, startEnvironment: null, ports: {} } }, "UAT", admin);
+  assert.deepEqual([store.serviceUsing("local", "/opt/nifi"), store.serviceUsing("local", "/opt/nifi", "/opt/nifi/conf"), store.standalones().find((s) => s.id === "old")!.member.confDir], ["old", "old", "/opt/nifi/conf"]);
+  store.close();
+
+  // A service executor that ignores confDir reads <installDir>/conf: not what discovery fingerprinted, nothing registered.
+  const old = harness({ found: split(), ignoreConf: true });
+  await assert.rejects(old.takeover.confirm(old.takeover.createDraft(admin).draft.id, admin), (e: TakeoverError) => e.code === "confirm/read" && /elsewhere than discovery/.test(e.details.join()));
+  assert.equal(old.store.standalones().length, 0);
+});
 
 test("a draft is made from the newest discoveries, and confirming imports the files read on the hosts", async () => {
   const { store, takeover, box } = harness();

@@ -233,13 +233,15 @@ export type RegisteredService = (Extract<DraftItem, { kind: "standalone" }> | Ex
 export const services = () => call<{ standalones: RegisteredService[]; clusters: RegisteredService[] }>("GET", "services");
 export const serviceStatus = (id: string) => call<ServiceStatus>("GET", `services/${encodeURIComponent(id)}/status`);
 export type ServiceConfigView = { service: string; revision: number; source: string; savedAt: string; savedBy: string; via: string; note: string | null;
-  body: { members: { host: string; installDir: string; files: Omit<ConfigFileRecord, "sealed">[]; missing: string[] }[] };
+  body: { members: { host: string; installDir: string; confDir?: string; files: Omit<ConfigFileRecord, "sealed">[]; missing: string[] }[] };
   revisions: { revision: number; source: string; savedAt: string; savedBy: string; note: string | null }[] };
 export const serviceConfig = (id: string, revision?: number) => call<ServiceConfigView>("GET", `services/${encodeURIComponent(id)}/config${revision ? `?revision=${revision}` : ""}`);
 /** svc-discover on a host's service executor; the newest one. */
-export type DiscoveryView = { id: string; host: string; dirs: string[]; state: string; message: string | null; startedAt: string | null; finishedAt: string | null;
-  result: { scannedAt?: string; user?: string; isRoot?: boolean; instances: Record<string, any>[]; dirs: { dir: string; found: boolean; running?: boolean; error?: string }[]; skipped: { pid: number; user: string }[] } | null; log: string };
-export const discover = (host: string, dirs: string[] = []) => call<{ id: string; host: string; dirs: string[]; state: string }>("POST", `hosts/${encodeURIComponent(host)}/discover`, { dirs });
+/** One asked installation: its path, or with its conf directory when that is elsewhere (and conf.dir does not say so). */
+export type DiscoverDir = string | { install: string; conf?: string };
+export type DiscoveryView = { id: string; host: string; dirs: DiscoverDir[]; state: string; message: string | null; startedAt: string | null; finishedAt: string | null;
+  result: { scannedAt?: string; user?: string; isRoot?: boolean; instances: Record<string, any>[]; dirs: { dir: string; conf?: string; found: boolean; running?: boolean; error?: string }[]; skipped: { pid: number; user: string }[] } | null; log: string };
+export const discover = (host: string, dirs: DiscoverDir[] = []) => call<{ id: string; host: string; dirs: DiscoverDir[]; state: string }>("POST", `hosts/${encodeURIComponent(host)}/discover`, { dirs });
 export const discovery = (host: string) => call<DiscoveryView>("GET", `hosts/${encodeURIComponent(host)}/discover`);
 export type DraftSummary = Omit<ServiceDraft, "items" | "review">;
 const drafts = (rest = "") => `services/drafts${rest}`;

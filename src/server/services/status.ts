@@ -5,13 +5,15 @@
 
 import type { ExecutorInfo } from "../handoff.ts";
 import type { Store } from "../store.ts";
-import type { DraftItem, ServiceMember, ServicePorts } from "./draft.ts";
+import { confDirOf, installKey, type DraftItem, type ServiceMember, type ServicePorts } from "./draft.ts";
+import { discoveredKey } from "./assess.ts";
 
 export type MemberState = "running" | "stopped" | "not-found" | "unknown";
 
 export interface MemberStatus {
   host: string;
   installDir: string;
+  confDir: string;
   nodeAddress?: string | null;
   serviceUser: string | null;
   ports: ServicePorts;
@@ -41,7 +43,6 @@ export interface ServiceStatus {
   summary: { members: number; running: number; executorsOnline: number; versionsSeen: string[] };
 }
 
-const dirOf = (d: string) => d.replace(/\/+$/, "");
 
 /** The status of one registered service, or undefined when there is none with that id. */
 export function serviceStatus(store: Store, executor: (host: string) => ExecutorInfo, id: string): ServiceStatus | undefined {
@@ -63,10 +64,10 @@ export function serviceStatus(store: Store, executor: (host: string) => Executor
   const statuses = members.map((m): MemberStatus => {
     const e = executor(m.host);
     const d = discoveryOf(m.host);
-    const found = d?.instances.find((i) => dirOf(String(i.installDir ?? "")) === dirOf(m.installDir));
+    const found = d?.instances.find((i) => discoveredKey({ host: m.host, instance: i }) === installKey(m));
     const state: MemberState = !d ? "unknown" : !found ? "not-found" : found.running ? "running" : "stopped";
     return {
-      host: m.host, installDir: m.installDir, ...(m.nodeAddress !== undefined ? { nodeAddress: m.nodeAddress } : {}), serviceUser: m.serviceUser, ports: m.ports,
+      host: m.host, installDir: m.installDir, confDir: confDirOf(m), ...(m.nodeAddress !== undefined ? { nodeAddress: m.nodeAddress } : {}), serviceUser: m.serviceUser, ports: m.ports,
       executor: { online: e.online, ...(e.reason ? { reason: e.reason } : {}), ...(e.heartbeat?.version ? { version: e.heartbeat.version } : {}) },
       state,
       seen: d ? { job: d.job, at: d.at, version: found?.version ?? null, pid: found?.process?.pid ?? null, webUrl: found?.webUrl ?? null } : null,

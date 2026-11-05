@@ -823,19 +823,23 @@ test("service ops step 3: discovery runs on the host's service executor, and its
   assert.equal((await post(t, "/api/hosts/app2/discover", "admin", { dirs: ["relative"] })).status, 400);
   assert.equal((await latest()).status, 404, "none yet");
 
-  const started = await post(t, "/api/hosts/app2/discover", "admin", { dirs: ["/opt/nifi-2.0.0"] });
+  for (const bad of [[{ install: "relative" }], [{ install: "/x", conf: "conf" }], [{ install: "/x", other: "/y" }], [["/x"]]])
+    assert.equal((await post(t, "/api/hosts/app2/discover", "admin", { dirs: bad })).status, 400, JSON.stringify(bad));
+  // A conf directory elsewhere goes with its installation; {install} alone goes on as the plain path.
+  const asked = ["/opt/nifi-2.0.0", { install: "/webapp/install", conf: "/webapp/deploy/nifi/conf" }, { install: "/srv/nifi", conf: "" }];
+  const started = await post(t, "/api/hosts/app2/discover", "admin", { dirs: asked });
   assert.equal(started.status, 201);
   const { id } = await started.json();
   assert.match(id, /^svc-discover-/);
   assert.equal((await (await latest()).json()).state, "queued");
   const job = (await (await call("/executor/v1/jobs/next", service)).json()).job;
-  assert.deepEqual([job.id, job.kind, job.dirs], [id, "svc-discover", ["/opt/nifi-2.0.0"]]);
+  assert.deepEqual([job.id, job.kind, job.dirs], [id, "svc-discover", ["/opt/nifi-2.0.0", { install: "/webapp/install", conf: "/webapp/deploy/nifi/conf" }, "/srv/nifi"]]);
   assert.equal((await (await latest()).json()).state, "running");
   const result = { user: "ferenc", isRoot: false, instances: [{ service: "nifi", installDir: "/opt/nifi-2.0.0", running: false, version: "2.0.0" }], dirs: [{ dir: "/opt/nifi-2.0.0", found: true }], skipped: [] };
   await call(`/executor/v1/jobs/${id}/log`, service, { method: "POST", body: "found 1 NiFi\n" });
   await call(`/executor/v1/jobs/${id}/status`, service, { method: "PUT", body: JSON.stringify({ protocol: 2, id, kind: "svc-discover", state: "succeeded", startedAt: "2026-11-04T00:00:00Z", finishedAt: "2026-11-04T00:00:01Z", steps: [], result }) });
   const done = await (await latest()).json();
-  assert.deepEqual([done.id, done.state, done.result, done.dirs], [id, "succeeded", result, ["/opt/nifi-2.0.0"]]);
+  assert.deepEqual([done.id, done.state, done.result, done.dirs], [id, "succeeded", result, job.dirs]);
   assert.match(done.log, /found 1 NiFi/);
 
   // A newer one is what GET returns; an older one is still there by its id. Other hosts' ids are not served.

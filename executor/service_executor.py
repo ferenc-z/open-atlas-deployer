@@ -57,6 +57,10 @@ def config(env_file=None, environ=None):
         "wait_seconds": int(e.get("EXECUTOR_WAIT_SECONDS", "25")),
         "poll_seconds": float(e.get("EXECUTOR_POLL_SECONDS", "2")),
         "work": pathlib.Path(e.get("EXECUTOR_WORK", "/var/lib/open-atlas-service-executor")),
+        # svc-discover: where NiFi is looked for besides the running processes (globs, separated by spaces or commas;
+        # set and empty: nowhere).
+        "scan_dirs": tuple(re.split(r"[\s,]+", e["EXECUTOR_SCAN_DIRS"].strip())) if e.get("EXECUTOR_SCAN_DIRS", "").strip()
+        else (() if "EXECUTOR_SCAN_DIRS" in e else COMMON_DIRS),
         # The read channel: how many reads run at once, and the longest one may take.
         "read_slots": max(1, int(e.get("EXECUTOR_READ_SLOTS", "4"))),
         "read_timeout": max(1, int(e.get("EXECUTOR_READ_TIMEOUT", "120"))),
@@ -101,8 +105,17 @@ NIFI_MAIN = "org.apache.nifi.NiFi"
 # The configuration files fingerprinted (the profile's files, §5.1, and the ones beside them in conf/).
 NIFI_CONF_FILES = ("nifi.properties", "bootstrap.conf", "state-management.xml", "authorizers.xml", "login-identity-providers.xml",
                    "logback.xml", "zookeeper.properties", "bootstrap-notification-services.xml")
-# Where NiFi is often unpacked; an instance there is found even when it does not run.
+# Where NiFi is often unpacked; an instance there is found even when it does not run. EXECUTOR_SCAN_DIRS replaces them.
 COMMON_DIRS = ("/opt/nifi*", "/opt/*/nifi*", "/usr/local/nifi*", "/srv/nifi*")
+# The configuration files nifi.properties (or bootstrap.conf) names, resolved against the installation (NiFi's working
+# directory): with conf.dir moved out of the installation, they may still be under <install>/conf.
+CONF_FILE_KEYS = {
+    "state-management.xml": ("nifi.properties", "nifi.state.management.configuration.file"),
+    "authorizers.xml": ("nifi.properties", "nifi.authorizer.configuration.file"),
+    "login-identity-providers.xml": ("nifi.properties", "nifi.login.identity.provider.configuration.file"),
+    "zookeeper.properties": ("nifi.properties", "nifi.state.management.embedded.zookeeper.properties"),
+    "bootstrap-notification-services.xml": ("bootstrap.conf", "notification.services.file"),
+}
 # Values never sent to the Deployer: passwords and keys in the properties, and secrets in the start environment.
 SECRET_PROPERTY = re.compile(r"pass(word|wd|phrase)?|secret|token|credential|sensitive\.props\.key|\.key$|private", re.I)
 SECRET_ENV = re.compile(r"PASS|SECRET|TOKEN|CREDENTIAL|_KEY$|^KEY$|PRIVATE|COOKIE", re.I)
@@ -205,7 +218,7 @@ class Discovery:
             if self.uid is not None and uid != self.uid:
                 self.skipped.append({"pid": int(d.name), "user": user_name(uid)})
                 continue
-            found[int(d.name)] = {"args": args, "uid": uid, "ppid": ppid}
+            found[int(d.name)] = {"pid": int(d.name), "args": args, "uid": uid, "ppid": ppid}
         return found
 
     @staticmethod
@@ -213,16 +226,81 @@ class Discovery:
         prefix = f"-D{name}="
         return next((a[len(prefix):] for a in args if a.startswith(prefix)), None)
 
-    def home_of(self, pid, args):
-        """The installation a NiFi process belongs to: two levels above its bootstrap.conf or nifi.properties, else its cwd."""
-        for name in ("org.apache.nifi.bootstrap.config.file", "nifi.properties.file.path"):
-            value = self.define(args, name)
-            if value:
-                return os.path.normpath(os.path.dirname(os.path.dirname(value)))
+    @staticmethod
+    def classpath(args):
+        """The entries of a java command line's class path (-cp, -classpath, --class-path)."""
+        for i, a in enumerate(args):
+            if a in ("-cp", "-classpath", "--class-path") and i + 1 < len(args):
+                yield from (e for e in args[i + 1].split(":") if e)
+            elif a.startswith("--class-path="):
+                yield from (e for e in a.split("=", 1)[1].split(":") if e)
+
+    @classmethod
+    def install_from_classpath(cls, args):
+        """The installation whose lib/ the jars on the class path come from: lib/bootstrap/* (the bootstrap) or
+        lib/*.jar (the NiFi JVM). Directories on the class path (conf/, wherever it is) do not count."""
+        for entry in cls.classpath(args):
+            if not (entry.endswith(".jar") or entry.endswith("/*")) or not entry.startswith("/"):
+                continue
+            parts = os.path.normpath(entry).split("/")[:-1]
+            if "lib" in parts:
+                at = len(parts) - 1 - parts[::-1].index("lib")
+                return "/".join(parts[:at]) or "/"
+        return None
+
+    def cwd(self, pid):
         try:
             return os.path.normpath(os.readlink(self.proc / str(pid) / "cwd"))
         except OSError:
             return None
+
+    @staticmethod
+    def resolve(home, value):
+        """A path NiFi reads relative to its working directory (nifi.sh starts it in the installation)."""
+        return os.path.normpath(value if os.path.isabs(value) else os.path.join(str(home), value))
+
+    @classmethod
+    def layout(cls, home, conf=None, bootstrap_file=None, properties_file=None):
+        """Where an installation's pieces are: installDir (bin/, lib/), confDir (nifi.properties and the files beside
+        it), bootstrapFile. confDir, when not given: the directory of properties_file (the JVM's
+        -Dnifi.properties.file.path), else bootstrap.conf's conf.dir (relative to the installation), else <install>/conf.
+        bootstrap.conf: bootstrap_file (the bootstrap's -Dorg.apache.nifi.bootstrap.config.file), else <install>/conf
+        (where nifi.sh reads it), else the conf directory."""
+        home = os.path.normpath(str(home))
+        if properties_file:
+            properties_file = cls.resolve(home, properties_file)
+            conf = conf or os.path.dirname(properties_file)
+        if bootstrap_file:
+            bootstrap_file = cls.resolve(home, bootstrap_file)
+        else:
+            candidates = [os.path.join(home, "conf", "bootstrap.conf")] + ([os.path.join(conf, "bootstrap.conf")] if conf else [])
+            bootstrap_file = next((c for c in candidates if os.path.isfile(c)), candidates[0])
+        if not conf:
+            try:
+                value = read_properties(bootstrap_file).get("conf.dir", "").strip()
+            except OSError:
+                value = ""
+            conf = cls.resolve(home, value) if value else os.path.join(home, "conf")
+        conf = os.path.normpath(conf)
+        return {"installDir": home, "confDir": conf, "bootstrapFile": bootstrap_file,
+                "propertiesFile": properties_file or os.path.join(conf, "nifi.properties")}
+
+    def layout_of(self, main, boot):
+        """An instance's layout from its processes (main: the NiFi JVM's, boot: the bootstrap's, either may be None).
+        The installation: where the class path's jars are, else the working directory, else above the conf directory."""
+        main_args, boot_args = (main or {}).get("args", []), (boot or {}).get("args", [])
+        props = self.define(main_args, "nifi.properties.file.path")
+        boot_file = self.define(boot_args, "org.apache.nifi.bootstrap.config.file") or self.define(main_args, "org.apache.nifi.bootstrap.config.file")
+        home = self.install_from_classpath(main_args) or self.install_from_classpath(boot_args)
+        if not home:
+            home = self.cwd((boot or main)["pid"]) if (boot or main) else None
+        if not home and (props or boot_file):
+            if not os.path.isabs(props or boot_file):
+                return None
+            home = os.path.normpath(os.path.dirname(os.path.dirname(props or boot_file)))
+        if not home:
+            return None
+        return self.layout(home, bootstrap_file=boot_file, properties_file=props)
 
     def environ(self, pid):
         try:
@@ -267,19 +345,29 @@ class Discovery:
         return sorted(ports)
 
     def running(self):
-        """installDir -> what its processes say (bootstrap and NiFi JVM pids, user, java, start environment, ports)."""
+        """(installDir, confDir) -> what its processes say (layout, bootstrap and NiFi JVM pids, user, java, start
+        environment, ports). A NiFi JVM belongs with the bootstrap that started it (its parent); one installation may
+        run several instances, each with its own conf directory."""
         procs = self.processes()
-        out = {}
+        groups = {}
         for pid, p in sorted(procs.items()):
-            home = self.home_of(pid, p["args"])
-            if not home:
+            if NIFI_MAIN in p["args"]:
+                parent = procs.get(p["ppid"])
+                root = p["ppid"] if parent and NIFI_MAIN not in parent["args"] else pid
+                groups.setdefault(root, {})["pid"] = pid
+            else:
+                groups.setdefault(pid, {})["bootstrapPid"] = pid
+        out = {}
+        for g in groups.values():
+            main, boot = procs.get(g.get("pid")), procs.get(g.get("bootstrapPid"))
+            where = self.layout_of(main, boot)
+            if not where:
                 continue
-            entry = out.setdefault(home, {"uid": p["uid"]})
-            role = "pid" if NIFI_MAIN in p["args"] else "bootstrapPid"
-            entry.setdefault(role, pid)
-            if role == "pid":
-                entry["propertiesFile"] = self.define(p["args"], "nifi.properties.file.path")
-        for home, entry in out.items():
+            entry = out.setdefault((where["installDir"], where["confDir"]), {"uid": (main or boot)["uid"], **where})
+            for role in ("pid", "bootstrapPid"):
+                if g.get(role):
+                    entry.setdefault(role, g[role])
+        for entry in out.values():
             main, boot = entry.get("pid"), entry.get("bootstrapPid")
             # The environment nifi.sh started with is the bootstrap's (S10); the JVM inherits it.
             env, problem = self.environ(boot or main)
@@ -297,7 +385,42 @@ class Discovery:
 
     @staticmethod
     def is_nifi(home):
-        return (home / "conf" / "nifi.properties").is_file() or (home / "bin" / "nifi.sh").is_file()
+        """An installation: bin/nifi.sh, or lib/ with NiFi's jars (its conf/ may be elsewhere)."""
+        home = pathlib.Path(home)
+        return (home / "bin" / "nifi.sh").is_file() or any((home / "lib").glob("nifi-*.jar"))
+
+    @staticmethod
+    def not_nifi(home):
+        """Why a directory is not an installation, for the asked directories."""
+        if (pathlib.Path(home) / "conf" / "nifi.properties").is_file():
+            return "conf/nifi.properties but no bin/nifi.sh or lib/ here: give the installation directory, with this one's conf/ as its conf directory"
+        return "no bin/nifi.sh or lib/nifi-*.jar here: not a NiFi installation"
+
+    @staticmethod
+    def conf_files(where, props=None, boot=None):
+        """name -> path of the configuration files (NIFI_CONF_FILES): nifi.properties and bootstrap.conf as the layout
+        says, the ones nifi.properties or bootstrap.conf name where they name them (same kind of file), the rest in
+        the conf directory."""
+        conf = where["confDir"]
+        out = {"nifi.properties": where["propertiesFile"], "bootstrap.conf": where["bootstrapFile"]}
+        read = {"nifi.properties": props, "bootstrap.conf": boot}
+        for name in NIFI_CONF_FILES:
+            if name in out:
+                continue
+            path = os.path.join(conf, name)
+            if name in CONF_FILE_KEYS:
+                source, key = CONF_FILE_KEYS[name]
+                values = read[source]
+                if values is None:
+                    try:
+                        values = read[source] = read_properties(out[source])
+                    except OSError:
+                        values = read[source] = {}
+                value = (values.get(key) or "").strip()
+                if value and os.path.splitext(value)[1] == os.path.splitext(name)[1]:
+                    path = Discovery.resolve(where["installDir"], value)
+            out[name] = path
+        return out
 
     @staticmethod
     def version(home):
@@ -346,28 +469,28 @@ class Discovery:
                     continue
         return found
 
-    def instance(self, home, proc=None, source="process"):
-        """What one installation is: version, users, start environment, ports, the cluster settings, file fingerprints."""
-        home = pathlib.Path(home)
+    def instance(self, where, proc=None, source="process"):
+        """What one instance is (where: its layout): version, users, start environment, ports, the cluster settings,
+        file fingerprints."""
+        home = pathlib.Path(where["installDir"])
         problems = list((proc or {}).get("problems", []))
-        props_file = pathlib.Path(os.path.normpath((proc or {}).get("propertiesFile") or home / "conf" / "nifi.properties"))
-        conf = props_file.parent
+        props_file, boot_file = where["propertiesFile"], where["bootstrapFile"]
         props, boot = {}, {}
         try:
             props = read_properties(props_file)
         except OSError as e:
             problems.append(f"cannot read {props_file}: {e.strerror or e}")
         try:
-            boot = read_properties(conf / "bootstrap.conf")
+            boot = read_properties(boot_file)
         except OSError as e:
-            problems.append(f"cannot read {conf / 'bootstrap.conf'}: {e.strerror or e}")
+            problems.append(f"cannot read {boot_file}: {e.strerror or e}")
         try:
             owner = user_name(home.stat().st_uid)
         except OSError:
             owner = None
         files = []
-        for name in NIFI_CONF_FILES:
-            path = props_file if name == "nifi.properties" else conf / name
+        for name, path in self.conf_files(where, props, boot).items():
+            path = pathlib.Path(path)
             try:
                 st = path.stat()
                 files.append({"name": name, "path": str(path), "sha256": sha256_file(path), "size": st.st_size, "modifiedAt": iso_at(st.st_mtime)})
@@ -384,6 +507,8 @@ class Discovery:
         return {
             "service": "nifi",
             "installDir": str(home),
+            # Where nifi.properties is (and the files beside it): <install>/conf unless conf.dir moved it.
+            "confDir": where["confDir"],
             "source": source,
             "running": running,
             "version": self.version(home),
@@ -423,34 +548,61 @@ class Discovery:
             "problems": problems,
         }
 
+    @staticmethod
+    def asked_dir(d):
+        """One entry of request.dirs: an installation's path, or {"install": path, "conf": path} when its conf
+        directory is elsewhere (and conf.dir in bootstrap.conf does not say so). (install, conf or None), or None."""
+        ok = lambda p: isinstance(p, str) and p.startswith("/") and "\0" not in p and len(p) <= 1024
+        if ok(d):
+            return d, None
+        if isinstance(d, dict) and set(d) <= {"install", "conf"} and ok(d.get("install")) and (d.get("conf") is None or ok(d["conf"])):
+            return d["install"], d.get("conf")
+        return None
+
     def run(self, dirs=()):
         """Every NiFi found: running ones from their processes, then the asked and the common directories."""
         procs = self.running()
-        instances = {home: self.instance(home, p) for home, p in procs.items()}
-        for home in instances:
-            self.log(f"running: {home} (pid {procs[home].get('pid') or '-'}, version {instances[home]['version']})")
+        instances = {key: self.instance(p, p) for key, p in procs.items()}
+        for key, i in instances.items():
+            self.log(f"running: {key[0]} conf {key[1]} (pid {procs[key].get('pid') or '-'}, version {i['version']})")
         asked = []
         for d in dirs:
-            home = os.path.normpath(d)
-            if home in instances:
-                asked.append({"dir": d, "found": True, "running": instances[home]["running"]})
-                continue
+            install, conf = self.asked_dir(d)
+            home = os.path.normpath(install)
+            shown = {"dir": install, **({"conf": conf} if conf else {})}
             if not os.path.isdir(home):
-                asked.append({"dir": d, "found": False, "error": "no such directory (or not readable by this executor)"})
+                asked.append({**shown, "found": False, "error": "no such directory (or not readable by this executor)"})
                 continue
-            if not self.is_nifi(pathlib.Path(home)):
-                asked.append({"dir": d, "found": False, "error": "no conf/nifi.properties or bin/nifi.sh here: not a NiFi installation"})
+            if conf and not os.path.isfile(os.path.join(conf, "nifi.properties")):
+                asked.append({**shown, "found": False, "error": f"no nifi.properties in {conf} (or not readable by this executor)"})
                 continue
-            instances[home] = self.instance(home, None, source="dir")
-            asked.append({"dir": d, "found": True, "running": False})
-            self.log(f"asked: {home} (not running, version {instances[home]['version']})")
+            if conf is None:
+                # An installation that runs: whichever conf directory it runs with (a nifi.sh changed to read another
+                # bootstrap.conf would not show in conf.dir).
+                same = [k for k in instances if k[0] == home and instances[k]["running"]]
+                if same:
+                    asked.append({**shown, "found": True, "running": True})
+                    continue
+            where = self.layout(home, conf=os.path.normpath(conf) if conf else None)
+            key = (where["installDir"], where["confDir"])
+            if key in instances:
+                asked.append({**shown, "found": True, "running": instances[key]["running"]})
+                continue
+            if not self.is_nifi(home):
+                asked.append({**shown, "found": False, "error": self.not_nifi(home)})
+                continue
+            instances[key] = self.instance(where, None, source="dir")
+            asked.append({**shown, "found": True, "running": False})
+            self.log(f"asked: {home} conf {where['confDir']} (not running, version {instances[key]['version']})")
         for pattern in self.common:
             for home in sorted(glob.glob(pattern)):
                 home = os.path.normpath(home)
-                if home not in instances and os.path.isdir(home) and self.is_nifi(pathlib.Path(home)):
-                    instances[home] = self.instance(home, None, source="common-dir")
-                    self.log(f"common directory: {home} (not running)")
-        return {"instances": [instances[h] for h in sorted(instances)], "dirs": asked, "skipped": self.skipped}
+                if any(k[0] == home for k in instances) or not os.path.isdir(home) or not self.is_nifi(home):
+                    continue
+                where = self.layout(home)
+                instances[(where["installDir"], where["confDir"])] = self.instance(where, None, source="common-dir")
+                self.log(f"common directory: {home} conf {where['confDir']} (not running)")
+        return {"instances": [instances[k] for k in sorted(instances)], "dirs": asked, "skipped": self.skipped}
 
 
 class ServiceExecutor(ProtocolExecutor):
@@ -462,9 +614,8 @@ class ServiceExecutor(ProtocolExecutor):
     EXECUTOR = "service"
     # Read jobs: kind -> method(job) returning the job's result (a dict).
     READ_JOBS = {"svc-discover": "discover", "svc-read": "read_files"}
-    # Where discovery looks (tests point these elsewhere).
+    # Where discovery looks (tests point these elsewhere; the directories scanned are the configuration's scan_dirs).
     PROC = "/proc"
-    COMMON_DIRS = COMMON_DIRS
     AUTOSTART_DIRS = AUTOSTART_DIRS
     INTERRUPTED = "The service executor stopped while this job ran."
 
@@ -500,27 +651,32 @@ class ServiceExecutor(ProtocolExecutor):
         """svc-discover (§6 step 2): the NiFi on this machine, read only. request.dirs: installations to read as well,
         for instances not running or unpacked somewhere uncommon. Not root, only this user's processes are looked at."""
         dirs = job.request.get("dirs") or []
-        if not isinstance(dirs, list) or len(dirs) > MAX_DIRS or not all(isinstance(d, str) and d.startswith("/") and "\0" not in d for d in dirs):
-            raise Refused(f"dirs is a list of at most {MAX_DIRS} absolute paths")
+        if not isinstance(dirs, list) or len(dirs) > MAX_DIRS or not all(Discovery.asked_dir(d) for d in dirs):
+            raise Refused(f"dirs is a list of at most {MAX_DIRS} installations: absolute paths, or {{install, conf}} with absolute paths")
         if not pathlib.Path(self.PROC).is_dir():
             raise Failed(f"{self.PROC} is not readable here: svc-discover needs Linux")
         key = job.request.get("fingerprintKey")
         if key is not None and (not isinstance(key, str) or not 16 <= len(key) <= 128):
             raise Refused("fingerprintKey is a string of 16 to 128 characters")
         name, root = self.user()
-        found = Discovery(self.PROC, uid=None if root else os.geteuid(), common=self.COMMON_DIRS, log=job.log, fingerprint_key=key,
+        found = Discovery(self.PROC, uid=None if root else os.geteuid(), common=self.cfg.get("scan_dirs", COMMON_DIRS), log=job.log, fingerprint_key=key,
                           autostart=self.AUTOSTART_DIRS).run(dirs)
         job.log(f"found {len(found['instances'])} NiFi" + (f"; {len(found['skipped'])} process(es) of other users not looked at (not root)" if found["skipped"] else ""))
         return {"scannedAt": now_iso(), "user": name, "isRoot": root, **found}
 
     def read_files(self, job):
         """svc-read (§6 step 5): an installation's configuration files, for the Deployer to import as the first revision.
-        request.installDir: a NiFi installation (absolute); request.files: names among the configuration files
-        (NIFI_CONF_FILES), all of them when absent. The content goes once over the content channel (it holds passwords
-        and keys; the Deployer seals them); the status carries only names, sizes and hashes."""
-        home, names = job.request.get("installDir"), job.request.get("files")
+        request.installDir: a NiFi installation (absolute); request.confDir: its conf directory as discovery reported
+        it (absent: as discovery would find it, bootstrap.conf's conf.dir or <install>/conf); request.bootstrapFile: the
+        bootstrap.conf discovery saw (absent: <install>/conf's, else the conf directory's); request.files: names among
+        the configuration files (NIFI_CONF_FILES), all of them when absent. Each is read where discovery fingerprinted
+        it (Discovery.conf_files). The content goes once over the content channel (it holds passwords and keys; the
+        Deployer seals them); the status carries only names, sizes and hashes."""
+        home, conf, names = job.request.get("installDir"), job.request.get("confDir"), job.request.get("files")
         if not isinstance(home, str) or not home.startswith("/") or "\0" in home:
             raise Refused("installDir is the absolute path of a NiFi installation")
+        if conf is not None and (not isinstance(conf, str) or not conf.startswith("/") or "\0" in conf):
+            raise Refused("confDir is the absolute path of the installation's conf directory")
         if names is None:
             names = list(NIFI_CONF_FILES)
         if not isinstance(names, list) or not all(n in NIFI_CONF_FILES for n in names):
@@ -528,9 +684,16 @@ class ServiceExecutor(ProtocolExecutor):
         home = pathlib.Path(os.path.normpath(home))
         if not home.is_dir() or not Discovery.is_nifi(home):
             raise Refused(f"{home} is not a NiFi installation (or not readable by this executor)")
+        if conf is not None and not os.path.isfile(os.path.join(conf, "nifi.properties")):
+            raise Refused(f"{conf} holds no nifi.properties (or is not readable by this executor)")
+        boot = job.request.get("bootstrapFile")
+        if boot is not None and (not isinstance(boot, str) or not boot.startswith("/") or "\0" in boot or os.path.basename(boot) != "bootstrap.conf"):
+            raise Refused("bootstrapFile is the absolute path of the installation's bootstrap.conf")
+        where = Discovery.layout(home, conf=os.path.normpath(conf) if conf else None, bootstrap_file=boot)
+        paths = Discovery.conf_files(where)
         files, content, missing, total = [], [], [], 0
         for name in dict.fromkeys(names):
-            path = home / "conf" / name
+            path = pathlib.Path(paths[name])
             try:
                 data = path.read_bytes() if path.is_file() else None
                 st = path.stat() if data is not None else None
@@ -546,8 +709,8 @@ class ServiceExecutor(ProtocolExecutor):
             files.append(meta)
             content.append({**meta, "content": base64.b64encode(data).decode()})
             job.log(f"read {path} ({len(data)} bytes)")
-        self.api.put_env_content(job.id, json.dumps({"installDir": str(home), "files": content}))
-        return {"installDir": str(home), "files": files, "missing": missing}
+        self.api.put_env_content(job.id, json.dumps({"installDir": str(home), "confDir": where["confDir"], "files": content}))
+        return {"installDir": str(home), "confDir": where["confDir"], "files": files, "missing": missing}
 
     def beat_body(self, busy):
         body = super().beat_body(busy)
