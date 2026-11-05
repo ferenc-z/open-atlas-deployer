@@ -3,6 +3,52 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
+## Unreleased
+
+Managed services, phase 1 (NiFi 1.x and 2.x, read only): every NiFi on the hosts in one place. The executor version
+is still 0.7.3 in the code; it is raised together with `EXECUTOR_VERSION` before the release.
+
+**Service executor**
+- A second executor, installed only where services are managed: `open-atlas-service-executor-<version>.tar.gz` in
+  the same `executor-v<version>` release, its own `install.sh` (no Docker check; runs as root or as a plain user, who
+  then sees only their own processes). The deploy executor and the service executor share `executor_core.py`, and
+  each release file is still one script (`bundle.py`), so a 0.7.x deploy executor upgrades as before.
+- A token belongs to one executor of a host; the heartbeat says which (`executor: deploy|service`) and a mismatch is
+  refused. Deploy jobs never go to a service executor. The Hosts page shows the service executor, its version and
+  whether it runs as root.
+- Read jobs run in parallel (`EXECUTOR_READ_SLOTS`, a time limit per job), changes wait for them.
+- `svc-discover` finds NiFi installations from their processes (1.x `RunNiFi`, 2.x `BootstrapProcess`), the usual
+  directories and directories typed in: version, owner and service user, ports, cluster settings, heap, storage
+  devices, autostart units, the configuration's keys and file hashes. Secret values come back hidden, with a keyed
+  fingerprint so nodes can still be compared.
+- `svc-read` reads an installation's configuration files (size limits), sent to the Deployer outside the job state.
+
+**Services in the Deployer**
+- Service profiles `nifi-1.x` and `nifi-2.x`: the configuration files and a catalog of keys (cluster or node scope,
+  restart needed, secret, since/until), checked against 1.12.1, 2.0.0 and 2.5.0.
+- Takeover: discoveries become a draft, nodes grouped into clusters by their cluster and ZooKeeper settings;
+  differences between nodes, port conflicts and other risks are found by rules (errors, warnings, notes). The AI can
+  explain the findings through OMA; takeover works without it. An admin confirms the whole draft: the standalone
+  instances and clusters are registered and each installation's files are imported, sealed, as configuration
+  revision 1 (a redacted copy for the page). Files changed since the discovery are refused.
+- A new Services group on the page: **Instances & clusters** (list and details: version, nodes, executor online,
+  running or stopped as of the newest discovery, the redacted revision 1) and **Takeover** (discover per host, make
+  a draft, review and edit it, confirm or discard).
+- `GET /api/services`, `GET /api/services/:id/status`, `GET /api/services/:id/config`, the draft routes under
+  `/api/services/drafts` and `POST|GET /api/hosts/:id/discover`; every change goes to the audit.
+- Read-only MCP tools `list_service_clusters` and `get_cluster_status`.
+- `bin/executor-token.ts <data> <host> <file> service` issues a service executor token, `--revoke deploy|service`
+  revokes one, without the page.
+- New tables only (`executor_beats`, `service_*`) and a column on `executor_tokens`. 0.2.4 opens the database, but
+  would take a service executor token for a deploy executor one: revoke it before going back.
+
+**Known limits**
+- No probes of its own yet: whether an instance runs is what the newest discovery saw, with no scheduled discovery.
+- Not yet: alert thresholds, removing a service, turning a standalone instance into a cluster, a cluster's common
+  layer and node overrides, starting and stopping, logs and metrics (later phases).
+- The service executor cannot be upgraded from the Hosts page or the Overview yet, and the setup package does not
+  include it.
+
 ## 0.2.4
 
 Executor 0.7.3, unchanged.
