@@ -15,7 +15,8 @@ import type { Config } from "../src/server/config.ts";
 import type { Environment } from "../src/compose/generate.ts";
 import { Deployments } from "../src/server/deploy.ts";
 import { EnvManager, Schemas } from "../src/server/env.ts";
-import { EXECUTOR_VERSION, Handoff, PROTOCOL } from "../src/server/handoff.ts";
+import { EXECUTOR_VERSION, Handoff, hostIds, PROTOCOL } from "../src/server/handoff.ts";
+import { Takeover } from "../src/server/services/takeover.ts";
 import { DEPLOYER_VERSION } from "../src/server/version.ts";
 import { Observer } from "../src/server/observe.ts";
 import { Peer } from "../src/server/peer.ts";
@@ -153,7 +154,8 @@ function setup(options: SetupOptions = {}) {
   const workbenchAdmin = phase5?.workbench ?? new WorkbenchAdmin("http://workbench:8090", () => workbenchKey.value(), fetcher);
   const deployerSettings = new DeployerSettings(store, box, options.deployerEnv ?? {});
   const restarts = { count: 0 };
-  const app = createApp({ config, store, sessions, observer, deployments, versions, env, workbench: workbenchAdmin, workbenchKey, deployerSettings, restart: () => { restarts.count++; }, ...(phase5 ? { omaFetcher: phase5.fetcher } : {}), ...(peer ? { peer } : {}), ...(keys ? { keys } : {}), ...(onboarding ? { onboarding } : {}) });
+  const takeover = new Takeover({ store, handoff, box, environment: () => deployments.environment().env.name, hosts: () => hostIds(deployments.environment().env), readTimeoutMs: 5000, pollMs: 5 });
+  const app = createApp({ config, store, takeover, sessions, observer, deployments, versions, env, workbench: workbenchAdmin, workbenchKey, deployerSettings, restart: () => { restarts.count++; }, ...(phase5 ? { omaFetcher: phase5.fetcher } : {}), ...(peer ? { peer } : {}), ...(keys ? { keys } : {}), ...(onboarding ? { onboarding } : {}) });
   const request = (path: string, init: RequestInit & { as?: string; cookie?: string } = {}) => {
     const headers = new Headers(init.headers);
     const cookies = [init.as ? `${SESSION}=${init.as}` : "", init.cookie ?? ""].filter(Boolean).join("; ");
@@ -842,6 +844,65 @@ test("service ops step 3: discovery runs on the host's service executor, and its
   assert.equal((await (await latest(`?job=${id}`)).json()).state, "succeeded");
   assert.equal((await t.request(`/api/hosts/app1/discover?job=${id}`, { as: "viewer" })).status, 404);
   assert.ok(t.store.listAudit().some((e) => e.action === "service.discover" && e.target === "app2"));
+});
+
+test("service ops step 5: a takeover draft from discovery, confirmed with each installation's files as revision 1", async () => {
+  const t = withBuiltApp();
+  setEnvironment(t, ({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", hosts, registries: { ghcr: "ghcr.io/acme" }, apps: { shop: { version: "1.2.0", host: "app2" } } }));
+  const call = (path: string, token: string, init: RequestInit = {}) => t.app.request(`/deploy${path}`, { ...init, headers: { authorization: `Bearer ${token}`, ...(typeof init.body === "string" && init.body.startsWith("{") ? { "content-type": "application/json" } : {}) } });
+  const service = (await (await post(t, "/api/hosts/app2/token", "admin", { executor: "service" })).json()).token as string;
+  await call("/executor/v1/heartbeat", service, { method: "POST", body: JSON.stringify({ executor: "service", version: EXECUTOR_VERSION, protocols: [2], kinds: ["svc-discover", "svc-read", "executor-upgrade"], busy: null, user: "ferenc", isRoot: false, reading: [], readSlots: 4 }) });
+
+  assert.equal((await post(t, "/api/services/drafts", "admin", {})).status, 409, "no discovery yet");
+  const { id } = await (await post(t, "/api/hosts/app2/discover", "admin", {})).json();
+  const job = (await (await call("/executor/v1/jobs/next", service)).json()).job;
+  assert.ok(typeof job.fingerprintKey === "string" && job.fingerprintKey.length >= 16, "secrets come back as fingerprints under the Deployer's key");
+  const files = { "/opt/a": "nifi.web.https.port=8443\nnifi.sensitive.props.key=one\n", "/opt/b": "nifi.web.https.port=9443\nnifi.sensitive.props.key=two\n" } as Record<string, string>;
+  const instance = (dir: string, port: number, fp: string) => ({
+    service: "nifi", installDir: dir, running: true, version: "2.5.0", serviceUser: "nifi", startEnvironment: { JAVA_HOME: "/jdk" }, ports: { https: port, management: port + 1 },
+    webUrl: `https://app2:${port}/nifi`, cluster: { isNode: true, nodeAddress: dir.slice(-1), zookeeper: "zk:2181", zookeeperRoot: "/prod-flow" },
+    properties: { "nifi.cluster.is.node": "true", "nifi.zookeeper.connect.string": "zk:2181", "nifi.zookeeper.root.node": "/prod-flow", "nifi.sensitive.props.key": "(hidden)" },
+    bootstrap: {}, fingerprints: { "nifi.properties": { "nifi.sensitive.props.key": fp } }, autostart: [], problems: [],
+    files: [{ name: "nifi.properties", path: `${dir}/conf/nifi.properties`, sha256: sha256(files[dir]!), size: 1, modifiedAt: "t" }],
+  });
+  const result = { user: "nifi", isRoot: true, instances: [instance("/opt/a", 8443, "f1"), instance("/opt/b", 9443, "f2")], dirs: [], skipped: [] };
+  await call(`/executor/v1/jobs/${id}/status`, service, { method: "PUT", body: JSON.stringify({ protocol: 2, id, kind: "svc-discover", state: "succeeded", steps: [], result }) });
+
+  assert.equal((await post(t, "/api/services/drafts", "uat", {})).status, 403);
+  const created = await post(t, "/api/services/drafts", "admin", {});
+  assert.equal(created.status, 201);
+  const { draft } = await created.json();
+  assert.deepEqual(draft.items.map((i: { kind: string; id: string }) => [i.kind, i.id]), [["cluster", "prod-flow"]]);
+  const key = draft.items[0].findings.find((f: { key?: string }) => f.key === "nifi.sensitive.props.key");
+  assert.deepEqual([key.severity, key.values.map((v: { value: string }) => v.value)], ["error", ["value A", "value B"]]);
+  assert.deepEqual((await (await t.request("/api/services/drafts?state=open", { as: "viewer" })).json()).drafts.map((d: { id: string }) => d.id), [draft.id]);
+  assert.equal((await (await t.request(`/api/services/drafts/${draft.id}`, { as: "viewer" })).json()).id, draft.id);
+  assert.equal((await post(t, `/api/services/drafts/${draft.id}/review`, "admin", {})).status, 503, "no OMA: no AI review, the rest works");
+
+  // Confirming: the executor reads each installation's files while the request waits.
+  const confirming = post(t, `/api/services/drafts/${draft.id}/confirm`, "admin", {});
+  for (let answered = 0; answered < 2;) {
+    const next = await call("/executor/v1/jobs/next", service);
+    if (next.status !== 200) { await new Promise((r) => setTimeout(r, 5)); continue; }
+    const read = (await next.json()).job;
+    assert.equal(read.kind, "svc-read");
+    const text = files[read.installDir]!;
+    const meta = { name: "nifi.properties", path: `${read.installDir}/conf/nifi.properties`, sha256: sha256(text), size: text.length, modifiedAt: "t" };
+    await call(`/executor/v1/jobs/${read.id}/env-content`, service, { method: "PUT", body: JSON.stringify({ installDir: read.installDir, files: [{ ...meta, content: Buffer.from(text).toString("base64") }] }) });
+    await call(`/executor/v1/jobs/${read.id}/status`, service, { method: "PUT", body: JSON.stringify({ protocol: 2, id: read.id, kind: "svc-read", state: "succeeded", steps: [], result: { installDir: read.installDir, files: [meta], missing: [] } }) });
+    answered++;
+  }
+  const confirmed = await confirming;
+  assert.equal(confirmed.status, 200);
+  assert.deepEqual((await confirmed.json()).registered, ["prod-flow"]);
+  const listed = await (await t.request("/api/services", { as: "viewer" })).json();
+  assert.deepEqual([listed.clusters.map((c: { id: string; configRevision: number }) => [c.id, c.configRevision]), listed.standalones], [[["prod-flow", 1]], []]);
+  const cfg = await (await t.request("/api/services/prod-flow/config", { as: "viewer" })).json();
+  assert.equal(cfg.revision, 1);
+  const shown = JSON.stringify(cfg);
+  assert.ok(shown.includes("nifi.sensitive.props.key=(hidden)") && !shown.includes("=one") && !shown.includes("v1:"), "the page gets the redacted copy, never the sealed one");
+  assert.equal(t.box.open(t.store.serviceConfig("prod-flow")!.body.members[0]!.files[0]!.sealed), files["/opt/a"]);
+  assert.equal((await post(t, `/api/services/drafts/${draft.id}/confirm`, "admin", {})).status, 409, "confirmed once");
 });
 
 test("S18: a state database from before keeps its executor tokens and jobs as the deploy executor's", () => {

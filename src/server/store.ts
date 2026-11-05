@@ -11,7 +11,8 @@ import type { Environment, Manifest } from "../compose/generate.ts";
 import { changedPaths } from "./jsonpatch.ts";
 import { crossAppConflicts, validateManifest } from "../manifest/validate.ts";
 import { compareVersions } from "../manifest/version.ts";
-import { checkDraftItem, type DraftCluster, type DraftItem, type DraftStandalone, type DraftState, type ServiceDraft, type ServiceMember } from "./services/draft.ts";
+import { checkDraftItem, type DraftCluster, type DraftItem, type DraftReview, type DraftStandalone, type DraftState, type ServiceDraft, type ServiceMember } from "./services/draft.ts";
+import type { ServiceConfigBody } from "./services/config.ts";
 import { randomBytes } from "node:crypto";
 
 export interface Actor { id: string; via: "workbench" | "emergency" | "cli" | "key" | "service" }
@@ -102,10 +103,13 @@ CREATE TABLE IF NOT EXISTS service_nodes (
   added_at TEXT NOT NULL, removed_at TEXT, PRIMARY KEY (cluster, host, install_dir));
 CREATE TABLE IF NOT EXISTS service_drafts (
   id TEXT PRIMARY KEY, state TEXT NOT NULL, environment TEXT NOT NULL, sources TEXT NOT NULL,
-  created_at TEXT NOT NULL, created_by TEXT NOT NULL, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL);
+  created_at TEXT NOT NULL, created_by TEXT NOT NULL, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL, review TEXT);
 CREATE TABLE IF NOT EXISTS service_draft_items (
   draft TEXT NOT NULL REFERENCES service_drafts(id), id TEXT NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL,
   updated_at TEXT NOT NULL, updated_by TEXT NOT NULL, PRIMARY KEY (draft, id));
+CREATE TABLE IF NOT EXISTS service_configs (
+  service TEXT NOT NULL, revision INTEGER NOT NULL, body TEXT NOT NULL, source TEXT NOT NULL, saved_at TEXT NOT NULL,
+  saved_by TEXT NOT NULL, via TEXT NOT NULL, note TEXT, PRIMARY KEY (service, revision));
 `;
 
 /** queued: waiting for the host's executor to claim it; the rest are the executor's states. */
@@ -244,6 +248,8 @@ export class Store {
     for (const table of ["executor_tokens", "executor_jobs"]) {
       if (!(this.db.prepare(`PRAGMA table_info(${table})`).all() as Row[]).some((c) => c.name === "executor")) this.db.exec(`ALTER TABLE ${table} ADD COLUMN executor TEXT`);
     }
+    // Service ops step 5: a takeover draft's AI review (step 4's tables had no such column).
+    if (!(this.db.prepare("PRAGMA table_info(service_drafts)").all() as Row[]).some((c) => c.name === "review")) this.db.exec("ALTER TABLE service_drafts ADD COLUMN review TEXT");
   }
 
   close() { this.db.close(); }
@@ -838,11 +844,11 @@ export class Store {
     if (!d) return undefined;
     const items = (this.db.prepare("SELECT body, updated_at, updated_by FROM service_draft_items WHERE draft = ? ORDER BY rowid").all(id) as Row[])
       .map((r) => ({ ...JSON.parse(r.body), updatedAt: r.updated_at, updatedBy: r.updated_by }));
-    return { id: d.id, state: d.state, environment: d.environment, sources: JSON.parse(d.sources), items, createdAt: d.created_at, createdBy: d.created_by, updatedAt: d.updated_at, updatedBy: d.updated_by };
+    return { id: d.id, state: d.state, environment: d.environment, sources: JSON.parse(d.sources), items, review: parse(d.review ?? null), createdAt: d.created_at, createdBy: d.created_by, updatedAt: d.updated_at, updatedBy: d.updated_by };
   }
 
   /** Drafts newest first, without their items. */
-  serviceDrafts(state?: DraftState): Omit<ServiceDraft, "items">[] {
+  serviceDrafts(state?: DraftState): Omit<ServiceDraft, "items" | "review">[] {
     return (this.db.prepare("SELECT * FROM service_drafts WHERE (?1 IS NULL OR state = ?1) ORDER BY created_at DESC, rowid DESC").all(state ?? null) as Row[])
       .map((d) => ({ id: d.id, state: d.state, environment: d.environment, sources: JSON.parse(d.sources), createdAt: d.created_at, createdBy: d.created_by, updatedAt: d.updated_at, updatedBy: d.updated_by }));
   }
@@ -874,6 +880,64 @@ export class Store {
     });
   }
 
+  /** The assessment again (step 5): every item's body replaced at once, the items themselves unchanged. */
+  reassessServiceDraft(draft: string, items: DraftItem[], actor: Actor) {
+    this.inTransaction(() => {
+      this.openDraft(draft);
+      const ids = new Set(this.draftItems(draft).map((i) => i.id));
+      if (items.length !== ids.size || items.some((i) => !ids.has(i.id))) throw new StoreError("draft/item-invalid", "A reassessment keeps the draft's items.");
+      const at = this.stamp();
+      for (const item of items) this.db.prepare("UPDATE service_draft_items SET body = ?, updated_at = ?, updated_by = ? WHERE draft = ? AND id = ?").run(JSON.stringify(item), at, actor.id, draft, item.id);
+      this.db.prepare("UPDATE service_drafts SET updated_at = ?, updated_by = ? WHERE id = ?").run(at, actor.id, draft);
+      this.insertAudit(actor, "service.draft-assessed", draft, { findings: Object.fromEntries(items.map((i) => [i.id, (i.findings ?? []).length])) });
+    });
+  }
+
+  /** The AI review's state (P1); written by the request and when the session ends, not an edit of the draft. */
+  setServiceDraftReview(draft: string, review: DraftReview | null) {
+    this.db.prepare("UPDATE service_drafts SET review = ? WHERE id = ?").run(review && JSON.stringify(review), draft);
+  }
+
+  /**
+   * Confirms an open draft (§6 step 5): registers every item, keeps each one's imported configuration as its revision 1,
+   * and closes the draft, all in one transaction. expected: the draft's updatedAt the confirmation was prepared on (the
+   * files were read for that version of it); a draft changed meanwhile is refused.
+   */
+  confirmServiceDraft(draft: string, configs: Record<string, ServiceConfigBody>, actor: Actor, expected?: string): string[] {
+    return this.inTransaction(() => {
+      const d = this.openDraft(draft);
+      if (expected !== undefined && d.updated_at !== expected) throw new StoreError("draft/changed", `Takeover draft ${draft} changed while it was being confirmed; confirm it again.`);
+      const items = this.draftItems(draft);
+      if (!items.length) throw new StoreError("draft/empty", `Takeover draft ${draft} has no items.`);
+      const missing = items.filter((i) => !configs[i.id]);
+      if (missing.length) throw new StoreError("draft/config-missing", "Every item needs its configuration imported.", missing.map((i) => i.id));
+      const at = this.stamp();
+      for (const item of items) {
+        if (item.kind === "standalone") this.insertStandalone(item, d.environment, actor, draft);
+        else this.insertCluster(item, d.environment, actor, draft);
+        this.db.prepare("INSERT INTO service_configs (service, revision, body, source, saved_at, saved_by, via, note) VALUES (?, 1, ?, 'import', ?, ?, ?, ?)")
+          .run(item.id, JSON.stringify(configs[item.id]), at, actor.id, actor.via, `Imported when takeover draft ${draft} was confirmed`);
+        this.insertAudit(actor, "service.config-imported", `${item.id}#1`, { files: configs[item.id]!.members.map((m) => ({ installation: `${m.host}:${m.installDir}`, files: m.files.map((f) => `${f.name} ${f.sha256.slice(0, 12)}`) })) });
+      }
+      this.db.prepare("UPDATE service_drafts SET state = 'confirmed', updated_at = ?, updated_by = ? WHERE id = ?").run(at, actor.id, draft);
+      this.insertAudit(actor, "service.draft-confirmed", draft, { items: items.map((i) => i.id) });
+      return items.map((i) => i.id);
+    });
+  }
+
+  /** A service's configuration at a revision (the newest when none is given), sealed copies included. */
+  serviceConfig(service: string, revision?: number): { service: string; revision: number; body: ServiceConfigBody; source: string; savedAt: string; savedBy: string; via: string; note: string | null } | undefined {
+    const r = (revision === undefined
+      ? this.db.prepare("SELECT * FROM service_configs WHERE service = ? ORDER BY revision DESC LIMIT 1").get(service)
+      : this.db.prepare("SELECT * FROM service_configs WHERE service = ? AND revision = ?").get(service, revision)) as Row | undefined;
+    return r && { service: r.service, revision: r.revision, body: JSON.parse(r.body), source: r.source, savedAt: r.saved_at, savedBy: r.saved_by, via: r.via, note: r.note ?? null };
+  }
+
+  serviceConfigRevisions(service: string): { revision: number; source: string; savedAt: string; savedBy: string; note: string | null }[] {
+    return (this.db.prepare("SELECT revision, source, saved_at, saved_by, note FROM service_configs WHERE service = ? ORDER BY revision DESC").all(service) as Row[])
+      .map((r) => ({ revision: r.revision, source: r.source, savedAt: r.saved_at, savedBy: r.saved_by, note: r.note ?? null }));
+  }
+
   /** Closes an open draft without registering anything; its items stay for the record. */
   discardServiceDraft(draft: string, actor: Actor) {
     this.inTransaction(() => {
@@ -902,29 +966,34 @@ export class Store {
 
   /** Registers a standalone instance (step 5 does it when a draft is confirmed). */
   addStandalone(s: DraftStandalone, environment: string, actor: Actor, draft: string | null = null) {
-    this.inTransaction(() => {
-      this.checkRegistration(s, [s.member]);
-      const m = s.member;
-      this.db.prepare(`INSERT INTO service_standalones (id, service, profile, version, environment, host, install_dir, service_user, start_env, ports, web_url, draft, discovery, created_at, created_by)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(s.id, s.service, s.profile, s.version, environment, m.host, m.installDir.replace(/\/+$/, ""), m.serviceUser,
-        m.startEnvironment && JSON.stringify(m.startEnvironment), JSON.stringify(m.ports), s.webUrl, draft, m.discovery ? JSON.stringify(m.discovery) : null, this.stamp(), actor.id);
-      this.insertAudit(actor, "service.standalone-added", s.id, { host: m.host, installDir: m.installDir, version: s.version, draft });
-    });
+    this.inTransaction(() => this.insertStandalone(s, environment, actor, draft));
   }
 
   /** Registers a cluster with its nodes. */
   addCluster(c: DraftCluster, environment: string, actor: Actor, draft: string | null = null) {
-    this.inTransaction(() => {
-      this.checkRegistration(c, c.nodes);
-      const at = this.stamp();
-      this.db.prepare(`INSERT INTO service_clusters (id, service, profile, version, environment, zookeeper, zookeeper_root, web_url, draft, created_at, created_by)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(c.id, c.service, c.profile, c.version, environment, c.zookeeper, c.zookeeperRoot, c.webUrl, draft, at, actor.id);
-      for (const n of c.nodes) {
-        this.db.prepare(`INSERT INTO service_nodes (cluster, host, install_dir, service_user, start_env, control, ports, node_address, discovery, added_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-          .run(c.id, n.host, n.installDir.replace(/\/+$/, ""), n.serviceUser, n.startEnvironment && JSON.stringify(n.startEnvironment), "nifi.sh", JSON.stringify(n.ports), n.nodeAddress ?? null, n.discovery ? JSON.stringify(n.discovery) : null, at);
-      }
-      this.insertAudit(actor, "service.cluster-added", c.id, { nodes: c.nodes.map((n) => `${n.host}:${n.installDir}`), version: c.version, draft });
-    });
+    this.inTransaction(() => this.insertCluster(c, environment, actor, draft));
+  }
+
+  // The registrations themselves, inside the caller's transaction (transactions do not nest).
+  private insertStandalone(s: DraftStandalone, environment: string, actor: Actor, draft: string | null) {
+    this.checkRegistration(s, [s.member]);
+    const m = s.member;
+    this.db.prepare(`INSERT INTO service_standalones (id, service, profile, version, environment, host, install_dir, service_user, start_env, ports, web_url, draft, discovery, created_at, created_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(s.id, s.service, s.profile, s.version, environment, m.host, m.installDir.replace(/\/+$/, ""), m.serviceUser,
+      m.startEnvironment && JSON.stringify(m.startEnvironment), JSON.stringify(m.ports), s.webUrl, draft, m.discovery ? JSON.stringify(m.discovery) : null, this.stamp(), actor.id);
+    this.insertAudit(actor, "service.standalone-added", s.id, { host: m.host, installDir: m.installDir, version: s.version, draft });
+  }
+
+  private insertCluster(c: DraftCluster, environment: string, actor: Actor, draft: string | null) {
+    this.checkRegistration(c, c.nodes);
+    const at = this.stamp();
+    this.db.prepare(`INSERT INTO service_clusters (id, service, profile, version, environment, zookeeper, zookeeper_root, web_url, draft, created_at, created_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(c.id, c.service, c.profile, c.version, environment, c.zookeeper, c.zookeeperRoot, c.webUrl, draft, at, actor.id);
+    for (const n of c.nodes) {
+      this.db.prepare(`INSERT INTO service_nodes (cluster, host, install_dir, service_user, start_env, control, ports, node_address, discovery, added_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(c.id, n.host, n.installDir.replace(/\/+$/, ""), n.serviceUser, n.startEnvironment && JSON.stringify(n.startEnvironment), "nifi.sh", JSON.stringify(n.ports), n.nodeAddress ?? null, n.discovery ? JSON.stringify(n.discovery) : null, at);
+    }
+    this.insertAudit(actor, "service.cluster-added", c.id, { nodes: c.nodes.map((n) => `${n.host}:${n.installDir}`), version: c.version, draft });
   }
 
   private toMember(r: Row): ServiceMember & { control?: string } {

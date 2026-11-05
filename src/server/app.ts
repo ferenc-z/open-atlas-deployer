@@ -27,6 +27,9 @@ import { EXECUTOR_KINDS, EXECUTOR_VERSION, hostIds, hostOf, newJobId, tokenSha25
 import { lineDiff } from "./ingress.ts";
 import { environmentStatus, hostStateOf, parseDockerPs, type Observer } from "./observe.ts";
 import { StoreError, type Actor, type Store } from "./store.ts";
+import { withoutSealed } from "./services/config.ts";
+import type { DraftItem } from "./services/draft.ts";
+import { TakeoverError, type Takeover } from "./services/takeover.ts";
 import { DEPLOYER_VERSION } from "./version.ts";
 import { validateEnvironment } from "./environment.ts";
 import { applyPatch, changedPaths, PatchError } from "./jsonpatch.ts";
@@ -62,6 +65,8 @@ export interface Dependencies {
   restart?: () => void;
   /** §15.4 step 6: how the AI checks reach OMA (tests pass a fake). */
   omaFetcher?: typeof fetch;
+  /** Service ops §6: taking over discovered services (drafts, confirmation). */
+  takeover?: Takeover;
 }
 
 const reject = (c: Context, status: 400 | 401 | 403 | 404 | 409 | 429 | 503, code: string, message: string, details: string[] = []) =>
@@ -71,7 +76,7 @@ const actorOf = (p: Principal): Actor => ({ id: p.id, via: p.via });
 
 const TYPES: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".json": "application/json", ".ico": "image/x-icon" };
 
-export function createApp({ config, store, sessions, observer, deployments, versions, env: envVars, peer, keys, onboarding, drift, briefs, ...deps }: Dependencies): Hono {
+export function createApp({ config, store, sessions, observer, deployments, versions, env: envVars, peer, keys, onboarding, drift, briefs, takeover, ...deps }: Dependencies): Hono {
   const workbenchKey = deps.workbenchKey ?? new WorkbenchKey(store, config.workbenchApiKeyFile, undefined);
   const workbench = deps.workbench ?? new WorkbenchAdmin(config.workbenchUrl, () => workbenchKey.value());
   const deployerSettings = deps.deployerSettings ?? new DeployerSettings(store, undefined, {});
@@ -631,7 +636,8 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     if (!executor.online) return reject(c, 409, "discover/executor-offline", executor.reason ?? `The service executor on ${host} is offline.`);
     if (!executor.heartbeat?.kinds?.includes("svc-discover")) return reject(c, 409, "discover/executor-old", `Service executor ${executor.heartbeat?.version} on ${host} cannot discover services; upgrade it first.`);
     const id = newJobId("svc-discover");
-    handoff.submit(id, { kind: "svc-discover", dirs, timeoutSeconds: 60, requestedBy: p.id }, host, "service");
+    // P1: secret values come back as fingerprints under this Deployer's key, so a cluster's nodes can be compared.
+    handoff.submit(id, { kind: "svc-discover", dirs, timeoutSeconds: 60, requestedBy: p.id, ...(takeover ? { fingerprintKey: takeover.fingerprintKey() } : {}) }, host, "service");
     store.audit(actorOf(p), "service.discover", host, { job: id, dirs });
     return c.json({ id, host, dirs, state: "queued" }, 201);
   });
@@ -649,6 +655,91 @@ export function createApp({ config, store, sessions, observer, deployments, vers
       message: s?.message ?? null, startedAt: s?.startedAt ?? null, finishedAt: s?.finishedAt ?? null,
       result: s?.state === "succeeded" ? s.result : null, log: handoff.log(id, 16 * 1024),
     });
+  });
+
+  // Service ops §6 steps 3 and 5: takeover drafts. A draft is made from the hosts' newest discoveries, grouped and
+  // assessed by rules (P1); an administrator edits and confirms it, which imports every installation's configuration as
+  // revision 1 and registers it. The AI review is optional.
+  const takeoverFailed = (c: Context, error: unknown) => {
+    if (error instanceof TakeoverError) return reject(c, error.status, error.code, error.message, error.details);
+    if (error instanceof StoreError) return reject(c, error.code === "draft/unknown" || error.code === "draft/item-unknown" ? 404 : error.code === "draft/item-invalid" ? 400 : 409, error.code, error.message, error.details);
+    throw error;
+  };
+  const noTakeover = (c: Context) => reject(c, 503, "takeover/off", "Taking over services is not set up in this Deployer.");
+  api.get("/api/services", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    const configured = (id: string) => store.serviceConfigRevisions(id)[0]?.revision ?? null;
+    return c.json({
+      standalones: store.standalones().map((s) => ({ ...s, configRevision: configured(s.id) })),
+      clusters: store.clusters().map((s) => ({ ...s, configRevision: configured(s.id) })),
+    });
+  });
+  api.get("/api/services/:id/config", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    const revision = c.req.query("revision");
+    const cfg = store.serviceConfig(c.req.param("id"), revision === undefined ? undefined : Number(revision));
+    if (!cfg) return reject(c, 404, "service-config/none", `No configuration${revision ? ` revision ${revision}` : ""} for ${c.req.param("id")}.`);
+    return c.json({ ...cfg, body: withoutSealed(cfg.body), revisions: store.serviceConfigRevisions(cfg.service) });
+  });
+  api.get("/api/services/drafts", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    const state = c.req.query("state");
+    if (state !== undefined && !["open", "confirmed", "discarded"].includes(state)) return reject(c, 400, "draft/state", "state is open, confirmed or discarded.");
+    return c.json({ drafts: store.serviceDrafts(state as "open" | undefined) });
+  });
+  api.post("/api/services/drafts", async (c) => {
+    const p = await authenticate(c, "admin");
+    if (p instanceof Response) return p;
+    if (!takeover) return noTakeover(c);
+    const body = await c.req.json().catch(() => ({})) as { hosts?: unknown };
+    if (body.hosts !== undefined && (!Array.isArray(body.hosts) || !body.hosts.every((h) => typeof h === "string"))) return reject(c, 400, "draft/hosts", "hosts is a list of host ids.");
+    try { return c.json(takeover.createDraft(actorOf(p), body.hosts as string[] | undefined), 201); } catch (error) { return takeoverFailed(c, error); }
+  });
+  api.get("/api/services/drafts/:id", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    if (!takeover) { const d = store.serviceDraft(c.req.param("id")); return d ? c.json(d) : reject(c, 404, "draft/unknown", `No takeover draft ${c.req.param("id")}.`); }
+    try { return c.json(await takeover.withReview(c.req.param("id"))); } catch (error) { return takeoverFailed(c, error); }
+  });
+  api.put("/api/services/drafts/:id/items/:item", async (c) => {
+    const p = await authenticate(c, "admin");
+    if (p instanceof Response) return p;
+    if (!takeover) return noTakeover(c);
+    const item = await c.req.json().catch(() => null) as DraftItem | null;
+    if (!item || typeof item !== "object" || item.id !== c.req.param("item")) return reject(c, 400, "draft/item-invalid", "The body is the item, with the id of the path.");
+    try { return c.json(takeover.putItem(c.req.param("id"), item, actorOf(p))); } catch (error) { return takeoverFailed(c, error); }
+  });
+  api.delete("/api/services/drafts/:id/items/:item", async (c) => {
+    const p = await authenticate(c, "admin");
+    if (p instanceof Response) return p;
+    if (!takeover) return noTakeover(c);
+    try { return c.json(takeover.removeItem(c.req.param("id"), c.req.param("item"), actorOf(p))); } catch (error) { return takeoverFailed(c, error); }
+  });
+  api.post("/api/services/drafts/:id/assess", async (c) => {
+    const p = await authenticate(c, "admin");
+    if (p instanceof Response) return p;
+    if (!takeover) return noTakeover(c);
+    try { return c.json(takeover.reassess(c.req.param("id"), actorOf(p))); } catch (error) { return takeoverFailed(c, error); }
+  });
+  api.post("/api/services/drafts/:id/review", async (c) => {
+    const p = await authenticate(c, "admin");
+    if (p instanceof Response) return p;
+    if (!takeover) return noTakeover(c);
+    try { return c.json(await takeover.review(c.req.param("id"), actorOf(p)), 202); } catch (error) { return takeoverFailed(c, error); }
+  });
+  api.post("/api/services/drafts/:id/discard", async (c) => {
+    const p = await authenticate(c, "admin");
+    if (p instanceof Response) return p;
+    try { store.discardServiceDraft(c.req.param("id"), actorOf(p)); return c.json(store.serviceDraft(c.req.param("id"))); } catch (error) { return takeoverFailed(c, error); }
+  });
+  api.post("/api/services/drafts/:id/confirm", async (c) => {
+    const p = await authenticate(c, "admin");
+    if (p instanceof Response) return p;
+    if (!takeover) return noTakeover(c);
+    try { return c.json(await takeover.confirm(c.req.param("id"), actorOf(p))); } catch (error) { return takeoverFailed(c, error); }
   });
 
   // D36: how each app is reached, the recommended nginx configuration with its revisions, and the internal CA.

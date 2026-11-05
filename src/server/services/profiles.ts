@@ -46,9 +46,11 @@ const p = (key: string, type: CatalogEntry["type"], def: string | null, scope: C
 const b = (key: string, type: CatalogEntry["type"], def: string | null, scope: CatalogEntry["scope"], more: Partial<CatalogEntry> = {}): CatalogEntry =>
   p(key, type, def, scope, { file: "bootstrap.conf", ...more });
 
-/** Keys the same in both lines (defaults as shipped in 1.12.1 and 2.x). */
+/** Keys both lines have. Defaults are what NiFi ships (checked against conf/ of the 1.12.1, 2.0.0 and 2.5.0 archives,
+ *  2026-11-05); a key the shipped file leaves out has its built-in value or null. A line's own defaults: defaults(). */
 const COMMON: CatalogEntry[] = [
   p("nifi.cluster.is.node", "boolean", "false", "cluster", { grouping: true }),
+  p("nifi.cluster.protocol.is.secure", "boolean", "false", "cluster", { note: "Shipped false in both lines; with HTTPS NiFi secures the cluster protocol anyway." }),
   p("nifi.cluster.node.address", "host", "", "node"),
   p("nifi.cluster.node.protocol.port", "port", "", "node"),
   p("nifi.cluster.load.balance.host", "host", "", "node"),
@@ -57,6 +59,7 @@ const COMMON: CatalogEntry[] = [
   p("nifi.cluster.flow.election.max.candidates", "integer", "", "cluster"),
   p("nifi.cluster.node.connection.timeout", "duration", "5 sec", "cluster"),
   p("nifi.cluster.node.read.timeout", "duration", "5 sec", "cluster"),
+  p("nifi.cluster.load.balance.comms.timeout", "duration", "30 sec", "cluster"),
   p("nifi.zookeeper.connect.string", "string", "", "cluster", { grouping: true, note: "An external dependency, not managed (S22)." }),
   p("nifi.zookeeper.root.node", "string", "/nifi", "cluster", { grouping: true }),
   p("nifi.zookeeper.connect.timeout", "duration", "10 secs", "cluster"),
@@ -82,11 +85,14 @@ const COMMON: CatalogEntry[] = [
   p("nifi.content.repository.directory.default", "path", "./content_repository", "node"),
   p("nifi.provenance.repository.directory.default", "path", "./provenance_repository", "node"),
   p("nifi.database.directory", "path", "./database_repository", "node"),
-  b("java", "path", "java", "node", { note: "The java command; nodes may differ in path, not in major version." }),
   b("run.as", "string", "", "node"),
   b("java.arg.2", "string", "-Xms512m", "cluster", { note: "Initial heap (-Xms)." }),
   b("java.arg.3", "string", "-Xmx512m", "cluster", { note: "Maximum heap (-Xmx)." }),
 ];
+
+/** COMMON with one line's shipped defaults in place of the shared ones. */
+const defaults = (values: Record<string, string | null>, file: ConfigFile = "nifi.properties") =>
+  COMMON.map((e) => (e.file === file && e.key in values ? { ...e, default: values[e.key]! } : e));
 
 const NIFI_1: ServiceProfile = {
   id: "nifi-1.x", service: "nifi", major: 1, tested: ["1.12.1"], java: ["8", "11"],
@@ -102,13 +108,12 @@ const NIFI_1: ServiceProfile = {
   probes: ["/nifi-api/system-diagnostics", "/nifi-api/flow/status", "/nifi-api/controller/cluster", "/nifi-api/flow/bulletin-board"],
   logs: ["logs/nifi-app.log", "logs/nifi-user.log", "logs/nifi-bootstrap.log"],
   catalog: [
-    ...COMMON,
-    p("nifi.cluster.protocol.is.secure", "boolean", "false", "cluster"),
+    ...defaults({ "nifi.web.http.port": "8080", "nifi.remote.input.secure": "false", "nifi.sensitive.props.algorithm": "PBEWITHMD5AND256BITAES-CBC-OPENSSL" }),
+    b("java", "path", "java", "node", { note: "The java command; nodes may differ in path, not in major version. 2.x has no such key (JAVA_HOME)." }),
     p("nifi.flow.configuration.file", "path", "./conf/flow.xml.gz", "node"),
     p("nifi.flow.configuration.json.file", "path", "./conf/flow.json.gz", "node", { since: "1.16.0" }),
     p("nifi.templates.directory", "path", "./conf/templates", "node"),
     p("nifi.variable.registry.properties", "string", "", "cluster"),
-    p("nifi.cluster.load.balance.comms.timeout", "duration", "30 sec", "cluster"),
   ],
 };
 
@@ -119,12 +124,15 @@ const NIFI_2: ServiceProfile = {
   probes: NIFI_1.probes,
   logs: NIFI_1.logs,
   catalog: [
-    ...COMMON,
+    ...defaults({
+      "nifi.web.https.host": "localhost", "nifi.web.https.port": "8443", "nifi.sensitive.props.algorithm": "NIFI_PBKDF2_AES_GCM_256",
+      "nifi.security.keystore": "./conf/keystore.p12", "nifi.security.keystoreType": "PKCS12", "nifi.security.truststore": "./conf/truststore.p12", "nifi.security.truststoreType": "PKCS12",
+    }).map((e) => (e.file === "bootstrap.conf" && (e.key === "java.arg.2" || e.key === "java.arg.3") ? { ...e, default: e.key === "java.arg.2" ? "-Xms1g" : "-Xmx1g" } : e)),
     p("nifi.flow.configuration.file", "path", "./conf/flow.json.gz", "node", { note: "2.x keeps the flow only as JSON." }),
-    p("nifi.python.command", "string", "python3", "cluster", { note: "Leave the line out to turn Python processors off; an empty value fails the start." }),
+    p("nifi.python.command", "string", null, "cluster", { note: "Shipped commented out (Python processors off); an empty value fails the start, so leave the line out." }),
     p("nifi.python.framework.source.directory", "path", "./python/framework", "node"),
-    p("nifi.python.extensions.source.directory.default", "path", "./python_extensions", "node"),
-    b("management.server.address", "url", "http://127.0.0.1:52020", "node", { note: "Two 2.x on one host must use different ports." }),
+    p("nifi.python.extensions.source.directory.default", "path", "./python/extensions", "node"),
+    b("management.server.address", "url", "http://127.0.0.1:52020", "node", { note: "Not in the shipped file; NiFi listens here when it is absent. Two 2.x on one host must use different ports." }),
   ],
 };
 

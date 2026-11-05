@@ -92,7 +92,7 @@ class RegistrationTest(Base):
         beat = self.api.beats[-1]
         self.assertEqual(beat["executor"], "service")
         self.assertEqual(beat["protocols"], [2])
-        self.assertEqual(beat["kinds"], ["svc-discover", "executor-upgrade"], "the service jobs; never the deploy ones")
+        self.assertEqual(beat["kinds"], ["svc-discover", "svc-read", "executor-upgrade"], "the service jobs; never the deploy ones")
         name, root = sx.ServiceExecutor.user()
         self.assertEqual((beat["user"], beat["isRoot"]), (name, root))
         self.assertEqual(beat["isRoot"], os.geteuid() == 0)
@@ -372,6 +372,52 @@ class DiscoverTest(Base):
         f.write_text("# c\n! c\na=1\nb = two words \nc:3\nd=\nlong=x\\\n   y\n")
         self.assertEqual(sx.read_properties(f), {"a": "1", "b": "two words", "c": "3", "d": "", "long": "xy"})
         self.assertEqual([sx.as_port(v) for v in ("8443", "http://127.0.0.1:52020", "", "x", "70000")], [8443, 52020, None, None, None])
+
+    def test_secrets_are_fingerprinted_with_the_deployers_key(self):
+        key = "k" * 32
+        c = self.by_dir(self.discovery(fingerprint_key=key).run())["c250-1"]
+        fp = c["fingerprints"]["nifi.properties"]
+        self.assertEqual(sorted(fp), ["nifi.security.keystorePasswd", "nifi.sensitive.props.key"], "only the hidden values; an empty one is not")
+        self.assertEqual(fp["nifi.sensitive.props.key"], sx.secret_fingerprints({"nifi.sensitive.props.key": "a-real-secret"}, key)["nifi.sensitive.props.key"])
+        self.assertNotEqual(fp["nifi.sensitive.props.key"], sx.secret_fingerprints({"nifi.sensitive.props.key": "a-real-secret"}, "x" * 32)["nifi.sensitive.props.key"])
+        self.assertNotIn("a-real-secret", json.dumps(c))
+        self.assertNotIn("fingerprints", self.by_dir(self.discovery().run())["c250-1"], "no key, no fingerprints")
+
+    def test_storage_and_autostart(self):
+        units = self.root / "units"
+        units.mkdir()
+        (units / "nifi-c250.service").write_text(f"[Service]\nExecStart={self.c250}/bin/nifi.sh start\n")
+        (units / "other.service").write_text("[Service]\nExecStart=/bin/true\n")
+        found = self.by_dir(self.discovery(autostart=(str(units), str(self.root / "missing"))).run())
+        c = found["c250-1"]
+        self.assertEqual(c["autostart"], [str(units / "nifi-c250.service")])
+        self.assertEqual(found["n112"]["autostart"], [])
+        self.assertEqual(c["storage"]["content"]["path"], str(self.c250 / "content_repository"))
+        self.assertEqual(c["storage"]["content"]["device"], self.c250.stat().st_dev, "a directory not there yet counts where it would be made")
+        self.assertEqual(c["storage"]["logs"]["path"], str(self.c250 / "logs"))
+
+    def test_svc_read_sends_the_files_once_over_the_content_channel(self):
+        ex = self.executor()
+        self.api.queue.append({"protocol": 2, "id": "svc-read-0001", "kind": "svc-read", "installDir": str(self.c250), "files": ["nifi.properties", "authorizers.xml"]})
+        self.api.queue.append({"protocol": 2, "id": "svc-read-0002", "kind": "svc-read", "installDir": str(self.c250)})
+        self.api.queue.append({"protocol": 2, "id": "svc-read-0003", "kind": "svc-read", "installDir": str(self.c250), "files": ["../../etc/passwd"]})
+        self.api.queue.append({"protocol": 2, "id": "svc-read-0004", "kind": "svc-read", "installDir": str(self.lab)})
+        for _ in range(4):
+            ex.run_once()
+        ex.wait_reads()
+        s = self.api.status["svc-read-0001"]
+        self.assertEqual(s["state"], "succeeded", s.get("message"))
+        self.assertEqual(([f["name"] for f in s["result"]["files"]], s["result"]["missing"]), (["nifi.properties"], ["authorizers.xml"]))
+        self.assertNotIn("a-real-secret", json.dumps(s), "the status has no content")
+        sent = json.loads(self.api.env["svc-read-0001"])
+        import base64
+        import hashlib
+        body = base64.b64decode(sent["files"][0]["content"])
+        self.assertIn(b"nifi.sensitive.props.key=a-real-secret", body)
+        self.assertEqual(sent["files"][0]["sha256"], hashlib.sha256(body).hexdigest())
+        self.assertEqual(sorted(f["name"] for f in self.api.status["svc-read-0002"]["result"]["files"]), ["bootstrap.conf", "logback.xml", "nifi.properties"])
+        self.assertEqual(self.api.status["svc-read-0003"]["state"], "refused", "only the configuration files by name")
+        self.assertEqual(self.api.status["svc-read-0004"]["state"], "refused", "not a NiFi installation")
 
 
 @unittest.skipUnless(all(shutil.which(c) for c in ("sh", "tar", "sha256sum")) and hasattr(os, "symlink"), "needs sh, tar, sha256sum")

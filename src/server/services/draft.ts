@@ -32,7 +32,7 @@ interface ItemBase {
   profile: ProfileId;
   version: string;
   webUrl: string | null;
-  /** Step 5's findings (differences, risks) and the AI's notes, kept with the item; shapes are step 5's. */
+  /** The assessment's findings (assess.ts Finding: differences between nodes, port conflicts, risks), by the rules. */
   findings?: unknown[];
   note?: string | null;
 }
@@ -41,6 +41,8 @@ export interface DraftCluster extends ItemBase { kind: "cluster"; zookeeper: str
 export type DraftItem = DraftStandalone | DraftCluster;
 
 export type DraftState = "open" | "confirmed" | "discarded";
+/** The AI review of a draft (P1, optional): explanations and advice on top of the rules' findings, from an OMA session. */
+export interface DraftReview { state: "running" | "done" | "failed"; session: string | null; requestedAt: string; requestedBy: string; finishedAt?: string; text?: string; error?: string }
 export interface ServiceDraft {
   id: string;
   state: DraftState;
@@ -48,6 +50,7 @@ export interface ServiceDraft {
   /** The discoveries the draft was made from, one per host. */
   sources: { job: string; host: string }[];
   items: (DraftItem & { updatedAt: string; updatedBy: string })[];
+  review: DraftReview | null;
   createdAt: string;
   createdBy: string;
   updatedAt: string;

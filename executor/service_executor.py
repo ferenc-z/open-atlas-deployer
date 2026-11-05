@@ -12,14 +12,18 @@ by side, at most EXECUTOR_READ_SLOTS at a time, each within its timeout (the req
 EXECUTOR_READ_TIMEOUT); a job that runs over is reported failed and its late result dropped. The change channel runs one
 job at a time, after the reads in flight have ended; for now it only has executor-upgrade (the executor's own release,
 §8.6). The read jobs so far: svc-discover (§6 step 2), which finds the NiFi on the machine from their processes and
-from the directories it is given. The executor refuses any kind it does not know, deploy jobs included.
+from the directories it is given, and svc-read (§6 step 5), which reads an installation's configuration files for the
+Deployer to import; their content goes once over the job's content channel, never into the job's status. The executor
+refuses any kind it does not know, deploy jobs included.
 
 The release holds one file: package.sh puts executor_core's code in place of the import block below (bundle.py).
 
 Standard library only; Python 3.9.
 """
+import base64
 import glob
 import hashlib
+import hmac
 import json
 import os
 import pathlib
@@ -104,6 +108,11 @@ SECRET_PROPERTY = re.compile(r"pass(word|wd|phrase)?|secret|token|credential|sen
 SECRET_ENV = re.compile(r"PASS|SECRET|TOKEN|CREDENTIAL|_KEY$|^KEY$|PRIVATE|COOKIE", re.I)
 HIDDEN = "(hidden)"
 MAX_DIRS = 32
+# svc-read: the largest configuration file sent, and all of one installation's together.
+READ_FILE_MAX = 1 << 20
+READ_TOTAL_MAX = 4 << 20
+# Where an init system would start NiFi at boot (§6 step 3, the risk "no autostart", S10).
+AUTOSTART_DIRS = ("/etc/systemd/system", "/usr/lib/systemd/system", "/lib/systemd/system", "/etc/init.d")
 
 
 def read_properties(path):
@@ -126,6 +135,13 @@ def read_properties(path):
 def hide_secrets(props, pattern=SECRET_PROPERTY):
     """Secret-looking values replaced by "(hidden)"; an empty one stays empty, so a missing key shows."""
     return {k: (HIDDEN if v and pattern.search(k) else v) for k, v in props.items()}
+
+
+def secret_fingerprints(props, key, pattern=SECRET_PROPERTY):
+    """For the values hide_secrets hides: an HMAC under the Deployer's key (the request's fingerprintKey), so the nodes
+    of a cluster can be compared (nifi.sensitive.props.key the same everywhere) without the value leaving the host."""
+    return {k: hmac.new(key.encode(), f"{k}\0{v}".encode(), hashlib.sha256).hexdigest()[:32]
+            for k, v in props.items() if v and pattern.search(k)}
 
 
 def as_port(value):
@@ -160,11 +176,13 @@ class Discovery:
 
     proc: the /proc to read (tests give a fake one); uid: whose processes count (None: everyone's, as root)."""
 
-    def __init__(self, proc="/proc", uid=None, common=COMMON_DIRS, log=lambda text: None):
+    def __init__(self, proc="/proc", uid=None, common=COMMON_DIRS, log=lambda text: None, fingerprint_key=None, autostart=AUTOSTART_DIRS):
         self.proc = pathlib.Path(proc)
         self.uid = uid
         self.common = common
         self.log = log
+        self.fingerprint_key = fingerprint_key
+        self.autostart_dirs = autostart
 
     # --- processes ---
 
@@ -291,6 +309,43 @@ class Discovery:
                     return m.group(1)
         return None
 
+    @staticmethod
+    def storage(home, props, env):
+        """Where the repositories and the logs are, with the device each is on (st_dev): on one disk, a full content
+        repository stops the logs too (a risk §6 step 3 lists)."""
+        def place(value):
+            path = pathlib.Path(os.path.normpath(value if os.path.isabs(value) else home / value))
+            probe = path
+            while not probe.exists() and probe != probe.parent:
+                probe = probe.parent
+            try:
+                return {"path": str(path), "device": probe.stat().st_dev}
+            except OSError:
+                return {"path": str(path), "device": None}
+        return {
+            "flowfile": place(props.get("nifi.flowfile.repository.directory") or "./flowfile_repository"),
+            "content": place(props.get("nifi.content.repository.directory.default") or "./content_repository"),
+            "provenance": place(props.get("nifi.provenance.repository.directory.default") or "./provenance_repository"),
+            "database": place(props.get("nifi.database.directory") or "./database_repository"),
+            "logs": place((env or {}).get("NIFI_LOG_DIR") or "logs"),
+        }
+
+    def autostart(self, home):
+        """The systemd units and init scripts that name the installation: what would start it at boot."""
+        found = []
+        for d in self.autostart_dirs:
+            try:
+                entries = sorted(pathlib.Path(d).iterdir())
+            except OSError:
+                continue
+            for f in entries:
+                try:
+                    if f.is_file() and f.stat().st_size < 65536 and str(home) in f.read_text(errors="replace"):
+                        found.append(str(f))
+                except OSError:
+                    continue
+        return found
+
     def instance(self, home, proc=None, source="process"):
         """What one installation is: version, users, start environment, ports, the cluster settings, file fingerprints."""
         home = pathlib.Path(home)
@@ -359,6 +414,11 @@ class Discovery:
             "bootstrapJava": boot.get("java") or None,
             "properties": hide_secrets(props),
             "bootstrap": hide_secrets(boot),
+            # Only when the Deployer sent a fingerprintKey (older Deployers did not).
+            **({"fingerprints": {"nifi.properties": secret_fingerprints(props, self.fingerprint_key),
+                                 "bootstrap.conf": secret_fingerprints(boot, self.fingerprint_key)}} if self.fingerprint_key else {}),
+            "storage": self.storage(home, props, (proc or {}).get("environment")),
+            "autostart": self.autostart(home),
             "files": files,
             "problems": problems,
         }
@@ -401,10 +461,11 @@ class ServiceExecutor(ProtocolExecutor):
     MAIN = "service_executor.py"
     EXECUTOR = "service"
     # Read jobs: kind -> method(job) returning the job's result (a dict).
-    READ_JOBS = {"svc-discover": "discover"}
+    READ_JOBS = {"svc-discover": "discover", "svc-read": "read_files"}
     # Where discovery looks (tests point these elsewhere).
     PROC = "/proc"
     COMMON_DIRS = COMMON_DIRS
+    AUTOSTART_DIRS = AUTOSTART_DIRS
     INTERRUPTED = "The service executor stopped while this job ran."
 
     def __init__(self, cfg, out=sys.stdout, api=None):
@@ -443,10 +504,50 @@ class ServiceExecutor(ProtocolExecutor):
             raise Refused(f"dirs is a list of at most {MAX_DIRS} absolute paths")
         if not pathlib.Path(self.PROC).is_dir():
             raise Failed(f"{self.PROC} is not readable here: svc-discover needs Linux")
+        key = job.request.get("fingerprintKey")
+        if key is not None and (not isinstance(key, str) or not 16 <= len(key) <= 128):
+            raise Refused("fingerprintKey is a string of 16 to 128 characters")
         name, root = self.user()
-        found = Discovery(self.PROC, uid=None if root else os.geteuid(), common=self.COMMON_DIRS, log=job.log).run(dirs)
+        found = Discovery(self.PROC, uid=None if root else os.geteuid(), common=self.COMMON_DIRS, log=job.log, fingerprint_key=key,
+                          autostart=self.AUTOSTART_DIRS).run(dirs)
         job.log(f"found {len(found['instances'])} NiFi" + (f"; {len(found['skipped'])} process(es) of other users not looked at (not root)" if found["skipped"] else ""))
         return {"scannedAt": now_iso(), "user": name, "isRoot": root, **found}
+
+    def read_files(self, job):
+        """svc-read (§6 step 5): an installation's configuration files, for the Deployer to import as the first revision.
+        request.installDir: a NiFi installation (absolute); request.files: names among the configuration files
+        (NIFI_CONF_FILES), all of them when absent. The content goes once over the content channel (it holds passwords
+        and keys; the Deployer seals them); the status carries only names, sizes and hashes."""
+        home, names = job.request.get("installDir"), job.request.get("files")
+        if not isinstance(home, str) or not home.startswith("/") or "\0" in home:
+            raise Refused("installDir is the absolute path of a NiFi installation")
+        if names is None:
+            names = list(NIFI_CONF_FILES)
+        if not isinstance(names, list) or not all(n in NIFI_CONF_FILES for n in names):
+            raise Refused(f"files are names among {', '.join(NIFI_CONF_FILES)}")
+        home = pathlib.Path(os.path.normpath(home))
+        if not home.is_dir() or not Discovery.is_nifi(home):
+            raise Refused(f"{home} is not a NiFi installation (or not readable by this executor)")
+        files, content, missing, total = [], [], [], 0
+        for name in dict.fromkeys(names):
+            path = home / "conf" / name
+            try:
+                data = path.read_bytes() if path.is_file() else None
+                st = path.stat() if data is not None else None
+            except OSError as e:
+                raise Failed(f"cannot read {path}: {e.strerror or e}")
+            if data is None:
+                missing.append(name)
+                continue
+            if len(data) > READ_FILE_MAX or total + len(data) > READ_TOTAL_MAX:
+                raise Failed(f"{path} is too large to import ({len(data)} bytes)")
+            total += len(data)
+            meta = {"name": name, "path": str(path), "sha256": hashlib.sha256(data).hexdigest(), "size": len(data), "modifiedAt": iso_at(st.st_mtime)}
+            files.append(meta)
+            content.append({**meta, "content": base64.b64encode(data).decode()})
+            job.log(f"read {path} ({len(data)} bytes)")
+        self.api.put_env_content(job.id, json.dumps({"installDir": str(home), "files": content}))
+        return {"installDir": str(home), "files": files, "missing": missing}
 
     def beat_body(self, busy):
         body = super().beat_body(busy)
