@@ -29,6 +29,7 @@ import { environmentStatus, hostStateOf, parseDockerPs, type Observer } from "./
 import { StoreError, type Actor, type Store } from "./store.ts";
 import { withoutSealed } from "./services/config.ts";
 import type { DraftItem } from "./services/draft.ts";
+import { serviceStatus } from "./services/status.ts";
 import { TakeoverError, type Takeover } from "./services/takeover.ts";
 import { DEPLOYER_VERSION } from "./version.ts";
 import { validateEnvironment } from "./environment.ts";
@@ -670,9 +671,11 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     const p = await authenticate(c, "view");
     if (p instanceof Response) return p;
     const configured = (id: string) => store.serviceConfigRevisions(id)[0]?.revision ?? null;
+    // Step 6: with each its members' status in short (running at the newest discovery, executors online).
+    const summary = (id: string) => serviceStatus(store, (h) => handoff.executor(h, "service"), id)?.summary ?? null;
     return c.json({
-      standalones: store.standalones().map((s) => ({ ...s, configRevision: configured(s.id) })),
-      clusters: store.clusters().map((s) => ({ ...s, configRevision: configured(s.id) })),
+      standalones: store.standalones().map((s) => ({ ...s, configRevision: configured(s.id), status: summary(s.id) })),
+      clusters: store.clusters().map((s) => ({ ...s, configRevision: configured(s.id), status: summary(s.id) })),
     });
   });
   api.get("/api/services/:id/config", async (c) => {
@@ -689,6 +692,13 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     const state = c.req.query("state");
     if (state !== undefined && !["open", "confirmed", "discarded"].includes(state)) return reject(c, 400, "draft/state", "state is open, confirmed or discarded.");
     return c.json({ drafts: store.serviceDrafts(state as "open" | undefined) });
+  });
+  // Step 6: one standalone instance or cluster with its members' status (get_cluster_status).
+  api.get("/api/services/:id/status", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    const status = serviceStatus(store, (h) => handoff.executor(h, "service"), c.req.param("id"));
+    return status ? c.json(status) : reject(c, 404, "service/unknown", `No standalone instance or cluster ${c.req.param("id")}.`);
   });
   api.post("/api/services/drafts", async (c) => {
     const p = await authenticate(c, "admin");

@@ -715,8 +715,8 @@ export class Store {
   }
 
   /** The newest job of one kind queued for one executor of a host (job ids start with their kind, newJobId). */
-  latestExecutorJob(host: string, executor: ExecutorKind, kind: string): string | undefined {
-    const r = this.db.prepare("SELECT id FROM executor_jobs WHERE host = ? AND COALESCE(executor, 'deploy') = ? AND substr(id, 1, ?) = ? ORDER BY queued_at DESC, rowid DESC LIMIT 1")
+  latestExecutorJob(host: string, executor: ExecutorKind, kind: string, succeeded = false): string | undefined {
+    const r = this.db.prepare(`SELECT id FROM executor_jobs WHERE host = ? AND COALESCE(executor, 'deploy') = ? AND substr(id, 1, ?) = ?${succeeded ? " AND json_extract(status, '$.state') = 'succeeded'" : ""} ORDER BY queued_at DESC, rowid DESC LIMIT 1`)
       .get(host, executor, kind.length + 1, `${kind}-`) as Row | undefined;
     return r?.id;
   }

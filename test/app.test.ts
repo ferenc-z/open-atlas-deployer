@@ -2115,3 +2115,53 @@ test("D45: the Deployer's own settings are set on the page, checked, sealed, and
   assert.equal((await restart()).status, 202);
   assert.equal(t.restarts.count, 1);
 });
+
+test("service ops step 6: a registered service's status is its members' executors and their hosts' newest discovery, also over /mcp", async () => {
+  const t = setup({ services: fakeState() });
+  setEnvironment(t, ({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", hosts, registries: { ghcr: "ghcr.io/acme" }, apps: { shop: { version: "1.2.0", host: "app2" } } }));
+  const call = (path: string, token: string, init: RequestInit = {}) => t.app.request(`/deploy${path}`, { ...init, headers: { authorization: `Bearer ${token}`, ...(typeof init.body === "string" && init.body.startsWith("{") ? { "content-type": "application/json" } : {}) } });
+  const service = (await (await post(t, "/api/hosts/app2/token", "admin", { executor: "service" })).json()).token as string;
+  await call("/executor/v1/heartbeat", service, { method: "POST", body: JSON.stringify({ executor: "service", version: EXECUTOR_VERSION, protocols: [2], kinds: ["svc-discover", "svc-read", "executor-upgrade"], busy: null, user: "ferenc", isRoot: false, reading: [], readSlots: 4 }) });
+  const member = (host: string, installDir: string, https: number) => ({ host, installDir, serviceUser: "nifi", startEnvironment: null, ports: { https }, nodeAddress: installDir.slice(-1), discovery: null });
+  const actor = { id: "admin", via: "workbench" as const };
+  t.store.addCluster({ kind: "cluster", id: "flow", service: "nifi", profile: "nifi-2.x", version: "2.5.0", webUrl: "https://app2:8443/nifi", zookeeper: "zk:2181", zookeeperRoot: "/flow", nodes: [member("app2", "/opt/a", 8443), member("app2", "/opt/b", 9443)] }, "uat", actor);
+  const { nodeAddress: _n, ...single } = member("app1", "/opt/n200", 8444);
+  t.store.addStandalone({ kind: "standalone", id: "n200", service: "nifi", profile: "nifi-2.x", version: "2.0.0", webUrl: null, member: single }, "uat", actor);
+
+  const status = async (id: string) => { const r = await t.request(`/api/services/${id}/status`, { as: "viewer" }); return { code: r.status, body: await r.json() }; };
+  let flow = (await status("flow")).body;
+  assert.deepEqual(flow.members.map((m: { state: string; executor: { online: boolean } }) => [m.state, m.executor.online]), [["unknown", true], ["unknown", true]], "no discovery yet");
+  const single1 = (await status("n200")).body;
+  assert.deepEqual([single1.kind, single1.members[0].state, single1.members[0].executor.online], ["standalone", "unknown", false], "app1 has no service executor");
+  assert.equal((await status("nothing")).code, 404);
+
+  // A discovery that failed does not count; the newest succeeded one does.
+  const discover = async (state: string, instances: Record<string, unknown>[]) => {
+    const { id } = await (await post(t, "/api/hosts/app2/discover", "admin", {})).json();
+    await call("/executor/v1/jobs/next", service);
+    await call(`/executor/v1/jobs/${id}/status`, service, { method: "PUT", body: JSON.stringify({ protocol: 2, id, kind: "svc-discover", state, steps: [], ...(state === "succeeded" ? { result: { scannedAt: "2026-11-05T01:00:00Z", instances, dirs: [], skipped: [] } } : { message: "boom" }) }) });
+  };
+  await discover("succeeded", [{ installDir: "/opt/a/", running: true, version: "2.5.0", process: { pid: 11 }, webUrl: "https://app2:8443/nifi" }, { installDir: "/opt/b", running: false, version: "2.5.1", process: null }]);
+  await discover("failed", []);
+  flow = (await status("flow")).body;
+  assert.deepEqual(flow.members.map((m: { state: string; seen: { version: string; pid: number | null } }) => [m.state, m.seen.version, m.seen.pid]), [["running", "2.5.0", 11], ["stopped", "2.5.1", null]]);
+  assert.deepEqual(flow.summary, { members: 2, running: 1, executorsOnline: 2, versionsSeen: ["2.5.1"] });
+  assert.equal(flow.zookeeperRoot, "/flow");
+  await discover("succeeded", [{ installDir: "/opt/a", running: true, version: "2.5.0", process: { pid: 12 } }]);
+  assert.deepEqual((await status("flow")).body.members.map((m: { state: string }) => m.state), ["running", "not-found"], "the newest discovery did not see /opt/b");
+
+  const listed = await (await t.request("/api/services", { as: "viewer" })).json();
+  assert.deepEqual(listed.clusters.map((c: { id: string; status: { running: number; members: number } }) => [c.id, c.status.running, c.status.members]), [["flow", 1, 2]]);
+  assert.deepEqual(listed.standalones.map((c: { id: string; status: { running: number } }) => [c.id, c.status.running]), [["n200", 0]]);
+
+  // The read-only tools: a service key (the Deploy Assistant's) sees them.
+  const key = (await makeKey(t, "admin", { kind: "service", name: "deploy-assistant", days: 30 })).body.key as string;
+  const names = ((await mcp(t, key, "tools/list")).body.result.tools as { name: string }[]).map((x) => x.name);
+  assert.ok(names.includes("list_service_clusters") && names.includes("get_cluster_status"));
+  const clusters = await tool(t, key, "list_service_clusters");
+  assert.deepEqual(clusters.value.clusters.map((c: { id: string }) => c.id), ["flow"]);
+  const got = await tool(t, key, "get_cluster_status", { id: "flow" });
+  assert.deepEqual([got.isError, got.value.summary.running, got.value.members[0].seen.pid], [false, 1, 12]);
+  assert.equal((await tool(t, key, "get_cluster_status", { id: "nothing" })).value.finding.code, "service/unknown");
+  assert.equal((await tool(t, key, "get_cluster_status", {})).value.finding.code, "mcp/arguments");
+});

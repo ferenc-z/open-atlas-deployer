@@ -8,13 +8,14 @@ import { AssistantPanel, KeysPage } from "./Assistant.tsx";
 import { OnboardingPage } from "./Onboarding.tsx";
 import { BriefCard, DriftBanner } from "./Brief.tsx";
 import { HostsPage } from "./Hosts.tsx";
+import { ServicesPage, TakeoverPage } from "./Services.tsx";
 import { IngressPage } from "./Ingress.tsx";
 import { Platform } from "./Platform.tsx";
 import { SettingsPage } from "./Settings.tsx";
 import { SetupPage } from "./Setup.tsx";
 import { ask } from "./Confirm.tsx";
 
-type Tab = "setup" | "status" | "history" | "hosts" | "settings" | "env" | "registry" | "onboarding" | "ingress" | "keys" | "audit";
+type Tab = "setup" | "status" | "history" | "hosts" | "settings" | "env" | "registry" | "onboarding" | "ingress" | "keys" | "audit" | "services" | "takeover";
 type Panel = { kind: "deploy"; app: string; initial?: { version: string; pinFrom?: string } } | { kind: "job"; id: string } | undefined;
 
 const VERDICT: Record<string, { label: string; tone: string }> = {
@@ -82,6 +83,8 @@ export function App() {
           {shown === "status" && <><SetupLine status={setup} onOpen={() => go("setup")} /><DriftBanner /><Status panel={panel} setPanel={setPanel} isAdmin={p.permissions.includes("admin")} canRegenerate={p.permissions.includes("deploy-uat") || p.permissions.includes("deploy-prod")} onAssessment={(id) => { setPanel(undefined); setAssessment(id); setTab("onboarding"); }} /></>}
           {shown === "history" && <HistoryPage onBack={(j) => { setPanel({ kind: "deploy", app: j.app, initial: { version: j.version, pinFrom: j.id } }); setTab("status"); }} />}
           {shown === "hosts" && <HostsPage isAdmin={p.permissions.includes("admin")} />}
+          {shown === "services" && <ServicesPage onTakeover={() => go("takeover")} />}
+          {shown === "takeover" && <TakeoverPage isAdmin={p.permissions.includes("admin")} onRegistered={() => go("services")} />}
           {shown === "settings" && <SettingsPage />}
           {shown === "env" && <EnvPage />}
           {shown === "ingress" && <IngressPage />}
@@ -102,6 +105,8 @@ function Sidebar({ principal, environment, tab, setTab, setupOnly, onSignedOut, 
   const groups: [string, [Tab, string][]][] = setupOnly ? [["First setup", [["setup", "Setup"]]]] : [
     ["Deploy", [["status", "Overview"], ["history", "Deploy history"], ["hosts", "Hosts"], ["settings", "Environment settings"]]],
     ["Apps", [["registry", "Apps & manifests"], ["onboarding", "Onboarding & assessments"], ["env", "Environment variables"], ["ingress", "Ingress"]]],
+    // S3: managed services (NiFi) have their own pages, apart from the apps.
+    ["Services", [["services", "Instances & clusters"], ["takeover", "Takeover"]]],
     ["Admin", [["keys", "API keys"], ...(principal.permissions.includes("admin") ? [["audit", "Audit"] as [Tab, string]] : [])]],
   ];
   const prod = environment?.toLowerCase() === "prod";

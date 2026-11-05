@@ -220,3 +220,35 @@ export const openIssue = (id: string) => call<AssessmentView>("POST", asm(id, "/
 export const planWithOverride = (id: string, version: string, reason: string) => call<Plan>("POST", `apps/${encodeURIComponent(id)}/plan`, { version, override: { reason } });
 export const deployWithOverride = (id: string, version: string, acknowledgeManual: boolean, reason: string) =>
   call<{ job: Job }>("POST", `apps/${encodeURIComponent(id)}/deploy`, { version, acknowledgeManual, override: { reason } });
+
+// Service ops (phase 1): managed services (NiFi) taken over from discovery, and their status.
+import type { DraftItem, ServiceDraft } from "../server/services/draft.ts";
+import type { Finding, Skipped } from "../server/services/assess.ts";
+import type { MemberStatus, ServiceStatus } from "../server/services/status.ts";
+import type { ConfigFileRecord } from "../server/services/config.ts";
+export type { DraftItem, Finding, MemberStatus, ServiceDraft, ServiceStatus, Skipped };
+export type ServiceSummary = ServiceStatus["summary"];
+type Registered = { environment: string; draft: string | null; createdAt: string; createdBy: string; configRevision: number | null; status: ServiceSummary | null };
+export type RegisteredService = (Extract<DraftItem, { kind: "standalone" }> | Extract<DraftItem, { kind: "cluster" }>) & Registered;
+export const services = () => call<{ standalones: RegisteredService[]; clusters: RegisteredService[] }>("GET", "services");
+export const serviceStatus = (id: string) => call<ServiceStatus>("GET", `services/${encodeURIComponent(id)}/status`);
+export type ServiceConfigView = { service: string; revision: number; source: string; savedAt: string; savedBy: string; via: string; note: string | null;
+  body: { members: { host: string; installDir: string; files: Omit<ConfigFileRecord, "sealed">[]; missing: string[] }[] };
+  revisions: { revision: number; source: string; savedAt: string; savedBy: string; note: string | null }[] };
+export const serviceConfig = (id: string, revision?: number) => call<ServiceConfigView>("GET", `services/${encodeURIComponent(id)}/config${revision ? `?revision=${revision}` : ""}`);
+/** svc-discover on a host's service executor; the newest one. */
+export type DiscoveryView = { id: string; host: string; dirs: string[]; state: string; message: string | null; startedAt: string | null; finishedAt: string | null;
+  result: { scannedAt?: string; user?: string; isRoot?: boolean; instances: Record<string, any>[]; dirs: { dir: string; found: boolean; running?: boolean; error?: string }[]; skipped: { pid: number; user: string }[] } | null; log: string };
+export const discover = (host: string, dirs: string[] = []) => call<{ id: string; host: string; dirs: string[]; state: string }>("POST", `hosts/${encodeURIComponent(host)}/discover`, { dirs });
+export const discovery = (host: string) => call<DiscoveryView>("GET", `hosts/${encodeURIComponent(host)}/discover`);
+export type DraftSummary = Omit<ServiceDraft, "items" | "review">;
+const drafts = (rest = "") => `services/drafts${rest}`;
+export const serviceDrafts = (state?: "open" | "confirmed" | "discarded") => call<{ drafts: DraftSummary[] }>("GET", drafts(state ? `?state=${state}` : ""));
+export const serviceDraft = (id: string) => call<ServiceDraft>("GET", drafts(`/${encodeURIComponent(id)}`));
+export const createServiceDraft = (hosts?: string[]) => call<{ draft: ServiceDraft; skipped: Skipped[]; missing: string[] }>("POST", drafts(), hosts ? { hosts } : {});
+export const putDraftItem = (id: string, item: DraftItem) => call<{ result: "added" | "changed"; draft: ServiceDraft }>("PUT", drafts(`/${encodeURIComponent(id)}/items/${encodeURIComponent(item.id)}`), item);
+export const removeDraftItem = (id: string, item: string) => call<ServiceDraft>("DELETE", drafts(`/${encodeURIComponent(id)}/items/${encodeURIComponent(item)}`));
+export const reassessDraft = (id: string) => call<ServiceDraft>("POST", drafts(`/${encodeURIComponent(id)}/assess`), {});
+export const reviewDraft = (id: string) => call<ServiceDraft>("POST", drafts(`/${encodeURIComponent(id)}/review`), {});
+export const discardDraft = (id: string) => call<ServiceDraft>("POST", drafts(`/${encodeURIComponent(id)}/discard`), {});
+export const confirmDraft = (id: string) => call<{ draft: ServiceDraft; registered: string[]; reads: string[] }>("POST", drafts(`/${encodeURIComponent(id)}/confirm`), {});
