@@ -397,3 +397,14 @@ p.page-note { margin: -4px 0 14px; }
 .spark { display: inline-flex; align-items: center; gap: 6px; }
 .svc-card-trend { display: flex; flex-wrap: wrap; gap: 4px 14px; }
 .chart-section { display: grid; gap: 8px; }
+/* Phase 2 step 3: alerts and the timeline. */
+.nav-count { margin-left: 6px; padding: 0 6px; font-size: 11px; }
+.timeline li.tl-bad::before { background: var(--bad); }
+.timeline li.tl-warn::before { background: var(--warn); }
+.timeline li.tl-ok::before { background: var(--ok); }
+.timeline li.tl-muted::before { background: var(--border); }
+.service-health { margin-bottom: 16px; padding: 14px 20px; }
+.service-health .toolbar { margin-bottom: 0; }
+.service-health .findings { margin-top: 8px; }
+.thresholds td { vertical-align: top; }
+.nowrap { white-space: nowrap; }

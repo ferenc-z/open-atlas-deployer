@@ -8,6 +8,7 @@ import * as api from "./api.ts";
 import type { Field, MemberStatus, MetricsView, Range, ServiceBulletin, ServiceConfigView, ServiceStatus } from "./api.ts";
 import { LineChart, type Series } from "./Charts.tsx";
 import { ServiceConfig } from "./ServiceConfig.tsx";
+import { AlertBadge, EventsAndAlerts, OpenAlerts, Timeline } from "./Alerts.tsx";
 import { ago, CertBadge, certTone, ConfCell, daysLeft, daysText, fmtBytes, fmtNumber, memberKey, serviceName, SEVERITY, STATE, StatusNotes, UpBadge, webPort, when } from "./svc.tsx";
 
 type Loaded = { s: ServiceStatus; cfg: ServiceConfigView | null | undefined };
@@ -16,6 +17,7 @@ type Tab = { id: string; label: string; shown: (l: Loaded) => boolean; render: (
 const TABS: Tab[] = [
   { id: "overview", label: "Overview", shown: () => true, render: (l) => <Overview {...l} /> },
   { id: "metrics", label: "Metrics", shown: (l) => l.s.members.some((m) => m.live), render: (l) => <Metrics s={l.s} /> },
+  { id: "events", label: "Events and alerts", shown: () => true, render: (l) => <EventsAndAlerts s={l.s} /> },
   { id: "nodes", label: "Nodes", shown: () => true, render: (l) => <Nodes s={l.s} /> },
   { id: "configuration", label: "Configuration", shown: () => true, render: (l) => <ServiceConfig cfg={l.cfg} status={l.s} /> },
 ];
@@ -48,9 +50,10 @@ export function ServiceDetail({ id, onBack }: { id: string; onBack: () => void }
             <span className="badge info">{cluster ? `Cluster · ${s.members.length} nodes` : "Standalone"}</span>
             <UpBadge s={s.summary} />
             <CertBadge s={s.summary} />
+            <AlertBadge s={s.summary} />
             {cluster && s.summary.differences > 0 && <span className="badge warn" title="Configuration differences between the nodes found at takeover">{s.summary.differences} node difference{s.summary.differences > 1 ? "s" : ""}</span>}
-            {f.error > 0 && <span className="badge bad" title="Takeover findings (alerts come in phase 2 step 3)">{f.error} error{f.error > 1 ? "s" : ""}</span>}
-            {f.warning > 0 && <span className="badge warn" title="Takeover findings (alerts come in phase 2 step 3)">{f.warning} warning{f.warning > 1 ? "s" : ""}</span>}
+            {f.error > 0 && <span className="badge bad" title="Takeover findings (the alerts are on Events and alerts)">{f.error} error{f.error > 1 ? "s" : ""}</span>}
+            {f.warning > 0 && <span className="badge warn" title="Takeover findings (the alerts are on Events and alerts)">{f.warning} warning{f.warning > 1 ? "s" : ""}</span>}
             <StatusNotes s={s.summary} />
           </div>
           <div className="svc-summary-facts muted small">
@@ -93,6 +96,7 @@ function Overview({ s }: Loaded) {
   const connected = s.members.filter((m) => m.live?.connection === "CONNECTED").length;
   return (
     <div className="panel">
+      <OpenAlerts s={s} />
       <div className="metrics">
         <div className="metric"><span className="muted small">{cluster ? "Nodes" : "Installations"}</span><strong>{s.summary.running}/{s.summary.members} up</strong><span className="small muted">{cluster ? `${connected} connected · ` : ""}{s.summary.executorsOnline} executor{s.summary.executorsOnline === 1 ? "" : "s"} online</span></div>
         {sampled && <>
@@ -145,12 +149,11 @@ function Overview({ s }: Loaded) {
           ))}</tbody>
         </table>
       </div>}
-      {s.events.length > 0 && <div>
+      <div>
         <h3>Timeline</h3>
-        <ol className="timeline">{s.events.map((e, i) => (
-          <li key={i}><span className="muted small">{when(e.at)}</span> <span>{e.text}</span> <span className="muted small">by {e.by}</span></li>
-        ))}</ol>
-      </div>}
+        <p className="muted small">The newest 20; all of it on Events and alerts.</p>
+        <Timeline events={s.events} />
+      </div>
     </div>
   );
 }
@@ -163,7 +166,7 @@ function Certificates({ s }: { s: ServiceStatus }) {
   return (
     <div>
       <h3>Certificates</h3>
-      <p className="muted small">Read by each host's service executor from nifi.properties' keystore and truststore (and its own monitor certificate) about once an hour; only the newest reading is kept. 30 days or less is a warning, 7 days or less critical.</p>
+      <p className="muted small">Read by each host's service executor from nifi.properties' keystore and truststore (and its own monitor certificate) about once an hour; only the newest reading is kept. {s.summary.certDays.warn} days or less is a warning, {s.summary.certDays.crit} days or less critical (the thresholds on Events and alerts).</p>
       <table>
         <thead><tr><th>{s.kind === "cluster" ? "Node" : "Host"}</th><th>Store</th><th>Subject</th><th>Issuer</th><th>Expires</th><th>Left</th><th>Read</th></tr></thead>
         <tbody>{rows.map((c, i) => {
@@ -176,7 +179,7 @@ function Certificates({ s }: { s: ServiceStatus }) {
                 <td className="mono small">{c.subject}</td>
                 <td className="mono small muted">{c.issuer}</td>
                 <td className="small">{c.notAfter ? new Date(c.notAfter).toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" }) : "—"}</td>
-                <td>{days !== null ? <span className={`badge ${certTone(days)}`}>{daysText(days)}</span> : "—"}</td>
+                <td>{days !== null ? <span className={`badge ${certTone(days, s.summary.certDays)}`}>{daysText(days)}</span> : "—"}</td>
               </>}
               <td className="muted small" title={when(c.readAt)}>{ago(c.readAt)}</td>
             </tr>
@@ -251,7 +254,7 @@ function Nodes({ s }: { s: ServiceStatus }) {
               <td className="mono small">{Object.entries(m.ports).filter(([, v]) => v).map(([k, v]) => `${k} ${v}`).join(" · ") || "—"}</td>
               <td>{m.executor.online ? <span className="badge ok">Online</span> : <span className="badge bad" title={m.executor.reason}>Offline</span>} <span className="muted">{m.executor.version ?? ""}</span></td>
               <td><StateBadge m={m} /></td>
-              <td>{days !== null && c ? <span className={`badge ${certTone(days)}`} title={`${c.subject ?? "?"} (${c.store}), ${when(c.notAfter)}`}>{daysText(days)}</span> : <span className="muted">—</span>}{bad > 0 && <span className="badge warn" title={s.certs.filter((x) => x.member === m.key && x.error).map((x) => `${x.store}: ${x.error}`).join("\n")}>{bad} unreadable</span>}</td>
+              <td>{days !== null && c ? <span className={`badge ${certTone(days, s.summary.certDays)}`} title={`${c.subject ?? "?"} (${c.store}), ${when(c.notAfter)}`}>{daysText(days)}</span> : <span className="muted">—</span>}{bad > 0 && <span className="badge warn" title={s.certs.filter((x) => x.member === m.key && x.error).map((x) => `${x.store}: ${x.error}`).join("\n")}>{bad} unreadable</span>}</td>
               <td className="muted small" title={m.asOf ? when(m.asOf) : undefined}>{m.asOf ? <>{ago(m.asOf)}{version && <> · <span className={version === s.version ? "" : "error"}>{version}</span></>}{m.live?.pid ? ` · pid ${m.live.pid}` : m.seen?.pid ? ` · pid ${m.seen.pid}` : ""}</> : "—"}</td>
             </tr>
           );

@@ -77,6 +77,19 @@ executors; `EXECUTOR_VERSION` with it).
   1 hour, 6 hours, 2 days, 30 days), key numbers, the newest bulletins and the certificates on **Overview**, the
   soonest expiry in the summary line (`cert 23d`) and per node on **Nodes**; the list cards show the last hour's heap
   and queue and a certificate expiring within 30 days.
+- Phase 2 health rules (`services/rules.ts`), run in the Deployer as samples come in and once a minute: executor
+  lost (after `executorLostMinutes`), no samples, process not running, node disconnected (coordinator's view), no
+  coordinator, back pressure for N minutes (one alert per service: it is flow-wide), repository disk 80/90 %, heap
+  above 85 % for 5 minutes, ERROR bulletins, ZooKeeper messages in bulletins, versions differ, no monitor certificate,
+  certificate expiring (30 days WARN, 7 days or expired CRIT), certificate unreadable. The profile gives the defaults,
+  `PUT /api/services/:id/thresholds` (admin, audited) overrides them per service. One open alert per rule and member
+  (`service_alerts`), resolved when the rule no longer holds; a rule that cannot tell leaves it open. A timeline per
+  service (`service_events`): alerts opening, changing level and resolving, nodes disconnecting and reconnecting,
+  restarts (start time), version changes, takeover, imported configuration (services from before get the last two).
+  `GET /api/services/:id/alerts`, `…/events`, `GET /api/alerts`. Pages: **Events and alerts** tab (open alerts,
+  timeline, resolved, thresholds with what each means), problems and timeline on **Overview**, the alert count on the
+  cards, the table and the summary line, **Alerts** in the sidebar (with the open count), a services health card on
+  the home Overview. `status.events` now comes from the timeline (kind `taken-over` in place of `registered`).
 - `bin/executor-token.ts <data> <host> <file> service` issues a service executor token, `--revoke deploy|service`
   revokes one, without the page.
 - An `environment.json` without `apps` no longer breaks `GET /api/setup` (500).
@@ -89,7 +102,7 @@ executors; `EXECUTOR_VERSION` with it).
   would take a service executor token for a deploy executor one: revoke it before going back.
 
 **Known limits**
-- No alerts or rules yet (phase 2 step 3): certificate expiry and back pressure are only shown.
+- Alerts are not pushed (S13). ZooKeeper errors come only from bulletins until the log summary (phase 2 step 4).
 - Not yet: alert thresholds, removing a service, turning a standalone instance into a cluster, a cluster's common
   layer and node overrides, starting and stopping, logs (later phases).
 - The service executor cannot be upgraded from the Hosts page or the Overview yet, and the setup package does not

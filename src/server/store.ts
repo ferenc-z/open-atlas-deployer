@@ -124,6 +124,16 @@ CREATE TABLE IF NOT EXISTS service_certs (
   service TEXT NOT NULL, member TEXT NOT NULL, store TEXT NOT NULL, path TEXT, type TEXT, alias TEXT, chain INTEGER,
   subject TEXT, issuer TEXT, not_before TEXT, not_after TEXT, read_at TEXT NOT NULL, error TEXT);
 CREATE INDEX IF NOT EXISTS service_certs_member ON service_certs (service, member);
+CREATE TABLE IF NOT EXISTS service_alerts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, service TEXT NOT NULL, member TEXT NOT NULL, rule TEXT NOT NULL, level TEXT NOT NULL,
+  state TEXT NOT NULL, opened_at TEXT NOT NULL, resolved_at TEXT, detail TEXT, updated_at TEXT NOT NULL);
+CREATE UNIQUE INDEX IF NOT EXISTS service_alerts_open ON service_alerts (service, member, rule) WHERE state = 'open';
+CREATE INDEX IF NOT EXISTS service_alerts_at ON service_alerts (service, opened_at);
+CREATE TABLE IF NOT EXISTS service_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, service TEXT NOT NULL, member TEXT, at TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT);
+CREATE INDEX IF NOT EXISTS service_events_at ON service_events (service, at);
+CREATE TABLE IF NOT EXISTS service_facts (
+  service TEXT NOT NULL, member TEXT NOT NULL, key TEXT NOT NULL, value TEXT, at TEXT NOT NULL, PRIMARY KEY (service, member, key));
 `;
 
 /** queued: waiting for the host's executor to claim it; the rest are the executor's states. */
@@ -270,6 +280,15 @@ export class Store {
     }
     // Phase 2 step 2: each sample's flat numbers (the Metrics tab, the rollups), next to step 1's raw body.
     if (!(this.db.prepare("PRAGMA table_info(service_samples)").all() as Row[]).some((c) => c.name === "point")) this.db.exec("ALTER TABLE service_samples ADD COLUMN point TEXT");
+    // Phase 2 step 3: services registered before the timeline get their takeover and imported configurations on it.
+    this.db.exec(`INSERT INTO service_events (service, member, at, kind, detail)
+      SELECT id, NULL, created_at, 'taken-over', json_object('text', 'Taken over' || CASE WHEN draft IS NULL THEN '' ELSE ' from draft ' || draft END, 'by', created_by)
+      FROM (SELECT id, created_at, draft, created_by FROM service_standalones UNION ALL SELECT id, created_at, draft, created_by FROM service_clusters) r
+      WHERE NOT EXISTS (SELECT 1 FROM service_events e WHERE e.service = r.id AND e.kind = 'taken-over')`);
+    this.db.exec(`INSERT INTO service_events (service, member, at, kind, detail)
+      SELECT service, NULL, saved_at, 'config-imported', json_object('text', 'Configuration revision ' || revision || ' imported from the hosts', 'by', saved_by, 'revision', revision)
+      FROM service_configs c WHERE source = 'import'
+      AND NOT EXISTS (SELECT 1 FROM service_events e WHERE e.service = c.service AND e.kind = 'config-imported' AND json_extract(e.detail, '$.revision') = c.revision)`);
   }
 
   close() { this.db.close(); }
@@ -937,6 +956,7 @@ export class Store {
         else this.insertCluster(item, d.environment, actor, draft);
         this.db.prepare("INSERT INTO service_configs (service, revision, body, source, saved_at, saved_by, via, note) VALUES (?, 1, ?, 'import', ?, ?, ?, ?)")
           .run(item.id, JSON.stringify(configs[item.id]), at, actor.id, actor.via, `Imported when takeover draft ${draft} was confirmed`);
+        this.insertServiceEvent({ service: item.id, member: null, at, kind: "config-imported", detail: { text: "Configuration revision 1 imported from the hosts", by: actor.id, revision: 1 } });
         this.insertAudit(actor, "service.config-imported", `${item.id}#1`, { files: configs[item.id]!.members.map((m) => ({ installation: `${m.host}:${m.installDir}`, files: m.files.map((f) => `${f.name} ${f.sha256.slice(0, 12)}`) })) });
       }
       this.db.prepare("UPDATE service_drafts SET state = 'confirmed', updated_at = ?, updated_by = ? WHERE id = ?").run(at, actor.id, draft);
@@ -1007,6 +1027,7 @@ export class Store {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(s.id, s.service, s.profile, s.version, environment, m.host, m.installDir.replace(/\/+$/, ""), confDirOf(m), m.serviceUser,
       m.startEnvironment && JSON.stringify(m.startEnvironment), JSON.stringify(m.ports), s.webUrl, draft, m.discovery ? JSON.stringify(m.discovery) : null, this.stamp(), actor.id);
     this.insertAudit(actor, "service.standalone-added", s.id, { host: m.host, installDir: m.installDir, confDir: confDirOf(m), version: s.version, draft });
+    this.insertServiceEvent({ service: s.id, member: null, at: this.stamp(), kind: "taken-over", detail: { text: `Taken over${draft ? ` from draft ${draft}` : ""}`, by: actor.id } });
   }
 
   private insertCluster(c: DraftCluster, environment: string, actor: Actor, draft: string | null) {
@@ -1019,6 +1040,7 @@ export class Store {
         .run(c.id, n.host, n.installDir.replace(/\/+$/, ""), confDirOf(n), n.serviceUser, n.startEnvironment && JSON.stringify(n.startEnvironment), "nifi.sh", JSON.stringify(n.ports), n.nodeAddress ?? null, n.discovery ? JSON.stringify(n.discovery) : null, at);
     }
     this.insertAudit(actor, "service.cluster-added", c.id, { nodes: c.nodes.map(installKey), version: c.version, draft });
+    this.insertServiceEvent({ service: c.id, member: null, at, kind: "taken-over", detail: { text: `Taken over${draft ? ` from draft ${draft}` : ""}`, by: actor.id } });
   }
 
   private toMember(r: Row): ServiceMember & { control?: string } {
@@ -1145,7 +1167,103 @@ export class Store {
     });
     return out;
   }
+
+  // Phase 2 step 3 (§15.3): alerts (one open per service, member and rule; resolved when the rule no longer holds), the
+  // event timeline, the facts the timeline compares with (start time, version, connection), the threshold overrides.
+  // A service-wide alert has the member "*"; its events have no member.
+
+  /** Alerts newest first (open ones before resolved ones): of one service or all, open, resolved or both. */
+  serviceAlerts(options: { service?: string; state?: "open" | "resolved"; since?: string; limit?: number } = {}): ServiceAlert[] {
+    const where = ["1 = 1"], args: (string | number)[] = [];
+    if (options.service) { where.push("service = ?"); args.push(options.service); }
+    if (options.state) { where.push("state = ?"); args.push(options.state); }
+    if (options.since) { where.push("(state = 'open' OR resolved_at >= ?)"); args.push(options.since); }
+    args.push(Math.min(1000, Math.max(1, options.limit ?? 200)));
+    return (this.db.prepare(`SELECT * FROM service_alerts WHERE ${where.join(" AND ")} ORDER BY state = 'open' DESC, COALESCE(resolved_at, opened_at) DESC, id DESC LIMIT ?`).all(...args) as Row[]).map(toAlert);
+  }
+
+  /** Opens an alert with its timeline event; none when one is open already for the same service, member and rule. */
+  openServiceAlert(a: { service: string; member: string; rule: string; level: AlertLevel; detail: Record<string, unknown> }, at: string, event: Record<string, unknown>): number | undefined {
+    return this.inTransaction(() => {
+      const r = this.db.prepare("INSERT OR IGNORE INTO service_alerts (service, member, rule, level, state, opened_at, detail, updated_at) VALUES (?, ?, ?, ?, 'open', ?, ?, ?)")
+        .run(a.service, a.member, a.rule, a.level, at, JSON.stringify(a.detail), at);
+      if (!Number(r.changes)) return undefined;
+      const id = Number(r.lastInsertRowid);
+      this.insertServiceEvent({ service: a.service, member: a.member === "*" ? null : a.member, at, kind: "alert-opened", detail: { ...event, alert: id, rule: a.rule, level: a.level } });
+      return id;
+    });
+  }
+
+  /** An open alert's new level and detail; a new level also goes on the timeline. */
+  updateServiceAlert(id: number, level: AlertLevel, detail: Record<string, unknown>, at: string, event: Record<string, unknown>) {
+    this.inTransaction(() => {
+      const was = this.db.prepare("SELECT * FROM service_alerts WHERE id = ? AND state = 'open'").get(id) as Row | undefined;
+      if (!was) return;
+      this.db.prepare("UPDATE service_alerts SET level = ?, detail = ?, updated_at = ? WHERE id = ?").run(level, JSON.stringify(detail), at, id);
+      if (was.level !== level) this.insertServiceEvent({ service: was.service, member: was.member === "*" ? null : was.member, at, kind: "alert-changed", detail: { ...event, alert: id, rule: was.rule, level, was: was.level } });
+    });
+  }
+
+  resolveServiceAlert(id: number, at: string, event: Record<string, unknown>) {
+    this.inTransaction(() => {
+      const was = this.db.prepare("SELECT * FROM service_alerts WHERE id = ? AND state = 'open'").get(id) as Row | undefined;
+      if (!was) return;
+      this.db.prepare("UPDATE service_alerts SET state = 'resolved', resolved_at = ?, updated_at = ? WHERE id = ?").run(at, at, id);
+      this.insertServiceEvent({ service: was.service, member: was.member === "*" ? null : was.member, at, kind: "alert-resolved", detail: { ...event, alert: id, rule: was.rule, level: was.level } });
+    });
+  }
+
+  addServiceEvent(e: Omit<ServiceEvent, "id">) { this.insertServiceEvent(e); }
+
+  private insertServiceEvent(e: Omit<ServiceEvent, "id">) {
+    this.db.prepare("INSERT INTO service_events (service, member, at, kind, detail) VALUES (?, ?, ?, ?, ?)").run(e.service, e.member, e.at, e.kind, JSON.stringify(e.detail ?? {}));
+  }
+
+  /** A service's timeline, newest first. */
+  serviceEvents(service: string, options: { from?: string; to?: string; kind?: string; limit?: number } = {}): ServiceEvent[] {
+    const where = ["service = ?"], args: (string | number)[] = [service];
+    if (options.from) { where.push("at >= ?"); args.push(options.from); }
+    if (options.to) { where.push("at < ?"); args.push(options.to); }
+    if (options.kind) { where.push("kind = ?"); args.push(options.kind); }
+    args.push(Math.min(1000, Math.max(1, options.limit ?? 200)));
+    return (this.db.prepare(`SELECT * FROM service_events WHERE ${where.join(" AND ")} ORDER BY at DESC, id DESC LIMIT ?`).all(...args) as Row[])
+      .map((r) => ({ id: r.id, service: r.service, member: r.member ?? null, at: r.at, kind: r.kind, detail: parse(r.detail) ?? {} }));
+  }
+
+  /** What the rules saw last of each member (start time, version, connection), by "member\0key": to tell what changed. */
+  serviceFacts(service: string): Map<string, string | null> {
+    return new Map((this.db.prepare("SELECT member, key, value FROM service_facts WHERE service = ?").all(service) as Row[]).map((r) => [`${r.member}\0${r.key}`, r.value ?? null]));
+  }
+
+  setServiceFact(service: string, member: string, key: string, value: string | null) {
+    this.db.prepare("INSERT OR REPLACE INTO service_facts (service, member, key, value, at) VALUES (?, ?, ?, ?, ?)").run(service, member, key, value, this.stamp());
+  }
+
+  /** A service's threshold overrides (the profile's defaults apply to the rest). */
+  serviceThresholds(service: string): Record<string, number> {
+    const r = this.db.prepare("SELECT thresholds FROM service_standalones WHERE id = ?1 AND removed_at IS NULL UNION ALL SELECT thresholds FROM service_clusters WHERE id = ?1 AND removed_at IS NULL").get(service) as Row | undefined;
+    return parse(r?.thresholds ?? null) ?? {};
+  }
+
+  /** Replaces a service's threshold overrides (none: the defaults), audited and on the timeline. */
+  setServiceThresholds(service: string, overrides: Record<string, number>, actor: Actor) {
+    this.inTransaction(() => {
+      const was = this.serviceThresholds(service);
+      const value = Object.keys(overrides).length ? JSON.stringify(overrides) : null;
+      const changed = Number(this.db.prepare("UPDATE service_standalones SET thresholds = ? WHERE id = ? AND removed_at IS NULL").run(value, service).changes)
+        + Number(this.db.prepare("UPDATE service_clusters SET thresholds = ? WHERE id = ? AND removed_at IS NULL").run(value, service).changes);
+      if (!changed) throw new StoreError("service/unknown", `No standalone instance or cluster ${service}.`);
+      this.insertAudit(actor, "service.thresholds", service, { from: was, to: overrides });
+      const text = Object.keys(overrides).length ? `Alert thresholds set: ${Object.entries(overrides).map(([k, v]) => `${k} ${v}`).join(", ")}` : "Alert thresholds back to the profile's defaults";
+      this.insertServiceEvent({ service, member: null, at: this.stamp(), kind: "thresholds", detail: { text, by: actor.id } });
+    });
+  }
 }
+
+export type AlertLevel = "WARN" | "CRIT";
+export interface ServiceAlert { id: number; service: string; member: string; rule: string; level: AlertLevel; state: "open" | "resolved"; openedAt: string; resolvedAt: string | null; updatedAt: string; detail: Record<string, unknown> }
+export interface ServiceEvent { id: number; service: string; member: string | null; at: string; kind: string; detail: Record<string, unknown> }
+const toAlert = (r: Row): ServiceAlert => ({ id: r.id, service: r.service, member: r.member, rule: r.rule, level: r.level, state: r.state, openedAt: r.opened_at, resolvedAt: r.resolved_at ?? null, updatedAt: r.updated_at, detail: parse(r.detail) ?? {} });
 
 /** A sample's flat numbers (services/metrics.ts). */
 export type Point = Record<string, number | null>;

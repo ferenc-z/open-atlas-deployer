@@ -267,3 +267,18 @@ export type { Field, MetricsView, Range, ServiceBulletin, ServiceCert };
 export const serviceMetrics = (id: string, range: Range, fields?: Field[]) =>
   call<MetricsView>("GET", `services/${encodeURIComponent(id)}/metrics?range=${range}${fields ? `&fields=${fields.join(",")}` : ""}`);
 export const serviceBulletins = (id: string, limit = 50) => call<{ bulletins: ServiceBulletin[] }>("GET", `services/${encodeURIComponent(id)}/bulletins?limit=${limit}`);
+// Phase 2 step 3 (§15.3): alerts, the timeline, the thresholds.
+import type { RuleId } from "../server/services/rules.ts";
+import type { Thresholds } from "../server/services/profiles.ts";
+import type { TimelineEvent } from "../server/services/status.ts";
+import type { ServiceAlert } from "../server/store.ts";
+export type { RuleId, Thresholds, TimelineEvent };
+export type AlertView = ServiceAlert & { label: string; text: string; memberLabel: string | null };
+export type RuleInfo = { label: string; scope: "member" | "service"; levels: ("WARN" | "CRIT")[]; description: string };
+export type ThresholdInfo = { label: string; unit: string; min: number; max: number; rule: RuleId; description: string };
+export type ThresholdsView = { defaults: Thresholds; overrides: Partial<Thresholds>; effective: Thresholds; info: Record<keyof Thresholds, ThresholdInfo> };
+export const serviceAlerts = (id: string) => call<{ alerts: AlertView[]; rules: Record<RuleId, RuleInfo>; thresholds: ThresholdsView; canEdit: boolean }>("GET", `services/${encodeURIComponent(id)}/alerts`);
+export const serviceEvents = (id: string, limit = 200) => call<{ events: TimelineEvent[] }>("GET", `services/${encodeURIComponent(id)}/events?limit=${limit}`);
+export const putThresholds = (id: string, thresholds: Partial<Record<keyof Thresholds, number | null>>) => call<{ thresholds: ThresholdsView }>("PUT", `services/${encodeURIComponent(id)}/thresholds`, { thresholds });
+export type GlobalAlert = AlertView & { kind: "standalone" | "cluster"; environment: string; profile: string };
+export const alerts = (state: "open" | "all" = "open") => call<{ alerts: GlobalAlert[]; open: number; rules: Record<RuleId, RuleInfo> }>("GET", `alerts?state=${state}`);

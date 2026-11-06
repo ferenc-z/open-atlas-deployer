@@ -9,13 +9,14 @@ import { OnboardingPage } from "./Onboarding.tsx";
 import { BriefCard, DriftBanner } from "./Brief.tsx";
 import { HostsPage } from "./Hosts.tsx";
 import { ServicesPage, TakeoverPage } from "./Services.tsx";
+import { AlertsPage, ServiceHealthCard } from "./Alerts.tsx";
 import { IngressPage } from "./Ingress.tsx";
 import { Platform } from "./Platform.tsx";
 import { SettingsPage } from "./Settings.tsx";
 import { SetupPage } from "./Setup.tsx";
 import { ask } from "./Confirm.tsx";
 
-type Tab = "setup" | "status" | "history" | "hosts" | "settings" | "env" | "registry" | "onboarding" | "ingress" | "keys" | "audit" | "services" | "takeover";
+type Tab = "setup" | "status" | "history" | "hosts" | "settings" | "env" | "registry" | "onboarding" | "ingress" | "keys" | "audit" | "services" | "takeover" | "alerts";
 type Panel = { kind: "deploy"; app: string; initial?: { version: string; pinFrom?: string } } | { kind: "job"; id: string } | undefined;
 
 const VERDICT: Record<string, { label: string; tone: string }> = {
@@ -46,6 +47,8 @@ export function App() {
   const [panel, setPanel] = useState<Panel>();
   const [assistant, setAssistant] = useState(false);
   const [assessment, setAssessment] = useState<string | undefined>();
+  // A service to open on the Services page (from the Alerts page or the health card).
+  const [service, setService] = useState<string | undefined>();
   const actions =useMemo(() => ({ openPlan: (app: string, version: string, pinFrom?: string) => { setPanel({ kind: "deploy", app, initial: { version, ...(pinFrom ? { pinFrom } : {}) } }); setTab("status"); } }), []);
   // §15 (D41): until setup is complete, Setup is the only page.
   const [setup, setSetup] = useState<SetupStatus | undefined>();
@@ -68,7 +71,8 @@ export function App() {
   if (!setup) return <main className="center"><p className="muted">Checking setup…</p></main>;
   const setupOnly = !setup.complete;
   const shown: Tab = setupOnly ? "setup" : tab;
-  const go = (t: Tab) => { setTab(t); if (t !== "onboarding") setAssessment(undefined); };
+  const go = (t: Tab) => { setTab(t); if (t !== "onboarding") setAssessment(undefined); setService(undefined); };
+  const openService = (id: string) => { setTab("services"); setService(id); };
   return (
     <div className="shell">
       <Sidebar principal={p} environment={me.environment} tab={shown} setTab={go} setupOnly={setupOnly} onSignedOut={load} assistant={assistant} toggleAssistant={() => setAssistant(!assistant)} />
@@ -81,10 +85,11 @@ export function App() {
         {p.actAs && <div className="banner info">{p.actAs.administrator} is using Workbench as {p.displayName}, so permissions here are also those of {p.displayName}.</div>}
         <main>
           {shown === "setup" && <SetupPage workbenchUrl={me.workbenchUrl} onChanged={setupChanged} onGo={go} />}
-          {shown === "status" && <><SetupLine status={setup} onOpen={() => go("setup")} /><DriftBanner /><Status panel={panel} setPanel={setPanel} isAdmin={p.permissions.includes("admin")} canRegenerate={p.permissions.includes("deploy-uat") || p.permissions.includes("deploy-prod")} onAssessment={(id) => { setPanel(undefined); setAssessment(id); setTab("onboarding"); }} /></>}
+          {shown === "status" && <><SetupLine status={setup} onOpen={() => go("setup")} /><DriftBanner /><Status services={<ServiceHealthCard onServices={() => go("services")} onAlerts={() => go("alerts")} />} panel={panel} setPanel={setPanel} isAdmin={p.permissions.includes("admin")} canRegenerate={p.permissions.includes("deploy-uat") || p.permissions.includes("deploy-prod")} onAssessment={(id) => { setPanel(undefined); setAssessment(id); setTab("onboarding"); }} /></>}
           {shown === "history" && <HistoryPage onBack={(j) => { setPanel({ kind: "deploy", app: j.app, initial: { version: j.version, pinFrom: j.id } }); setTab("status"); }} />}
           {shown === "hosts" && <HostsPage isAdmin={p.permissions.includes("admin")} />}
-          {shown === "services" && <ServicesPage onTakeover={() => go("takeover")} />}
+          {shown === "services" && <ServicesPage key={service ?? ""} onTakeover={() => go("takeover")} {...(service ? { initialOpen: service } : {})} />}
+          {shown === "alerts" && <AlertsPage onOpen={openService} />}
           {shown === "takeover" && <TakeoverPage isAdmin={p.permissions.includes("admin")} onRegistered={() => go("services")} />}
           {shown === "settings" && <SettingsPage />}
           {shown === "env" && <EnvPage />}
@@ -103,11 +108,20 @@ export function App() {
 /** D33: navigation down the left, in three groups; on a phone it folds into a menu button. */
 function Sidebar({ principal, environment, tab, setTab, setupOnly, onSignedOut, assistant, toggleAssistant }: { principal: Principal; environment?: string; tab: Tab; setTab: (t: Tab) => void; setupOnly: boolean; onSignedOut: () => void; assistant: boolean; toggleAssistant: () => void }) {
   const [open, setOpen] = useState(false);
+  // The open alerts' count beside Alerts (phase 2 step 3).
+  const [alerts, setAlerts] = useState<{ open: number; crit: number } | undefined>();
+  useEffect(() => {
+    if (setupOnly) return;
+    const load = () => api.alerts("open").then((a) => setAlerts({ open: a.open, crit: a.alerts.filter((x) => x.level === "CRIT").length }), () => setAlerts(undefined));
+    load();
+    const t = setInterval(load, 30_000);
+    return () => clearInterval(t);
+  }, [setupOnly]);
   const groups: [string, [Tab, string][]][] = setupOnly ? [["First setup", [["setup", "Setup"]]]] : [
     ["Deploy", [["status", "Overview"], ["history", "Deploy history"], ["hosts", "Hosts"], ["settings", "Environment settings"]]],
     ["Apps", [["registry", "Apps & manifests"], ["onboarding", "Onboarding & assessments"], ["env", "Environment variables"], ["ingress", "Ingress"]]],
     // S3: managed services (NiFi) have their own pages, apart from the apps.
-    ["Services", [["services", "Instances & clusters"], ["takeover", "Takeover"]]],
+    ["Services", [["services", "Instances & clusters"], ["alerts", "Alerts"], ["takeover", "Takeover"]]],
     ["Admin", [["keys", "API keys"], ...(principal.permissions.includes("admin") ? [["audit", "Audit"] as [Tab, string]] : [])]],
   ];
   const prod = environment?.toLowerCase() === "prod";
@@ -123,7 +137,7 @@ function Sidebar({ principal, environment, tab, setTab, setupOnly, onSignedOut, 
           <div key={title} className="group">
             <div className="group-title">{title}</div>
             <div className="group-items">
-              {items.map(([id, label]) => <button key={id} className={tab === id ? "active" : ""} onClick={() => { setTab(id); setOpen(false); }}>{label}</button>)}
+              {items.map(([id, label]) => <button key={id} className={tab === id ? "active" : ""} onClick={() => { setTab(id); setOpen(false); }}>{label}{id === "alerts" && alerts?.open ? <span className={`badge ${alerts.crit ? "bad" : "warn"} nav-count`}>{alerts.open}</span> : null}</button>)}
             </div>
           </div>
         ))}
@@ -209,7 +223,7 @@ function Forbidden({ message }: { message: string }) {
   );
 }
 
-function Status({ panel, setPanel, isAdmin, canRegenerate, onAssessment }: { panel: Panel; setPanel: (p: Panel) => void; isAdmin: boolean; canRegenerate: boolean; onAssessment: (id: string) => void }) {
+function Status({ panel, setPanel, isAdmin, canRegenerate, onAssessment, services }: { services?: React.ReactNode; panel: Panel; setPanel: (p: Panel) => void; isAdmin: boolean; canRegenerate: boolean; onAssessment: (id: string) => void }) {
   const [data, setData] = useState<StatusView | undefined>();
   const [error, setError] = useState("");
   const [open, setOpen] = useState<Record<string, boolean>>({});
@@ -230,6 +244,7 @@ function Status({ panel, setPanel, isAdmin, canRegenerate, onAssessment }: { pan
         <button onClick={refresh}>Refresh</button>
       </div>
       <Platform />
+      {services}
       <BriefCard canRegenerate={canRegenerate} />
       {data.peer && "error" in data.peer && <p className="banner warn">Cannot check the UAT records: {data.peer.error}. Only officially released versions can be deployed, or an admin can skip the promotion rule.</p>}
       {panel?.kind === "deploy" && <DeployPanel key={`${panel.app}-${panel.initial?.version ?? ""}-${panel.initial?.pinFrom ?? ""}`} app={panel.app} isAdmin={isAdmin} {...(panel.initial ? { initial: panel.initial } : {})} onClose={() => setPanel(undefined)} onJob={(id) => setPanel({ kind: "job", id })} onAssessment={onAssessment} />}

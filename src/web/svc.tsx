@@ -71,7 +71,7 @@ export const fmtUnit = (v: number | null | undefined, unit: string) =>
   v === null || v === undefined ? "—" : unit === "bytes" ? fmtBytes(v) : unit === "%" ? `${fmtNumber(v)} %` : unit === "bool" ? (v >= 0.5 ? "up" : "down") : `${fmtNumber(v)}${unit === "count" ? "" : ` ${unit}`}`;
 
 /** S27 and the step 3 rule's defaults: 7 days or less (or expired) critical, 30 days or less a warning. */
-export const certTone = (days: number) => (days <= 7 ? "bad" : days <= 30 ? "warn" : "muted");
+export const certTone = (days: number, limits: { warn: number; crit: number } = { warn: 30, crit: 7 }) => (days <= limits.crit ? "bad" : days <= limits.warn ? "warn" : "muted");
 export const daysLeft = (notAfter: string, now = Date.now()) => Math.floor((Date.parse(notAfter) - now) / 86_400_000);
 export const daysText = (days: number) => (days < 0 ? `expired ${-days}d ago` : `${days}d`);
 
@@ -81,9 +81,9 @@ export function CertBadge({ s, only30 = false }: { s: ServiceSummary | null; onl
   const c = s.cert;
   const unread = s.certErrors > 0 && <span className="badge warn" title="A keystore or truststore could not be read (see the certificates on Overview)">cert unreadable</span>;
   if (!c) return unread || null;
-  if (only30 && c.days > 30) return unread || null;
+  if (only30 && c.days > (s.certDays?.warn ?? 30)) return unread || null;
   return <>
-    <span className={`badge ${certTone(c.days)}`} title={`Soonest certificate expiry: ${c.subject ?? "?"} in the ${c.store} of ${c.member}, ${when(c.notAfter)}`}>cert {daysText(c.days)}</span>
+    <span className={`badge ${certTone(c.days, s.certDays)}`} title={`Soonest certificate expiry: ${c.subject ?? "?"} in the ${c.store} of ${c.member}, ${when(c.notAfter)}`}>cert {daysText(c.days)}</span>
     {unread}
   </>;
 }

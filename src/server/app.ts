@@ -31,7 +31,8 @@ import { StoreError, type Actor, type Store } from "./store.ts";
 import { withoutSealed } from "./services/config.ts";
 import { configView } from "./services/configview.ts";
 import type { DraftItem } from "./services/draft.ts";
-import { serviceStatus } from "./services/status.ts";
+import { serviceStatus, thresholdsOf, timeline } from "./services/status.ts";
+import { alertView, check, parseThresholds, RULES, THRESHOLDS } from "./services/rules.ts";
 import { TakeoverError, type Takeover } from "./services/takeover.ts";
 import { acceptSamples, watchList } from "./services/watch.ts";
 import { FIELDS, ingest, metrics, RANGES, trend, type Field, type Range } from "./services/metrics.ts";
@@ -158,6 +159,10 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     const got = acceptSamples(watchList(store, host), await c.req.json().catch(() => null));
     if ("error" in got) return reject(c, 400, "samples/invalid", got.error);
     ingest(store, got.accepted);
+    // §15.3: the rules run as the samples come in (and once a minute, index.ts).
+    for (const id of new Set(got.accepted.map((x) => x.service))) {
+      try { check(store, (h) => handoff.executor(h, "service"), id); } catch (error) { console.error(`service rules ${id}:`, error); }
+    }
     return c.json({ ok: true, accepted: got.accepted.length, dropped: got.dropped });
   }));
   api.get("/executor/v1/jobs/next", executorRoute(async (c, host, kind) => {
@@ -762,6 +767,56 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     const q = (k: string) => c.req.query(k) || undefined;
     const level = q("level")?.toUpperCase();
     return c.json({ bulletins: store.serviceBulletins(id, { ...(q("from") ? { from: q("from")! } : {}), ...(q("to") ? { to: q("to")! } : {}), ...(level ? { level } : {}), ...(q("limit") ? { limit: Number(q("limit")) } : {}) }) });
+  });
+  // Phase 2 step 3 (§15.3): a service's alerts (open first, then resolved; state=open|resolved, limit), with the rules and
+  // the thresholds in effect; its timeline; an admin's threshold overrides; every service's alerts.
+  api.get("/api/services/:id/alerts", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    const id = c.req.param("id");
+    const s = registeredService(id);
+    if (!s) return reject(c, 404, "service/unknown", `No standalone instance or cluster ${id}.`);
+    const state = c.req.query("state");
+    if (state !== undefined && state !== "open" && state !== "resolved") return reject(c, 400, "alerts/state", "state is open or resolved.");
+    const limit = c.req.query("limit") ? Number(c.req.query("limit")) : 200;
+    return c.json({
+      alerts: store.serviceAlerts({ service: id, ...(state ? { state } : {}), limit }).map(alertView),
+      rules: RULES, thresholds: { ...thresholdsOf(store, id, s.profile), info: THRESHOLDS },
+      canEdit: p.permissions.includes("admin") && !isKey(p),
+    });
+  });
+  api.get("/api/services/:id/events", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    const id = c.req.param("id");
+    if (!registeredService(id)) return reject(c, 404, "service/unknown", `No standalone instance or cluster ${id}.`);
+    const q = (k: string) => c.req.query(k) || undefined;
+    return c.json({ events: timeline(store, id, { ...(q("from") ? { from: q("from")! } : {}), ...(q("to") ? { to: q("to")! } : {}), ...(q("kind") ? { kind: q("kind")! } : {}), ...(q("limit") ? { limit: Number(q("limit")) } : {}) }) });
+  });
+  api.put("/api/services/:id/thresholds", async (c) => {
+    const p = await authenticate(c, "admin");
+    if (p instanceof Response) return p;
+    const id = c.req.param("id");
+    const s = registeredService(id);
+    if (!s) return reject(c, 404, "service/unknown", `No standalone instance or cluster ${id}.`);
+    const got = parseThresholds(await c.req.json().catch(() => null), thresholdsOf(store, id, s.profile).defaults);
+    if ("error" in got) return reject(c, 400, "thresholds/invalid", got.error, got.details);
+    store.setServiceThresholds(id, got.overrides as Record<string, number>, actorOf(p));
+    // The alerts follow the new thresholds at once.
+    const result = check(store, (h) => handoff.executor(h, "service"), id);
+    return c.json({ thresholds: { ...thresholdsOf(store, id, s.profile), info: THRESHOLDS }, check: result ?? null });
+  });
+  // Every service's open alerts, and with state=all also those resolved in the last day (since=ISO for longer).
+  api.get("/api/alerts", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    const state = c.req.query("state") ?? "open";
+    if (!["open", "resolved", "all"].includes(state)) return reject(c, 400, "alerts/state", "state is open, resolved or all.");
+    const since = c.req.query("since") ?? new Date(Date.now() - 86_400_000).toISOString();
+    const services = new Map([...store.standalones(), ...store.clusters()].map((x) => [x.id, { kind: x.kind, environment: x.environment, profile: x.profile }] as const));
+    const alerts = store.serviceAlerts({ ...(state === "all" ? { since } : { state: state as "open" | "resolved" }), limit: Number(c.req.query("limit") ?? 500) })
+      .filter((a) => services.has(a.service)).map((a) => ({ ...alertView(a), ...services.get(a.service)! }));
+    return c.json({ alerts, open: alerts.filter((a) => a.state === "open").length, rules: RULES });
   });
   api.post("/api/services/drafts", async (c) => {
     const p = await authenticate(c, "admin");

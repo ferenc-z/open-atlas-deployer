@@ -2187,9 +2187,9 @@ test("service ops step 6: a registered service's status is its members' executor
   await discover("failed", []);
   flow = (await status("flow")).body;
   assert.deepEqual(flow.members.map((m: { state: string; seen: { version: string; pid: number | null } }) => [m.state, m.seen.version, m.seen.pid]), [["running", "2.5.0", 11], ["stopped", "2.5.1", null]]);
-  assert.deepEqual(flow.summary, { members: 2, running: 1, executorsOnline: 2, versionsSeen: ["2.5.1"], differences: 0, findings: { error: 0, warning: 0, info: 0 }, asOf: "2026-11-05T01:00:00Z", period: 60, cert: null, certErrors: 0 });
+  assert.deepEqual(flow.summary, { members: 2, running: 1, executorsOnline: 2, versionsSeen: ["2.5.1"], differences: 0, findings: { error: 0, warning: 0, info: 0 }, asOf: "2026-11-05T01:00:00Z", period: 60, cert: null, certErrors: 0, certDays: { warn: 30, crit: 7 }, alerts: { open: 0, CRIT: 0, WARN: 0 } });
   assert.deepEqual(flow.members.map((m: { source: string }) => m.source), ["discovery", "discovery"], "never sampled: as of the discovery");
-  assert.deepEqual([flow.findings, flow.events.map((e: { kind: string }) => e.kind)], [[], ["registered"]], "registered without a draft or a configuration");
+  assert.deepEqual([flow.findings, flow.events.map((e: { kind: string }) => e.kind)], [[], ["taken-over"]], "registered without a draft or a configuration");
   assert.equal(flow.zookeeperRoot, "/flow");
   await discover("succeeded", [{ installDir: "/opt/a", running: true, version: "2.5.0", process: { pid: 12 } }]);
   assert.deepEqual((await status("flow")).body.members.map((m: { state: string }) => m.state), ["running", "not-found"], "the newest discovery did not see /opt/b");
@@ -2288,4 +2288,24 @@ test("§15.2 P5, §15.3: a service executor's heartbeat reply carries its watch 
   assert.deepEqual(b.bulletins.map((x: { id: number; at: string; node: string }) => [x.id, x.at, x.node]), [[3, "2026-11-06T01:03:30Z", "node-8443"]]);
   const listed = await (await t.request("/api/services", { as: "viewer" })).json();
   assert.equal(listed.clusters[0].trend.heapPct.length, 12, "the cards' trend: an hour in 5-minute steps");
+
+  // Step 3: the rules run as samples come in. app2:/opt/a's newest sample is old and its executor online for long: no samples.
+  t.store.setServiceFact("flow", "app2:/opt/a", "onlineSince", "2026-11-06T00:00:00Z");
+  await send(service, [sample("app2:/opt/a", "2026-11-06T01:05:00Z")]);
+  const a = await (await t.request("/api/services/flow/alerts", { as: "viewer" })).json();
+  assert.deepEqual([a.canEdit, a.thresholds.effective.certWarnDays, a.thresholds.info.certWarnDays.unit, a.rules["node-disconnected"].levels], [false, 30, "days", ["CRIT"]]);
+  assert.deepEqual(a.alerts.map((x: { rule: string; member: string; state: string; level: string }) => [x.rule, x.member, x.state, x.level]), [["no-samples", "app2:/opt/a", "open", "WARN"]]);
+  assert.equal((await (await t.request("/api/services", { as: "viewer" })).json()).clusters[0].status.alerts.open, 1, "the card's alert count");
+  const ev = await (await t.request("/api/services/flow/events", { as: "viewer" })).json();
+  assert.deepEqual(ev.events.map((e: { kind: string }) => e.kind), ["alert-opened", "taken-over"]);
+  assert.equal((await put(t, "/api/services/flow/thresholds", "viewer", { thresholds: { certWarnDays: 400 } })).status, 403);
+  const badPut = await put(t, "/api/services/flow/thresholds", "admin", { thresholds: { certWarnDays: 5 } });
+  assert.deepEqual([badPut.status, (await badPut.json()).details], [400, ["certCritDays must be below certWarnDays"]]);
+  const okPut = await put(t, "/api/services/flow/thresholds", "admin", { thresholds: { certWarnDays: 400 } });
+  assert.deepEqual([okPut.status, (await okPut.json()).thresholds.overrides], [200, { certWarnDays: 400 }]);
+  assert.equal((await put(t, "/api/services/none/thresholds", "admin", { thresholds: {} })).status, 404);
+  const all = await (await t.request("/api/alerts", { as: "viewer" })).json();
+  assert.deepEqual(all.alerts.map((x: { service: string; environment: string; kind: string; label: string }) => [x.service, x.environment, x.kind, x.label]), [["flow", "uat", "cluster", "No samples"]]);
+  assert.equal(all.open, 1);
+  assert.equal((await t.request("/api/alerts?state=nope", { as: "viewer" })).status, 400);
 });

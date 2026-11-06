@@ -82,6 +82,6 @@ test("a registered service's status carries its takeover findings and a timeline
   assert.deepEqual(s.findings.map((f) => f.code), ["autostart/none", "not-running"]);
   assert.deepEqual(s.summary.findings, { error: 0, warning: 1, info: 1 });
   assert.equal(s.summary.differences, 0);
-  assert.deepEqual(s.events.map((e) => e.kind), ["registered"]);
+  assert.deepEqual(s.events.map((e) => e.kind), ["taken-over"]);
   store.close();
 });

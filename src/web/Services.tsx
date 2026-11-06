@@ -13,6 +13,7 @@ import { Markdown } from "./Markdown.tsx";
 import { ServiceDetail } from "./ServiceDetail.tsx";
 import { CertBadge, ConfCell, confElsewhere, DifferenceBadge, memberKey, membersOf, serviceName, SEVERITY, STATE, StatusNotes, UpBadge, webPort, when } from "./svc.tsx";
 import { Sparkline } from "./Charts.tsx";
+import { AlertBadge } from "./Alerts.tsx";
 
 type Problem = { message: string; details: string[] };
 const problemOf = (e: unknown): Problem => ({ message: (e as Error).message, details: (e as api.ApiError).details ?? [] });
@@ -31,9 +32,9 @@ const savedLayout = (): Layout => { try { return localStorage.getItem(LAYOUT_KEY
 const kindLabel = (s: RegisteredService) => (s.kind === "cluster" ? `Cluster · ${s.nodes.length} nodes` : "Standalone");
 const where = (m: { host: string; ports: { https?: number | null; http?: number | null } }) => `${m.host}${webPort(m.ports) ? `:${webPort(m.ports)}` : ""}`;
 
-export function ServicesPage({ onTakeover }: { onTakeover: () => void }) {
+export function ServicesPage({ onTakeover, initialOpen }: { onTakeover: () => void; initialOpen?: string }) {
   const [list, setList] = useState<{ standalones: RegisteredService[]; clusters: RegisteredService[] } | undefined>();
-  const [open, setOpen] = useState<string | undefined>();
+  const [open, setOpen] = useState<string | undefined>(initialOpen);
   const [layout, setLayoutState] = useState<Layout>(savedLayout);
   const [error, setError] = useState("");
   const refresh = useCallback(() => { api.services().then(setList, (e: Error) => setError(e.message)); }, []);
@@ -83,7 +84,7 @@ function ServiceCard({ s, onOpen }: { s: RegisteredService; onOpen: () => void }
   const members = membersOf(s);
   return (
     <button className="svc-card" onClick={onOpen} title={`Open ${s.id}`}>
-      <div className="svc-card-head"><strong className="mono">{s.id}</strong><UpBadge s={s.status} /></div>
+      <div className="svc-card-head"><strong className="mono">{s.id}</strong><span><AlertBadge s={s.status} /> <UpBadge s={s.status} /></span></div>
       <div className="muted small">{kindLabel(s)} · {serviceName(s.service)} <span className="mono">{s.version}</span> <span className="muted">({s.profile})</span></div>
       <ul className="svc-members mono small">{members.map((m, i) => (
         <li key={memberKey(m)}><span className={`dot ${STATE[s.states[i] ?? "unknown"].tone}`} title={STATE[s.states[i] ?? "unknown"].label} />{where(m)}{s.kind === "cluster" && m.nodeAddress ? <span className="muted"> · {m.nodeAddress}</span> : null}</li>
@@ -122,7 +123,7 @@ function ServiceTable({ services, onOpen }: { services: RegisteredService[]; onO
               <td>{kindLabel(s)}</td>
               <td>{serviceName(s.service)} <span className="mono">{s.version}</span></td>
               <td className="mono small">{cluster ? <span className="muted">{members.length} nodes</span> : where(members[0]!)}</td>
-              <td><UpBadge s={s.status} /> <CertBadge s={s.status} only30 /> <StatusNotes s={s.status} /></td>
+              <td><UpBadge s={s.status} /> <AlertBadge s={s.status} /> <CertBadge s={s.status} only30 /> <StatusNotes s={s.status} /></td>
               <td>{s.configRevision ? <span className="mono">r{s.configRevision}</span> : <span className="muted">None</span>}</td>
               <td>{cluster ? <DifferenceBadge s={s.status} cluster /> : <span className="muted">—</span>}</td>
             </tr>

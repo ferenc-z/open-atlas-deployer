@@ -9,6 +9,14 @@ import type { Point, ServiceCert, Store } from "../store.ts";
 import { confDirOf, installKey, type DraftItem, type ServiceMember, type ServicePorts } from "./draft.ts";
 import { discoveredKey, type Finding } from "./assess.ts";
 import { ownNode } from "./metrics.ts";
+import { NIFI_THRESHOLDS, profile, type Thresholds } from "./profiles.ts";
+
+/** A service's thresholds in effect: its profile's defaults, overridden by its thresholds column. */
+export function thresholdsOf(store: Store, id: string, profileId: string): { defaults: Thresholds; overrides: Partial<Thresholds>; effective: Thresholds } {
+  const defaults = profile(profileId)?.thresholds ?? NIFI_THRESHOLDS;
+  const overrides = Object.fromEntries(Object.entries(store.serviceThresholds(id)).filter(([k, v]) => k in defaults && typeof v === "number")) as Partial<Thresholds>;
+  return { defaults, overrides, effective: { ...defaults, ...overrides } };
+}
 
 /** running / stopped: as of the newest sample (or discovery); not-found: the newest discovery did not see it;
  *  unknown: no sample for 3 periods (or nothing at all yet); lost: the member's service executor is offline. */
@@ -45,7 +53,7 @@ export interface MemberStatus {
   nodeAddress?: string | null;
   serviceUser: string | null;
   ports: ServicePorts;
-  executor: { online: boolean; reason?: string; version?: string };
+  executor: { online: boolean; reason?: string; version?: string; ageSeconds?: number };
   state: MemberState;
   /** Where the state comes from, and as of when. */
   source: "samples" | "discovery" | "executor" | "none";
@@ -78,11 +86,22 @@ export interface ServiceStatus {
   summary: {
     members: number; running: number; executorsOnline: number; versionsSeen: string[]; differences: number; findings: Record<Finding["severity"], number>;
     asOf: string | null; period: number; cert: CertSummary | null; certErrors: number;
+    /** Phase 2 step 3: the open alerts by level. */
+    alerts: { open: number; CRIT: number; WARN: number };
+    /** The certificate rule's thresholds in effect (days): the badges colour by them. */
+    certDays: { warn: number; crit: number };
   };
   findings: Finding[];
   /** S27: every certificate of every member, as of each member's newest reading. */
   certs: ServiceCert[];
-  events: { at: string; kind: "registered" | "config"; text: string; by: string }[];
+  /** The newest of the timeline (service_events, rules.ts): takeover, configuration, alerts, restarts, connections. */
+  events: TimelineEvent[];
+}
+
+export interface TimelineEvent { at: string; kind: string; member: string | null; text: string; by: string | null; level: string | null }
+
+export function timeline(store: Store, id: string, options: { limit?: number; from?: string; to?: string; kind?: string } = {}): TimelineEvent[] {
+  return store.serviceEvents(id, options).map((e) => ({ at: e.at, kind: e.kind, member: e.member, text: String(e.detail.text ?? e.kind), by: typeof e.detail.by === "string" ? e.detail.by : null, level: typeof e.detail.level === "string" ? e.detail.level : null }));
 }
 
 export function takeoverFindings(store: Store, draft: string | null, id: string): Finding[] {
@@ -158,7 +177,7 @@ export function serviceStatus(store: Store, executor: (host: string) => Executor
     else { state = "unknown"; source = "none"; asOf = null; }
     return {
       key: installKey(m), host: m.host, installDir: m.installDir, confDir: confDirOf(m), ...(m.nodeAddress !== undefined ? { nodeAddress: m.nodeAddress } : {}), serviceUser: m.serviceUser, ports: m.ports,
-      executor: { online: e.online, ...(e.reason ? { reason: e.reason } : {}), ...(e.heartbeat?.version ? { version: e.heartbeat.version } : {}) },
+      executor: { online: e.online, ...(e.reason ? { reason: e.reason } : {}), ...(e.heartbeat?.version ? { version: e.heartbeat.version } : {}), ...(e.ageSeconds !== undefined ? { ageSeconds: e.ageSeconds } : {}) },
       state, source, asOf, live,
       seen: d ? { job: d.job, at: d.at, version: found?.version ?? null, pid: found?.process?.pid ?? null, webUrl: found?.webUrl ?? null } : null,
     };
@@ -170,6 +189,8 @@ export function serviceStatus(store: Store, executor: (host: string) => Executor
   const versionsSeen = [...new Set(statuses.map((m) => m.live?.version ?? m.seen?.version).filter((v): v is string => Boolean(v) && v !== item.version))];
   const keys = new Set(members.map(installKey));
   const certs = store.serviceCerts(item.id).filter((x) => keys.has(x.member));
+  const limits = thresholdsOf(store, item.id, item.profile).effective;
+  const open = store.serviceAlerts({ service: item.id, state: "open" });
   const asOfs = statuses.map((m) => m.asOf).filter((a): a is string => Boolean(a)).sort();
   return {
     id: item.id, kind: item.kind, service: item.service, profile: item.profile, version: item.version, webUrl: item.webUrl,
@@ -182,12 +203,11 @@ export function serviceStatus(store: Store, executor: (host: string) => Executor
       differences: findings.filter((f) => f.code === "cluster/differs" || f.code === "cluster/version-differs").length,
       findings: { error: count("error"), warning: count("warning"), info: count("info") },
       asOf: asOfs[0] ?? null, period, cert: soonestCert(certs, now), certErrors: certs.filter((x) => x.error).length,
+      certDays: { warn: limits.certWarnDays, crit: limits.certCritDays },
+      alerts: { open: open.length, CRIT: open.filter((a) => a.level === "CRIT").length, WARN: open.filter((a) => a.level === "WARN").length },
     },
     findings,
     certs,
-    events: [
-      ...revisions.map((r) => ({ at: r.savedAt, kind: "config" as const, text: `Configuration revision ${r.revision}${r.source === "import" ? ", imported from the hosts" : ` (${r.source})`}${r.note ? `: ${r.note}` : ""}`, by: r.savedBy })),
-      { at: item.createdAt, kind: "registered" as const, text: `Taken over${item.draft ? ` from draft ${item.draft}` : ""}`, by: item.createdBy },
-    ].sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : a.kind === "config" ? -1 : 1)),
+    events: timeline(store, item.id, { limit: 20 }),
   };
 }

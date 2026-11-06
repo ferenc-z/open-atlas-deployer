@@ -58,7 +58,31 @@ export interface ServiceProfile {
   probes: string[];
   logs: string[];
   catalog: CatalogEntry[];
+  /** §9.2: the health rules' default thresholds (rules.ts); a service's thresholds column overrides them. */
+  thresholds: Thresholds;
 }
+
+/** The thresholds of the health rules (services/rules.ts THRESHOLDS says what each is). */
+export interface Thresholds {
+  executorLostMinutes: number;
+  backpressureMinutes: number;
+  repoDiskWarnPct: number;
+  repoDiskCritPct: number;
+  heapPct: number;
+  heapMinutes: number;
+  errorBulletins: number;
+  errorBulletinMinutes: number;
+  zkErrors: number;
+  zkMinutes: number;
+  certWarnDays: number;
+  certCritDays: number;
+}
+
+/** Both NiFi lines start from the same thresholds (§9.2, §15.3). */
+export const NIFI_THRESHOLDS: Thresholds = {
+  executorLostMinutes: 2, backpressureMinutes: 10, repoDiskWarnPct: 80, repoDiskCritPct: 90, heapPct: 85, heapMinutes: 5,
+  errorBulletins: 10, errorBulletinMinutes: 5, zkErrors: 3, zkMinutes: 5, certWarnDays: 30, certCritDays: 7,
+};
 
 /** What each catalog key does, in a line (the pages show it on hover). */
 const DESCRIPTIONS: Record<string, string> = {
@@ -180,6 +204,7 @@ const NIFI_1: ServiceProfile = {
   control: { start: "bin/nifi.sh start", stop: "bin/nifi.sh stop", status: "bin/nifi.sh status", runAs: "owner" },
   probes: ["/nifi-api/system-diagnostics", "/nifi-api/flow/status", "/nifi-api/controller/cluster", "/nifi-api/flow/bulletin-board"],
   logs: ["logs/nifi-app.log", "logs/nifi-user.log", "logs/nifi-bootstrap.log"],
+  thresholds: NIFI_THRESHOLDS,
   catalog: [
     ...defaults({ "nifi.web.http.port": "8080", "nifi.remote.input.secure": "false", "nifi.sensitive.props.algorithm": "PBEWITHMD5AND256BITAES-CBC-OPENSSL" }),
     b("java", "path", "java", "node", { note: "The java command; nodes may differ in path, not in major version. 2.x has no such key (JAVA_HOME)." }),
@@ -196,6 +221,7 @@ const NIFI_2: ServiceProfile = {
   control: NIFI_1.control,
   probes: NIFI_1.probes,
   logs: NIFI_1.logs,
+  thresholds: NIFI_THRESHOLDS,
   catalog: [
     ...defaults({
       "nifi.web.https.host": "localhost", "nifi.web.https.port": "8443", "nifi.sensitive.props.algorithm": "NIFI_PBKDF2_AES_GCM_256",
