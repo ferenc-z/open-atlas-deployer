@@ -12,6 +12,8 @@
 
 import type { Principal } from "./auth.ts";
 import type { Store } from "./store.ts";
+import { installKey } from "./services/draft.ts";
+import { redactStrings, redactText } from "./services/redact.ts";
 
 interface Property { type: "string" | "integer" | "boolean" | "array" | "object"; description: string; items?: { type: "object" | "string" } }
 type Method = "GET" | "POST" | "PUT" | "DELETE";
@@ -29,6 +31,8 @@ export interface Tool {
   properties: Record<string, Property>;
   required?: string[];
   request: (a: Record<string, unknown>) => { method: Method; path: string; query?: Record<string, unknown>; body?: unknown; headers?: Record<string, string> };
+  /** What the AI gets of a successful answer, when not the route's body as it is (service ops: redacted, narrowed). */
+  shape?: (body: any, a: Record<string, unknown>) => unknown;
 }
 
 const s = (description: string): Property => ({ type: "string", description });
@@ -92,6 +96,93 @@ const ADMIN: Tool[] = [
     request: (a) => ({ method: "GET", path: "/api/audit", query: { actor: a.actor, action: a.action, target: a.target, since: a.since, limit: a.limit } }) },
 ];
 
+// Managed services (service ops §10, §15.3), read-only, deploy-viewer like the pages. The overall picture comes from the
+// collector's samples here; components (queues, processors, process groups) are Studio's nifi-ops Graph (§9.4).
+// Log lines and bulletins, and every text of alerts, events and configuration, are redacted before the AI gets them (§9.3).
+const SERVICE = s("The cluster's or standalone instance's id, as list_service_clusters names it.");
+const MEMBER = s("A member's key, as get_cluster_status lists them (members[].key, e.g. host:/opt/nifi).");
+const FROM = s("Optional ISO time (UTC), from.");
+const TO = s("Optional ISO time (UTC), to; now by default.");
+const strs = (description: string): Property => ({ type: "array", items: { type: "string" }, description });
+const redacted = (body: unknown) => redactStrings(body);
+type Any = Record<string, any>;
+
+/** get_metrics: per member and field the last, min, max and average over the range; the series only when asked for. */
+function metricsShape(body: Any, a: Record<string, unknown>) {
+  const units = Object.fromEntries(Object.entries(body.fields ?? {}).map(([k, v]) => [k, (v as Any).unit]));
+  return {
+    from: body.from, to: body.to, step: body.step, source: body.source, units,
+    members: (body.members ?? []).map((m: Any) => {
+      const summary = Object.fromEntries(Object.entries(m.values as Record<string, (number | null)[]>).map(([f, vs]) => {
+        const xs = vs.filter((v): v is number => typeof v === "number");
+        const avg = xs.length ? Math.round((xs.reduce((x, y) => x + y, 0) / xs.length) * 10) / 10 : null;
+        return [f, { last: [...vs].reverse().find((v) => v !== null) ?? null, min: xs.length ? Math.min(...xs) : null, max: xs.length ? Math.max(...xs) : null, avg }];
+      }));
+      return { member: m.member, points: m.at.length, first: m.at[0] ?? null, last: m.at.at(-1) ?? null, summary, ...(a.series ? { at: m.at, values: m.values } : {}) };
+    }),
+  };
+}
+
+const memberMatches = (m: { host: string; installDir: string; confDir?: string }, want: unknown) => !want || installKey(m) === want || m.host === want;
+
+/** get_service_config: the redacted files of a revision; files other than properties and XML (not redacted at import) through the log redaction. */
+function configShape(body: Any, a: Record<string, unknown>) {
+  const members = (body.body?.members ?? []).filter((m: any) => memberMatches(m, a.member)).map((m: any) => ({
+    key: installKey(m), host: m.host, installDir: m.installDir, ...(m.confDir ? { confDir: m.confDir } : {}), missing: m.missing ?? [],
+    files: m.files.filter((f: Any) => !a.file || f.name === a.file).map((f: Any) => ({ name: f.name, path: f.path, format: f.format, sha256: f.sha256, modifiedAt: f.modifiedAt, hidden: f.secrets, text: f.format === "other" ? redactText(f.redacted) : f.redacted })),
+  }));
+  return { service: body.service, revision: body.revision, savedAt: body.savedAt, savedBy: body.savedBy, source: body.source, note: body.note, revisions: body.revisions ?? [], members };
+}
+
+/** diff_service_config: phase 2 compares a revision's nodes (two revisions come with configuration management, phase 3). */
+function diffShape(body: Any, a: Record<string, unknown>) {
+  const nodes = (body.body?.members ?? []).map((m: any) => installKey(m));
+  const compare = body.view?.compare as Any[] | null | undefined;
+  if (!compare) return { service: body.service, revision: body.revision, kind: "standalone", nodes, files: [], note: "A standalone instance has no nodes to compare. Comparing two revisions comes with configuration management (phase 3)." };
+  const files = compare.map((f) => ({
+    name: f.name, identical: f.identical, differing: f.differing,
+    rows: (f.rows as Any[]).filter((r) => a.all || r.severity).map((r) => ({ key: r.key, section: r.section, severity: r.severity, values: r.values.map((v: Any, i: number) => ({ node: nodes[i] ?? i, value: v.value, from: v.from })) })),
+  }));
+  return redactStrings({
+    service: body.service, revision: body.revision, kind: "cluster", nodes, files,
+    legend: "severity error: the nodes must agree (secret or grouping key); warning: they should agree, or the catalog does not know the key; info: a per-node key. Secrets read \"(hidden)\" or are compared as value A / value B. from: file, default (the catalog's, not in the file) or unset.",
+  });
+}
+
+const SERVICE_TOOLS: Tool[] = [
+  { name: "get_metrics", readOnly: true, description: "A service's numbers per member over a time range, from the collector's samples (the last 2 days raw, older from 5-minute rollups): heap, GC, threads, queued flowfiles and bytes, back pressure, the repositories' disks, process CPU and RSS, host load, memory and disk. Answers per member and field last / min / max / avg; series: true adds the points. The overall picture of a service; a queue or processor in detail is Studio's.",
+    properties: { id: SERVICE, range: s("Optional: 1h (default), 6h, 2d or 30d."), from: FROM, to: TO, step: n("Optional seconds between points, 10 to 86400."), member: MEMBER, fields: strs("Optional fields, e.g. heapPct, gcMsPerMin, queuedCount, bpFull, bpMaxPct, repoContentPct, cpuPct, diskPct (up, heapUsed, heapMax, nonHeap, gcPerMin, threads, activeThreads, queuedBytes, repoFlowfilePct, repoProvenancePct, rss, load1, memPct)."), series: { type: "boolean", description: "Optional: also every point." } }, required: ["id"],
+    request: (a) => ({ method: "GET", path: `/api/services/${enc(a.id)}/metrics`, query: { range: a.range, from: a.from, to: a.to, step: a.step, member: a.member, fields: Array.isArray(a.fields) ? a.fields.join(",") : undefined } }),
+    shape: metricsShape },
+  { name: "list_alerts", readOnly: true, description: "Health alerts (§9.2), open first: rule, level (WARN/CRIT), member (* for the whole service), when opened and resolved, the detail. With id: that service's alerts with the rules and the thresholds in effect; without: every service's (open by default; state all adds those resolved in the last day).",
+    properties: { id: s("Optional: one service's id."), state: s("Optional: open or resolved; without id also all."), limit: n("Optional, default 200 (500 without id).") },
+    request: (a) => (a.id
+      ? { method: "GET", path: `/api/services/${enc(a.id)}/alerts`, query: { state: a.state, limit: a.limit } }
+      : { method: "GET", path: "/api/alerts", query: { state: a.state, limit: a.limit } }),
+    shape: redacted },
+  { name: "list_events", readOnly: true, description: "A service's timeline, newest first: alerts opened, changed and resolved, nodes disconnected and reconnected, process restarts, version changes, the takeover, configuration imports, threshold changes. What changed before a problem is often the cause.",
+    properties: { id: SERVICE, from: FROM, to: TO, kind: s("Optional: one kind, e.g. process-restarted, node-disconnected, alert-opened."), limit: n("Optional, default 100.") }, required: ["id"],
+    request: (a) => ({ method: "GET", path: `/api/services/${enc(a.id)}/events`, query: { from: a.from, to: a.to, kind: a.kind, limit: a.limit } }), shape: redacted },
+  { name: "get_bulletins", readOnly: true, description: "A service's NiFi bulletins as the collector took them (kept 2 days), newest first: time, level, node, source component and type, message (secret-looking parts hidden).",
+    properties: { id: SERVICE, level: s("Optional: ERROR, WARNING or INFO."), from: FROM, to: TO, limit: n("Optional, default 200, at most 1000.") }, required: ["id"],
+    request: (a) => ({ method: "GET", path: `/api/services/${enc(a.id)}/bulletins`, query: { level: a.level, from: a.from, to: a.to, limit: a.limit } }), shape: redacted },
+  { name: "search_logs", readOnly: true, description: "Searches a service's logs on every node at once (or the members given), rolled .gz files too, merged by time: a time range (the last hour by default), levels, text or a regular expression (case-insensitive, stack traces included). At most 5000 lines a node; a node that fails is marked and the others still answer. Secret-looking parts are hidden. For counts of WARN/ERROR messages over hours, get_cluster_status's alerts and list_alerts are cheaper.",
+    properties: { id: SERVICE, from: FROM, to: TO, members: strs("Optional member keys."), files: strs("Optional file names (no paths), default nifi-app.log and its rolled files."), levels: strs("Optional: among TRACE, DEBUG, INFO, WARN, ERROR, FATAL."), query: s("Optional text, or a regular expression with regex: true."), regex: { type: "boolean", description: "Optional: query is a regular expression." }, limit: n("Optional lines a node, default 1000.") }, required: ["id"],
+    request: (a) => { const { id, ...body } = a; return { method: "POST", path: `/api/services/${enc(id)}/logs/search`, body }; }, shape: redacted },
+  { name: "tail_logs", readOnly: true, description: "The last lines of one member's log file (nifi-app.log by default): a snapshot, not a stream. member can be left out for a standalone instance. Secret-looking parts are hidden.",
+    properties: { id: SERVICE, member: MEMBER, file: s("Optional file name in the member's log directory, default nifi-app.log."), lines: n("Optional, 1 to 5000, default 200.") }, required: ["id"],
+    request: (a) => ({ method: "GET", path: `/api/services/${enc(a.id)}/logs/lines`, query: { member: a.member, file: a.file, lines: a.lines } }), shape: redacted },
+  { name: "get_service_config", readOnly: true, description: "A service's configuration as the Deployer keeps it (the newest revision, or the one given): per member its files (nifi.properties, bootstrap.conf, …) as text, secret values reading (hidden) and named in hidden. member and file narrow it.",
+    properties: { id: SERVICE, revision: n("Optional revision; the newest by default."), member: s("Optional: a member key or host."), file: s("Optional: one file name, e.g. nifi.properties.") }, required: ["id"],
+    request: (a) => ({ method: "GET", path: `/api/services/${enc(a.id)}/config`, query: { revision: a.revision } }), shape: configShape },
+  { name: "diff_service_config", readOnly: true, description: "A cluster's configuration compared node by node (one revision, the newest by default): per file the keys that differ, worst first, each node's value and whether it comes from the file or the catalog default; all: true lists every key. Secrets are only compared (value A / value B). Comparing two revisions is not there yet (phase 3).",
+    properties: { id: SERVICE, revision: n("Optional revision."), all: { type: "boolean", description: "Optional: also the keys that agree." } }, required: ["id"],
+    request: (a) => ({ method: "GET", path: `/api/services/${enc(a.id)}/config`, query: { revision: a.revision } }), shape: diffShape },
+  { name: "lookup_property", readOnly: true, description: "The service profile's property catalog: for a key (exact) or words (q) in keys and descriptions, its file, type, default, whether the nodes of a cluster must agree (scope cluster) or each has its own (node), whether a change needs a restart, whether it is sensitive, the versions it exists in, what it does. By service (its profile and version), or profile (nifi-1.x, nifi-2.x) and version.",
+    properties: { service: s("Optional: a registered service's id."), profile: s("Optional: nifi-1.x or nifi-2.x."), version: s("Optional NiFi version, e.g. 1.12.1."), key: s("Optional: the exact key, e.g. nifi.cluster.node.protocol.port."), q: s("Optional words to look for."), file: s("Optional: nifi.properties or bootstrap.conf."), limit: n("Optional, default 50.") },
+    request: (a) => ({ method: "GET", path: "/api/service-properties", query: { service: a.service, profile: a.profile, version: a.version, key: a.key, q: a.q, file: a.file, limit: a.limit } }) },
+];
+
 function manifestBody(a: Record<string, unknown>) {
   return { appliesFrom: a.applies_from, newAppliesFrom: a.new_applies_from, base: a.base, patch: a.patch, manifest: a.manifest };
 }
@@ -112,6 +203,7 @@ export const TOOLS: Tool[] = [
   // Managed services (service ops §10, phase 1): what was taken over, and how it is doing.
   { name: "list_service_clusters", readOnly: true, description: "The managed services (NiFi) registered in this environment: clusters with their nodes and standalone instances, each with version, profile, hosts and install directories, configuration revision, and in short how many members are running (live, from the service executors' samples), as of when, and the soonest certificate expiry.", properties: {}, request: () => ({ method: "GET", path: "/api/services" }) },
   { name: "get_cluster_status", readOnly: true, description: "One cluster or standalone instance (id from list_service_clusters): every member with its host's service executor (online or not) and its state from the collector's newest sample: running or stopped as of that sample (asOf), unknown after 3 sampling periods without one, lost when the executor is offline; never sampled: as of the newest discovery (source). Also the live pid, version, cluster connection, key numbers and every certificate with its expiry.", properties: { id: s("The cluster's or standalone instance's id, as list_service_clusters names it.") }, required: ["id"], request: (a) => ({ method: "GET", path: `/api/services/${enc(a.id)}/status` }) },
+  ...SERVICE_TOOLS,
   // Assessments (§10.5.6): the Onboarding Assessor reads these and writes only its own draft, with the task token.
   { name: "onboarding_draft", readOnly: true, description: "An assessment: its draft (the manifest being built, env keys), every change with who and why, the scanned facts, findings of the last validation, report.", properties: { id: ASSESSMENT }, required: ["id"], request: (a) => ({ method: "GET", path: `/api/assessments/${enc(a.id)}` }) },
   { name: "environment_facts", readOnly: true, description: "Ports, service names and data paths this environment already uses, per app; no env values.", properties: {}, request: () => ({ method: "GET", path: "/api/environment-facts" }) },
@@ -198,7 +290,7 @@ export async function handleMcp(message: any, ctx: McpContext): Promise<unknown>
       const { request_id: requestId, ...rest } = args;
       const answer = await ctx.call(tool.request(rest));
       const ok = answer.status < 400;
-      const result = ok ? text(answer.body) : text({ finding: { code: answer.body?.error ?? `http/${answer.status}`, at: [tool.name], expected: answer.body?.message ?? `HTTP ${answer.status}` }, ...(answer.body?.details?.length ? { details: answer.body.details } : {}) }, true);
+      const result = ok ? text(tool.shape ? tool.shape(answer.body, rest) : answer.body) : text({ finding: { code: answer.body?.error ?? `http/${answer.status}`, at: [tool.name], expected: answer.body?.message ?? `HTTP ${answer.status}` }, ...(answer.body?.details?.length ? { details: answer.body.details } : {}) }, true);
       store.audit({ id: principal.id, via: principal.via === "service" ? "service" : "key" }, `mcp.${tool.name}`, String(args.app ?? args.job ?? args.host ?? args.id ?? "-"), { key: principal.keyId ?? null, status: answer.status, ...(requestId ? { requestId } : {}), ...(typeof args.note === "string" ? { note: args.note } : {}) });
       if (!tool.readOnly && ok) store.saveMcpAnswer(keyId, String(requestId), tool.name, result);
       return rpc(id, result);

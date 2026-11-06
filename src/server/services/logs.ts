@@ -141,7 +141,8 @@ export class ServiceLogs {
   private member(id: string, key: string): LogMember {
     const all = this.members(id);
     if (!all) throw new LogsError(404, "service/unknown", `No standalone instance or cluster ${id}.`);
-    const m = all.find((x) => x.key === key);
+    // A standalone instance has one member: no key needed (the MCP tail_logs).
+    const m = key === "" && all.length === 1 ? all[0] : all.find((x) => x.key === key);
     if (!m) throw new LogsError(404, "logs/member", `${key} is not a member of ${id}.`);
     return m;
   }

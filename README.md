@@ -439,7 +439,7 @@ claude mcp add --transport http open-atlas-deployer https://<域名>/deploy/mcp 
 
 ### Deploy Assistant 的发布
 
-- 提示词 [agents/deploy-assistant.md](agents/deploy-assistant.md)，包定义 [templates/deploy-assistant.oma.json](templates/deploy-assistant.oma.json)（只开 Deployer 的 MCP，`allowed_tools` 只列只读工具，沙箱工具关闭，表格渲染器），随 Deployer 一起发版。
+- 提示词 [agents/deploy-assistant.md](agents/deploy-assistant.md)，包定义 [templates/deploy-assistant.oma.json](templates/deploy-assistant.oma.json)（只开 Deployer 的 MCP，`allowed_tools` 只列只读工具，沙箱工具关闭，表格渲染器），随 Deployer 一起发版。`agents/skills/*.md`（如 NiFi 运维）发布时接在提示词后面。
 - 发布：
 
 ```bash

@@ -6,7 +6,7 @@
 // Usage: node bin/publish-assistant.ts <builder MCP url> <builder key file> <model> <Deployer MCP url> <state file> [deploy-assistant | onboarding-assessor]
 //   e.g. node bin/publish-assistant.ts https://oma:3008/mcp /etc/oa/oma-builder.key claude-x https://wb.example/deploy/mcp ./assistant-uat.json
 
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fill } from "../src/server/drivers/types.ts";
 import { McpClient } from "../src/server/mcp-client.ts";
@@ -19,7 +19,11 @@ if (!builderUrl || !keyFile || !model || !mcpUrl || !stateFile) {
   process.exit(2);
 }
 const root = join(import.meta.dirname, "..");
-const values = { model, mcpUrl, system: readFileSync(join(root, "agents", `${agentName}.md`), "utf8") };
+// The Deploy Assistant's skills (agents/skills/*.md, e.g. NiFi operations) go into its system prompt: an OMA package carries
+// only references to Skills published on their own, and OMA injects a Skill into the prompt anyway.
+const skillsDir = join(root, "agents", "skills");
+const skills = agentName === "deploy-assistant" && existsSync(skillsDir) ? readdirSync(skillsDir).filter((f) => f.endsWith(".md")).sort().map((f) => readFileSync(join(skillsDir, f), "utf8")) : [];
+const values = { model, mcpUrl, system: [readFileSync(join(root, "agents", `${agentName}.md`), "utf8"), ...skills].join("\n\n") };
 const missing = new Set<string>();
 const filled = JSON.parse(readFileSync(join(root, "templates", `${agentName}.oma.json`), "utf8"), (_k, v) => {
   if (typeof v !== "string") return v;

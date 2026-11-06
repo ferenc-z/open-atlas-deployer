@@ -2388,3 +2388,149 @@ test("phase 2 step 4: a service's logs over the API: members and summary, files,
   assert.equal((await call(`/executor/v1/jobs/${tail.id}/chunk`, "dpe_nope", { method: "POST", body: "{}" })).status, 401);
   assert.equal((await t.request("/api/services/flow/logs/tail?member=app2:/opt/a&file=old.log.gz", { as: "viewer" })).status, 400);
 });
+
+test("phase 2 step 5: the read-only service tools over /mcp: metrics, alerts, events, bulletins, logs, configuration, node diff, property catalog; logs and bulletins redacted", async () => {
+  const t = setup({ services: fakeState() });
+  setEnvironment(t, ({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", hosts, registries: { ghcr: "ghcr.io/acme" }, apps: { shop: { version: "1.2.0", host: "app2" } } }));
+  const call = (path: string, token: string, init: RequestInit & { type?: string } = {}) => t.app.request(`/deploy${path}`, { ...init, headers: { authorization: `Bearer ${token}`, ...(init.type ? { "content-type": init.type } : typeof init.body === "string" && init.body.startsWith("{") ? { "content-type": "application/json" } : {}) } });
+  const service = (await (await post(t, "/api/hosts/app2/token", "admin", { executor: "service" })).json()).token as string;
+  await call("/executor/v1/heartbeat", service, { method: "POST", body: JSON.stringify({ executor: "service", version: EXECUTOR_VERSION, protocols: [2], kinds: ["svc-discover", "svc-read", "log-read", "log-tail", "executor-upgrade"], busy: null, user: "ferenc", isRoot: false, reading: [], readSlots: 4 }) });
+  const member = (installDir: string, https: number) => ({ host: "app2", installDir, serviceUser: "nifi", startEnvironment: null, ports: { https }, nodeAddress: `node-${https}`, discovery: null });
+  const actor = { id: "admin", via: "cli" as const };
+  t.store.addCluster({ kind: "cluster", id: "flow", service: "nifi", profile: "nifi-2.x", version: "2.5.0", webUrl: null, zookeeper: "zk:2181", zookeeperRoot: "/flow", nodes: [member("/opt/a", 8443), member("/opt/b", 9443)] }, "uat", actor);
+  const { nodeAddress: _n, ...single } = member("/opt/n1", 18443);
+  t.store.addStandalone({ kind: "standalone", id: "n1", service: "nifi", profile: "nifi-1.x", version: "1.12.1", webUrl: null, member: single }, "uat", actor);
+  const A = "app2:/opt/a", B = "app2:/opt/b";
+
+  // Configuration revision 1, as a takeover imports it (redacted copies beside the sealed ones).
+  const file = (name: string, format: string, redacted: string, secrets: string[] = []) => ({ name, path: `/conf/${name}`, sha256: name + redacted.length, size: redacted.length, modifiedAt: "2026-11-06T00:00:00Z", format, sealed: "x", redacted, secrets });
+  const props = (protocol: number, https: number) => `nifi.cluster.node.protocol.port=${protocol}\nnifi.web.https.port=${https}\nnifi.sensitive.props.key=(hidden)\nnifi.cluster.is.node=true\n`;
+  const body = (members: { installDir: string; files: unknown[] }[]) => JSON.stringify({ members: members.map((m) => ({ host: "app2", missing: [], ...m })) });
+  const db = (t.store as any).db;
+  const addConfig = db.prepare("INSERT INTO service_configs (service, revision, body, source, saved_at, saved_by, via, note) VALUES (?, 1, ?, 'import', '2026-11-06T00:00:00Z', 'admin', 'cli', NULL)");
+  addConfig.run("flow", body([
+    { installDir: "/opt/a", files: [file("nifi.properties", "properties", props(11443, 8443), ["nifi.sensitive.props.key"]), file("extra.json", "other", "{\"password\": \"s3cret\", \"port\": 1}")] },
+    { installDir: "/opt/b", files: [file("nifi.properties", "properties", props(11444, 9443), ["nifi.sensitive.props.key"])] },
+  ]));
+  addConfig.run("n1", body([{ installDir: "/opt/n1", files: [file("nifi.properties", "properties", "nifi.web.https.port=18443\n")] }]));
+
+  // Samples, bulletins, an alert and an event.
+  const at = (m: number) => new Date(Date.now() - m * 60_000).toISOString();
+  t.store.addServiceSamples([5, 3, 1].flatMap((m, i) => [
+    { service: "flow", member: A, at: at(m), point: { heapPct: 40 + i * 10, queuedCount: 100 * i } },
+    { service: "flow", member: B, at: at(m), point: { heapPct: 30, queuedCount: null } },
+  ]));
+  t.store.addServiceBulletins([
+    { service: "flow", member: A, node: "node-8443:8443", id: 1, at: at(2), level: "ERROR", category: "Log Message", source: "PutDatabaseRecord", sourceType: "PROCESSOR", message: "Cannot connect to jdbc:postgresql://etl:hunter2@db:5432/x with password=hunter2" },
+    { service: "flow", member: A, node: "node-8443:8443", id: 2, at: at(1), level: "WARNING", category: "Log Message", source: "InvokeHTTP", sourceType: "PROCESSOR", message: "401 for Authorization: Bearer abcdefghijklmnop" },
+  ]);
+  t.store.openServiceAlert({ service: "flow", member: B, rule: "node-disconnected", level: "CRIT", detail: { text: "node-9443:9443 is DISCONNECTED (token=abc123)" } }, at(2), { text: "Node disconnected" });
+  t.store.addServiceEvent({ service: "flow", member: A, at: at(4), kind: "process-restarted", detail: { text: "Process restarted (pid 12)" } });
+
+  const key = (await makeKey(t, "admin", { kind: "service", name: "deploy-assistant", days: 30 })).body.key as string;
+  const names = ((await mcp(t, key, "tools/list")).body.result.tools as { name: string; annotations: { readOnlyHint: boolean } }[]);
+  const NEW = ["get_metrics", "list_alerts", "list_events", "get_bulletins", "search_logs", "tail_logs", "get_service_config", "diff_service_config", "lookup_property"];
+  for (const n of NEW) assert.equal(names.find((x) => x.name === n)?.annotations.readOnlyHint, true, `${n} is a read-only tool the service key sees`);
+
+  // get_metrics: per member and field last / min / max / avg; the points only with series.
+  const m = await tool(t, key, "get_metrics", { id: "flow", fields: ["heapPct", "queuedCount"], step: 60 });
+  assert.equal(m.isError, false);
+  const ma = m.value.members.find((x: { member: string }) => x.member === A);
+  assert.deepEqual([ma.points, ma.summary.heapPct, ma.at], [3, { last: 60, min: 40, max: 60, avg: 50 }, undefined]);
+  assert.deepEqual(m.value.members.find((x: { member: string }) => x.member === B).summary.queuedCount, { last: null, min: null, max: null, avg: null });
+  assert.equal(m.value.units.heapPct, "%");
+  assert.deepEqual((await tool(t, key, "get_metrics", { id: "flow", member: A, fields: ["heapPct"], step: 60, series: true })).value.members[0].values.heapPct, [40, 50, 60]);
+  assert.equal((await tool(t, key, "get_metrics", { id: "flow", fields: ["nope"] })).value.finding.code, "metrics/fields");
+  assert.equal((await tool(t, key, "get_metrics", { id: "nothing" })).value.finding.code, "service/unknown");
+
+  // list_alerts (one service, and all) and list_events: the texts redacted.
+  const alerts = (await tool(t, key, "list_alerts", { id: "flow" })).value;
+  assert.deepEqual(alerts.alerts.map((a: { rule: string; state: string }) => [a.rule, a.state]), [["node-disconnected", "open"]]);
+  assert.ok(JSON.stringify(alerts.alerts).includes("token=[hidden]") && !JSON.stringify(alerts).includes("abc123"));
+  assert.ok(alerts.rules["node-disconnected"] && alerts.thresholds.info, "with the rules and thresholds");
+  const all = (await tool(t, key, "list_alerts", { state: "all" })).value;
+  assert.deepEqual([all.open, all.alerts[0].service], [1, "flow"]);
+  assert.equal((await tool(t, key, "list_alerts", { state: "nope" })).value.finding.code, "alerts/state");
+  const events = (await tool(t, key, "list_events", { id: "flow" })).value.events;
+  assert.deepEqual(events.map((e: { kind: string }) => e.kind), ["alert-opened", "process-restarted", "taken-over"]);
+  assert.deepEqual((await tool(t, key, "list_events", { id: "flow", kind: "process-restarted" })).value.events.length, 1);
+
+  // get_bulletins: redacted for the AI; the page (deploy-viewer) still reads them as NiFi wrote them (§9.3).
+  const bulletins = (await tool(t, key, "get_bulletins", { id: "flow" })).value.bulletins;
+  assert.deepEqual(bulletins.map((b: { message: string }) => b.message), ["401 for Authorization: Bearer [hidden]", "Cannot connect to jdbc:postgresql://etl:[hidden]@db:5432/x with password=[hidden]"]);
+  assert.equal((await tool(t, key, "get_bulletins", { id: "flow", level: "ERROR" })).value.bulletins.length, 1);
+  const page = await (await t.request("/api/services/flow/bulletins", { as: "viewer" })).json();
+  assert.ok(page.bulletins.some((b: { message: string }) => b.message.includes("hunter2")), "the page shows the raw text");
+
+  /** Plays the executor: takes the next job and answers it with content. */
+  const answer = async (reply: (job: Record<string, any>) => unknown) => {
+    for (let i = 0; i < 200; i++) {
+      const r = await call("/executor/v1/jobs/next", service);
+      if (r.status === 200) {
+        const job = (await r.json()).job;
+        await call(`/executor/v1/jobs/${job.id}/content`, service, { method: "PUT", body: JSON.stringify(reply(job)), type: "application/octet-stream" });
+        await call(`/executor/v1/jobs/${job.id}/status`, service, { method: "PUT", body: JSON.stringify({ protocol: 2, id: job.id, kind: job.kind, state: "succeeded", steps: [], result: { mode: job.mode } }) });
+        return job;
+      }
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    throw new Error("no job came");
+  };
+
+  // search_logs: both nodes, merged by time, the lines redacted.
+  const searching = tool(t, key, "search_logs", { id: "flow", query: "login", levels: ["ERROR"], from: "2026-11-06T00:00:00Z", to: "2026-11-06T02:00:00Z" });
+  const line = (job: Record<string, any>) => ({ file: "nifi-app.log", at: job.member === A ? "2026-11-06T01:00:02.000Z" : "2026-11-06T01:00:01.000Z", local: "x", level: "ERROR", logger: "o.a.n.X", thread: "t", text: `login failed for ${job.member === A ? "password=topsecret" : "https://admin:pw123@ldap"}\n-----BEGIN PRIVATE KEY-----\nMIIabc\n-----END PRIVATE KEY-----` });
+  const jobs = [await answer((job) => ({ entries: [line(job)], truncated: null })), await answer((job) => ({ entries: [line(job)], truncated: null }))];
+  assert.deepEqual(jobs.map((j) => [j.mode, j.query, j.levels]), [["search", "login", ["ERROR"]], ["search", "login", ["ERROR"]]]);
+  const found = (await searching).value;
+  assert.deepEqual(found.entries.map((e: { member: string; text: string }) => [e.member, e.text]), [
+    [B, "login failed for https://admin:[hidden]@ldap\n[private key hidden]"],
+    [A, "login failed for password=[hidden]\n[private key hidden]"],
+  ]);
+  assert.equal((await tool(t, key, "search_logs", { id: "flow", regex: true, query: "(" })).value.finding.code, "logs/search");
+
+  // tail_logs: the last lines; a standalone instance needs no member.
+  const tailing = tool(t, key, "tail_logs", { id: "n1", lines: 2 });
+  const tailJob = await answer(() => ({ file: "nifi-app.log", lines: ["started", "keystorePasswd=changeit used"] }));
+  assert.deepEqual([tailJob.mode, tailJob.member, tailJob.lines, tailJob.file], ["lines", "app2:/opt/n1", 2, "nifi-app.log"]);
+  assert.deepEqual((await tailing).value.lines, ["started", "keystorePasswd=[hidden] used"]);
+  assert.equal((await tool(t, key, "tail_logs", { id: "flow" })).value.finding.code, "logs/member", "a cluster needs a member");
+  assert.equal((await tool(t, key, "tail_logs", { id: "n1", lines: 9999 })).value.finding.code, "logs/lines");
+
+  // get_service_config: the redacted files, narrowed by member and file; other files through the redaction too.
+  const cfg = (await tool(t, key, "get_service_config", { id: "flow" })).value;
+  assert.deepEqual([cfg.revision, cfg.members.map((x: { key: string }) => x.key), cfg.revisions.map((r: { revision: number }) => r.revision)], [1, [A, B], [1]]);
+  const [props1, extra] = cfg.members[0].files;
+  assert.match(props1.text, /nifi\.sensitive\.props\.key=\(hidden\)/);
+  assert.deepEqual(props1.hidden, ["nifi.sensitive.props.key"]);
+  assert.equal(extra.text, "{\"password\": [hidden], \"port\": 1}");
+  assert.ok(!JSON.stringify(cfg).includes("s3cret") && !JSON.stringify(cfg).includes("sealed"));
+  const one = (await tool(t, key, "get_service_config", { id: "flow", member: B, file: "nifi.properties" })).value;
+  assert.deepEqual(one.members.map((x: { key: string; files: { name: string }[] }) => [x.key, x.files.map((f) => f.name)]), [[B, ["nifi.properties"]]]);
+  assert.equal((await tool(t, key, "get_service_config", { id: "flow", revision: 7 })).value.finding.code, "service-config/none");
+
+  // diff_service_config: the nodes compared, only what differs unless all.
+  const diff = (await tool(t, key, "diff_service_config", { id: "flow" })).value;
+  assert.deepEqual(diff.nodes, [A, B]);
+  const p = diff.files.find((f: { name: string }) => f.name === "nifi.properties");
+  assert.deepEqual(p.rows.map((r: { key: string; severity: string; values: { node: string; value: string }[] }) => [r.key, r.severity, r.values.map((v) => `${v.node}=${v.value}`)]), [
+    ["nifi.cluster.node.protocol.port", "info", [`${A}=11443`, `${B}=11444`]],
+    ["nifi.web.https.port", "info", [`${A}=8443`, `${B}=9443`]],
+  ]);
+  assert.ok((await tool(t, key, "diff_service_config", { id: "flow", all: true })).value.files[0].rows.some((r: { key: string; severity: null }) => r.key === "nifi.cluster.is.node" && r.severity === null));
+  const standalone = (await tool(t, key, "diff_service_config", { id: "n1" })).value;
+  assert.deepEqual([standalone.kind, standalone.files, standalone.nodes], ["standalone", [], ["app2:/opt/n1"]]);
+
+  // lookup_property: by service (profile and version), by key or words; a key another version has.
+  const prop = (await tool(t, key, "lookup_property", { service: "flow", key: "nifi.cluster.node.protocol.port" })).value;
+  assert.deepEqual([prop.profile, prop.version, prop.entries.map((e: { key: string; scope: string; file: string }) => [e.key, e.scope, e.file])], ["nifi-2.x", "2.5.0", [["nifi.cluster.node.protocol.port", "node", "nifi.properties"]]]);
+  assert.ok(prop.entries[0].description.length > 0);
+  const words = (await tool(t, key, "lookup_property", { version: "2.5.0", q: "https port" })).value;
+  assert.ok(words.entries.some((e: { key: string }) => e.key === "nifi.web.https.port"));
+  const old = (await tool(t, key, "lookup_property", { service: "n1", key: "nifi.flow.configuration.json.file" })).value;
+  assert.deepEqual([old.profile, old.entries, old.otherVersions.map((e: { since: string }) => e.since)], ["nifi-1.x", [], ["1.16.0"]]);
+  assert.equal((await tool(t, key, "lookup_property", {})).value.finding.code, "properties/profile");
+  assert.equal((await tool(t, key, "lookup_property", { profile: "nifi-2.x", file: "x.conf" })).value.finding.code, "properties/file");
+  assert.equal((await tool(t, key, "lookup_property", { service: "nothing" })).value.finding.code, "service/unknown");
+  assert.equal((await t.request("/api/service-properties?profile=nifi-2.x", { as: "nobody" })).status, 403);
+});

@@ -115,6 +115,16 @@ executors; `EXECUTOR_VERSION` with it).
   (Server-Sent Events; one tail per node and file, shared, renewed from its cursor while someone follows). A Logs
   tab on the service page: follow, search, download, the WARN/ERROR summary. Log jobs only go to an executor whose
   heartbeat names them.
+- Phase 2 read-only MCP tools (deploy-viewer, as the pages): `get_metrics` (last / min / max / avg per member and
+  field, points with `series`), `list_alerts`, `list_events`, `get_bulletins`, `search_logs`, `tail_logs` (the last
+  N lines, not a stream; no member needed for a standalone), `get_service_config`, `diff_service_config` (a
+  cluster's nodes; two revisions come with phase 3) and `lookup_property` (the profile's catalog,
+  `GET /api/service-properties`). Log lines, bulletins and the texts of alerts, events and configuration are
+  redacted before they reach the AI (`services/redact.ts`, the service executor's rules); the pages still show
+  people with deploy-viewer the raw logs and bulletins. The Deploy Assistant's package allows these tools and its
+  prompt carries the NiFi operations skill (`agents/skills/nifi-ops.md`: the overall picture from the samples,
+  components only through Studio).
+- `/mcp` answers a refused log read or an executor that cannot run a job with its error code (was a 500).
 
 **Known limits**
 - Alerts are not pushed (S13).

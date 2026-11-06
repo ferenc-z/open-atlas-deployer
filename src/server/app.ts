@@ -30,6 +30,7 @@ import { environmentStatus, hostStateOf, parseDockerPs, type Observer } from "./
 import { StoreError, type Actor, type Store } from "./store.ts";
 import { withoutSealed } from "./services/config.ts";
 import { configView } from "./services/configview.ts";
+import { catalogFor, profile as profileById, profileFor, PROFILES } from "./services/profiles.ts";
 import type { DraftItem } from "./services/draft.ts";
 import { serviceStatus, thresholdsOf, timeline } from "./services/status.ts";
 import { alertView, check, parseThresholds, RULES, THRESHOLDS } from "./services/rules.ts";
@@ -745,6 +746,31 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     const state = c.req.query("state");
     if (state !== undefined && !["open", "confirmed", "discarded"].includes(state)) return reject(c, 400, "draft/state", "state is open, confirmed or discarded.");
     return c.json({ drafts: store.serviceDrafts(state as "open" | undefined) });
+  });
+  // §10 lookup_property: the profiles' property catalog, for a registered service (its profile and version) or a profile
+  // and version; key = exact key, q = words in the key or its description; file narrows to nifi.properties or bootstrap.conf.
+  api.get("/api/service-properties", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    const q = (k: string) => c.req.query(k) || undefined;
+    const service = q("service") ? registeredService(q("service")!) : undefined;
+    if (q("service") && !service) return reject(c, 404, "service/unknown", `No standalone instance or cluster ${q("service")}.`);
+    const version = service?.version ?? q("version");
+    const prof = service ? profileById(service.profile) : q("profile") ? profileById(q("profile")!) : version ? profileFor("nifi", version)?.profile : undefined;
+    if (!prof) return reject(c, 400, "properties/profile", `Give service, profile (${PROFILES.map((x) => x.id).join(", ")}) or version.`);
+    const file = q("file");
+    if (file && !prof.files.some((f) => f.name === file)) return reject(c, 400, "properties/file", `file is one of ${prof.files.map((f) => f.name).join(", ")}.`);
+    const key = q("key"), words = q("q")?.toLowerCase().split(/\s+/).filter(Boolean) ?? [];
+    const pool = version ? catalogFor(prof, version) : prof.catalog;
+    const entries = pool.filter((e) => (!file || e.file === file) && (!key || e.key === key) && words.every((w) => `${e.key} ${e.description} ${e.note ?? ""}`.toLowerCase().includes(w)));
+    const limit = Math.min(200, Math.max(1, Number(q("limit") ?? 50) || 50));
+    // A key this version does not have, but another of the profile's versions does: say since/until.
+    const elsewhere = key && !entries.length ? prof.catalog.filter((e) => e.key === key && (!file || e.file === file)) : [];
+    return c.json({
+      profile: prof.id, version: version ?? null, tested: prof.tested, ...(service ? { service: service.id } : {}),
+      entries: entries.slice(0, limit), more: Math.max(0, entries.length - limit),
+      ...(elsewhere.length ? { otherVersions: elsewhere } : {}),
+    });
   });
   // Step 6: one standalone instance or cluster with its members' status (get_cluster_status).
   api.get("/api/services/:id/status", async (c) => {
@@ -1559,12 +1585,15 @@ export function createApp({ config, store, sessions, observer, deployments, vers
   if (config.basePath) app.get("/", (c) => c.redirect(`${config.basePath}/`));
   app.route(config.basePath || "/", api);
   // §15.2: a job the executor does not name in its heartbeat is refused wherever it is submitted; anything else as Hono does.
-  app.onError((error, c) => {
+  // On api too: /mcp dispatches to api.fetch directly, which does not reach app's handler.
+  const failed = (error: Error, c: Context) => {
     if (error instanceof ExecutorUnsupported) return reject(c, error.status, error.code, error.message, error.missing);
     if (error instanceof LogsError) return reject(c, error.status, error.code, error.message);
     if (error instanceof HTTPException) return error.getResponse();
     console.error(error);
     return c.text("Internal Server Error", 500);
-  });
+  };
+  api.onError(failed);
+  app.onError(failed);
   return app;
 }
