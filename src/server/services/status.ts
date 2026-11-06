@@ -1,16 +1,44 @@
-// Service ops §11 phase 1: how a registered standalone instance or cluster is doing, from what the Deployer already
-// has: each member's host's service executor (online or not) and that host's newest finished discovery (was the
-// installation's NiFi running then, at which version and pid). Phase 1 has no probes of its own (§9 is phase 2), so
-// "running" means "running when last discovered", with the time; discovering again brings it up to date.
+// Service ops: how a registered standalone instance or cluster is doing. Phase 2 (§15.2): the state is live, from the
+// collector's newest sample of each member — running or stopped as of that sample ("as of" kept); no sample for more
+// than 3 sampling periods: unknown; the member's service executor offline: lost. A member never sampled yet (an
+// executor without the collector, or just registered) falls back to its host's newest discovery as in phase 1.
+// A cluster's node connections come from the coordinator's view (/controller/cluster is complete only there).
 
 import type { ExecutorInfo } from "../handoff.ts";
-import type { Store } from "../store.ts";
+import type { Point, ServiceCert, Store } from "../store.ts";
 import { confDirOf, installKey, type DraftItem, type ServiceMember, type ServicePorts } from "./draft.ts";
 import { discoveredKey, type Finding } from "./assess.ts";
+import { ownNode } from "./metrics.ts";
 
-export type MemberState = "running" | "stopped" | "not-found" | "unknown";
+/** running / stopped: as of the newest sample (or discovery); not-found: the newest discovery did not see it;
+ *  unknown: no sample for 3 periods (or nothing at all yet); lost: the member's service executor is offline. */
+export type MemberState = "running" | "stopped" | "not-found" | "unknown" | "lost";
+
+/** The default sampling period when the heartbeat does not say (EXECUTOR_COLLECT_SECONDS). */
+export const DEFAULT_PERIOD = 60;
+/** A member without a sample for this many periods is unknown. */
+export const STALE_PERIODS = 3;
+
+export interface LiveView {
+  at: string;
+  receivedAt: string;
+  running: boolean | null;
+  pid: number | null;
+  startedAt: string | null;
+  /** The collector's verdict on the REST API: ok, partial, unreachable, not-running, no-certificate, no-https. */
+  nifi: string | null;
+  version: string | null;
+  /** A cluster node's connection status and roles, in the coordinator's view. */
+  connection: string | null;
+  roles: string[];
+  /** The sample's flat numbers (heap, queue, threads, …: metrics.ts FIELDS). */
+  point: Point | null;
+  problems: string[];
+}
 
 export interface MemberStatus {
+  /** installKey: how samples, metrics and certificates name the member. */
+  key: string;
   host: string;
   installDir: string;
   confDir: string;
@@ -18,11 +46,16 @@ export interface MemberStatus {
   serviceUser: string | null;
   ports: ServicePorts;
   executor: { online: boolean; reason?: string; version?: string };
-  /** running / stopped: discovery saw the installation (running or not); not-found: the newest discovery did not see it; unknown: no discovery yet. */
   state: MemberState;
-  /** The discovery the state is from. */
+  /** Where the state comes from, and as of when. */
+  source: "samples" | "discovery" | "executor" | "none";
+  asOf: string | null;
+  live: LiveView | null;
+  /** The newest discovery (phase 1's state; still shown). */
   seen: { job: string; at: string | null; version: string | null; pid: number | null; webUrl: string | null } | null;
 }
+
+export interface CertSummary { member: string; store: string; subject: string | null; notAfter: string; days: number }
 
 export interface ServiceStatus {
   id: string;
@@ -39,25 +72,40 @@ export interface ServiceStatus {
   createdBy: string;
   configRevision: number | null;
   members: MemberStatus[];
-  /** How many members were running at their host's newest discovery, of how many; versions seen that differ from the registered one;
-   *  differences: the takeover's node-difference findings; findings: the takeover's findings by severity (phase 1 has no alerts). */
-  summary: { members: number; running: number; executorsOnline: number; versionsSeen: string[]; differences: number; findings: Record<Finding["severity"], number> };
-  /** What the takeover draft found for this item (rules, §6 step 3), errors first. */
+  /** members running of how many; executors online; versions seen that differ from the registered one; differences: the
+   *  takeover's node-difference findings; findings: the takeover's findings by severity (alerts are step 3);
+   *  asOf: the oldest member's as-of time; cert: the soonest-expiring certificate; certErrors: stores that could not be read. */
+  summary: {
+    members: number; running: number; executorsOnline: number; versionsSeen: string[]; differences: number; findings: Record<Finding["severity"], number>;
+    asOf: string | null; period: number; cert: CertSummary | null; certErrors: number;
+  };
   findings: Finding[];
-  /** What happened to it, newest first: phase 1 has the registration and the configuration revisions (S23 timeline). */
+  /** S27: every certificate of every member, as of each member's newest reading. */
+  certs: ServiceCert[];
   events: { at: string; kind: "registered" | "config"; text: string; by: string }[];
 }
 
-/** The takeover findings of a registered item: those of the draft item it was confirmed from. */
 export function takeoverFindings(store: Store, draft: string | null, id: string): Finding[] {
   if (!draft) return [];
   const item = store.serviceDraft(draft)?.items.find((i) => i.id === id);
   return (item?.findings ?? []) as Finding[];
 }
 
+type Any = Record<string, any>;
+
+/** The soonest-expiring certificate of a service's (end-entity and CA alike: either breaks TLS). */
+export function soonestCert(certs: ServiceCert[], now: Date): CertSummary | null {
+  let best: CertSummary | null = null;
+  for (const c of certs) {
+    if (!c.notAfter) continue;
+    const days = Math.floor((Date.parse(c.notAfter) - now.getTime()) / 86_400_000);
+    if (!best || c.notAfter < best.notAfter) best = { member: c.member, store: c.store, subject: c.subject, notAfter: c.notAfter, days };
+  }
+  return best;
+}
 
 /** The status of one registered service, or undefined when there is none with that id. */
-export function serviceStatus(store: Store, executor: (host: string) => ExecutorInfo, id: string): ServiceStatus | undefined {
+export function serviceStatus(store: Store, executor: (host: string) => ExecutorInfo, id: string, now: Date = new Date()): ServiceStatus | undefined {
   const s = store.standalones().find((x) => x.id === id);
   const c = s ? undefined : store.clusters().find((x) => x.id === id);
   const item = s ?? c;
@@ -73,22 +121,56 @@ export function serviceStatus(store: Store, executor: (host: string) => Executor
     }
     return discoveries.get(host)!;
   };
+  const samples = new Map(store.latestServiceSamples(id).map((x) => [x.member, x]));
+  // The coordinator's view of the cluster: the newest sample whose own node is the coordinator, else the newest with a view.
+  const views = [...samples.values()].filter((x) => Array.isArray((x.body.nifi as Any | undefined)?.cluster?.nodes)).sort((a, b) => (a.at < b.at ? 1 : -1));
+  const coordinator = views.find((x) => {
+    const m = members.find((mm) => installKey(mm) === x.member);
+    return m && (ownNode((x.body.nifi as Any).cluster.nodes as Any[], m)?.roles as string[] | undefined)?.includes("Cluster Coordinator");
+  }) ?? views[0];
+  let period = DEFAULT_PERIOD;
   const statuses = members.map((m): MemberStatus => {
     const e = executor(m.host);
+    const seconds = Number(e.heartbeat?.collector?.seconds);
+    if (seconds > 0) period = seconds;
+    const memberPeriod = seconds > 0 ? seconds : DEFAULT_PERIOD;
     const d = discoveryOf(m.host);
     const found = d?.instances.find((i) => discoveredKey({ host: m.host, instance: i }) === installKey(m));
-    const state: MemberState = !d ? "unknown" : !found ? "not-found" : found.running ? "running" : "stopped";
+    const sample = samples.get(installKey(m));
+    let live: LiveView | null = null;
+    if (sample) {
+      const b = sample.body as Any;
+      const view = coordinator ? ownNode((coordinator.body.nifi as Any).cluster.nodes as Any[], m) : undefined;
+      live = {
+        at: sample.at, receivedAt: sample.receivedAt, running: typeof b.process?.running === "boolean" ? b.process.running : null, pid: b.process?.pid ?? null,
+        startedAt: b.process?.startedAt ?? null, nifi: b.nifi?.state ?? null, version: b.nifi?.about?.version ?? null,
+        connection: s ? null : (view?.status as string | undefined) ?? null, roles: s ? [] : (view?.roles as string[] | undefined) ?? [],
+        point: sample.point, problems: Array.isArray(b.problems) ? b.problems.map(String) : [],
+      };
+    }
+    let state: MemberState, source: MemberStatus["source"], asOf: string | null;
+    if (!e.online) { state = "lost"; source = "executor"; asOf = live?.at ?? null; }
+    else if (live) {
+      const stale = now.getTime() - Date.parse(live.at) > STALE_PERIODS * memberPeriod * 1000;
+      state = stale || live.running === null ? "unknown" : live.running ? "running" : "stopped";
+      source = "samples"; asOf = live.at;
+    } else if (d) { state = !found ? "not-found" : found.running ? "running" : "stopped"; source = "discovery"; asOf = d.at; }
+    else { state = "unknown"; source = "none"; asOf = null; }
     return {
-      host: m.host, installDir: m.installDir, confDir: confDirOf(m), ...(m.nodeAddress !== undefined ? { nodeAddress: m.nodeAddress } : {}), serviceUser: m.serviceUser, ports: m.ports,
+      key: installKey(m), host: m.host, installDir: m.installDir, confDir: confDirOf(m), ...(m.nodeAddress !== undefined ? { nodeAddress: m.nodeAddress } : {}), serviceUser: m.serviceUser, ports: m.ports,
       executor: { online: e.online, ...(e.reason ? { reason: e.reason } : {}), ...(e.heartbeat?.version ? { version: e.heartbeat.version } : {}) },
-      state,
+      state, source, asOf, live,
       seen: d ? { job: d.job, at: d.at, version: found?.version ?? null, pid: found?.process?.pid ?? null, webUrl: found?.webUrl ?? null } : null,
     };
   });
   const findings = takeoverFindings(store, item.draft, item.id);
-  const count = (s: Finding["severity"]) => findings.filter((f) => f.severity === s).length;
+  const count = (sev: Finding["severity"]) => findings.filter((f) => f.severity === sev).length;
   const revisions = store.serviceConfigRevisions(item.id);
-  const versionsSeen =[...new Set(statuses.map((m) => m.seen?.version).filter((v): v is string => Boolean(v) && v !== item.version))];
+  // A version differing from the registered one, live (REST) or as discovered.
+  const versionsSeen = [...new Set(statuses.map((m) => m.live?.version ?? m.seen?.version).filter((v): v is string => Boolean(v) && v !== item.version))];
+  const keys = new Set(members.map(installKey));
+  const certs = store.serviceCerts(item.id).filter((x) => keys.has(x.member));
+  const asOfs = statuses.map((m) => m.asOf).filter((a): a is string => Boolean(a)).sort();
   return {
     id: item.id, kind: item.kind, service: item.service, profile: item.profile, version: item.version, webUrl: item.webUrl,
     ...(c ? { zookeeper: c.zookeeper, zookeeperRoot: c.zookeeperRoot } : {}),
@@ -99,8 +181,10 @@ export function serviceStatus(store: Store, executor: (host: string) => Executor
       members: statuses.length, running: statuses.filter((m) => m.state === "running").length, executorsOnline: statuses.filter((m) => m.executor.online).length, versionsSeen,
       differences: findings.filter((f) => f.code === "cluster/differs" || f.code === "cluster/version-differs").length,
       findings: { error: count("error"), warning: count("warning"), info: count("info") },
+      asOf: asOfs[0] ?? null, period, cert: soonestCert(certs, now), certErrors: certs.filter((x) => x.error).length,
     },
     findings,
+    certs,
     events: [
       ...revisions.map((r) => ({ at: r.savedAt, kind: "config" as const, text: `Configuration revision ${r.revision}${r.source === "import" ? ", imported from the hosts" : ` (${r.source})`}${r.note ? `: ${r.note}` : ""}`, by: r.savedBy })),
       { at: item.createdAt, kind: "registered" as const, text: `Taken over${item.draft ? ` from draft ${item.draft}` : ""}`, by: item.createdBy },

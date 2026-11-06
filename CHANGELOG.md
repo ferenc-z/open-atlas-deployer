@@ -35,7 +35,8 @@ executors; `EXECUTOR_VERSION` with it).
   each NiFi the Deployer registered on its host. The list comes with every heartbeat reply (`watch`); nothing else
   is sampled. A sample holds the process (running, pid, start time, memory, CPU) and the host (load, memory), the
   disks of the repositories and logs (once per device), the REST API's about, system diagnostics (per node on a
-  cluster), flow status, cluster nodes and new bulletins, called with the host's monitor certificate
+  cluster), flow status, cluster nodes, new bulletins and back pressure (the root group's recursive status: connections
+  at their threshold, the fullest ones), called with the host's monitor certificate
   (`EXECUTOR_NIFI_CLIENT_CERT`, `_KEY`, `EXECUTOR_NIFI_CA`; the name checked is `nifi.web.https.host`;
   `EXECUTOR_NIFI_CA_RELAXED=1` for a CA without critical Basic Constraints), and once an hour the certificates of the
   keystore and truststore (JKS or PKCS12, through the NiFi's own `keytool`, the password passed in the environment)
@@ -52,14 +53,30 @@ executors; `EXECUTOR_VERSION` with it).
   instances and clusters are registered and each installation's files are imported, sealed, as configuration
   revision 1 (a redacted copy for the page). Files changed since the discovery are refused.
 - A new Services group on the page: **Instances & clusters** (list and details: version, nodes, executor online,
-  running or stopped as of the newest discovery, the redacted revision 1) and **Takeover** (discover per host, make
+  running or stopped, the redacted revision 1) and **Takeover** (discover per host, make
   a draft, review and edit it, confirm or discard).
 - `GET /api/services`, `GET /api/services/:id/status`, `GET /api/services/:id/config`, the draft routes under
   `/api/services/drafts` and `POST|GET /api/hosts/:id/discover`; every change goes to the audit.
 - Read-only MCP tools `list_service_clusters` and `get_cluster_status`.
 - A service executor's heartbeat reply lists the installations registered on its host (`watch`); its samples are
-  kept as they come (`service_samples`) for those only. A takeover warns (`host/multiple-nifi`) when a host would
+  kept for those only (`service_samples`). A takeover warns (`host/multiple-nifi`) when a host would
   have more than one NiFi registered.
+- Phase 2 metrics: each sample is kept 2 days with its numbers (heap, GC time from the counters, threads, the node's
+  queue share, back pressure, repository disks, process CPU from `cpuSeconds`, RSS, host load, memory and disks),
+  rolled up every 5 minutes (average, maximum, last; kept 30 days); cleaned up hourly. Bulletins go to
+  `service_bulletins`, dated from NiFi's time of day (the zone from the cluster view or the newest bulletin), each once
+  by node, id and time (ids start from 0 again after a restart). Certificates go to `service_certs`, only the newest
+  reading (by `readAt`).
+- Live state: a member is running or stopped as of its newest sample (`asOf`), unknown after 3 sampling periods
+  without one, lost while its service executor is offline; never sampled, as of the newest discovery. A cluster's
+  node connections come from the coordinator's view. `/status` and `get_cluster_status` carry it, with the live pid,
+  version, numbers and every certificate.
+- `GET /api/services/:id/metrics` (`range=1h|6h|2d|30d` or `from`/`to`, `step`, `member`, `fields`) and
+  `GET /api/services/:id/bulletins`.
+- The service page: a **Metrics** tab (heap, GC, threads, queue, back pressure, repositories, host; a line per node;
+  1 hour, 6 hours, 2 days, 30 days), key numbers, the newest bulletins and the certificates on **Overview**, the
+  soonest expiry in the summary line (`cert 23d`) and per node on **Nodes**; the list cards show the last hour's heap
+  and queue and a certificate expiring within 30 days.
 - `bin/executor-token.ts <data> <host> <file> service` issues a service executor token, `--revoke deploy|service`
   revokes one, without the page.
 - An `environment.json` without `apps` no longer breaks `GET /api/setup` (500).
@@ -72,9 +89,9 @@ executors; `EXECUTOR_VERSION` with it).
   would take a service executor token for a deploy executor one: revoke it before going back.
 
 **Known limits**
-- No probes of its own yet: whether an instance runs is what the newest discovery saw, with no scheduled discovery.
+- No alerts or rules yet (phase 2 step 3): certificate expiry and back pressure are only shown.
 - Not yet: alert thresholds, removing a service, turning a standalone instance into a cluster, a cluster's common
-  layer and node overrides, starting and stopping, logs and metrics (later phases).
+  layer and node overrides, starting and stopping, logs (later phases).
 - The service executor cannot be upgraded from the Hosts page or the Overview yet, and the setup package does not
   include it.
 

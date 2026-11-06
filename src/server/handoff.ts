@@ -29,6 +29,8 @@ export interface Heartbeat {
   busy: string | null;
   /** Job kinds this executor performs. */
   kinds?: string[];
+  /** §15.3: a service executor's collector (sampling period in seconds, members watched, samples waiting to be sent). */
+  collector?: { seconds?: number; watching?: number; backlog?: number; certificate?: unknown };
   /** The deploy root on its host. */
   root?: string;
   /** §8.6: what kind of source the host upgrades its executor from (EXECUTOR_UPGRADE_FROM); null: not set. */

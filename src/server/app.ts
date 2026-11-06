@@ -34,6 +34,7 @@ import type { DraftItem } from "./services/draft.ts";
 import { serviceStatus } from "./services/status.ts";
 import { TakeoverError, type Takeover } from "./services/takeover.ts";
 import { acceptSamples, watchList } from "./services/watch.ts";
+import { FIELDS, ingest, metrics, RANGES, trend, type Field, type Range } from "./services/metrics.ts";
 import { DEPLOYER_VERSION } from "./version.ts";
 import { validateEnvironment } from "./environment.ts";
 import { applyPatch, changedPaths, PatchError } from "./jsonpatch.ts";
@@ -156,7 +157,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     if (Number(c.req.header("content-length") ?? 0) > 4 << 20) return reject(c, 400, "samples/too-large", "At most 4 MiB of samples per request.");
     const got = acceptSamples(watchList(store, host), await c.req.json().catch(() => null));
     if ("error" in got) return reject(c, 400, "samples/invalid", got.error);
-    store.addServiceSamples(got.accepted);
+    ingest(store, got.accepted);
     return c.json({ ok: true, accepted: got.accepted.length, dropped: got.dropped });
   }));
   api.get("/executor/v1/jobs/next", executorRoute(async (c, host, kind) => {
@@ -697,7 +698,9 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     const configured = (id: string) => store.serviceConfigRevisions(id)[0]?.revision ?? null;
     // Step 6: with each its members' status in short (running at the newest discovery, executors online).
     // S23: and each member's state in the members' order, for the table view's node rows.
-    const status = (id: string) => { const st = serviceStatus(store, (h) => handoff.executor(h, "service"), id); return { status: st?.summary ?? null, states: st?.members.map((m) => m.state) ?? [] }; };
+    // Phase 2: live states, and the cards' small trends (heap, queue) over the last hour.
+    const now = new Date();
+    const status = (id: string) => { const st = serviceStatus(store, (h) => handoff.executor(h, "service"), id, now); return { status: st?.summary ?? null, states: st?.members.map((m) => m.state) ?? [], trend: trend(store, id, now) }; };
     return c.json({
       standalones: store.standalones().map((s) => ({ ...s, configRevision: configured(s.id), ...status(s.id) })),
       clusters: store.clusters().map((s) => ({ ...s, configRevision: configured(s.id), ...status(s.id) })),
@@ -728,6 +731,37 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     if (p instanceof Response) return p;
     const status = serviceStatus(store, (h) => handoff.executor(h, "service"), c.req.param("id"));
     return status ? c.json(status) : reject(c, 404, "service/unknown", `No standalone instance or cluster ${c.req.param("id")}.`);
+  });
+  const registeredService = (id: string) => store.standalones().find((s) => s.id === id) ?? store.clusters().find((s) => s.id === id);
+  // §15.3: a service's numbers per member, range=1h|6h|2d|30d or from/to (ISO), step in seconds, member, fields (comma-separated).
+  api.get("/api/services/:id/metrics", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    const id = c.req.param("id");
+    if (!registeredService(id)) return reject(c, 404, "service/unknown", `No standalone instance or cluster ${id}.`);
+    const now = new Date();
+    const range = c.req.query("range");
+    if (range !== undefined && !(range in RANGES)) return reject(c, 400, "metrics/range", `range is one of ${Object.keys(RANGES).join(", ")}.`);
+    const to = c.req.query("to") ? new Date(c.req.query("to")!) : now;
+    const from = c.req.query("from") ? new Date(c.req.query("from")!) : new Date(to.getTime() - RANGES[(range ?? "1h") as Range] * 1000);
+    if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime()) || from >= to) return reject(c, 400, "metrics/time", "from and to are ISO times, from before to.");
+    const step = c.req.query("step") ? Number(c.req.query("step")) : undefined;
+    if (step !== undefined && !(step >= 10 && step <= 86400)) return reject(c, 400, "metrics/step", "step is 10 to 86400 seconds.");
+    const fields = c.req.query("fields")?.split(",").filter(Boolean);
+    const unknown = fields?.filter((f) => !(f in FIELDS));
+    if (unknown?.length) return reject(c, 400, "metrics/fields", `Unknown fields: ${unknown.join(", ")}.`, Object.keys(FIELDS));
+    const member = c.req.query("member");
+    return c.json(metrics(store, id, { from, to, now, ...(step ? { step } : {}), ...(member ? { member } : {}), ...(fields ? { fields: fields as Field[] } : {}) }));
+  });
+  // §15.3: the bulletins taken from the samples, newest first (level, from, to, limit ≤ 1000).
+  api.get("/api/services/:id/bulletins", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    const id = c.req.param("id");
+    if (!registeredService(id)) return reject(c, 404, "service/unknown", `No standalone instance or cluster ${id}.`);
+    const q = (k: string) => c.req.query(k) || undefined;
+    const level = q("level")?.toUpperCase();
+    return c.json({ bulletins: store.serviceBulletins(id, { ...(q("from") ? { from: q("from")! } : {}), ...(q("to") ? { to: q("to")! } : {}), ...(level ? { level } : {}), ...(q("limit") ? { limit: Number(q("limit")) } : {}) }) });
   });
   api.post("/api/services/drafts", async (c) => {
     const p = await authenticate(c, "admin");

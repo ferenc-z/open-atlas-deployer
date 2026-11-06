@@ -29,6 +29,7 @@ import { Takeover } from "./services/takeover.ts";
 import { Store } from "./store.ts";
 import { WorkbenchKey } from "./workbench-key.ts";
 import { readToken, Versions, type TokenSource } from "./versions.ts";
+import { prune, rollUp } from "./services/metrics.ts";
 
 // D45: deployer.env first (the state directory and the credential key come only from there), then what an
 // administrator set on the page for the settings the file leaves unset.
@@ -103,6 +104,16 @@ setInterval(() => {
 }, 2_000).unref();
 setInterval(() => { briefs.tick().catch((error) => console.error("brief:", error)); }, 60_000).unref();
 setInterval(() => { drift.check().catch((error) => console.error("drift:", error)); }, 10 * 60_000).unref();
+// §15.3: the services' 5-minute rollups as each bucket ends, and the hourly cleanup (raw 2 days, rollups 30 days).
+const serviceUpkeep = (cleanup: boolean) => {
+  try {
+    rollUp(store, new Date());
+    if (cleanup) prune(store, new Date());
+  } catch (error) { console.error("service metrics:", error); }
+};
+setInterval(() => serviceUpkeep(false), 60_000).unref();
+setInterval(() => serviceUpkeep(true), 60 * 60_000).unref();
+setTimeout(() => serviceUpkeep(true), 30_000).unref();
 
 serve({ fetch: app.fetch, hostname: config.bind, port: config.port }, (info) => {
   console.log(`Open Atlas Deployer on http://${info.address}:${info.port}${config.basePath}/ (Workbench ${config.workbenchUrl})`);

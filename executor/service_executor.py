@@ -832,7 +832,34 @@ def trim_bulletins(d):
     return out
 
 
-TRIM = {"about": trim_about, "diagnostics": trim_diagnostics, "status": trim_status, "cluster": trim_cluster, "bulletins": trim_bulletins}
+BACKPRESSURE_TOP = 5
+
+
+def trim_backpressure(d):
+    """Back pressure from the root process group's recursive status (§15.4 step 2): how many connections there are,
+    how many are at their threshold (object count or size at 100 %), the fullest percentage and the fullest few."""
+    conns = []
+
+    def walk(snap, group):
+        if not isinstance(snap, dict):
+            return
+        for c in snap.get("connectionStatusSnapshots") or []:
+            c = (c or {}).get("connectionStatusSnapshot") or {}
+            conns.append({"id": c.get("id"), "name": c.get("name"), "group": group, "sourceName": c.get("sourceName"), "destinationName": c.get("destinationName"),
+                          **_num(c, "percentUseCount", "percentUseBytes", "flowFilesQueued", "bytesQueued")})
+        for g in snap.get("processGroupStatusSnapshots") or []:
+            g = (g or {}).get("processGroupStatusSnapshot") or {}
+            walk(g, g.get("name"))
+
+    root = ((d or {}).get("processGroupStatus") or {}).get("aggregateSnapshot")
+    walk(root, (root or {}).get("name"))
+    fill = lambda c: max(c.get("percentUseCount") or 0, c.get("percentUseBytes") or 0)
+    conns.sort(key=fill, reverse=True)
+    return {"connections": len(conns), "full": sum(1 for c in conns if fill(c) >= 100), "maxPercent": fill(conns[0]) if conns else 0,
+            "top": [c for c in conns[:BACKPRESSURE_TOP] if fill(c) > 0]}
+
+
+TRIM = {"about": trim_about, "diagnostics": trim_diagnostics, "status": trim_status, "cluster": trim_cluster, "bulletins": trim_bulletins, "backpressure": trim_backpressure}
 
 
 class Collector:
@@ -925,7 +952,8 @@ class Collector:
                                 w.get("nodeAddress") or props.get("nifi.cluster.node.address"))
         node = props.get("nifi.cluster.is.node", "false").strip().lower() == "true"
         calls = [("about", "flow/about"), ("diagnostics", "system-diagnostics?nodewise=true" if node else "system-diagnostics"), ("status", "flow/status"),
-                 *([("cluster", "controller/cluster")] if node else []), ("bulletins", f"flow/bulletin-board?limit={BULLETINS}")]
+                 *([("cluster", "controller/cluster")] if node else []), ("bulletins", f"flow/bulletin-board?limit={BULLETINS}"),
+                 ("backpressure", "flow/process-groups/root/status?recursive=true")]
         out, errors = {"state": "ok", "url": f"https://{sni}:{port}"}, {}
         deadline = time.monotonic() + NIFI_BUDGET
         for name, path in calls:

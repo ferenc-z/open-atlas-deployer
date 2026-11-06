@@ -230,7 +230,9 @@ import type { CatalogView, CompareRow, ConfigView, FileCompare, PropertyRow } fr
 export type { CatalogView, CompareRow, ConfigView, FileCompare, PropertyRow };
 export type { DraftItem, Finding, MemberStatus, ServiceDraft, ServiceStatus, Skipped };
 export type ServiceSummary = ServiceStatus["summary"];
-type Registered = { environment: string; draft: string | null; createdAt: string; createdBy: string; configRevision: number | null; status: ServiceSummary | null; states: MemberStatus["state"][] };
+type Registered = { environment: string; draft: string | null; createdAt: string; createdBy: string; configRevision: number | null; status: ServiceSummary | null; states: MemberStatus["state"][];
+  /** Phase 2: the last hour in 5-minute steps (heap % averaged over the members, queued flowfiles summed). */
+  trend: { heapPct: (number | null)[]; queuedCount: (number | null)[] } };
 export type RegisteredService = (Extract<DraftItem, { kind: "standalone" }> | Extract<DraftItem, { kind: "cluster" }>) & Registered;
 export const services = () => call<{ standalones: RegisteredService[]; clusters: RegisteredService[] }>("GET", "services");
 export const serviceStatus = (id: string) => call<ServiceStatus>("GET", `services/${encodeURIComponent(id)}/status`);
@@ -258,3 +260,10 @@ export const reassessDraft = (id: string) => call<ServiceDraft>("POST", drafts(`
 export const reviewDraft = (id: string) => call<ServiceDraft>("POST", drafts(`/${encodeURIComponent(id)}/review`), {});
 export const discardDraft = (id: string) => call<ServiceDraft>("POST", drafts(`/${encodeURIComponent(id)}/discard`), {});
 export const confirmDraft = (id: string) => call<{ draft: ServiceDraft; registered: string[]; reads: string[] }>("POST", drafts(`/${encodeURIComponent(id)}/confirm`), {});
+// Phase 2 step 2 (§15.3): a service's numbers per member, its bulletins.
+import type { Field, MetricsView, Range } from "../server/services/metrics.ts";
+import type { ServiceBulletin, ServiceCert } from "../server/store.ts";
+export type { Field, MetricsView, Range, ServiceBulletin, ServiceCert };
+export const serviceMetrics = (id: string, range: Range, fields?: Field[]) =>
+  call<MetricsView>("GET", `services/${encodeURIComponent(id)}/metrics?range=${range}${fields ? `&fields=${fields.join(",")}` : ""}`);
+export const serviceBulletins = (id: string, limit = 50) => call<{ bulletins: ServiceBulletin[] }>("GET", `services/${encodeURIComponent(id)}/bulletins?limit=${limit}`);

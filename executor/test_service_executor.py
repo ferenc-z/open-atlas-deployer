@@ -572,7 +572,8 @@ NIFI_DATA = HERE / "testdata" / "nifi"
 # port -> the version whose recorded answers it gives.
 LAB_PORTS = {18443: "1.12.1", 18444: "2.0.0", 18445: "2.5.0-cluster"}
 REST_FILES = {"flow/about": "about", "system-diagnostics": "system-diagnostics", "system-diagnostics?nodewise=true": "system-diagnostics-nodewise",
-              "flow/status": "flow-status", "controller/cluster": "controller-cluster", f"flow/bulletin-board?limit={sx.BULLETINS}": "bulletin-board"}
+              "flow/status": "flow-status", "controller/cluster": "controller-cluster", f"flow/bulletin-board?limit={sx.BULLETINS}": "bulletin-board",
+              "flow/process-groups/root/status?recursive=true": "root-status"}
 
 
 def recorded(version, path):
@@ -656,6 +657,20 @@ class RestTrimTest(unittest.TestCase):
         self.assertEqual([(b["id"], b["level"], b["nodeAddress"]) for b in bulletins], [(0, "INFO", "localhost:18445"), (1, "INFO", "localhost:18445"), (2, "INFO", "localhost:18445")])
         self.assertIn("elected Active Cluster Coordinator", bulletins[0]["message"])
         self.assertEqual(sx.trim_bulletins(json.loads(recorded("1.12.1", f"flow/bulletin-board?limit={sx.BULLETINS}")[1])), [])
+        for version in ("1.12.1", "2.0.0", "2.5.0-cluster"):
+            self.assertEqual(sx.trim_backpressure(json.loads(recorded(version, "flow/process-groups/root/status?recursive=true")[1])),
+                             {"connections": 0, "full": 0, "maxPercent": 0, "top": []}, "the lab's flows are empty")
+
+    def test_back_pressure_of_nested_groups(self):
+        conn = lambda i, count, size: {"connectionStatusSnapshot": {"id": i, "name": f"c{i}", "sourceName": "a", "destinationName": "b", "percentUseCount": count, "percentUseBytes": size, "flowFilesQueued": count * 100, "bytesQueued": 1, "queued": "text"}}
+        tree = {"processGroupStatus": {"aggregateSnapshot": {"name": "root", "connectionStatusSnapshots": [conn(1, 10, 0)], "processGroupStatusSnapshots": [
+            {"processGroupStatusSnapshot": {"name": "ingest", "connectionStatusSnapshots": [conn(2, 100, 5), conn(3, 0, 0)], "processGroupStatusSnapshots": [
+                {"processGroupStatusSnapshot": {"name": "deep", "connectionStatusSnapshots": [conn(4, 20, 100)]}}]}}]}}}
+        bp = sx.trim_backpressure(tree)
+        self.assertEqual((bp["connections"], bp["full"], bp["maxPercent"]), (4, 2, 100))
+        self.assertEqual([(c["id"], c["group"]) for c in bp["top"]], [(2, "ingest"), (4, "deep"), (1, "root")], "fullest first, empty ones left out")
+        self.assertNotIn("queued", bp["top"][0], "only numbers and names")
+        self.assertEqual(sx.trim_backpressure({}), {"connections": 0, "full": 0, "maxPercent": 0, "top": []})
 
     def test_keytool_listings_of_both_store_types(self):
         jks = sx.parse_keytool((NIFI_DATA / "1.12.1-keytool-truststore-jks.txt").read_text())
@@ -789,7 +804,8 @@ class CollectorTest(Base):
         self.assertEqual(len(n["cluster"]["nodes"]), 2)
         self.assertEqual(len(n["bulletins"]), 3)
         paths = [call[3] for call in c.calls if call[1] == 18445]
-        self.assertEqual(paths, ["flow/about", "system-diagnostics?nodewise=true", "flow/status", "controller/cluster", f"flow/bulletin-board?limit={sx.BULLETINS}"])
+        self.assertEqual(paths, ["flow/about", "system-diagnostics?nodewise=true", "flow/status", "controller/cluster", f"flow/bulletin-board?limit={sx.BULLETINS}",
+                                 "flow/process-groups/root/status?recursive=true"])
         self.assertTrue(all(call[0] == call[2] == "localhost" and call[4] <= sx.REQUEST_TIMEOUT for call in c.calls), "connects to nifi.web.https.host, checks that name")
 
         standalone = samples["n112"]["nifi"]
@@ -844,7 +860,7 @@ class CollectorTest(Base):
         finally:
             sx.time.monotonic = real
         self.assertEqual(node["state"], "partial")
-        self.assertEqual(sorted(node["errors"]), ["bulletins", "cluster"])
+        self.assertEqual(sorted(node["errors"]), ["backpressure", "bulletins", "cluster"])
         self.assertTrue(all(v.startswith("skipped") for v in node["errors"].values()))
         self.assertIn("status", node)
 

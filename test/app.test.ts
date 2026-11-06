@@ -2174,7 +2174,7 @@ test("service ops step 6: a registered service's status is its members' executor
   let flow = (await status("flow")).body;
   assert.deepEqual(flow.members.map((m: { state: string; executor: { online: boolean } }) => [m.state, m.executor.online]), [["unknown", true], ["unknown", true]], "no discovery yet");
   const single1 = (await status("n200")).body;
-  assert.deepEqual([single1.kind, single1.members[0].state, single1.members[0].executor.online], ["standalone", "unknown", false], "app1 has no service executor");
+  assert.deepEqual([single1.kind, single1.members[0].state, single1.members[0].executor.online], ["standalone", "lost", false], "app1 has no service executor: lost");
   assert.equal((await status("nothing")).code, 404);
 
   // A discovery that failed does not count; the newest succeeded one does.
@@ -2187,7 +2187,8 @@ test("service ops step 6: a registered service's status is its members' executor
   await discover("failed", []);
   flow = (await status("flow")).body;
   assert.deepEqual(flow.members.map((m: { state: string; seen: { version: string; pid: number | null } }) => [m.state, m.seen.version, m.seen.pid]), [["running", "2.5.0", 11], ["stopped", "2.5.1", null]]);
-  assert.deepEqual(flow.summary, { members: 2, running: 1, executorsOnline: 2, versionsSeen: ["2.5.1"], differences: 0, findings: { error: 0, warning: 0, info: 0 } });
+  assert.deepEqual(flow.summary, { members: 2, running: 1, executorsOnline: 2, versionsSeen: ["2.5.1"], differences: 0, findings: { error: 0, warning: 0, info: 0 }, asOf: "2026-11-05T01:00:00Z", period: 60, cert: null, certErrors: 0 });
+  assert.deepEqual(flow.members.map((m: { source: string }) => m.source), ["discovery", "discovery"], "never sampled: as of the discovery");
   assert.deepEqual([flow.findings, flow.events.map((e: { kind: string }) => e.kind)], [[], ["registered"]], "registered without a draft or a configuration");
   assert.equal(flow.zookeeperRoot, "/flow");
   await discover("succeeded", [{ installDir: "/opt/a", running: true, version: "2.5.0", process: { pid: 12 } }]);
@@ -2274,4 +2275,17 @@ test("§15.2 P5, §15.3: a service executor's heartbeat reply carries its watch 
   assert.equal((await call("/executor/v1/samples", service, { method: "POST", body: "{\"nope\":1}" })).status, 400);
   assert.equal((await send(deploy, [sample("app2:/opt/a", "2026-11-06T01:03:00Z")])).status, 409);
   assert.equal((await send("dpe_unknown", [])).status, 401);
+
+  // Step 2: the numbers and bulletins of what was kept, over the API.
+  await send(service, [sample("app2:/opt/a", "2026-11-06T01:04:00Z", { nifi: { state: "ok", about: { timezone: "UTC" }, bulletins: [{ id: 3, timestamp: "01:03:30 UTC", nodeAddress: "node-8443", level: "ERROR", message: "boom" }] } })]);
+  const m = await (await t.request("/api/services/flow/metrics?from=2026-11-06T00:30:00Z&to=2026-11-06T01:30:00Z&fields=up,heapPct", { as: "viewer" })).json();
+  assert.deepEqual(m.members.map((x: { member: string; values: { up: number[] } }) => [x.member, x.values.up.filter((v) => v === 1).length]), [["app2:/opt/a", 3]]);
+  assert.deepEqual(Object.keys(m.members[0].values), ["up", "heapPct"]);
+  assert.equal((await t.request("/api/services/flow/metrics?range=1y", { as: "viewer" })).status, 400);
+  assert.equal((await t.request("/api/services/flow/metrics?fields=nope", { as: "viewer" })).status, 400);
+  assert.equal((await t.request("/api/services/none/metrics", { as: "viewer" })).status, 404);
+  const b = await (await t.request("/api/services/flow/bulletins?level=error", { as: "viewer" })).json();
+  assert.deepEqual(b.bulletins.map((x: { id: number; at: string; node: string }) => [x.id, x.at, x.node]), [[3, "2026-11-06T01:03:30Z", "node-8443"]]);
+  const listed = await (await t.request("/api/services", { as: "viewer" })).json();
+  assert.equal(listed.clusters[0].trend.heapPct.length, 12, "the cards' trend: an hour in 5-minute steps");
 });

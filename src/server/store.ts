@@ -113,6 +113,17 @@ CREATE TABLE IF NOT EXISTS service_configs (
 CREATE TABLE IF NOT EXISTS service_samples (
   service TEXT NOT NULL, member TEXT NOT NULL, at TEXT NOT NULL, body TEXT NOT NULL, received_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS service_samples_at ON service_samples (service, member, at);
+CREATE TABLE IF NOT EXISTS service_rollups (
+  service TEXT NOT NULL, member TEXT NOT NULL, bucket TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY (service, member, bucket));
+CREATE TABLE IF NOT EXISTS service_bulletins (
+  service TEXT NOT NULL, member TEXT NOT NULL, node TEXT NOT NULL, bulletin_id INTEGER NOT NULL, at TEXT NOT NULL, level TEXT,
+  category TEXT, source TEXT, source_type TEXT, message TEXT, received_at TEXT NOT NULL);
+CREATE UNIQUE INDEX IF NOT EXISTS service_bulletins_key ON service_bulletins (service, node, bulletin_id, at);
+CREATE INDEX IF NOT EXISTS service_bulletins_at ON service_bulletins (service, at);
+CREATE TABLE IF NOT EXISTS service_certs (
+  service TEXT NOT NULL, member TEXT NOT NULL, store TEXT NOT NULL, path TEXT, type TEXT, alias TEXT, chain INTEGER,
+  subject TEXT, issuer TEXT, not_before TEXT, not_after TEXT, read_at TEXT NOT NULL, error TEXT);
+CREATE INDEX IF NOT EXISTS service_certs_member ON service_certs (service, member);
 `;
 
 /** queued: waiting for the host's executor to claim it; the rest are the executor's states. */
@@ -257,6 +268,8 @@ export class Store {
     for (const table of ["service_standalones", "service_nodes"]) {
       if (!(this.db.prepare(`PRAGMA table_info(${table})`).all() as Row[]).some((c) => c.name === "conf_dir")) this.db.exec(`ALTER TABLE ${table} ADD COLUMN conf_dir TEXT`);
     }
+    // Phase 2 step 2: each sample's flat numbers (the Metrics tab, the rollups), next to step 1's raw body.
+    if (!(this.db.prepare("PRAGMA table_info(service_samples)").all() as Row[]).some((c) => c.name === "point")) this.db.exec("ALTER TABLE service_samples ADD COLUMN point TEXT");
   }
 
   close() { this.db.close(); }
@@ -1027,19 +1040,114 @@ export class Store {
     }));
   }
 
-  // §15.3: the collector's samples as the service executors send them (raw; phase 2 step 2 adds the rollups, the
-  // 2-day retention, bulletins and certificates taken out of them).
-  addServiceSamples(samples: { service: string; member: string; at: string }[]) {
+  // §15.3: the collector's samples as the service executors send them. Step 2 keeps each with its flat numbers
+  // (point: the Metrics tab and the rollups); bulletins and certificates go to their own tables (services/metrics.ts).
+  addServiceSamples(samples: { service: string; member: string; at: string; point?: Point | null }[]) {
     if (!samples.length) return;
     const at = this.stamp();
-    const insert = this.db.prepare("INSERT INTO service_samples (service, member, at, body, received_at) VALUES (?, ?, ?, ?, ?)");
-    this.inTransaction(() => { for (const s of samples) insert.run(s.service, s.member, s.at, JSON.stringify(s), at); });
+    const insert = this.db.prepare("INSERT INTO service_samples (service, member, at, body, received_at, point) VALUES (?, ?, ?, ?, ?, ?)");
+    this.inTransaction(() => { for (const { point, ...s } of samples) insert.run(s.service, s.member, s.at, JSON.stringify(s), at, point ? JSON.stringify(point) : null); });
   }
 
   /** The newest sample of each member of a service. */
-  latestServiceSamples(service: string): { member: string; at: string; receivedAt: string; body: Record<string, unknown> }[] {
-    return (this.db.prepare(`SELECT member, at, body, received_at FROM service_samples s WHERE service = ?1
+  latestServiceSamples(service: string): { member: string; at: string; receivedAt: string; body: Record<string, unknown>; point: Point | null }[] {
+    return (this.db.prepare(`SELECT member, at, body, received_at, point FROM service_samples s WHERE service = ?1
       AND rowid = (SELECT rowid FROM service_samples WHERE service = ?1 AND member = s.member ORDER BY at DESC, rowid DESC LIMIT 1) ORDER BY member`).all(service) as Row[])
-      .map((r) => ({ member: r.member, at: r.at, receivedAt: r.received_at, body: JSON.parse(r.body) }));
+      .map((r) => ({ member: r.member, at: r.at, receivedAt: r.received_at, body: JSON.parse(r.body), point: parse(r.point ?? null) }));
+  }
+
+  /** A member's newest sample before a time (the previous one, for the rates). */
+  serviceSampleBefore(service: string, member: string, before: string): { at: string; body: Record<string, unknown>; point: Point | null } | undefined {
+    const r = this.db.prepare("SELECT at, body, point FROM service_samples WHERE service = ? AND member = ? AND at < ? ORDER BY at DESC, rowid DESC LIMIT 1").get(service, member, before) as Row | undefined;
+    return r ? { at: r.at, body: JSON.parse(r.body), point: parse(r.point ?? null) } : undefined;
+  }
+
+  /** The flat numbers of a service's samples in [from, to), oldest first. */
+  servicePoints(service: string, from: string, to: string): { member: string; at: string; point: Point }[] {
+    return (this.db.prepare("SELECT member, at, point FROM service_samples WHERE service = ? AND at >= ? AND at < ? AND point IS NOT NULL ORDER BY at").all(service, from, to) as Row[])
+      .map((r) => ({ member: r.member, at: r.at, point: JSON.parse(r.point) }));
+  }
+
+  /** The members with samples at or after a time, with their oldest such sample. */
+  sampledMembers(since: string): { service: string; member: string; first: string }[] {
+    return (this.db.prepare("SELECT service, member, MIN(at) AS first FROM service_samples WHERE at >= ? AND point IS NOT NULL GROUP BY service, member").all(since) as Row[])
+      .map((r) => ({ service: r.service, member: r.member, first: r.first }));
+  }
+
+  /** The newest 5-minute bucket rolled up for a member. */
+  lastServiceRollup(service: string, member: string): string | undefined {
+    return ((this.db.prepare("SELECT MAX(bucket) AS b FROM service_rollups WHERE service = ? AND member = ?").get(service, member) as Row | undefined)?.b as string | null) ?? undefined;
+  }
+
+  memberPoints(service: string, member: string, from: string, to: string): { at: string; point: Point }[] {
+    return (this.db.prepare("SELECT at, point FROM service_samples WHERE service = ? AND member = ? AND at >= ? AND at < ? AND point IS NOT NULL ORDER BY at").all(service, member, from, to) as Row[])
+      .map((r) => ({ at: r.at, point: JSON.parse(r.point) }));
+  }
+
+  putServiceRollups(rows: { service: string; member: string; bucket: string; body: unknown }[]) {
+    if (!rows.length) return;
+    const put = this.db.prepare("INSERT OR REPLACE INTO service_rollups (service, member, bucket, body) VALUES (?, ?, ?, ?)");
+    this.inTransaction(() => { for (const r of rows) put.run(r.service, r.member, r.bucket, JSON.stringify(r.body)); });
+  }
+
+  serviceRollups(service: string, from: string, to: string): { member: string; bucket: string; body: any }[] {
+    return (this.db.prepare("SELECT member, bucket, body FROM service_rollups WHERE service = ? AND bucket >= ? AND bucket < ? ORDER BY bucket").all(service, from, to) as Row[])
+      .map((r) => ({ member: r.member, bucket: r.bucket, body: JSON.parse(r.body) }));
+  }
+
+  /** Bulletins, each once (by node, id and time: after a restart the ids start from 0 again, at other times). */
+  addServiceBulletins(rows: ServiceBulletin[]): number {
+    if (!rows.length) return 0;
+    const received = this.stamp();
+    const insert = this.db.prepare(`INSERT OR IGNORE INTO service_bulletins (service, member, node, bulletin_id, at, level, category, source, source_type, message, received_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    let added = 0;
+    this.inTransaction(() => { for (const b of rows) added += Number(insert.run(b.service, b.member, b.node, b.id, b.at, b.level, b.category, b.source, b.sourceType, b.message, received).changes); });
+    return added;
+  }
+
+  serviceBulletins(service: string, options: { from?: string; to?: string; level?: string; limit?: number } = {}): ServiceBulletin[] {
+    const where = ["service = ?"], args: (string | number)[] = [service];
+    if (options.from) { where.push("at >= ?"); args.push(options.from); }
+    if (options.to) { where.push("at < ?"); args.push(options.to); }
+    if (options.level) { where.push("level = ?"); args.push(options.level); }
+    args.push(Math.min(1000, Math.max(1, options.limit ?? 200)));
+    return (this.db.prepare(`SELECT * FROM service_bulletins WHERE ${where.join(" AND ")} ORDER BY at DESC, bulletin_id DESC LIMIT ?`).all(...args) as Row[])
+      .map((r) => ({ service: r.service, member: r.member, node: r.node, id: r.bulletin_id, at: r.at, level: r.level ?? null, category: r.category ?? null, source: r.source ?? null, sourceType: r.source_type ?? null, message: r.message ?? null }));
+  }
+
+  /** S27: a member's certificates as of one reading, kept only when newer (by readAt) than what is there; only the newest reading stays. */
+  putServiceCerts(service: string, member: string, readAt: string, rows: Omit<ServiceCert, "member" | "readAt">[]): boolean {
+    const had = (this.db.prepare("SELECT MAX(read_at) AS r FROM service_certs WHERE service = ? AND member = ?").get(service, member) as Row | undefined)?.r as string | null | undefined;
+    if (had && had >= readAt) return false;
+    const insert = this.db.prepare("INSERT INTO service_certs (service, member, store, path, type, alias, chain, subject, issuer, not_before, not_after, read_at, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    this.inTransaction(() => {
+      this.db.prepare("DELETE FROM service_certs WHERE service = ? AND member = ?").run(service, member);
+      for (const c of rows) insert.run(service, member, c.store, c.path, c.type, c.alias, c.chain, c.subject, c.issuer, c.notBefore, c.notAfter, readAt, c.error);
+    });
+    return true;
+  }
+
+  serviceCerts(service: string): ServiceCert[] {
+    return (this.db.prepare("SELECT * FROM service_certs WHERE service = ? ORDER BY member, store, alias, chain").all(service) as Row[]).map((r) => ({
+      member: r.member, store: r.store, path: r.path ?? null, type: r.type ?? null, alias: r.alias ?? null, chain: r.chain ?? null, subject: r.subject ?? null, issuer: r.issuer ?? null,
+      notBefore: r.not_before ?? null, notAfter: r.not_after ?? null, readAt: r.read_at, error: r.error ?? null,
+    }));
+  }
+
+  /** §15.3 retention: raw samples and bulletins before one time, rollups before another. */
+  pruneServiceData(samplesBefore: string, rollupsBefore: string): { samples: number; bulletins: number; rollups: number } {
+    const out = { samples: 0, bulletins: 0, rollups: 0 };
+    this.inTransaction(() => {
+      out.samples = Number(this.db.prepare("DELETE FROM service_samples WHERE at < ?").run(samplesBefore).changes);
+      out.bulletins = Number(this.db.prepare("DELETE FROM service_bulletins WHERE at < ?").run(samplesBefore).changes);
+      out.rollups = Number(this.db.prepare("DELETE FROM service_rollups WHERE bucket < ?").run(rollupsBefore).changes);
+    });
+    return out;
   }
 }
+
+/** A sample's flat numbers (services/metrics.ts). */
+export type Point = Record<string, number | null>;
+export interface ServiceBulletin { service: string; member: string; node: string; id: number; at: string; level: string | null; category: string | null; source: string | null; sourceType: string | null; message: string | null }
+export interface ServiceCert { member: string; store: string; path: string | null; type: string | null; alias: string | null; chain: number | null; subject: string | null; issuer: string | null; notBefore: string | null; notAfter: string | null; readAt: string; error: string | null }

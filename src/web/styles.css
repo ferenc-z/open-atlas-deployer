@@ -13,6 +13,10 @@
   --bad-bg: #fbe4e2;
   --info: #22558f;
   --info-bg: #e2edf9;
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --series-3: #1baf7a;
+  --series-4: #eda100;
   color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
@@ -31,6 +35,10 @@
     --bad-bg: #3d1b19;
     --info: #8fb8ea;
     --info-bg: #182a40;
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
+    --series-4: #c98500;
     color-scheme: dark;
   }
 }
@@ -372,3 +380,20 @@ table.props tr.sev-info td { background: var(--info-bg); }
 p.page-note { margin: -4px 0 14px; }
 .svc-summary-line h1.mono { font-size: 18px; }
 .row.config-filter input[type="checkbox"] { flex: none; min-width: 0; }
+
+/* Phase 2 step 2: the Metrics tab's charts (Charts.tsx), the cards' sparklines, certificates. */
+.range-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.charts { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 420px), 1fr)); gap: 12px; }
+.chart { margin: 0; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); min-width: 0; }
+.chart figcaption { margin-bottom: 4px; }
+.chart-plot { position: relative; }
+.chart-plot svg { display: block; overflow: visible; }
+.chart-grid { stroke: var(--border); stroke-width: 1; }
+.chart-cross { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 3 3; }
+.chart-axis { fill: var(--muted); font-size: 11px; }
+.chart-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; list-style: none; margin: 0 0 4px; padding: 0; }
+.swatch { display: inline-block; width: 10px; height: 3px; border-radius: 2px; margin-right: 6px; vertical-align: middle; }
+.chart-tip { position: absolute; top: 4px; pointer-events: none; min-width: 150px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12); }
+.spark { display: inline-flex; align-items: center; gap: 6px; }
+.svc-card-trend { display: flex; flex-wrap: wrap; gap: 4px 14px; }
+.chart-section { display: grid; gap: 8px; }

@@ -11,7 +11,8 @@ import type { DiscoveryView, DraftItem, DraftSummary, Finding, HostView, Registe
 import { ask } from "./Confirm.tsx";
 import { Markdown } from "./Markdown.tsx";
 import { ServiceDetail } from "./ServiceDetail.tsx";
-import { ConfCell, confElsewhere, DifferenceBadge, memberKey, membersOf, serviceName, SEVERITY, STATE, StatusNotes, UpBadge, webPort, when } from "./svc.tsx";
+import { CertBadge, ConfCell, confElsewhere, DifferenceBadge, memberKey, membersOf, serviceName, SEVERITY, STATE, StatusNotes, UpBadge, webPort, when } from "./svc.tsx";
+import { Sparkline } from "./Charts.tsx";
 
 type Problem = { message: string; details: string[] };
 const problemOf = (e: unknown): Problem => ({ message: (e as Error).message, details: (e as api.ApiError).details ?? [] });
@@ -53,7 +54,7 @@ export function ServicesPage({ onTakeover }: { onTakeover: () => void }) {
         </div>
         <button className="link" onClick={onTakeover}>Take over more…</button>
       </div>
-      <p className="muted page-note">NiFi taken over by the Deployer, by environment. Whether a member runs is as of its host's newest discovery; phase 1 has no live probes.</p>
+      <p className="muted page-note">NiFi taken over by the Deployer, by environment. Whether a member runs is live, from its host's service executor's samples (unknown after 3 sampling periods without one, lost when the executor is offline). The trends are the last hour.</p>
       {error && <p className="error">{error}</p>}
       {!all.length && <section className="card"><p className="muted">Nothing is registered yet. Discover on the hosts and confirm a takeover draft first.</p><button className="primary" onClick={onTakeover}>Open Takeover</button></section>}
       {all.length > 0 && envs.map((env) => {
@@ -87,8 +88,13 @@ function ServiceCard({ s, onOpen }: { s: RegisteredService; onOpen: () => void }
       <ul className="svc-members mono small">{members.map((m, i) => (
         <li key={memberKey(m)}><span className={`dot ${STATE[s.states[i] ?? "unknown"].tone}`} title={STATE[s.states[i] ?? "unknown"].label} />{where(m)}{s.kind === "cluster" && m.nodeAddress ? <span className="muted"> · {m.nodeAddress}</span> : null}</li>
       ))}</ul>
+      {s.trend && (s.trend.heapPct.some((v) => v !== null) || s.trend.queuedCount.some((v) => v !== null)) && <div className="svc-card-trend">
+        <Sparkline label="Heap" values={s.trend.heapPct} unit="%" />
+        <Sparkline label="Queued" values={s.trend.queuedCount} unit="count" />
+      </div>}
       <div className="svc-card-foot">
         <span className="small">{s.configRevision ? <>Config <span className="mono">r{s.configRevision}</span></> : <span className="muted">No configuration</span>}</span>
+        <CertBadge s={s.status} only30 />
         <DifferenceBadge s={s.status} cluster={s.kind === "cluster"} />
         <StatusNotes s={s.status} />
       </div>
@@ -116,7 +122,7 @@ function ServiceTable({ services, onOpen }: { services: RegisteredService[]; onO
               <td>{kindLabel(s)}</td>
               <td>{serviceName(s.service)} <span className="mono">{s.version}</span></td>
               <td className="mono small">{cluster ? <span className="muted">{members.length} nodes</span> : where(members[0]!)}</td>
-              <td><UpBadge s={s.status} /> <StatusNotes s={s.status} /></td>
+              <td><UpBadge s={s.status} /> <CertBadge s={s.status} only30 /> <StatusNotes s={s.status} /></td>
               <td>{s.configRevision ? <span className="mono">r{s.configRevision}</span> : <span className="muted">None</span>}</td>
               <td>{cluster ? <DifferenceBadge s={s.status} cluster /> : <span className="muted">—</span>}</td>
             </tr>
