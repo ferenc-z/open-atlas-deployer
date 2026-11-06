@@ -16,6 +16,14 @@ from the directories it is given, and svc-read (§6 step 5), which reads an inst
 Deployer to import; their content goes once over the job's content channel, never into the job's status. The executor
 refuses any kind it does not know, deploy jobs included.
 
+Beside the jobs runs the collector (§9.1, §15.3): every EXECUTOR_COLLECT_SECONDS it samples each NiFi the Deployer
+watches on this machine (the watch list comes with every heartbeat reply, §15.2 P5; nothing else is sampled): the
+process and the host from /proc, the disks of the repositories and logs, the NiFi's REST API with the monitor
+certificate (EXECUTOR_NIFI_CLIENT_CERT/KEY/CA, S11, P6) and, once an hour, the expiry of the certificates in its
+keystore and truststore (keytool, the password passed in the environment) and of the monitor certificate (S27). The
+samples go to POST /executor/v1/samples, at most 20 at a time; those the Deployer cannot take wait in memory up to 30
+minutes. One NiFi that hangs costs at most 10 seconds of its own sample.
+
 The release holds one file: package.sh puts executor_core's code in place of the import block below (bundle.py).
 
 Standard library only; Python 3.9.
@@ -24,11 +32,16 @@ import base64
 import glob
 import hashlib
 import hmac
+import http.client
 import json
 import os
 import pathlib
 import pwd
 import re
+import shutil
+import socket
+import ssl
+import subprocess
 import sys
 import threading
 import time
@@ -64,6 +77,15 @@ def config(env_file=None, environ=None):
         # The read channel: how many reads run at once, and the longest one may take.
         "read_slots": max(1, int(e.get("EXECUTOR_READ_SLOTS", "4"))),
         "read_timeout": max(1, int(e.get("EXECUTOR_READ_TIMEOUT", "120"))),
+        # The collector (§9.1, §15.3): how often it samples the NiFi the Deployer watches here (30 to 300 seconds), and
+        # the monitor certificate it calls their REST API with (S11, §15.2 P6; files of mode 600). Without the
+        # certificate it samples only /proc and the disks. EXECUTOR_NIFI_CA_RELAXED=1 accepts a CA whose Basic
+        # Constraints are not marked critical (Python 3.13+ refuses it under VERIFY_X509_STRICT; the lab's toolkit CA).
+        "collect_seconds": min(COLLECT_MAX, max(COLLECT_MIN, int(e.get("EXECUTOR_COLLECT_SECONDS", str(COLLECT_DEFAULT))))),
+        "nifi_client_cert": e.get("EXECUTOR_NIFI_CLIENT_CERT", "").strip(),
+        "nifi_client_key": e.get("EXECUTOR_NIFI_CLIENT_KEY", "").strip(),
+        "nifi_ca": e.get("EXECUTOR_NIFI_CA", "").strip(),
+        "nifi_ca_relaxed": e.get("EXECUTOR_NIFI_CA_RELAXED", "").strip().lower() in ("1", "true", "yes"),
         # §8.6: where the installed releases are, and the only place a newer one may come from.
         "base": pathlib.Path(e.get("EXECUTOR_BASE", "/opt/open-atlas-deployer/service-executor")),
         "upgrade_from": e.get("EXECUTOR_UPGRADE_FROM", "").strip(),
@@ -605,6 +627,478 @@ class Discovery:
         return {"instances": [instances[k] for k in sorted(instances)], "dirs": asked, "skipped": self.skipped}
 
 
+# --- the collector (§9.1, §15.3): a sample of every NiFi the Deployer watches on this machine, every minute ----------
+
+COLLECT_DEFAULT, COLLECT_MIN, COLLECT_MAX = 60, 30, 300
+# Per NiFi and round, and per REST request: a NiFi that hangs costs its own sample at most this, never the others'.
+NIFI_BUDGET = 10.0
+REQUEST_TIMEOUT = 5.0
+# The push (POST /executor/v1/samples): at most this many per request; while the Deployer cannot take them they wait in
+# memory, the oldest dropped after 30 minutes (and beyond MAX_BACKLOG).
+SAMPLES_PER_POST = 20
+BACKLOG_SECONDS = 30 * 60
+MAX_BACKLOG = 2000
+# Certificates (S27) are read once an hour, or when nifi.properties or a store file changes.
+CERTS_EVERY = 3600
+BULLETINS = 50
+MESSAGE_MAX = 2048
+REST_MAX = 4 << 20
+WATCH_MAX = 64
+# nifi.web.https.host values that bind every interface: the collector then connects to localhost.
+WILDCARD_HOSTS = ("", "0.0.0.0", "::", "[::]")
+DN_NAMES = {"commonName": "CN", "organizationalUnitName": "OU", "organizationName": "O", "countryName": "C", "localityName": "L", "stateOrProvinceName": "ST"}
+MONTHS = {m: i for i, m in enumerate(("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"), 1)}
+
+
+def ok_path(p):
+    return isinstance(p, str) and p.startswith("/") and "\0" not in p and len(p) <= 1024
+
+
+def watch_entries(value):
+    """The watch list of a heartbeat reply (§15.2 P5): what the Deployer registered on this host (service id, member,
+    profile, installation and conf directory, HTTPS host and port, log directory). Malformed entries are left out."""
+    out = []
+    for w in (value if isinstance(value, list) else [])[:WATCH_MAX]:
+        if not isinstance(w, dict) or not all(isinstance(w.get(k), str) and w[k] for k in ("service", "member")) or not ok_path(w.get("installDir")):
+            continue
+        conf, logs = w.get("confDir"), w.get("logDir")
+        https = w.get("https") if isinstance(w.get("https"), dict) else {}
+        out.append({
+            "service": w["service"][:200], "member": w["member"][:1200],
+            "profile": w["profile"] if isinstance(w.get("profile"), str) else None,
+            "installDir": os.path.normpath(w["installDir"]), "confDir": os.path.normpath(conf) if ok_path(conf) else None,
+            "https": {"host": https["host"] if isinstance(https.get("host"), str) else None, "port": as_port(https.get("port"))},
+            "nodeAddress": w["nodeAddress"] if isinstance(w.get("nodeAddress"), str) else None,
+            "logDir": os.path.normpath(logs) if ok_path(logs) else None,
+        })
+    return out
+
+
+def java_date(text):
+    """keytool's date ("Wed Nov 04 14:19:17 UTC 2026", run in English and UTC) as ISO 8601; other zones as given."""
+    m = re.match(r"^\w{3} (\w{3}) (\d{1,2}) (\d\d):(\d\d):(\d\d) (UTC|GMT) (\d{4})$", text.strip())
+    if not m or m.group(1) not in MONTHS:
+        return text.strip()
+    return f"{m.group(7)}-{MONTHS[m.group(1)]:02d}-{int(m.group(2)):02d}T{m.group(3)}:{m.group(4)}:{m.group(5)}Z"
+
+
+def parse_keytool(text):
+    """The certificates of `keytool -list -v`: per entry its alias, and per certificate (a private key entry has a
+    chain: chain 1 is the entry's own) the subject, issuer and validity."""
+    certs, alias, chain, cur = [], None, None, None
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("Alias name:"):
+            alias, chain, cur = s.split(":", 1)[1].strip(), None, None
+        elif re.match(r"^Certificate\[\d+\]:$", s):
+            chain = int(s[12:-2])
+        elif s.startswith("Owner:"):
+            cur = {"alias": alias, **({"chain": chain} if chain else {}), "subject": s[6:].strip()}
+            certs.append(cur)
+        elif s.startswith("Issuer:") and cur is not None and "issuer" not in cur:
+            cur["issuer"] = s[7:].strip()
+        elif s.startswith("Valid from:") and cur is not None and "notAfter" not in cur:
+            m = re.match(r"^Valid from: (.+) until: (.+)$", s)
+            if m:
+                cur["notBefore"], cur["notAfter"] = java_date(m.group(1)), java_date(m.group(2))
+    return certs
+
+
+def keytool_error(text):
+    """What a failed keytool said, in one line."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    said = next((line for line in lines if line.startswith("keytool error:")), lines[0] if lines else "keytool failed")
+    return re.sub(r"^keytool error:\s*(java\.[\w.]+Exception:\s*)?", "", said)[:300]
+
+
+def pem_certificate(path):
+    """A PEM certificate's subject, issuer and validity (the monitor certificate), without a library."""
+    try:
+        decoded = ssl._ssl._test_decode_cert(str(path))  # noqa: SLF001 (the standard library's own PEM reader)
+    except (AttributeError, OSError, ssl.SSLError) as e:
+        raise Failed(f"cannot read {path}: {getattr(e, 'strerror', None) or e}")
+
+    def dn(rdns):
+        # Most specific first, as keytool prints it.
+        return ", ".join(f"{DN_NAMES.get(k, k)}={v}" for rdn in reversed(rdns or ()) for k, v in rdn)
+
+    def iso(value):
+        return iso_at(ssl.cert_time_to_seconds(value)) if value else None
+    return {"subject": dn(decoded.get("subject")), "issuer": dn(decoded.get("issuer")), "notBefore": iso(decoded.get("notBefore")), "notAfter": iso(decoded.get("notAfter"))}
+
+
+def nifi_context(cfg):
+    """The TLS context of the collector's REST calls: the monitor certificate (S11), the CA it trusts, the host name
+    checked. (context, None), or (None, why not)."""
+    cert, key, ca = cfg.get("nifi_client_cert"), cfg.get("nifi_client_key"), cfg.get("nifi_ca")
+    if not cert or not key:
+        return None, "no monitor certificate (EXECUTOR_NIFI_CLIENT_CERT and EXECUTOR_NIFI_CLIENT_KEY are not set)"
+    try:
+        ctx = ssl.create_default_context(cafile=ca or None)
+        if cfg.get("nifi_ca_relaxed"):
+            ctx.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)
+        ctx.load_cert_chain(cert, key)
+    except (OSError, ssl.SSLError) as e:
+        return None, f"cannot load the monitor certificate: {getattr(e, 'strerror', None) or e}"
+    return ctx, None
+
+
+class SniConnection(http.client.HTTPSConnection):
+    """HTTPS to one address, with the TLS server name (SNI and the host name checked) set apart: the collector may
+    connect to localhost while the NiFi's certificate names nifi.web.https.host."""
+
+    def __init__(self, host, port, sni, context, timeout):
+        super().__init__(host, port, timeout=timeout, context=context)
+        self.sni, self.tls = sni, context
+
+    def connect(self):
+        sock = socket.create_connection((self.host, self.port), self.timeout)
+        self.sock = self.tls.wrap_socket(sock, server_hostname=self.sni)
+
+
+def endpoint(https_host, node_address=None):
+    """(where to connect, the TLS name): nifi.web.https.host when it names one; else localhost, checked against the
+    node address (or localhost)."""
+    host = (https_host or "").strip()
+    if host in WILDCARD_HOSTS:
+        return "localhost", (node_address or "localhost")
+    return host, host
+
+
+def _num(d, *keys):
+    return {k: d[k] for k in keys if isinstance(d.get(k), (int, float)) and not isinstance(d.get(k), bool)}
+
+
+def _storage(u):
+    return {"identifier": u.get("identifier"), **_num(u, "totalSpaceBytes", "usedSpaceBytes", "freeSpaceBytes")}
+
+
+def trim_snapshot(s):
+    """One system-diagnostics snapshot: heap, threads, GC, repositories, versions."""
+    s = s if isinstance(s, dict) else {}
+    v = s.get("versionInfo") or {}
+    return {
+        "heap": {"usedBytes": s.get("usedHeapBytes"), "maxBytes": s.get("maxHeapBytes"), "totalBytes": s.get("totalHeapBytes")},
+        "nonHeapUsedBytes": s.get("usedNonHeapBytes"),
+        **_num(s, "totalThreads", "daemonThreads", "availableProcessors", "processorLoadAverage"),
+        "uptime": s.get("uptime"),
+        "gc": [{"name": g.get("name"), "count": g.get("collectionCount"), "millis": g.get("collectionMillis")} for g in s.get("garbageCollection") or [] if isinstance(g, dict)],
+        "repositories": {
+            "flowfile": [_storage(s["flowFileRepositoryStorageUsage"])] if isinstance(s.get("flowFileRepositoryStorageUsage"), dict) else [],
+            "content": [_storage(u) for u in s.get("contentRepositoryStorageUsage") or [] if isinstance(u, dict)],
+            "provenance": [_storage(u) for u in s.get("provenanceRepositoryStorageUsage") or [] if isinstance(u, dict)],
+        },
+        "version": v.get("niFiVersion"), "java": v.get("javaVersion"),
+    }
+
+
+def trim_about(d):
+    a = (d or {}).get("about") or {}
+    return {k: a[k] for k in ("version", "buildTag", "timezone") if k in a}
+
+
+def trim_diagnostics(d):
+    sd = (d or {}).get("systemDiagnostics") or {}
+    out = {"aggregate": trim_snapshot(sd.get("aggregateSnapshot"))}
+    if isinstance(sd.get("nodeSnapshots"), list):
+        out["nodes"] = [{"nodeId": n.get("nodeId"), "address": n.get("address"), "apiPort": n.get("apiPort"), **trim_snapshot(n.get("snapshot"))}
+                        for n in sd["nodeSnapshots"] if isinstance(n, dict)]
+    return out
+
+
+def trim_status(d):
+    cs = (d or {}).get("controllerStatus") or {}
+    return {k: v for k, v in cs.items() if isinstance(v, (int, float, bool)) or k == "connectedNodes"}
+
+
+def trim_cluster(d):
+    nodes = ((d or {}).get("cluster") or {}).get("nodes") or []
+    keep = ("nodeId", "address", "apiPort", "status", "roles", "heartbeat", "nodeStartTime", "activeThreadCount", "flowFilesQueued", "bytesQueued")
+    return {"nodes": [{**{k: n.get(k) for k in keep if k in n},
+                       "events": [{"timestamp": e.get("timestamp"), "category": e.get("category"), "message": str(e.get("message", ""))[:MESSAGE_MAX]}
+                                  for e in (n.get("events") or [])[:5] if isinstance(e, dict)]} for n in nodes if isinstance(n, dict)]}
+
+
+def trim_bulletins(d):
+    """The bulletins: id, time (NiFi gives only the time of day, in its own zone), node, level, source, message."""
+    out = []
+    for b in ((d or {}).get("bulletinBoard") or {}).get("bulletins") or []:
+        if not isinstance(b, dict):
+            continue
+        inner = b.get("bulletin") if isinstance(b.get("bulletin"), dict) else {}
+        out.append({"id": b.get("id", inner.get("id")), "timestamp": b.get("timestamp", inner.get("timestamp")), "nodeAddress": b.get("nodeAddress", inner.get("nodeAddress")),
+                    **{k: inner.get(k) for k in ("level", "category", "sourceId", "sourceName", "sourceType", "groupId") if inner.get(k) is not None},
+                    **({"message": str(inner["message"])[:MESSAGE_MAX]} if inner.get("message") is not None else {})})
+    return out
+
+
+TRIM = {"about": trim_about, "diagnostics": trim_diagnostics, "status": trim_status, "cluster": trim_cluster, "bulletins": trim_bulletins}
+
+
+class Collector:
+    """Samples the watched NiFi (§15.3): process and host from /proc, disks, the REST API with the monitor certificate,
+    the certificates' expiry (S27). Only reads; passwords and keys never leave the host. Tests replace fetch and keytool."""
+
+    def __init__(self, cfg, proc="/proc", uid=None, log=lambda text: None):
+        self.cfg = cfg
+        self.proc = pathlib.Path(proc)
+        self.uid = uid
+        self.log = log
+        self.certs = {}      # member -> {"at": monotonic, "signature": ..., "stores": [...]}
+        self.keytools = {}   # member -> the keytool last found for it (a stopped NiFi has no JAVA_HOME to look at)
+        self.bulletins = {}  # member -> the bulletin keys of its last sample: only new ones are sent
+
+    # --- host and processes ---
+
+    def host(self):
+        out = {"cpus": os.cpu_count()}
+        try:
+            out["load"] = [float(x) for x in (self.proc / "loadavg").read_text().split()[:3]]
+        except (OSError, ValueError):
+            pass
+        try:
+            mem = {k: int(v.split()[0]) * 1024 for k, v in (line.split(":", 1) for line in (self.proc / "meminfo").read_text().splitlines() if ":" in line) if v.split()}
+            out["memory"] = {"totalBytes": mem.get("MemTotal"), "availableBytes": mem.get("MemAvailable")}
+        except (OSError, ValueError):
+            pass
+        return out
+
+    def process(self, pid):
+        """A process's resident memory and CPU seconds so far (the Deployer works out the rate)."""
+        out = {}
+        try:
+            status = dict(line.split(":", 1) for line in (self.proc / str(pid) / "status").read_text().splitlines() if ":" in line)
+            if "VmRSS" in status:
+                out["rssBytes"] = int(status["VmRSS"].split()[0]) * 1024
+            if "Threads" in status:
+                out["threads"] = int(status["Threads"].strip())
+        except (OSError, ValueError, IndexError):
+            pass
+        try:
+            fields = (self.proc / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()
+            out["cpuSeconds"] = round((int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK"), 2)
+        except (OSError, ValueError, IndexError):
+            pass
+        return out
+
+    @staticmethod
+    def disks(places):
+        """The disks the repositories and logs are on, once per device (st_dev), with what each holds."""
+        by_dev = {}
+        for name, path in places.items():
+            probe = pathlib.Path(path)
+            while not probe.exists() and probe != probe.parent:
+                probe = probe.parent
+            try:
+                st, vfs = probe.stat(), os.statvfs(probe)
+            except OSError:
+                continue
+            d = by_dev.setdefault(st.st_dev, {"device": st.st_dev, "path": str(probe), "totalBytes": vfs.f_blocks * vfs.f_frsize,
+                                              "freeBytes": vfs.f_bavail * vfs.f_frsize, "usedBytes": (vfs.f_blocks - vfs.f_bfree) * vfs.f_frsize, "holds": []})
+            d["holds"].append(name)
+        return list(by_dev.values())
+
+    # --- REST ---
+
+    def context(self):
+        return nifi_context(self.cfg)
+
+    def fetch(self, ctx, connect, port, sni, path, timeout):
+        """GET /nifi-api/<path>: (HTTP status, body). The Host header names the NiFi as it knows itself."""
+        conn = SniConnection(connect, port, sni, ctx, timeout)
+        try:
+            conn.request("GET", f"/nifi-api/{path}", headers={"Host": f"{sni}:{port}", "Accept": "application/json", "User-Agent": f"{PACKAGE}/{VERSION}"})
+            r = conn.getresponse()
+            return r.status, r.read(REST_MAX)
+        finally:
+            conn.close()
+
+    def rest(self, w, props, ctx, why_not):
+        """What the NiFi's REST API says, within NIFI_BUDGET. state: ok, partial (some calls failed), unreachable,
+        no-certificate (only /proc and the disks), no-https."""
+        if ctx is None:
+            return {"state": "no-certificate", "error": why_not}
+        port = w["https"]["port"] or as_port(props.get("nifi.web.https.port"))
+        if not port:
+            return {"state": "no-https", "error": "nifi.web.https.port is not set: the collector only calls NiFi over HTTPS"}
+        connect, sni = endpoint(w["https"]["host"] if w["https"]["host"] is not None else props.get("nifi.web.https.host"),
+                                w.get("nodeAddress") or props.get("nifi.cluster.node.address"))
+        node = props.get("nifi.cluster.is.node", "false").strip().lower() == "true"
+        calls = [("about", "flow/about"), ("diagnostics", "system-diagnostics?nodewise=true" if node else "system-diagnostics"), ("status", "flow/status"),
+                 *([("cluster", "controller/cluster")] if node else []), ("bulletins", f"flow/bulletin-board?limit={BULLETINS}")]
+        out, errors = {"state": "ok", "url": f"https://{sni}:{port}"}, {}
+        deadline = time.monotonic() + NIFI_BUDGET
+        for name, path in calls:
+            left = deadline - time.monotonic()
+            if left < 0.5:
+                errors[name] = f"skipped: {NIFI_BUDGET:g} seconds were used up"
+                continue
+            try:
+                status, body = self.fetch(ctx, connect, port, sni, path, min(REQUEST_TIMEOUT, left))
+            except (OSError, ssl.SSLError, http.client.HTTPException) as e:
+                errors[name] = (str(e) or type(e).__name__)[:300]
+                if name == "about":
+                    # Not answering at all: the rest would only wait the same way.
+                    return {"state": "unreachable", "url": out["url"], "error": errors[name]}
+                continue
+            if status != 200:
+                errors[name] = f"HTTP {status}: {body[:200].decode('utf-8', 'replace').strip()}"
+                continue
+            try:
+                out[name] = TRIM[name](json.loads(body))
+            except (ValueError, AttributeError, TypeError) as e:
+                errors[name] = f"unexpected answer: {e}"[:300]
+        if errors:
+            out.update(state="partial", errors=errors)
+        return out
+
+    # --- certificates (S27) ---
+
+    def keytool(self, member, proc, boot):
+        """keytool of the JDK the NiFi runs on: next to its java, in its JAVA_HOME, next to bootstrap.conf's java=,
+        else the PATH's."""
+        candidates = []
+        if proc and proc.get("java"):
+            candidates.append(os.path.join(os.path.dirname(proc["java"]), "keytool"))
+        java_home = ((proc or {}).get("environment") or {}).get("JAVA_HOME")
+        if java_home:
+            candidates.append(os.path.join(java_home, "bin", "keytool"))
+        if (boot.get("java") or "").startswith("/"):
+            candidates.append(os.path.join(os.path.dirname(boot["java"]), "keytool"))
+        found = next((c for c in candidates if os.path.isfile(c) and os.access(c, os.X_OK)), None) or self.keytools.get(member) or shutil.which("keytool")
+        if found:
+            self.keytools[member] = found
+        return found
+
+    def run_keytool(self, keytool, path, store_type, password):
+        """keytool -list -v in English and UTC; the password goes in the environment (-storepass:env), never the command line."""
+        args = [keytool, "-J-Duser.language=en", "-J-Duser.country=US", "-J-Duser.timezone=UTC", "-list", "-v", "-keystore", path, "-storetype", store_type]
+        env = dict(os.environ)
+        if password:
+            args += ["-storepass:env", "OA_STOREPASS"]
+            env["OA_STOREPASS"] = password
+        p = subprocess.run(args, env=env, capture_output=True, text=True, timeout=20, input="")
+        return p.returncode, p.stdout + p.stderr
+
+    def store_certs(self, member, where, props, boot, proc):
+        """The keystore's and truststore's certificates, as nifi.properties names them."""
+        out = []
+        for store in ("keystore", "truststore"):
+            path = (props.get(f"nifi.security.{store}") or "").strip()
+            if not path:
+                continue
+            path = Discovery.resolve(where["installDir"], path)
+            given = (props.get(f"nifi.security.{store}Type") or "").strip().upper()
+            store_type = given or ("JKS" if path.lower().endswith(".jks") else "PKCS12")
+            entry = {"store": store, "path": path, "type": store_type}
+            if (props.get(f"nifi.security.{store}Passwd.protected") or "").strip():
+                entry["error"] = f"the {store} password is encrypted in nifi.properties (nifi.security.{store}Passwd.protected); the collector cannot read the store"
+            elif not os.path.isfile(path):
+                entry["error"] = f"{path} does not exist (or is not readable by this executor)"
+            else:
+                tool = self.keytool(member, proc, boot)
+                if not tool:
+                    entry["error"] = "keytool not found (next to the NiFi's java, in its JAVA_HOME, or on the PATH)"
+                else:
+                    try:
+                        code, text = self.run_keytool(tool, path, store_type, props.get(f"nifi.security.{store}Passwd") or "")
+                    except (OSError, subprocess.SubprocessError) as e:
+                        code, text = -1, f"keytool error: {e}"
+                    certs = parse_keytool(text) if code == 0 else []
+                    if code != 0 or not certs and "contains 0 entries" not in text:
+                        entry["error"] = keytool_error(text) if code != 0 else "keytool listed no certificate"
+                    entry["certificates"] = certs
+            out.append(entry)
+        return out
+
+    def monitor_cert(self):
+        cert = self.cfg.get("nifi_client_cert")
+        if not cert:
+            return []
+        entry = {"store": "monitor", "path": cert, "type": "PEM"}
+        try:
+            entry["certificates"] = [pem_certificate(cert)]
+        except Failed as e:
+            entry["error"] = str(e)
+        return [entry]
+
+    def certificates(self, w, where, props, boot, proc):
+        """The certificates, read again once an hour or when nifi.properties or a store changed."""
+        def stamp(p):
+            try:
+                return os.stat(p).st_mtime
+            except OSError:
+                return None
+        files = [where["propertiesFile"], self.cfg.get("nifi_client_cert") or ""]
+        files += [Discovery.resolve(where["installDir"], (props.get(f"nifi.security.{s}") or "").strip()) for s in ("keystore", "truststore") if (props.get(f"nifi.security.{s}") or "").strip()]
+        signature = [(f, stamp(f)) for f in files]
+        cached = self.certs.get(w["member"])
+        if cached and cached["signature"] == signature and time.monotonic() - cached["at"] < CERTS_EVERY and not cached.get("retry"):
+            return cached["value"]
+        stores = self.store_certs(w["member"], where, props, boot, proc) + self.monitor_cert()
+        value = {"readAt": now_iso(), "stores": stores}
+        # A keytool not found while the NiFi is stopped is tried again next round, not in an hour.
+        self.certs[w["member"]] = {"at": time.monotonic(), "signature": signature, "value": value,
+                                   "retry": any("keytool not found" in (s.get("error") or "") for s in stores)}
+        return value
+
+    # --- one round ---
+
+    def running(self):
+        try:
+            return Discovery(self.proc, uid=self.uid).running()
+        except OSError as e:
+            self.log(f"collector: cannot read {self.proc}: {e}")
+            return {}
+
+    def sample(self, w, procs, host, ctx, why_not):
+        """One watched NiFi's sample. Whatever fails is said in it; nothing here stops the other NiFi's."""
+        where = Discovery.layout(w["installDir"], conf=w["confDir"])
+        out = {"service": w["service"], "member": w["member"], "at": now_iso(), "host": host, "problems": []}
+        props, boot = {}, {}
+        try:
+            props = read_properties(where["propertiesFile"])
+        except OSError as e:
+            out["problems"].append(f"cannot read {where['propertiesFile']}: {e.strerror or e}")
+        try:
+            boot = read_properties(where["bootstrapFile"])
+        except OSError:
+            pass
+        proc = procs.get((where["installDir"], where["confDir"]))
+        running = bool(proc and proc.get("pid"))
+        out["process"] = {"running": running, **({k: proc.get(k) for k in ("pid", "bootstrapPid", "startedAt")} if proc else {}),
+                          **(self.process(proc["pid"]) if running else {})}
+        places = {k: v["path"] for k, v in Discovery.storage(pathlib.Path(where["installDir"]), props, (proc or {}).get("environment")).items()}
+        if w.get("logDir"):
+            places["logs"] = w["logDir"]
+        out["disks"] = self.disks(places)
+        out["nifi"] = self.rest(w, props, ctx, why_not) if running else {"state": "not-running"}
+        if "bulletins" in out["nifi"]:
+            keys = {(b.get("id"), b.get("timestamp"), b.get("nodeAddress")) for b in out["nifi"]["bulletins"]}
+            seen = self.bulletins.get(w["member"], set())
+            out["nifi"]["bulletins"] = [b for b in out["nifi"]["bulletins"] if (b.get("id"), b.get("timestamp"), b.get("nodeAddress")) not in seen]
+            self.bulletins[w["member"]] = keys
+        try:
+            out["certs"] = self.certificates(w, where, props, boot, proc)
+        except Exception as e:  # never the sample's end
+            out["certs"] = {"readAt": now_iso(), "stores": [], "error": str(e)[:300]}
+        return out
+
+    def round(self, watch):
+        """A sample of each watched NiFi."""
+        if not watch:
+            return []
+        procs, host = self.running(), self.host()
+        ctx, why_not = self.context()
+        samples = []
+        for w in watch:
+            try:
+                samples.append(self.sample(w, procs, host, ctx, why_not))
+            except Exception as e:
+                samples.append({"service": w["service"], "member": w["member"], "at": now_iso(), "problems": [f"the collector failed: {e}"[:300]]})
+        return samples
+
+
 class ServiceExecutor(ProtocolExecutor):
     """The service executor: the read channel, and executor-upgrade on the change channel."""
 
@@ -627,6 +1121,81 @@ class ServiceExecutor(ProtocolExecutor):
         super().__init__(cfg, out=out, api=api)
         self.reads = {}  # job id -> thread, for the reads in flight
         self.reads_lock = threading.Lock()
+        # The collector (§15.3): what the Deployer watches here (None until a heartbeat reply said), and the samples
+        # not yet taken by the Deployer, as (monotonic time, sample).
+        self.watch = None
+        self.watch_lock = threading.Lock()
+        self.backlog = []
+        self.backlog_lock = threading.Lock()
+        self.stopping = threading.Event()
+        self.collector = None
+
+    # --- the collector (§9.1, §15.3) ---
+
+    def on_beat_reply(self, reply):
+        """The watch list comes with every heartbeat reply (§15.2 P5): a takeover or a removal counts from the next beat.
+        A Deployer that sends none (older than the collector) has nothing watched here."""
+        watch = watch_entries(reply.get("watch")) if "watch" in reply else []
+        with self.watch_lock:
+            changed = watch != self.watch
+            self.watch = watch
+        if changed:
+            self.say(f"collector: watching {len(watch)} NiFi" + (f" ({', '.join(w['service'] for w in watch)})" if watch else ""))
+
+    def make_collector(self):
+        name, root = self.user()
+        return Collector(self.cfg, proc=self.PROC, uid=None if root else os.geteuid(), log=self.say)
+
+    def collect_once(self):
+        """One round: a sample of each watched NiFi into the backlog, then as much of the backlog as the Deployer takes."""
+        with self.watch_lock:
+            watch = list(self.watch or [])
+        if self.collector is None:
+            self.collector = self.make_collector()
+        samples = self.collector.round(watch)
+        now = time.monotonic()
+        with self.backlog_lock:
+            self.backlog.extend((now, s) for s in samples)
+        self.push_samples()
+        return samples
+
+    def push_samples(self):
+        """The backlog to POST /executor/v1/samples, SAMPLES_PER_POST at a time; what the Deployer cannot take stays,
+        but no longer than BACKLOG_SECONDS (and at most MAX_BACKLOG samples), the oldest dropped first."""
+        with self.backlog_lock:
+            cutoff = time.monotonic() - BACKLOG_SECONDS
+            kept = [(t, s) for t, s in self.backlog if t >= cutoff][-MAX_BACKLOG:]
+            dropped = len(self.backlog) - len(kept)
+            self.backlog = kept
+        if dropped:
+            self.say(f"collector: dropped {dropped} sample(s) the Deployer did not take in time")
+        while True:
+            with self.backlog_lock:
+                batch = self.backlog[:SAMPLES_PER_POST]
+            if not batch:
+                return
+            try:
+                self.api.post_samples([s for _, s in batch])
+            except Exception as e:
+                self.say(f"collector: cannot send {len(self.backlog)} sample(s) yet: {e}")
+                return
+            with self.backlog_lock:
+                self.backlog = self.backlog[len(batch):]
+
+    def collect_loop(self):
+        while not self.stopping.is_set():
+            started = time.monotonic()
+            try:
+                self.collect_once()
+            except Exception as e:  # the collector keeps going; the next round tries again
+                self.say(f"collector: {e}")
+            self.stopping.wait(max(1.0, self.cfg["collect_seconds"] - (time.monotonic() - started)))
+
+    def serve(self):
+        # The collector runs beside the job loop, in its own thread with its own time limits; it waits for the first
+        # heartbeat reply to know what to watch.
+        threading.Thread(target=self.collect_loop, daemon=True, name="collector").start()
+        return super().serve()
 
     @property
     def version(self):
@@ -722,6 +1291,13 @@ class ServiceExecutor(ProtocolExecutor):
         with self.reads_lock:
             reading = sorted(self.reads)
         body.update({"user": name, "isRoot": root, "reading": reading, "readSlots": self.cfg["read_slots"]})
+        with self.watch_lock:
+            watching = None if self.watch is None else len(self.watch)
+        with self.backlog_lock:
+            backlog = len(self.backlog)
+        # §15.3: what the collector does (never the certificate's paths).
+        body["collector"] = {"seconds": self.cfg.get("collect_seconds", COLLECT_DEFAULT), "watching": watching, "backlog": backlog,
+                             "certificate": bool(self.cfg.get("nifi_client_cert") and self.cfg.get("nifi_client_key"))}
         return body
 
     # --- the loop: reads side by side, changes one at a time ------------------------------------------------
@@ -844,7 +1420,8 @@ class ServiceExecutor(ProtocolExecutor):
 def main(argv=None):
     import argparse
     p = argparse.ArgumentParser(description="Open Atlas service executor")
-    p.add_argument("command", choices=["serve", "once", "check"], help="serve: the systemd loop; once: one pass; check: print the configuration")
+    p.add_argument("command", choices=["serve", "once", "check", "collect"],
+                   help="serve: the systemd loop; once: one pass; check: print the configuration; collect: one heartbeat for the watch list, then one collector round printed (not sent)")
     p.add_argument("--env-file", default=os.environ.get("EXECUTOR_ENV_FILE", "/etc/open-atlas-deployer/service-executor.env"))
     a = p.parse_args(argv)
     cfg = config(a.env_file)
@@ -852,6 +1429,12 @@ def main(argv=None):
     if a.command == "check":
         name, root = ex.user()
         print(json.dumps({**{k: (str(v) if isinstance(v, pathlib.Path) else v) for k, v in cfg.items()}, "user": name, "root": root}, indent=2))
+        return 0
+    if a.command == "collect":
+        ex.heartbeat()
+        with ex.watch_lock:
+            watch = list(ex.watch or [])
+        print(json.dumps(ex.make_collector().round(watch), indent=2))
         return 0
     if a.command == "once":
         cfg["work"].mkdir(parents=True, exist_ok=True)

@@ -1,0 +1,91 @@
+{
+ "systemDiagnostics": {
+  "aggregateSnapshot": {
+   "totalNonHeap": "307.31 MB",
+   "totalNonHeapBytes": 322240512,
+   "usedNonHeap": "301.17 MB",
+   "usedNonHeapBytes": 315800920,
+   "freeNonHeap": "6.14 MB",
+   "freeNonHeapBytes": 6439592,
+   "maxNonHeap": "-1 bytes",
+   "maxNonHeapBytes": -1,
+   "totalHeap": "2 GB",
+   "totalHeapBytes": 2147483648,
+   "usedHeap": "946.23 MB",
+   "usedHeapBytes": 992191824,
+   "freeHeap": "1.08 GB",
+   "freeHeapBytes": 1155291824,
+   "maxHeap": "2 GB",
+   "maxHeapBytes": 2147483648,
+   "heapUtilization": "46.0%",
+   "availableProcessors": 64,
+   "processorLoadAverage": 1.583984375,
+   "totalThreads": 294,
+   "daemonThreads": 118,
+   "uptime": "00:02:42.653",
+   "flowFileRepositoryStorageUsage": {
+    "freeSpace": "1.8 TB",
+    "totalSpace": "1.97 TB",
+    "usedSpace": "167.12 GB",
+    "freeSpaceBytes": 1982759477248,
+    "totalSpaceBytes": 2162202353664,
+    "usedSpaceBytes": 179442876416,
+    "utilization": "8.0%"
+   },
+   "contentRepositoryStorageUsage": [
+    {
+     "identifier": "default",
+     "freeSpace": "1.8 TB",
+     "totalSpace": "1.97 TB",
+     "usedSpace": "167.12 GB",
+     "freeSpaceBytes": 1982759477248,
+     "totalSpaceBytes": 2162202353664,
+     "usedSpaceBytes": 179442876416,
+     "utilization": "8.0%"
+    }
+   ],
+   "provenanceRepositoryStorageUsage": [
+    {
+     "identifier": "default",
+     "freeSpace": "1.8 TB",
+     "totalSpace": "1.97 TB",
+     "usedSpace": "167.12 GB",
+     "freeSpaceBytes": 1982759477248,
+     "totalSpaceBytes": 2162202353664,
+     "usedSpaceBytes": 179442876416,
+     "utilization": "8.0%"
+    }
+   ],
+   "garbageCollection": [
+    {
+     "name": "G1 Young Generation",
+     "collectionCount": 20,
+     "collectionTime": "00:00:00.395",
+     "collectionMillis": 395
+    },
+    {
+     "name": "G1 Concurrent GC",
+     "collectionCount": 12,
+     "collectionTime": "00:00:00.039",
+     "collectionMillis": 39
+    },
+    {
+     "name": "G1 Old Generation",
+     "collectionCount": 0,
+     "collectionTime": "00:00:00.000",
+     "collectionMillis": 0
+    }
+   ],
+   "statsLastRefreshed": "19:59:11 CST",
+   "versionInfo": {
+    "niFiVersion": "2.5.0",
+    "javaVendor": "Eclipse Adoptium",
+    "javaVersion": "21.0.13",
+    "osName": "Linux",
+    "osVersion": "6.6.0-lab",
+    "osArchitecture": "amd64",
+    "buildTag": "rel/nifi-2.5.0"
+   }
+  }
+ }
+}

@@ -1,0 +1,277 @@
+{
+ "systemDiagnostics": {
+  "aggregateSnapshot": {
+   "totalNonHeap": "307.69 MB",
+   "totalNonHeapBytes": 322633728,
+   "usedNonHeap": "301.51 MB",
+   "usedNonHeapBytes": 316155864,
+   "freeNonHeap": "6.18 MB",
+   "freeNonHeapBytes": 6477864,
+   "maxNonHeap": "-1 bytes",
+   "maxNonHeapBytes": -1,
+   "totalHeap": "2 GB",
+   "totalHeapBytes": 2147483648,
+   "usedHeap": "951.23 MB",
+   "usedHeapBytes": 997434704,
+   "freeHeap": "1.07 GB",
+   "freeHeapBytes": 1150048944,
+   "maxHeap": "2 GB",
+   "maxHeapBytes": 2147483648,
+   "heapUtilization": "46.0%",
+   "availableProcessors": 64,
+   "processorLoadAverage": 1.583984375,
+   "totalThreads": 296,
+   "daemonThreads": 120,
+   "uptime": "00:02:42.702",
+   "flowFileRepositoryStorageUsage": {
+    "freeSpace": "1.8 TB",
+    "totalSpace": "1.97 TB",
+    "usedSpace": "167.12 GB",
+    "freeSpaceBytes": 1982759469056,
+    "totalSpaceBytes": 2162202353664,
+    "usedSpaceBytes": 179442884608,
+    "utilization": "8.0%"
+   },
+   "contentRepositoryStorageUsage": [
+    {
+     "identifier": "default",
+     "freeSpace": "1.8 TB",
+     "totalSpace": "1.97 TB",
+     "usedSpace": "167.12 GB",
+     "freeSpaceBytes": 1982759469056,
+     "totalSpaceBytes": 2162202353664,
+     "usedSpaceBytes": 179442884608,
+     "utilization": "8.0%"
+    }
+   ],
+   "provenanceRepositoryStorageUsage": [
+    {
+     "identifier": "default",
+     "freeSpace": "1.8 TB",
+     "totalSpace": "1.97 TB",
+     "usedSpace": "167.12 GB",
+     "freeSpaceBytes": 1982759469056,
+     "totalSpaceBytes": 2162202353664,
+     "usedSpaceBytes": 179442884608,
+     "utilization": "8.0%"
+    }
+   ],
+   "garbageCollection": [
+    {
+     "name": "G1 Concurrent GC",
+     "collectionCount": 12,
+     "collectionTime": "00:00:00.039",
+     "collectionMillis": 39
+    },
+    {
+     "name": "G1 Old Generation",
+     "collectionCount": 0,
+     "collectionTime": "00:00:00.000",
+     "collectionMillis": 0
+    },
+    {
+     "name": "G1 Young Generation",
+     "collectionCount": 20,
+     "collectionTime": "00:00:00.395",
+     "collectionMillis": 395
+    }
+   ],
+   "statsLastRefreshed": "19:59:11 CST",
+   "versionInfo": {
+    "niFiVersion": "2.5.0",
+    "javaVendor": "Eclipse Adoptium",
+    "javaVersion": "21.0.13",
+    "osName": "Linux",
+    "osVersion": "6.6.0-lab",
+    "osArchitecture": "amd64",
+    "buildTag": "rel/nifi-2.5.0"
+   }
+  },
+  "nodeSnapshots": [
+   {
+    "nodeId": "00000000-0000-4000-8000-000000000001",
+    "address": "localhost",
+    "apiPort": 18445,
+    "snapshot": {
+     "totalNonHeap": "155.5 MB",
+     "totalNonHeapBytes": 163053568,
+     "usedNonHeap": "152.92 MB",
+     "usedNonHeapBytes": 160353304,
+     "freeNonHeap": "2.58 MB",
+     "freeNonHeapBytes": 2700264,
+     "maxNonHeap": "-1 bytes",
+     "maxNonHeapBytes": -1,
+     "totalHeap": "1,024 MB",
+     "totalHeapBytes": 1073741824,
+     "usedHeap": "484.46 MB",
+     "usedHeapBytes": 507995104,
+     "freeHeap": "539.54 MB",
+     "freeHeapBytes": 565746720,
+     "maxHeap": "1,024 MB",
+     "maxHeapBytes": 1073741824,
+     "heapUtilization": "47.0%",
+     "availableProcessors": 32,
+     "processorLoadAverage": 0.7919921875,
+     "totalThreads": 174,
+     "daemonThreads": 63,
+     "uptime": "00:02:42.702",
+     "flowFileRepositoryStorageUsage": {
+      "freeSpace": "923.29 GB",
+      "totalSpace": "1,006.85 GB",
+      "usedSpace": "83.56 GB",
+      "freeSpaceBytes": 991379734528,
+      "totalSpaceBytes": 1081101176832,
+      "usedSpaceBytes": 89721442304,
+      "utilization": "8.0%"
+     },
+     "contentRepositoryStorageUsage": [
+      {
+       "identifier": "default",
+       "freeSpace": "923.29 GB",
+       "totalSpace": "1,006.85 GB",
+       "usedSpace": "83.56 GB",
+       "freeSpaceBytes": 991379734528,
+       "totalSpaceBytes": 1081101176832,
+       "usedSpaceBytes": 89721442304,
+       "utilization": "8.0%"
+      }
+     ],
+     "provenanceRepositoryStorageUsage": [
+      {
+       "identifier": "default",
+       "freeSpace": "923.29 GB",
+       "totalSpace": "1,006.85 GB",
+       "usedSpace": "83.56 GB",
+       "freeSpaceBytes": 991379734528,
+       "totalSpaceBytes": 1081101176832,
+       "usedSpaceBytes": 89721442304,
+       "utilization": "8.0%"
+      }
+     ],
+     "garbageCollection": [
+      {
+       "name": "G1 Concurrent GC",
+       "collectionCount": 6,
+       "collectionTime": "00:00:00.017",
+       "collectionMillis": 17
+      },
+      {
+       "name": "G1 Old Generation",
+       "collectionCount": 0,
+       "collectionTime": "00:00:00.000",
+       "collectionMillis": 0
+      },
+      {
+       "name": "G1 Young Generation",
+       "collectionCount": 10,
+       "collectionTime": "00:00:00.163",
+       "collectionMillis": 163
+      }
+     ],
+     "statsLastRefreshed": "19:59:11 CST",
+     "versionInfo": {
+      "niFiVersion": "2.5.0",
+      "javaVendor": "Eclipse Adoptium",
+      "javaVersion": "21.0.13",
+      "osName": "Linux",
+      "osVersion": "6.6.0-lab",
+      "osArchitecture": "amd64",
+      "buildTag": "rel/nifi-2.5.0"
+     }
+    }
+   },
+   {
+    "nodeId": "00000000-0000-4000-8000-000000000002",
+    "address": "localhost",
+    "apiPort": 18446,
+    "snapshot": {
+     "totalNonHeap": "152.19 MB",
+     "totalNonHeapBytes": 159580160,
+     "usedNonHeap": "148.58 MB",
+     "usedNonHeapBytes": 155802560,
+     "freeNonHeap": "3.6 MB",
+     "freeNonHeapBytes": 3777600,
+     "maxNonHeap": "-1 bytes",
+     "maxNonHeapBytes": -1,
+     "totalHeap": "1,024 MB",
+     "totalHeapBytes": 1073741824,
+     "usedHeap": "466.77 MB",
+     "usedHeapBytes": 489439600,
+     "freeHeap": "557.23 MB",
+     "freeHeapBytes": 584302224,
+     "maxHeap": "1,024 MB",
+     "maxHeapBytes": 1073741824,
+     "heapUtilization": "46.0%",
+     "availableProcessors": 32,
+     "processorLoadAverage": 0.7919921875,
+     "totalThreads": 122,
+     "daemonThreads": 57,
+     "uptime": "00:02:41.595",
+     "flowFileRepositoryStorageUsage": {
+      "freeSpace": "923.29 GB",
+      "totalSpace": "1,006.85 GB",
+      "usedSpace": "83.56 GB",
+      "freeSpaceBytes": 991379734528,
+      "totalSpaceBytes": 1081101176832,
+      "usedSpaceBytes": 89721442304,
+      "utilization": "8.0%"
+     },
+     "contentRepositoryStorageUsage": [
+      {
+       "identifier": "default",
+       "freeSpace": "923.29 GB",
+       "totalSpace": "1,006.85 GB",
+       "usedSpace": "83.56 GB",
+       "freeSpaceBytes": 991379734528,
+       "totalSpaceBytes": 1081101176832,
+       "usedSpaceBytes": 89721442304,
+       "utilization": "8.0%"
+      }
+     ],
+     "provenanceRepositoryStorageUsage": [
+      {
+       "identifier": "default",
+       "freeSpace": "923.29 GB",
+       "totalSpace": "1,006.85 GB",
+       "usedSpace": "83.56 GB",
+       "freeSpaceBytes": 991379734528,
+       "totalSpaceBytes": 1081101176832,
+       "usedSpaceBytes": 89721442304,
+       "utilization": "8.0%"
+      }
+     ],
+     "garbageCollection": [
+      {
+       "name": "G1 Concurrent GC",
+       "collectionCount": 6,
+       "collectionTime": "00:00:00.022",
+       "collectionMillis": 22
+      },
+      {
+       "name": "G1 Old Generation",
+       "collectionCount": 0,
+       "collectionTime": "00:00:00.000",
+       "collectionMillis": 0
+      },
+      {
+       "name": "G1 Young Generation",
+       "collectionCount": 10,
+       "collectionTime": "00:00:00.232",
+       "collectionMillis": 232
+      }
+     ],
+     "statsLastRefreshed": "19:59:11 CST",
+     "versionInfo": {
+      "niFiVersion": "2.5.0",
+      "javaVendor": "Eclipse Adoptium",
+      "javaVersion": "21.0.13",
+      "osName": "Linux",
+      "osVersion": "6.6.0-lab",
+      "osArchitecture": "amd64",
+      "buildTag": "rel/nifi-2.5.0"
+     }
+    }
+   }
+  ]
+ }
+}

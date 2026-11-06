@@ -31,6 +31,17 @@ executors; `EXECUTOR_VERSION` with it).
   `svc-read@2` (`confDir`, `bootstrapFile`). The Deployer checks a job's needs against them: a job the executor
   does not name is refused when it is submitted (409 `executor/unsupported`), or, queued before the executor said,
   refused when the executor asks for it, so an older executor never gets a request it would misread.
+- Phase 2, the collector: beside the jobs, every `EXECUTOR_COLLECT_SECONDS` (60, 30-300) the service executor samples
+  each NiFi the Deployer registered on its host. The list comes with every heartbeat reply (`watch`); nothing else
+  is sampled. A sample holds the process (running, pid, start time, memory, CPU) and the host (load, memory), the
+  disks of the repositories and logs (once per device), the REST API's about, system diagnostics (per node on a
+  cluster), flow status, cluster nodes and new bulletins, called with the host's monitor certificate
+  (`EXECUTOR_NIFI_CLIENT_CERT`, `_KEY`, `EXECUTOR_NIFI_CA`; the name checked is `nifi.web.https.host`;
+  `EXECUTOR_NIFI_CA_RELAXED=1` for a CA without critical Basic Constraints), and once an hour the certificates of the
+  keystore and truststore (JKS or PKCS12, through the NiFi's own `keytool`, the password passed in the environment)
+  and of the monitor certificate, with their expiry. Without the certificate only `/proc` and the disks are sampled.
+  One NiFi costs at most 10 seconds of a round; samples go to `POST /executor/v1/samples`, 20 at a time, and wait in
+  memory up to 30 minutes while the Deployer cannot take them.
 
 **Services in the Deployer**
 - Service profiles `nifi-1.x` and `nifi-2.x`: the configuration files and a catalog of keys (cluster or node scope,
@@ -46,6 +57,9 @@ executors; `EXECUTOR_VERSION` with it).
 - `GET /api/services`, `GET /api/services/:id/status`, `GET /api/services/:id/config`, the draft routes under
   `/api/services/drafts` and `POST|GET /api/hosts/:id/discover`; every change goes to the audit.
 - Read-only MCP tools `list_service_clusters` and `get_cluster_status`.
+- A service executor's heartbeat reply lists the installations registered on its host (`watch`); its samples are
+  kept as they come (`service_samples`) for those only. A takeover warns (`host/multiple-nifi`) when a host would
+  have more than one NiFi registered.
 - `bin/executor-token.ts <data> <host> <file> service` issues a service executor token, `--revoke deploy|service`
   revokes one, without the page.
 - An `environment.json` without `apps` no longer breaks `GET /api/setup` (500).

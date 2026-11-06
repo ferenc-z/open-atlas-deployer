@@ -110,6 +110,9 @@ CREATE TABLE IF NOT EXISTS service_draft_items (
 CREATE TABLE IF NOT EXISTS service_configs (
   service TEXT NOT NULL, revision INTEGER NOT NULL, body TEXT NOT NULL, source TEXT NOT NULL, saved_at TEXT NOT NULL,
   saved_by TEXT NOT NULL, via TEXT NOT NULL, note TEXT, PRIMARY KEY (service, revision));
+CREATE TABLE IF NOT EXISTS service_samples (
+  service TEXT NOT NULL, member TEXT NOT NULL, at TEXT NOT NULL, body TEXT NOT NULL, received_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS service_samples_at ON service_samples (service, member, at);
 `;
 
 /** queued: waiting for the host's executor to claim it; the rest are the executor's states. */
@@ -1022,5 +1025,21 @@ export class Store {
       nodes: (this.db.prepare("SELECT * FROM service_nodes WHERE cluster = ? AND removed_at IS NULL ORDER BY host, install_dir").all(r.id) as Row[]).map((n) => this.toMember(n)),
       environment: r.environment, draft: r.draft ?? null, createdAt: r.created_at, createdBy: r.created_by,
     }));
+  }
+
+  // §15.3: the collector's samples as the service executors send them (raw; phase 2 step 2 adds the rollups, the
+  // 2-day retention, bulletins and certificates taken out of them).
+  addServiceSamples(samples: { service: string; member: string; at: string }[]) {
+    if (!samples.length) return;
+    const at = this.stamp();
+    const insert = this.db.prepare("INSERT INTO service_samples (service, member, at, body, received_at) VALUES (?, ?, ?, ?, ?)");
+    this.inTransaction(() => { for (const s of samples) insert.run(s.service, s.member, s.at, JSON.stringify(s), at); });
+  }
+
+  /** The newest sample of each member of a service. */
+  latestServiceSamples(service: string): { member: string; at: string; receivedAt: string; body: Record<string, unknown> }[] {
+    return (this.db.prepare(`SELECT member, at, body, received_at FROM service_samples s WHERE service = ?1
+      AND rowid = (SELECT rowid FROM service_samples WHERE service = ?1 AND member = s.member ORDER BY at DESC, rowid DESC LIMIT 1) ORDER BY member`).all(service) as Row[])
+      .map((r) => ({ member: r.member, at: r.at, receivedAt: r.received_at, body: JSON.parse(r.body) }));
   }
 }

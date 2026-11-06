@@ -565,6 +565,374 @@ class SplitLayoutTest(Base):
         self.assertEqual((self.api.status["svc-read-0003"]["state"], self.api.status["svc-read-0004"]["state"]), ("refused", "refused"))
 
 
+# --- the collector (§15.3) ---------------------------------------------------------------------------------------
+
+# The lab's REST answers and keytool listings, recorded with the monitor certificate (node ids replaced).
+NIFI_DATA = HERE / "testdata" / "nifi"
+# port -> the version whose recorded answers it gives.
+LAB_PORTS = {18443: "1.12.1", 18444: "2.0.0", 18445: "2.5.0-cluster"}
+REST_FILES = {"flow/about": "about", "system-diagnostics": "system-diagnostics", "system-diagnostics?nodewise=true": "system-diagnostics-nodewise",
+              "flow/status": "flow-status", "controller/cluster": "controller-cluster", f"flow/bulletin-board?limit={sx.BULLETINS}": "bulletin-board"}
+
+
+def recorded(version, path):
+    """(HTTP status, body) as the lab answered; a standalone's /controller/cluster is a 404 in text."""
+    name = REST_FILES[path]
+    for ext, status in (("json", 200), ("txt", 404)):
+        f = NIFI_DATA / f"{version}-{name}.{ext}"
+        if f.is_file():
+            return status, f.read_bytes()
+    raise AssertionError(f"nothing recorded for {version} {path}")
+
+
+class LabCollector(sx.Collector):
+    """The collector against the recorded answers: ports not in down answer as a lab NiFi, keytool lists the recordings."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.calls, self.down, self.hang, self.keytool_runs = [], set(), set(), []
+
+    def context(self):
+        return "ctx", None
+
+    def fetch(self, ctx, connect, port, sni, path, timeout):
+        self.calls.append((connect, port, sni, path, timeout))
+        if port in self.down:
+            raise ConnectionRefusedError(111, "Connection refused")
+        if port in self.hang:
+            raise TimeoutError("timed out")
+        return recorded(LAB_PORTS[port], path)
+
+    def run_keytool(self, keytool, path, store_type, password):
+        self.keytool_runs.append((keytool, path, store_type, password))
+        if password == "wrong":
+            return 1, (NIFI_DATA / "keytool-wrong-password.txt").read_text()
+        name = "1.12.1-keytool-truststore-jks.txt" if store_type == "JKS" else "2.0.0-keytool-keystore-pkcs12.txt"
+        return 0, (NIFI_DATA / name).read_text()
+
+
+class WatchApi(FakeApi):
+    """The Deployer's heartbeat reply with a watch list, and the samples it took."""
+
+    def __init__(self):
+        super().__init__()
+        self.watch, self.samples, self.posts = None, [], []
+
+    def heartbeat(self, beat):
+        reply = super().heartbeat(beat)
+        return {**reply, **({"watch": self.watch} if self.watch is not None else {})}
+
+    def post_samples(self, samples):
+        if self.down:
+            raise sx.Failed("cannot reach the Deployer")
+        self.posts.append(len(samples))
+        self.samples.extend(samples)
+
+
+class RestTrimTest(unittest.TestCase):
+    def test_what_each_version_answers_is_cut_to_what_the_deployer_keeps(self):
+        for version, want in (("1.12.1", "1.12.1"), ("2.0.0", "2.0.0"), ("2.5.0-cluster", "2.5.0")):
+            about = sx.trim_about(json.loads(recorded(version, "flow/about")[1]))
+            self.assertEqual(about["version"], want)
+            d = sx.trim_diagnostics(json.loads(recorded(version, "system-diagnostics")[1]))["aggregate"]
+            self.assertEqual(d["version"], want)
+            self.assertGreater(d["heap"]["usedBytes"], 0)
+            self.assertGreater(d["heap"]["maxBytes"], d["heap"]["usedBytes"])
+            self.assertGreater(d["totalThreads"], 0)
+            self.assertTrue(d["gc"] and all(set(g) == {"name", "count", "millis"} for g in d["gc"]))
+            self.assertEqual(sorted(d["repositories"]), ["content", "flowfile", "provenance"])
+            self.assertGreater(d["repositories"]["content"][0]["totalSpaceBytes"], 0)
+            status = sx.trim_status(json.loads(recorded(version, "flow/status")[1]))
+            self.assertEqual((status["flowFilesQueued"], status["bytesQueued"]), (0, 0))
+            self.assertNotIn("queued", status, "only numbers")
+        nodes = sx.trim_diagnostics(json.loads(recorded("2.5.0-cluster", "system-diagnostics?nodewise=true")[1]))["nodes"]
+        self.assertEqual([(n["address"], n["apiPort"]) for n in nodes], [("localhost", 18445), ("localhost", 18446)])
+        self.assertTrue(all(n["heap"]["maxBytes"] == 1 << 30 for n in nodes), "each node's own heap, not the sum")
+        cluster = sx.trim_cluster(json.loads(recorded("2.5.0-cluster", "controller/cluster")[1]))
+        self.assertEqual([(n["apiPort"], n["status"], n["roles"]) for n in cluster["nodes"]],
+                         [(18445, "CONNECTED", ["Primary Node", "Cluster Coordinator"]), (18446, "CONNECTED", [])])
+        self.assertTrue(cluster["nodes"][0]["events"][0]["message"].startswith("Received first heartbeat"))
+        bulletins = sx.trim_bulletins(json.loads(recorded("2.5.0-cluster", f"flow/bulletin-board?limit={sx.BULLETINS}")[1]))
+        self.assertEqual([(b["id"], b["level"], b["nodeAddress"]) for b in bulletins], [(0, "INFO", "localhost:18445"), (1, "INFO", "localhost:18445"), (2, "INFO", "localhost:18445")])
+        self.assertIn("elected Active Cluster Coordinator", bulletins[0]["message"])
+        self.assertEqual(sx.trim_bulletins(json.loads(recorded("1.12.1", f"flow/bulletin-board?limit={sx.BULLETINS}")[1])), [])
+
+    def test_keytool_listings_of_both_store_types(self):
+        jks = sx.parse_keytool((NIFI_DATA / "1.12.1-keytool-truststore-jks.txt").read_text())
+        self.assertEqual(jks, [{"alias": "nifi-cert", "subject": "CN=localhost, OU=NIFI", "issuer": "CN=localhost, OU=NIFI",
+                                "notBefore": "2026-11-04T14:19:17Z", "notAfter": "2029-02-06T14:19:17Z"}])
+        p12 = sx.parse_keytool((NIFI_DATA / "2.0.0-keytool-keystore-pkcs12.txt").read_text())
+        self.assertEqual([(c["alias"], c["chain"], c["subject"], c["notAfter"]) for c in p12],
+                         [("nifi-key", 1, "CN=n200.lab, OU=NIFI", "2029-02-06T14:19:17Z"), ("nifi-key", 2, "CN=localhost, OU=NIFI", "2029-02-06T14:19:17Z")])
+        self.assertEqual(sx.keytool_error((NIFI_DATA / "keytool-wrong-password.txt").read_text()), "keystore password was incorrect")
+        self.assertEqual(sx.java_date("Tue Feb 06 14:19:17 CST 2029"), "Tue Feb 06 14:19:17 CST 2029", "another zone stays as written")
+
+    def test_where_to_connect_and_the_name_checked(self):
+        self.assertEqual(sx.endpoint("nifi1.corp"), ("nifi1.corp", "nifi1.corp"))
+        self.assertEqual(sx.endpoint("0.0.0.0", "nifi1.corp"), ("localhost", "nifi1.corp"), "bound everywhere: localhost, checked against the node's name")
+        self.assertEqual(sx.endpoint("", None), ("localhost", "localhost"))
+
+    def test_the_monitor_certificate_and_the_relaxed_ca(self):
+        self.assertEqual(sx.nifi_context({})[0], None)
+        self.assertIn("EXECUTOR_NIFI_CLIENT_CERT", sx.nifi_context({})[1])
+        ctx, why = sx.nifi_context({"nifi_client_cert": "/nonexistent.crt", "nifi_client_key": "/nonexistent.key"})
+        self.assertIsNone(ctx)
+        self.assertIn("cannot load the monitor certificate", why)
+
+        class Ctx:
+            verify_flags = getattr(sx.ssl, "VERIFY_X509_STRICT", 0x20) | 0x1
+
+            def load_cert_chain(self, cert, key):
+                self.chain = (cert, key)
+        made = []
+        real = sx.ssl.create_default_context
+        sx.ssl.create_default_context = lambda cafile=None: made.append(cafile) or Ctx()
+        try:
+            strict = sx.nifi_context({"nifi_client_cert": "/m.crt", "nifi_client_key": "/m.key", "nifi_ca": "/ca.crt"})[0]
+            relaxed = sx.nifi_context({"nifi_client_cert": "/m.crt", "nifi_client_key": "/m.key", "nifi_ca": "/ca.crt", "nifi_ca_relaxed": True})[0]
+        finally:
+            sx.ssl.create_default_context = real
+        flag = getattr(sx.ssl, "VERIFY_X509_STRICT", 0x20)
+        self.assertEqual((strict.verify_flags & flag, relaxed.verify_flags & flag, relaxed.verify_flags & 0x1), (flag, 0, 0x1), "only the strict flag goes")
+        self.assertEqual((made, relaxed.chain), (["/ca.crt", "/ca.crt"], ("/m.crt", "/m.key")))
+        c = sx.config(environ={"EXECUTOR_COLLECT_SECONDS": "5", "EXECUTOR_NIFI_CA_RELAXED": "1"})
+        self.assertEqual((c["collect_seconds"], c["nifi_ca_relaxed"]), (30, True))
+        self.assertEqual((sx.config(environ={})["collect_seconds"], sx.config(environ={"EXECUTOR_COLLECT_SECONDS": "900"})["collect_seconds"]), (60, 300))
+
+    @unittest.skipUnless(shutil.which("openssl"), "needs openssl")
+    def test_reads_a_pem_certificate(self):
+        with tempfile.TemporaryDirectory() as d:
+            subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-subj", "/OU=ops-lab/CN=monitor", "-days", "30",
+                            "-keyout", f"{d}/m.key", "-out", f"{d}/m.crt"], check=True, capture_output=True)
+            cert = sx.pem_certificate(f"{d}/m.crt")
+        self.assertEqual((cert["subject"], cert["issuer"]), ("CN=monitor, OU=ops-lab", "CN=monitor, OU=ops-lab"))
+        left = time.mktime(time.strptime(cert["notAfter"], "%Y-%m-%dT%H:%M:%SZ")) - time.mktime(time.strptime(cert["notBefore"], "%Y-%m-%dT%H:%M:%SZ"))
+        self.assertAlmostEqual(left / 86400, 30, delta=1)
+
+
+@unittest.skipUnless(hasattr(os, "geteuid") and hasattr(os, "symlink"), "needs a POSIX system")
+class CollectorTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.api = WatchApi()
+        self.proc = FakeProc(self.root / "proc")
+        (self.proc.root / "loadavg").write_text("0.50 0.40 0.30 1/200 999\n")
+        (self.proc.root / "meminfo").write_text("MemTotal:       16000000 kB\nMemFree:  1000 kB\nMemAvailable:   8000000 kB\n")
+        lab = self.root / "lab"
+        tls = {"nifi.web.https.host": "localhost", "nifi.security.keystore": "./conf/keystore.pkcs12", "nifi.security.keystoreType": "PKCS12",
+               "nifi.security.keystorePasswd": "kspw", "nifi.security.truststore": "./conf/truststore.jks", "nifi.security.truststoreType": "JKS",
+               "nifi.security.truststorePasswd": "tspw"}
+        self.n112 = nifi_home(lab, "n112", "1.12.1", {**tls, "nifi.web.https.port": "18443"}, two=False)
+        self.n200 = nifi_home(lab, "n200", "2.0.0", {**tls, "nifi.web.https.port": "18444", "nifi.security.keystorePasswd": "wrong"})
+        self.c250 = nifi_home(lab, "c250-1", "2.5.0", {**tls, "nifi.web.https.port": "18445", "nifi.cluster.is.node": "true", "nifi.cluster.node.address": "node1.lab"})
+        self.stopped = nifi_home(lab, "c250-2", "2.5.0", {**tls, "nifi.web.https.port": "18446", "nifi.cluster.is.node": "true"})
+        for home in (self.n112, self.n200, self.c250, self.stopped):
+            for f in ("keystore.pkcs12", "truststore.jks"):
+                (home / "conf" / f).write_bytes(b"store")
+        jdk = self.root / "jdk" / "bin"
+        jdk.mkdir(parents=True)
+        (jdk / "keytool").write_text("#!/bin/sh\n")
+        os.chmod(jdk / "keytool", 0o755)
+        lab_processes(self.proc, self.n112, two=False, env={"JAVA_HOME": str(self.root / "jdk")}, base=5000)
+        lab_processes(self.proc, self.n200, env={"JAVA_HOME": str(self.root / "jdk")}, base=6000)
+        lab_processes(self.proc, self.c250, env={"JAVA_HOME": str(self.root / "jdk")}, base=4000)
+        (self.proc.root / "4001" / "status").write_text(f"Name:\tjava\nPPid:\t4000\nUid:\t{os.geteuid()}\t0\t0\t0\nVmRSS:\t  204800 kB\nThreads:\t174\n")
+        (self.proc.root / "4001" / "stat").write_text("4001 (java) S 4000 " + " ".join(["0"] * 9) + f" {12 * os.sysconf('SC_CLK_TCK')} {3 * os.sysconf('SC_CLK_TCK')} " + " ".join(["0"] * 6) + " 250 0 0\n")
+        self.watch = [self.entry("n112", self.n112), self.entry("n200", self.n200), self.entry("c250", self.c250, https=18445, node="node1.lab"),
+                      self.entry("c250", self.stopped, https=18446)]
+
+    @staticmethod
+    def entry(service, home, https=None, node=None):
+        return {"service": service, "member": f"local:{home}", "profile": "nifi-2.x", "installDir": str(home), "confDir": str(home / "conf"),
+                "https": {"host": "localhost", "port": https}, "nodeAddress": node, "logDir": str(home / "logs")}
+
+    def collector(self, **cfg_over):
+        c = LabCollector(cfg(self.root, **cfg_over), proc=self.proc.root, uid=os.geteuid())
+        return c
+
+    def by_service(self, samples):
+        return {pathlib.Path(s["member"].split(":", 1)[1]).name: s for s in samples}
+
+    def test_the_watch_list_comes_with_every_heartbeat_reply(self):
+        ex = self.executor()
+        self.assertIsNone(ex.watch)
+        self.assertIsNone(ex.beat_body(None)["collector"]["watching"], "not known before the first reply")
+        self.api.watch = [*self.watch, {"service": "x"}, {"service": "y", "member": "m", "installDir": "relative"}, "nonsense"]
+        ex.selfcheck()
+        self.assertEqual([w["service"] for w in ex.watch], ["n112", "n200", "c250", "c250"], "malformed entries left out")
+        self.assertEqual(ex.watch[2]["https"], {"host": "localhost", "port": 18445})
+        self.api.watch = [self.watch[0]]
+        ex.heartbeat()
+        self.assertEqual([w["service"] for w in ex.watch], ["n112"], "a removal counts from the next beat")
+        self.assertEqual(ex.beat_body(None)["collector"], {"seconds": 60, "watching": 1, "backlog": 0, "certificate": False})
+        self.api.watch = None
+        ex.heartbeat()
+        self.assertEqual(ex.watch, [], "a Deployer that sends no list: nothing is watched")
+        self.api.down = True
+        ex.heartbeat()
+        self.assertEqual(ex.watch, [], "a failed beat changes nothing")
+
+    def test_a_round_samples_each_watched_nifi_from_proc_rest_and_its_certificates(self):
+        c = self.collector()
+        samples = self.by_service(c.round(sx.watch_entries(self.watch)))
+        self.assertEqual(sorted(samples), ["c250-1", "c250-2", "n112", "n200"])
+        node = samples["c250-1"]
+        self.assertEqual((node["service"], node["process"]["running"], node["process"]["pid"], node["process"]["bootstrapPid"]), ("c250", True, 4001, 4000))
+        self.assertEqual((node["process"]["rssBytes"], node["process"]["threads"], node["process"]["cpuSeconds"]), (200 << 20, 174, 15.0))
+        self.assertEqual(node["host"]["load"], [0.5, 0.4, 0.3])
+        self.assertEqual(node["host"]["memory"], {"totalBytes": 16000000 * 1024, "availableBytes": 8000000 * 1024})
+        self.assertEqual(len(node["disks"]), 1, "one device for the repositories and the logs")
+        self.assertEqual(sorted(node["disks"][0]["holds"]), ["content", "database", "flowfile", "logs", "provenance"])
+        n = node["nifi"]
+        self.assertEqual((n["state"], n["url"], n["about"]["version"]), ("ok", "https://localhost:18445", "2.5.0"))
+        self.assertEqual(len(n["diagnostics"]["nodes"]), 2, "a node asks nodewise")
+        self.assertEqual(len(n["cluster"]["nodes"]), 2)
+        self.assertEqual(len(n["bulletins"]), 3)
+        paths = [call[3] for call in c.calls if call[1] == 18445]
+        self.assertEqual(paths, ["flow/about", "system-diagnostics?nodewise=true", "flow/status", "controller/cluster", f"flow/bulletin-board?limit={sx.BULLETINS}"])
+        self.assertTrue(all(call[0] == call[2] == "localhost" and call[4] <= sx.REQUEST_TIMEOUT for call in c.calls), "connects to nifi.web.https.host, checks that name")
+
+        standalone = samples["n112"]["nifi"]
+        self.assertEqual((standalone["state"], standalone["about"]["version"]), ("ok", "1.12.1"))
+        self.assertNotIn("cluster", standalone)
+        self.assertNotIn("nodes", standalone["diagnostics"], "a standalone asks without nodewise")
+        self.assertEqual(samples["c250-2"]["process"], {"running": False})
+        self.assertEqual(samples["c250-2"]["nifi"], {"state": "not-running"})
+        self.assertNotIn(18446, [call[1] for call in c.calls], "a NiFi that does not run is not called")
+
+        # The certificates (S27): the keystore (PKCS12) and truststore (JKS) of each, keytool of the NiFi's JDK, the password in the environment.
+        certs = {s["store"]: s for s in samples["n112"]["certs"]["stores"]}
+        self.assertEqual(sorted(certs), ["keystore", "truststore"], "no monitor certificate configured")
+        self.assertEqual((certs["keystore"]["type"], certs["keystore"]["path"]), ("PKCS12", str(self.n112 / "conf" / "keystore.pkcs12")))
+        self.assertEqual([x["notAfter"] for x in certs["keystore"]["certificates"]], ["2029-02-06T14:19:17Z"] * 2)
+        self.assertEqual((certs["truststore"]["type"], certs["truststore"]["certificates"][0]["subject"]), ("JKS", "CN=localhost, OU=NIFI"))
+        self.assertTrue(all(run[0] == str(self.root / "jdk" / "bin" / "keytool") for run in c.keytool_runs))
+        self.assertIn((str(self.root / "jdk" / "bin" / "keytool"), str(self.n112 / "conf" / "truststore.jks"), "JKS", "tspw"), c.keytool_runs)
+        bad = {s["store"]: s for s in samples["n200"]["certs"]["stores"]}
+        self.assertEqual((bad["keystore"]["error"], bad["keystore"]["certificates"]), ("keystore password was incorrect", []))
+        self.assertEqual(len(bad["truststore"]["certificates"]), 1, "the other store is still read")
+        self.assertNotIn("kspw", json.dumps(list(samples.values())), "no password in a sample")
+
+    def test_one_nifi_down_or_hanging_affects_only_its_own_sample(self):
+        c = self.collector()
+        c.down.add(18444)
+        c.hang.add(18443)
+        samples = self.by_service(c.round(sx.watch_entries(self.watch)))
+        self.assertEqual(samples["n200"]["nifi"]["state"], "unreachable")
+        self.assertIn("Connection refused", samples["n200"]["nifi"]["error"])
+        self.assertEqual(samples["n112"]["nifi"]["state"], "unreachable")
+        self.assertEqual([call[3] for call in c.calls if call[1] in (18443, 18444)], ["flow/about", "flow/about"], "after the first call fails, no more waiting")
+        self.assertEqual(samples["c250-1"]["nifi"]["state"], "ok")
+        self.assertTrue(samples["n200"]["process"]["running"], "the process is still sampled")
+
+        # A call that fails after the first: the sample is partial, the rest is there.
+        orig = c.fetch
+        c.fetch = lambda ctx, connect, port, sni, path, timeout: (403, b"no read policy") if path == "controller/cluster" else orig(ctx, connect, port, sni, path, timeout)
+        node = self.by_service(c.round(sx.watch_entries(self.watch)))["c250-1"]["nifi"]
+        self.assertEqual((node["state"], node["errors"]), ("partial", {"cluster": "HTTP 403: no read policy"}))
+        self.assertIn("diagnostics", node)
+
+    def test_a_nifi_that_hangs_costs_at_most_its_budget(self):
+        c = self.collector()
+        clock = [1000.0]
+        real = sx.time.monotonic
+        sx.time.monotonic = lambda: clock[0]
+        # Each answer takes 4 seconds: about, diagnostics and status fit in the 10, the rest is skipped.
+        c.fetch = lambda ctx, connect, port, sni, path, timeout: (clock.__setitem__(0, clock[0] + 4), recorded(LAB_PORTS[port], path))[1]
+        try:
+            node = self.by_service(c.round(sx.watch_entries(self.watch[2:3])))["c250-1"]["nifi"]
+        finally:
+            sx.time.monotonic = real
+        self.assertEqual(node["state"], "partial")
+        self.assertEqual(sorted(node["errors"]), ["bulletins", "cluster"])
+        self.assertTrue(all(v.startswith("skipped") for v in node["errors"].values()))
+        self.assertIn("status", node)
+
+    def test_without_the_monitor_certificate_only_proc_and_the_disks(self):
+        c = sx.Collector(cfg(self.root), proc=self.proc.root, uid=os.geteuid())
+        c.run_keytool = LabCollector.run_keytool.__get__(c)
+        c.keytool_runs = []
+        samples = self.by_service(c.round(sx.watch_entries(self.watch)))
+        self.assertEqual(samples["c250-1"]["nifi"]["state"], "no-certificate")
+        self.assertIn("EXECUTOR_NIFI_CLIENT_CERT", samples["c250-1"]["nifi"]["error"])
+        self.assertTrue(samples["c250-1"]["process"]["running"])
+        self.assertTrue(samples["c250-1"]["disks"])
+        self.assertTrue(samples["c250-1"]["certs"]["stores"], "the certificates are read from the files all the same")
+
+    def test_only_new_bulletins_are_sent(self):
+        c = self.collector()
+        watch = sx.watch_entries(self.watch[2:3])
+        self.assertEqual(len(c.round(watch)[0]["nifi"]["bulletins"]), 3)
+        self.assertEqual(c.round(watch)[0]["nifi"]["bulletins"], [], "the same three again")
+
+    def test_certificates_are_read_once_an_hour_or_when_a_file_changes(self):
+        c = self.collector()
+        watch = sx.watch_entries(self.watch[:1])
+        first = c.round(watch)[0]["certs"]
+        runs = len(c.keytool_runs)
+        self.assertEqual(c.round(watch)[0]["certs"], first)
+        self.assertEqual(len(c.keytool_runs), runs, "cached")
+        ks = self.n112 / "conf" / "keystore.pkcs12"
+        os.utime(ks, (ks.stat().st_mtime + 5, ks.stat().st_mtime + 5))
+        c.round(watch)
+        self.assertEqual(len(c.keytool_runs), runs * 2, "a store changed: read again")
+        c.certs[watch[0]["member"]]["at"] -= sx.CERTS_EVERY
+        c.round(watch)
+        self.assertEqual(len(c.keytool_runs), runs * 3, "an hour later: read again")
+
+    def test_an_encrypted_password_or_no_keytool_is_said_not_fatal(self):
+        props = self.n112 / "conf" / "nifi.properties"
+        props.write_text(props.read_text() + "nifi.security.keystorePasswd.protected=aes/gcm/256\n")
+        c = self.collector()
+        stores = {s["store"]: s for s in c.round(sx.watch_entries(self.watch[:1]))[0]["certs"]["stores"]}
+        self.assertIn("encrypted in nifi.properties", stores["keystore"]["error"])
+        self.assertTrue(stores["truststore"]["certificates"])
+        self.assertNotIn(str(self.n112 / "conf" / "keystore.pkcs12"), [r[1] for r in c.keytool_runs])
+
+        c = self.collector()
+        os.unlink(self.root / "jdk" / "bin" / "keytool")
+        real = sx.shutil.which
+        sx.shutil.which = lambda name: None
+        try:
+            stores = c.round(sx.watch_entries(self.watch[1:2]))[0]["certs"]["stores"]
+        finally:
+            sx.shutil.which = real
+        self.assertTrue(all("keytool not found" in s["error"] for s in stores))
+        self.assertTrue(c.certs[self.watch[1]["member"]]["retry"], "tried again next round")
+
+    def test_samples_go_out_in_batches_and_wait_while_the_deployer_is_down(self):
+        ex = self.executor()
+        ex.collector = self.collector()
+        self.api.watch = self.watch
+        ex.heartbeat()
+        ex.collect_once()
+        self.assertEqual((self.api.posts, len(self.api.samples)), ([4], 4))
+        self.api.down = True
+        for _ in range(6):
+            ex.collect_once()
+        self.assertEqual(len(ex.backlog), 24)
+        self.assertEqual(ex.beat_body(None)["collector"]["backlog"], 24)
+        self.api.down = False
+        ex.push_samples()
+        self.assertEqual(self.api.posts, [4, 20, 4], f"at most {sx.SAMPLES_PER_POST} per request")
+        self.assertEqual(ex.backlog, [])
+        # Kept no longer than 30 minutes: the oldest go first.
+        self.api.down = True
+        ex.collect_once()
+        ex.backlog = [(t - sx.BACKLOG_SECONDS - 1, s) for t, s in ex.backlog[:2]] + ex.backlog[2:]
+        self.api.down = False
+        ex.push_samples()
+        self.assertEqual(self.api.posts[-1], 2)
+        self.assertEqual(len(self.api.samples), 30)
+
+    def test_a_collector_failure_is_in_the_sample(self):
+        c = self.collector()
+        c.sample = lambda *a: (_ for _ in ()).throw(RuntimeError("boom"))
+        out = c.round(sx.watch_entries(self.watch[:1]))
+        self.assertEqual(out[0]["problems"], ["the collector failed: boom"])
+        self.assertEqual(c.round([]), [], "nothing watched: nothing sampled")
+
+
 @unittest.skipUnless(all(shutil.which(c) for c in ("sh", "tar", "sha256sum")) and hasattr(os, "symlink"), "needs sh, tar, sha256sum")
 class ReleaseTest(Base):
     """The release: its own archive beside the deploy executor's, installed without root and upgraded like it."""

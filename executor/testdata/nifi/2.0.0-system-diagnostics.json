@@ -1,0 +1,93 @@
+{
+ "systemDiagnostics": {
+  "aggregateSnapshot": {
+   "totalNonHeap": "162.19 MB",
+   "totalNonHeapBytes": 170065920,
+   "usedNonHeap": "154.7 MB",
+   "usedNonHeapBytes": 162216824,
+   "freeNonHeap": "7.49 MB",
+   "freeNonHeapBytes": 7849096,
+   "maxNonHeap": "-1 bytes",
+   "maxNonHeapBytes": -1,
+   "totalHeap": "1,024 MB",
+   "totalHeapBytes": 1073741824,
+   "usedHeap": "174.52 MB",
+   "usedHeapBytes": 183000464,
+   "freeHeap": "849.48 MB",
+   "freeHeapBytes": 890741360,
+   "maxHeap": "1,024 MB",
+   "maxHeapBytes": 1073741824,
+   "heapUtilization": "17.0%",
+   "availableProcessors": 32,
+   "processorLoadAverage": 0.7919921875,
+   "totalThreads": 99,
+   "daemonThreads": 42,
+   "uptime": "00:02:43.178",
+   "flowFileRepositoryStorageUsage": {
+    "freeSpace": "923.29 GB",
+    "totalSpace": "1,006.85 GB",
+    "usedSpace": "83.56 GB",
+    "freeSpaceBytes": 991379763200,
+    "totalSpaceBytes": 1081101176832,
+    "usedSpaceBytes": 89721413632,
+    "utilization": "8.0%"
+   },
+   "contentRepositoryStorageUsage": [
+    {
+     "identifier": "default",
+     "freeSpace": "923.29 GB",
+     "totalSpace": "1,006.85 GB",
+     "usedSpace": "83.56 GB",
+     "freeSpaceBytes": 991379763200,
+     "totalSpaceBytes": 1081101176832,
+     "usedSpaceBytes": 89721413632,
+     "utilization": "8.0%"
+    }
+   ],
+   "provenanceRepositoryStorageUsage": [
+    {
+     "identifier": "default",
+     "freeSpace": "923.29 GB",
+     "totalSpace": "1,006.85 GB",
+     "usedSpace": "83.56 GB",
+     "freeSpaceBytes": 991379763200,
+     "totalSpaceBytes": 1081101176832,
+     "usedSpaceBytes": 89721413632,
+     "utilization": "8.0%"
+    }
+   ],
+   "garbageCollection": [
+    {
+     "name": "G1 Young Generation",
+     "collectionCount": 13,
+     "collectionTime": "00:00:00.196",
+     "collectionMillis": 196
+    },
+    {
+     "name": "G1 Concurrent GC",
+     "collectionCount": 8,
+     "collectionTime": "00:00:00.025",
+     "collectionMillis": 25
+    },
+    {
+     "name": "G1 Old Generation",
+     "collectionCount": 0,
+     "collectionTime": "00:00:00.000",
+     "collectionMillis": 0
+    }
+   ],
+   "statsLastRefreshed": "19:59:10 CST",
+   "versionInfo": {
+    "niFiVersion": "2.0.0",
+    "javaVendor": "Eclipse Adoptium",
+    "javaVersion": "21.0.13",
+    "osName": "Linux",
+    "osVersion": "6.6.0-lab",
+    "osArchitecture": "amd64",
+    "buildTag": "HEAD",
+    "buildRevision": "2f13b60",
+    "buildBranch": "NIFI-13915-RC2"
+   }
+  }
+ }
+}

@@ -1,0 +1,12 @@
+{
+ "about": {
+  "title": "NiFi",
+  "version": "2.0.0",
+  "uri": "https://localhost:18444/nifi-api/",
+  "contentViewerUrl": "https://localhost:18444/nifi/#/content-viewer",
+  "timezone": "CST",
+  "buildTag": "HEAD",
+  "buildRevision": "2f13b60",
+  "buildBranch": "NIFI-13915-RC2"
+ }
+}

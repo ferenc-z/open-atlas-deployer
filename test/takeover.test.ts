@@ -143,6 +143,22 @@ test("ports are checked per machine, in the draft and against what is registered
   assert.equal(portConflicts(items, [{ ...registered[0]!, member: { ...registered[0]!.member, installDir: `${LAB}/n112` } }]).get("n112"), undefined);
 });
 
+test("S26: a host that would have more than one NiFi registered gets a warning, not an error", () => {
+  const items = assessItems(groupDiscoveries(lab()).items, lab());
+  const f = findingsOf(items, "n112").find((x) => x.code === "host/multiple-nifi")!;
+  assert.equal(f.severity, "warning");
+  assert.match(f.message, /local would have 4 NiFi installations registered/);
+  assert.equal(f.values!.length, 4);
+  assert.ok(findingsOf(items, "nifi-lab-c250").some((x) => x.code === "host/multiple-nifi"), "the cluster's two nodes share the host too");
+
+  // One per machine: nothing; one more already registered there: the warning again.
+  const one = lab().slice(0, 1);
+  assert.ok(!findingsOf(assessItems(groupDiscoveries(one).items, one), "n112").some((x) => x.code === "host/multiple-nifi"));
+  const registered = [{ service: "nifi", profile: "nifi-2.x", member: { host: "local", installDir: "/srv/other", ports: { https: 9443 } } }];
+  assert.match(findingsOf(assessItems(groupDiscoveries(one).items, one, registered), "n112").find((x) => x.code === "host/multiple-nifi")!.message, /would have 2/);
+  assert.ok(!findingsOf(assessItems(groupDiscoveries(one).items, one, [{ ...registered[0]!, member: { ...registered[0]!.member, host: "other" } }]), "n112").some((x) => x.code === "host/multiple-nifi"));
+});
+
 test("the risks the design lists are found by rules", () => {
   const found = lab();
   found[0]!.instance.properties["nifi.sensitive.props.key"] = "";

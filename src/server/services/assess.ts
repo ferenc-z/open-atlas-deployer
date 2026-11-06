@@ -240,11 +240,31 @@ export function assessItem(item: DraftItem, byInstall: Map<string, Discovered>, 
   return out.sort((a, b) => order[a.severity] - order[b.severity]);
 }
 
+/** S26: production runs one NiFi per machine. A host that would have several registered (this draft's and those
+ *  already registered) gets a warning on each item with an installation there; not an error (the lab has four). */
+export function multipleOnHost(items: DraftItem[], registered: RegisteredMember[] = []): Map<string, Finding[]> {
+  const byHost = new Map<string, Set<string>>();
+  const add = (m: Pick<ServiceMember, "host" | "installDir" | "confDir">) => { const s = byHost.get(m.host) ?? new Set(); s.add(installKey(m)); byHost.set(m.host, s); };
+  for (const i of items) for (const m of i.kind === "cluster" ? i.nodes : [i.member]) add(m);
+  for (const r of registered) add(r.member);
+  const out = new Map<string, Finding[]>();
+  for (const i of items) {
+    const hosts = [...new Set((i.kind === "cluster" ? i.nodes : [i.member]).map((m) => m.host))].filter((h) => byHost.get(h)!.size > 1);
+    out.set(i.id, hosts.map((h) => ({
+      severity: "warning" as const, code: "host/multiple-nifi",
+      message: `${h} would have ${byHost.get(h)!.size} NiFi installations registered; production runs one NiFi per machine (they share its memory, disks and ports).`,
+      values: [...byHost.get(h)!].sort().map((k) => ({ host: h, installDir: k.slice(h.length + 1), value: null })),
+    })));
+  }
+  return out;
+}
+
 /** Every item with its findings (rules only), replacing what they had. */
 export function assessItems(items: DraftItem[], found: Discovered[], registered: RegisteredMember[] = []): DraftItem[] {
   const byInstall = new Map(found.map((d) => [discoveredKey(d), d]));
   const conflicts = portConflicts(items, registered);
-  return items.map((item) => ({ ...item, findings: assessItem(item, byInstall, conflicts.get(item.id)) }));
+  const crowded = multipleOnHost(items, registered);
+  return items.map((item) => ({ ...item, findings: assessItem(item, byInstall, [...(conflicts.get(item.id) ?? []), ...(crowded.get(item.id) ?? [])]) }));
 }
 
 /** What the AI review is asked (P1: it explains and advises; the grouping and findings are the rules'). No secret goes

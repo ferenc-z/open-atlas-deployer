@@ -140,6 +140,10 @@ class DeployerApi:
     def report_state(self, containers, files):
         self.call("POST", "/executor/v1/state", body={"containers": containers, "files": files})
 
+    def post_samples(self, samples):
+        """The service executor's collected samples (§15.3), at most 20 at a time."""
+        return self.call("POST", "/executor/v1/samples", body={"samples": samples})
+
 
 class ProtocolExecutor:
     """The job loop, registration and self-upgrade. A subclass names what follows and adds its jobs."""
@@ -250,9 +254,14 @@ class ProtocolExecutor:
     def send_beat(self, body):
         with self.beat_lock:
             try:
-                self.api.heartbeat(body)
+                reply = self.api.heartbeat(body)
             except Exception as e:  # the Deployer may be restarting; the next beat tries again
                 self.say(f"heartbeat failed: {e}")
+                return
+        self.on_beat_reply(reply if isinstance(reply, dict) else {})
+
+    def on_beat_reply(self, reply):
+        """What the Deployer answered a heartbeat with (the service executor takes its watch list from it, §15.2 P5)."""
 
     def heartbeat(self, busy=None):
         self.send_beat(self.beat_body(busy))
@@ -345,7 +354,8 @@ class ProtocolExecutor:
         waited = 0
         while True:
             try:
-                self.api.heartbeat(self.beat_body(None))
+                reply = self.api.heartbeat(self.beat_body(None))
+                self.on_beat_reply(reply if isinstance(reply, dict) else {})
                 break
             except Failed as e:
                 if "HTTP 401" in str(e):

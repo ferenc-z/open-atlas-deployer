@@ -2234,3 +2234,44 @@ test("§15.2: a job the executor does not name in its heartbeat is refused when 
   assert.deepEqual(handoff.missing("elsewhere", { kind: "log-read" }, "service"), [], "no heartbeat: not known");
   store.close();
 });
+
+test("§15.2 P5, §15.3: a service executor's heartbeat reply carries its watch list; its samples are kept for what it watches", async () => {
+  const t = setup({ services: fakeState() });
+  setEnvironment(t, ({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", hosts, registries: { ghcr: "ghcr.io/acme" }, apps: { shop: { version: "1.2.0", host: "app2" } } }));
+  const call = (path: string, token: string, init: RequestInit = {}) => t.app.request(`/deploy${path}`, { ...init, headers: { authorization: `Bearer ${token}`, ...(typeof init.body === "string" && init.body.startsWith("{") ? { "content-type": "application/json" } : {}) } });
+  const service = (await (await post(t, "/api/hosts/app2/token", "admin", { executor: "service" })).json()).token as string;
+  const deploy = (await (await post(t, "/api/hosts/app2/token", "admin", {})).json()).token as string;
+  const beat = async () => (await call("/executor/v1/heartbeat", service, { method: "POST", body: JSON.stringify({ executor: "service", version: EXECUTOR_VERSION, protocols: [2], kinds: ["svc-discover", "svc-read", "executor-upgrade", "svc-discover@2", "svc-read@2"], busy: null, user: "ferenc", isRoot: false, reading: [], readSlots: 4 }) })).json();
+  assert.deepEqual((await beat()).watch, [], "nothing registered yet");
+  const deployBeat = await (await call("/executor/v1/heartbeat", deploy, { method: "POST", body: JSON.stringify({ version: EXECUTOR_VERSION, protocols: [2], kinds: [], busy: null }) })).json();
+  assert.equal("watch" in deployBeat, false, "the deploy executor samples nothing");
+
+  // A discovery says the HTTPS host and the log directory; the members registered from it carry them in the list.
+  const { id: job } = await (await post(t, "/api/hosts/app2/discover", "admin", {})).json();
+  await call("/executor/v1/jobs/next", service);
+  const instance = (dir: string, conf?: string) => ({ installDir: dir, ...(conf ? { confDir: conf } : {}), running: true, version: "2.5.0", properties: { "nifi.web.https.host": "nifi.app2" }, storage: { logs: { path: `${dir}/logs`, device: 1 } } });
+  await call(`/executor/v1/jobs/${job}/status`, service, { method: "PUT", body: JSON.stringify({ protocol: 2, id: job, kind: "svc-discover", state: "succeeded", steps: [], result: { scannedAt: "2026-11-06T01:00:00Z", instances: [instance("/opt/a"), instance("/opt/b", "/etc/nifi-b")], dirs: [], skipped: [] } }) });
+  const member = (installDir: string, https: number, confDir?: string) => ({ host: "app2", installDir, ...(confDir ? { confDir } : {}), serviceUser: "nifi", startEnvironment: null, ports: { https }, nodeAddress: `node-${https}`, discovery: { job, host: "app2", installDir, ...(confDir ? { confDir } : {}) } });
+  const actor = { id: "admin", via: "workbench" as const };
+  t.store.addCluster({ kind: "cluster", id: "flow", service: "nifi", profile: "nifi-2.x", version: "2.5.0", webUrl: null, zookeeper: "zk:2181", zookeeperRoot: "/flow", nodes: [member("/opt/a", 8443), member("/opt/b", 9443, "/etc/nifi-b")] }, "uat", actor);
+  const { nodeAddress: _n, discovery: _d, ...single } = { ...member("/opt/n200", 8444), host: "app1" };
+  t.store.addStandalone({ kind: "standalone", id: "n200", service: "nifi", profile: "nifi-2.x", version: "2.0.0", webUrl: null, member: single }, "uat", actor);
+  const watch = (await beat()).watch;
+  assert.deepEqual(watch, [
+    { service: "flow", kind: "node", member: "app2:/opt/a", profile: "nifi-2.x", installDir: "/opt/a", confDir: "/opt/a/conf", https: { host: "nifi.app2", port: 8443 }, nodeAddress: "node-8443", logDir: "/opt/a/logs" },
+    { service: "flow", kind: "node", member: "app2:/opt/b (conf /etc/nifi-b)", profile: "nifi-2.x", installDir: "/opt/b", confDir: "/etc/nifi-b", https: { host: "nifi.app2", port: 9443 }, nodeAddress: "node-9443", logDir: "/opt/b/logs" },
+  ], "only this host's, n200 is on app1");
+
+  // Samples: only those of what the host watches are kept; at most 20 a request; only from the service executor.
+  const send = (token: string, samples: unknown[]) => call("/executor/v1/samples", token, { method: "POST", body: JSON.stringify({ samples }) });
+  const sample = (member: string, at: string, more: Record<string, unknown> = {}) => ({ service: "flow", member, at, process: { running: true, pid: 7 }, ...more });
+  const r = await send(service, [sample("app2:/opt/a", "2026-11-06T01:00:00Z"), sample("app2:/opt/a", "2026-11-06T01:01:00Z", { nifi: { state: "ok" } }), sample("app1:/opt/n200", "2026-11-06T01:00:00Z"), { service: "flow" }]);
+  assert.deepEqual([r.status, await r.json()], [200, { ok: true, accepted: 2, dropped: 2 }]);
+  const latest = t.store.latestServiceSamples("flow");
+  assert.deepEqual(latest.map((s) => [s.member, s.at, (s.body.nifi as { state: string }).state]), [["app2:/opt/a", "2026-11-06T01:01:00Z", "ok"]]);
+  assert.equal(t.store.latestServiceSamples("n200").length, 0, "another host's service is not this executor's to report");
+  assert.equal((await send(service, Array.from({ length: 21 }, () => sample("app2:/opt/a", "2026-11-06T01:02:00Z")))).status, 400);
+  assert.equal((await call("/executor/v1/samples", service, { method: "POST", body: "{\"nope\":1}" })).status, 400);
+  assert.equal((await send(deploy, [sample("app2:/opt/a", "2026-11-06T01:03:00Z")])).status, 409);
+  assert.equal((await send("dpe_unknown", [])).status, 401);
+});

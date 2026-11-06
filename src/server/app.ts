@@ -33,6 +33,7 @@ import { configView } from "./services/configview.ts";
 import type { DraftItem } from "./services/draft.ts";
 import { serviceStatus } from "./services/status.ts";
 import { TakeoverError, type Takeover } from "./services/takeover.ts";
+import { acceptSamples, watchList } from "./services/watch.ts";
 import { DEPLOYER_VERSION } from "./version.ts";
 import { validateEnvironment } from "./environment.ts";
 import { applyPatch, changedPaths, PatchError } from "./jsonpatch.ts";
@@ -146,7 +147,17 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     const says = beat?.executor ?? "deploy";
     if (says !== kind) return reject(c, 409, "executor/kind-mismatch", `This token is for the ${kind} executor of ${host}, but a ${says} executor sent it: issue a ${says} executor token for ${host} on the Hosts page.`);
     handoff.heartbeat(host, beat, kind);
-    return c.json({ ok: true, host, executor: kind, deployer: DEPLOYER_VERSION });
+    // §15.2 P5: a service executor's reply carries what it samples, the installations registered on its host.
+    return c.json({ ok: true, host, executor: kind, deployer: DEPLOYER_VERSION, ...(kind === "service" ? { watch: watchList(store, host) } : {}) });
+  }));
+  // §15.3: the collector's samples, at most 20 a request; only those of what the host watches are kept.
+  api.post("/executor/v1/samples", executorRoute(async (c, host, kind) => {
+    if (kind !== "service") return reject(c, 409, "executor/service-only", "Only a service executor sends samples.");
+    if (Number(c.req.header("content-length") ?? 0) > 4 << 20) return reject(c, 400, "samples/too-large", "At most 4 MiB of samples per request.");
+    const got = acceptSamples(watchList(store, host), await c.req.json().catch(() => null));
+    if ("error" in got) return reject(c, 400, "samples/invalid", got.error);
+    store.addServiceSamples(got.accepted);
+    return c.json({ ok: true, accepted: got.accepted.length, dropped: got.dropped });
   }));
   api.get("/executor/v1/jobs/next", executorRoute(async (c, host, kind) => {
     const wait = Math.min(30, Math.max(0, Number(c.req.query("wait") ?? 0))) * 1000;

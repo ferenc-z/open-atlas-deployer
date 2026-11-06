@@ -1,0 +1,60 @@
+{
+ "cluster": {
+  "nodes": [
+   {
+    "nodeId": "00000000-0000-4000-8000-000000000001",
+    "address": "localhost",
+    "apiPort": 18445,
+    "status": "CONNECTED",
+    "heartbeat": "11/06/2026 19:59:09 CST",
+    "roles": [
+     "Primary Node",
+     "Cluster Coordinator"
+    ],
+    "activeThreadCount": 0,
+    "queued": "0 / 0 bytes",
+    "events": [
+     {
+      "timestamp": "11/06/2026 19:57:05 CST",
+      "category": "INFO",
+      "message": "Received first heartbeat from connecting node. Node connected."
+     },
+     {
+      "timestamp": "11/06/2026 19:57:02 CST",
+      "category": "INFO",
+      "message": "Connection requested from existing node. Setting status to connecting."
+     }
+    ],
+    "nodeStartTime": "11/06/2026 19:56:48 CST",
+    "flowFilesQueued": 0,
+    "bytesQueued": 0
+   },
+   {
+    "nodeId": "00000000-0000-4000-8000-000000000002",
+    "address": "localhost",
+    "apiPort": 18446,
+    "status": "CONNECTED",
+    "heartbeat": "11/06/2026 19:59:09 CST",
+    "roles": [],
+    "activeThreadCount": 0,
+    "queued": "0 / 0 bytes",
+    "events": [
+     {
+      "timestamp": "11/06/2026 19:57:05 CST",
+      "category": "INFO",
+      "message": "Received first heartbeat from connecting node. Node connected."
+     },
+     {
+      "timestamp": "11/06/2026 19:56:57 CST",
+      "category": "INFO",
+      "message": "Connection requested from existing node. Setting status to connecting."
+     }
+    ],
+    "nodeStartTime": "11/06/2026 19:56:49 CST",
+    "flowFilesQueued": 0,
+    "bytesQueued": 0
+   }
+  ],
+  "generated": "19:59:11 CST"
+ }
+}

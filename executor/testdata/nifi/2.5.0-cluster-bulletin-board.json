@@ -1,0 +1,52 @@
+{
+ "bulletinBoard": {
+  "bulletins": [
+   {
+    "id": 0,
+    "timestamp": "19:56:56 CST",
+    "nodeAddress": "localhost:18445",
+    "canRead": true,
+    "bulletin": {
+     "id": 0,
+     "nodeAddress": "localhost:18445",
+     "category": "Cluster Coordinator",
+     "level": "INFO",
+     "message": "localhost:11445 has been elected Active Cluster Coordinator",
+     "timestamp": "19:56:56 CST",
+     "sourceType": "FLOW_CONTROLLER"
+    }
+   },
+   {
+    "id": 1,
+    "timestamp": "19:57:05 CST",
+    "nodeAddress": "localhost:18445",
+    "canRead": true,
+    "bulletin": {
+     "id": 1,
+     "nodeAddress": "localhost:18445",
+     "category": "Clustering",
+     "level": "INFO",
+     "message": "Event Reported for localhost:18445 -- Received first heartbeat from connecting node. Node connected.",
+     "timestamp": "19:57:05 CST",
+     "sourceType": "FLOW_CONTROLLER"
+    }
+   },
+   {
+    "id": 2,
+    "timestamp": "19:57:05 CST",
+    "nodeAddress": "localhost:18445",
+    "canRead": true,
+    "bulletin": {
+     "id": 2,
+     "nodeAddress": "localhost:18445",
+     "category": "Clustering",
+     "level": "INFO",
+     "message": "Event Reported for localhost:18446 -- Received first heartbeat from connecting node. Node connected.",
+     "timestamp": "19:57:05 CST",
+     "sourceType": "FLOW_CONTROLLER"
+    }
+   }
+  ],
+  "generated": "19:59:11 CST"
+ }
+}

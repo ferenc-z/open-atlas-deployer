@@ -1,0 +1,72 @@
+Keystore type: JKS
+Keystore provider: SUN
+
+Your keystore contains 1 entry
+
+Alias name: nifi-cert
+Creation date: Nov 4, 2026
+Entry type: trustedCertEntry
+
+Owner: CN=localhost, OU=NIFI
+Issuer: CN=localhost, OU=NIFI
+Serial number: 12ea1a90df184
+Valid from: Wed Nov 04 14:19:17 UTC 2026 until: Tue Feb 06 14:19:17 UTC 2029
+Certificate fingerprints:
+	 SHA1: 6B:3B:BC:34:AE:81:9F:35:6F:07:D6:D9:99:BE:D0:0F:53:E2:B4:B0
+	 SHA256: 12:B3:93:C9:9C:C8:6D:67:F3:E1:8C:CF:CB:74:1D:4F:76:17:C2:45:00:8C:D9:C4:7F:01:A8:50:CC:BD:37:20
+Signature algorithm name: SHA256withRSA
+Subject Public Key Algorithm: 2048-bit RSA key
+Version: 3
+
+Extensions: 
+
+#1: ObjectId: 2.5.29.35 Criticality=false
+AuthorityKeyIdentifier [
+KeyIdentifier [
+0000: A4 A5 B7 DF A0 12 AC 64   C9 45 BF 9E A6 F6 FC 1C  .......d.E......
+0010: AB 2D A8 98                                        .-..
+]
+]
+
+#2: ObjectId: 2.5.29.19 Criticality=false
+BasicConstraints:[
+  CA:true
+  PathLen:2147483647
+]
+
+#3: ObjectId: 2.5.29.37 Criticality=false
+ExtendedKeyUsages [
+  clientAuth
+  serverAuth
+]
+
+#4: ObjectId: 2.5.29.15 Criticality=true
+KeyUsage [
+  DigitalSignature
+  Non_repudiation
+  Key_Encipherment
+  Data_Encipherment
+  Key_Agreement
+  Key_CertSign
+  Crl_Sign
+]
+
+#5: ObjectId: 2.5.29.17 Criticality=false
+SubjectAlternativeName [
+  DNSName: localhost
+]
+
+#6: ObjectId: 2.5.29.14 Criticality=false
+SubjectKeyIdentifier [
+KeyIdentifier [
+0000: A4 A5 B7 DF A0 12 AC 64   C9 45 BF 9E A6 F6 FC 1C  .......d.E......
+0010: AB 2D A8 98                                        .-..
+]
+]
+
+
+
+*******************************************
+*******************************************
+
+
