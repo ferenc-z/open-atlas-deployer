@@ -235,5 +235,5 @@ for n in $ONLY; do
 done
 
 # lab.sh needs these next to it.
-if [ "$HERE" != "$LAB" ]; then cp "$HERE"/{lab.conf,lab.sh,setup.sh,grant.py,props.py} "$LAB/"; chmod +x "$LAB"/*.sh; fi
-log "done. Next: $LAB/lab.sh start && $LAB/lab.sh grant && $LAB/lab.sh status"
+if [ "$HERE" != "$LAB" ]; then cp "$HERE"/{lab.conf,lab.sh,setup.sh,grant.py,props.py,nginx.conf} "$LAB/"; chmod +x "$LAB"/*.sh; fi
+log "done. Next: $LAB/lab.sh start && $LAB/lab.sh grant && $LAB/lab.sh status (and $LAB/lab.sh nginx start for Studio, P8)"

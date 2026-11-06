@@ -15,7 +15,7 @@ export { EXECUTOR_KINDS, type ExecutorKind } from "./store.ts";
 
 export const PROTOCOL = 2;
 /** §8.6: the executor release this Deployer ships with (executor/deployer_executor.py VERSION); hosts on an older one are offered the upgrade. */
-export const EXECUTOR_VERSION = "0.7.3";
+export const EXECUTOR_VERSION = "0.8.0";
 
 export interface Heartbeat {
   /** S18: which executor sent it; absent from deploy executors before S18. */
@@ -64,6 +64,28 @@ export function hostOf(env: Pick<Environment, "hosts" | "apps">, app: string): s
   return env.apps[app]?.host ?? hostIds(env)[0]!;
 }
 
+/** §15.2: what a request needs of the executor, as the job kinds its heartbeat names. An executor says what it can do
+ *  by kind, not by version: the job's kind, and "<kind>@<n>" for a later form of a request. svc-discover@2: dirs
+ *  entries {install, conf}; svc-read@2: a conf directory (confDir) or bootstrap.conf elsewhere than <installDir>/conf. */
+export function kindsNeeded(request: Record<string, unknown>): string[] {
+  const kind = String(request.kind ?? "");
+  const out = [kind];
+  if (kind === "svc-discover" && Array.isArray(request.dirs) && request.dirs.some((d) => d !== null && typeof d === "object")) out.push("svc-discover@2");
+  if (kind === "svc-read") {
+    const home = String(request.installDir ?? "").replace(/\/+$/, "");
+    if (request.confDir || (typeof request.bootstrapFile === "string" && request.bootstrapFile !== `${home}/conf/bootstrap.conf`)) out.push("svc-read@2");
+  }
+  return out;
+}
+
+/** An executor that cannot run a request: refused before it is queued, or failed before it is handed over. */
+export class ExecutorUnsupported extends Error {
+  readonly status = 409;
+  readonly code = "executor/unsupported";
+  readonly missing: string[];
+  constructor(message: string, missing: string[]) { super(message); this.missing = missing; }
+}
+
 export const tokenSha256 = (token: string) => createHash("sha256").update(token).digest("hex");
 
 export class Handoff {
@@ -93,6 +115,18 @@ export class Handoff {
     return { online: true, ...info, heartbeat, ageSeconds };
   }
 
+  /** What of `request` the executor's last heartbeat does not name (kindsNeeded); [] when it names all of it, or when it
+   *  sent no heartbeat or no kinds (not known: the job waits, and is checked again when it is handed over). */
+  missing(host: string, request: Record<string, unknown>, kind: ExecutorKind = "deploy"): string[] {
+    const kinds = this.executor(host, kind).heartbeat?.kinds;
+    return Array.isArray(kinds) ? kindsNeeded(request).filter((k) => !kinds.includes(k)) : [];
+  }
+
+  private unsupported(host: string, request: Record<string, unknown>, kind: ExecutorKind, missing: string[]): ExecutorUnsupported {
+    const version = this.executor(host, kind).heartbeat?.version;
+    return new ExecutorUnsupported(`The ${kind === "deploy" ? "executor" : `${kind} executor`}${version ? ` ${version}` : ""} on ${host} cannot run this ${String(request.kind)} job (it does not name ${missing.join(", ")}): upgrade it first.`, missing);
+  }
+
   executors(env: Pick<Environment, "hosts">): ExecutorInfo[] {
     return hostIds(env).map((h) => this.executor(h));
   }
@@ -100,6 +134,8 @@ export class Handoff {
   /** Queues a job for one executor of a host (by default its deploy executor); an env job's content is kept apart and
    *  leaves the queue on pickup. */
   submit(id: string, request: Record<string, unknown>, host: string, kind: ExecutorKind = "deploy") {
+    const missing = this.missing(host, request, kind);
+    if (missing.length) throw this.unsupported(host, request, kind, missing);
     const { content, ...rest } = request;
     this.store.queueExecutorJob(id, host, { protocol: PROTOCOL, id, ...rest }, typeof content === "string" ? content : undefined, kind);
     for (const wake of this.waiting.get(`${kind}:${host}`) ?? []) wake();
@@ -142,7 +178,7 @@ export class Handoff {
    *  whose executor went away (restarted, network) takes no job, or it would be claimed with nobody to run it. */
   async next(host: string, waitMs = 0, signal?: AbortSignal, kind: ExecutorKind = "deploy"): Promise<Record<string, unknown> | undefined> {
     if (signal?.aborted) return undefined;
-    const now = this.store.claimExecutorJob(host, kind);
+    const now = this.claim(host, kind);
     if (now || waitMs <= 0) return now;
     await new Promise<void>((resolve) => {
       const key = `${kind}:${host}`;
@@ -153,7 +189,20 @@ export class Handoff {
       set.add(done);
       signal?.addEventListener("abort", done, { once: true });
     });
-    return signal?.aborted ? undefined : this.store.claimExecutorJob(host, kind);
+    return signal?.aborted ? undefined : this.claim(host, kind);
+  }
+
+  /** The next queued job the executor can run; one it cannot (queued before it said so, or it was replaced by an
+   *  older one since) fails here and never reaches it, so an old executor does not refuse a whole request it misreads. */
+  private claim(host: string, kind: ExecutorKind): Record<string, unknown> | undefined {
+    for (;;) {
+      const job = this.store.claimExecutorJob(host, kind);
+      if (!job) return undefined;
+      const missing = this.missing(host, job, kind);
+      if (!missing.length) return job;
+      const at = new Date(this.now()).toISOString();
+      this.store.setExecutorStatus(String(job.id), { state: "refused", steps: [], result: {}, message: this.unsupported(host, job, kind, missing).message, finishedAt: at });
+    }
   }
 
   /** Whether a job belongs to the executor asking about it. */

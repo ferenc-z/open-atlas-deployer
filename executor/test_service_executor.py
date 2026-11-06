@@ -92,7 +92,8 @@ class RegistrationTest(Base):
         beat = self.api.beats[-1]
         self.assertEqual(beat["executor"], "service")
         self.assertEqual(beat["protocols"], [2])
-        self.assertEqual(beat["kinds"], ["svc-discover", "svc-read", "executor-upgrade"], "the service jobs; never the deploy ones")
+        self.assertEqual(beat["kinds"], ["svc-discover", "svc-read", "executor-upgrade", "svc-discover@2", "svc-read@2"],
+                         "the service jobs and what they can do (§15.2); never the deploy ones")
         name, root = sx.ServiceExecutor.user()
         self.assertEqual((beat["user"], beat["isRoot"]), (name, root))
         self.assertEqual(beat["isRoot"], os.geteuid() == 0)

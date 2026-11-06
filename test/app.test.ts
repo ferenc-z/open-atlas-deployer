@@ -15,7 +15,7 @@ import type { Config } from "../src/server/config.ts";
 import type { Environment } from "../src/compose/generate.ts";
 import { Deployments } from "../src/server/deploy.ts";
 import { EnvManager, Schemas } from "../src/server/env.ts";
-import { EXECUTOR_VERSION, Handoff, hostIds, PROTOCOL } from "../src/server/handoff.ts";
+import { EXECUTOR_VERSION, ExecutorUnsupported, Handoff, hostIds, kindsNeeded, PROTOCOL } from "../src/server/handoff.ts";
 import { Takeover } from "../src/server/services/takeover.ts";
 import { DEPLOYER_VERSION } from "../src/server/version.ts";
 import { Observer } from "../src/server/observe.ts";
@@ -64,6 +64,10 @@ interface SetupOptions {
   oma?: Partial<Config>;
   /** D45: what deployer.env sets, for the Deployer's own settings. */
   deployerEnv?: NodeJS.ProcessEnv;
+  /** environment.json as written by hand (instead of the default one). */
+  environment?: unknown;
+  /** More settings, e.g. a development instance's devSkipSetup. */
+  config?: Partial<Config>;
 }
 
 function setup(options: SetupOptions = {}) {
@@ -89,7 +93,7 @@ function setup(options: SetupOptions = {}) {
 
   const dir = mkdtempSync(join(tmpdir(), "deployer-"));
   const environmentFile = join(dir, "environment.json");
-  if (!options.noEnvironment) writeFileSync(environmentFile, JSON.stringify({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", registries: {}, apps: { shop: { version: "1.2.0" } } }));
+  if (!options.noEnvironment) writeFileSync(environmentFile, JSON.stringify(options.environment ?? { name: "uat", project: "open-atlas", bindIp: "127.0.0.1", registries: {}, apps: { shop: { version: "1.2.0" } } }));
   const config: Config = {
     bind: "127.0.0.1", port: 0, basePath: "/deploy", dataDir: dir, workbenchUrl: "http://workbench:8090", workbenchPublicUrl: "/",
     environmentFile, observeUrls: {}, secureCookies: false, webDir: join(dir, "web"), templatesDir: join(dir, "templates"), initialManifestsDir: fileURLToPath(new URL("../manifests/initial", import.meta.url)), peerKeySha256: options.peerKeys ?? [], githubApi: "https://api.github.com", omaVaults: [], omaAssessorVaults: [], briefHour: 8,
@@ -98,6 +102,7 @@ function setup(options: SetupOptions = {}) {
     ...(options.emergency ? { emergencyPasswordHash: hashPassword(options.emergency) } : {}),
     ...(options.services && !options.pasteKey ? { workbenchApiKeyFile: join(dir, "wb.key") } : {}),
     ...(options.oma ? { omaApiKeyFile: join(dir, "oma.key"), ...options.oma } : {}),
+    ...options.config,
   };
   let now = Date.parse("2026-10-30T10:00:00Z");
   const store = new Store(":memory:", () => new Date(now));
@@ -273,6 +278,30 @@ const deployedWorkbench = (t: ReturnType<typeof setup>, version = "1.25.1") => {
 };
 const setupStates = (s: { steps: { id: string; state: string }[] }) => Object.fromEntries(s.steps.map((x) => [x.id, x.state]));
 const setupStep = (s: { steps: { id: string }[] }, id: string) => s.steps.find((x) => x.id === id) as Record<string, any>;
+
+test("§15: an environment.json written by hand without apps or registries does not break the setup status", async () => {
+  const t = setup({ environment: { name: "uat", project: "open-atlas", bindIp: "127.0.0.1" } });
+  const res = await t.request("/api/setup", { as: "admin" });
+  assert.equal(res.status, 200);
+  const s = await res.json();
+  assert.equal(s.complete, false);
+  assert.equal(setupStates(s).environment, "done");
+  assert.equal(setupStep(s, "workbench-deploy").workbench?.version ?? "1.25.1", "1.25.1");
+  assert.equal(s.devSkipped, undefined);
+});
+
+test("§15.4 step 0: a development instance (devSkipSetup) counts setup as complete; DEPLOYER_DEV is read only outside production", async () => {
+  const t = setup({ noEnvironment: true, config: { devSkipSetup: true } });
+  const s = await (await t.request("/api/setup", { as: "admin" })).json();
+  assert.equal(s.complete, true);
+  assert.equal(s.devSkipped, true);
+  assert.equal(setupStates(s).environment, "next", "the steps still say what is there");
+  const base = { DEPLOYER_WORKBENCH_URL: "http://workbench:8090" };
+  assert.equal(loadConfig({ ...base, DEPLOYER_DEV: "1", DEPLOYER_DEV_SKIP_SETUP: "1" }).devSkipSetup, true);
+  assert.equal(loadConfig({ ...base, DEPLOYER_DEV_SKIP_SETUP: "1" }).devSkipSetup, undefined, "not without DEPLOYER_DEV=1");
+  assert.equal(loadConfig({ ...base, DEPLOYER_DEV: "1", DEPLOYER_DEV_SKIP_SETUP: "1", NODE_ENV: "production" }).devSkipSetup, undefined, "the image (NODE_ENV=production) ignores it");
+  assert.equal(loadConfig({ ...base, DEPLOYER_DEV: "1" }).devSkipSetup, undefined);
+});
 
 test("§15: a new installation is set up with the emergency account up to Workbench, then with Workbench's admin up to its key and groups", async () => {
   const password = "correct horse battery staple";
@@ -766,7 +795,7 @@ test("S18: a host's service executor has its own token and heartbeat, shows on t
   const beat = (token: string, body: Record<string, unknown>) => call("/executor/v1/heartbeat", token, { method: "POST", body: JSON.stringify({ version: EXECUTOR_VERSION, protocols: [2], kinds: ["executor-upgrade"], busy: null, ...body }) });
   assert.equal((await beat(service, {})).status, 409, "a service token is not the deploy executor's");
   assert.equal((await beat(deploy, { executor: "service" })).status, 409, "nor the other way round");
-  const ok = await beat(service, { executor: "service", user: "ferenc", isRoot: false, reading: [], readSlots: 4 });
+  const ok = await beat(service, { executor: "service", kinds: ["svc-discover", "svc-read", "executor-upgrade"], user: "ferenc", isRoot: false, reading: [], readSlots: 4 });
   assert.equal(ok.status, 200);
   assert.equal((await ok.json()).executor, "service");
 
@@ -779,7 +808,7 @@ test("S18: a host's service executor has its own token and heartbeat, shows on t
   assert.equal((await (await t.request("/api/hosts", { as: "viewer" })).json()).hosts.find((h: { id: string }) => h.id === "app1").service, null, "no service executor on app1");
 
   // A deploy job for app2 waits for its deploy executor; the service executor's poll never takes it.
-  await beat(deploy, { project: "open-atlas", registries: [], databaseBackup: {} });
+  await beat(deploy, { project: "open-atlas", registries: [], databaseBackup: {}, kinds: ["build", "deploy", "executor-upgrade"] });
   const build = await (await post(t, "/api/apps/shop/build", "uat", { version: "1.2.0" })).json();
   const id = build.jobs[0].id;
   assert.equal((await call("/executor/v1/jobs/next", service)).status, 204);
@@ -818,6 +847,11 @@ test("service ops step 3: discovery runs on the host's service executor, and its
   assert.equal(old.status, 409);
   assert.equal((await old.json()).error, "discover/executor-old");
   await beat(["svc-discover", "executor-upgrade"]);
+  // §15.2: {install, conf} needs svc-discover@2; an executor that does not name it is refused before anything is queued.
+  const plain = await post(t, "/api/hosts/app2/discover", "admin", { dirs: [{ install: "/webapp/install", conf: "/webapp/deploy/nifi/conf" }] });
+  assert.equal(plain.status, 409);
+  assert.deepEqual([(await plain.json()).error, t.store.executorJobs("app2").length], ["executor/unsupported", 0]);
+  await beat(["svc-discover", "executor-upgrade", "svc-discover@2"]);
   assert.equal((await post(t, "/api/hosts/app2/discover", "uat", {})).status, 403, "taking over is for administrators");
   assert.equal((await post(t, "/api/hosts/nowhere/discover", "admin", {})).status, 404);
   assert.equal((await post(t, "/api/hosts/app2/discover", "admin", { dirs: ["relative"] })).status, 400);
@@ -2173,4 +2207,30 @@ test("service ops step 6: a registered service's status is its members' executor
   assert.deepEqual([got.isError, got.value.summary.running, got.value.members[0].seen.pid], [false, 1, 12]);
   assert.equal((await tool(t, key, "get_cluster_status", { id: "nothing" })).value.finding.code, "service/unknown");
   assert.equal((await tool(t, key, "get_cluster_status", {})).value.finding.code, "mcp/arguments");
+});
+
+test("§15.2: a job the executor does not name in its heartbeat is refused when submitted, or at hand-over when queued before", async () => {
+  const store = new Store(":memory:");
+  const handoff = new Handoff(store);
+  assert.deepEqual(kindsNeeded({ kind: "svc-discover", dirs: ["/opt/nifi"] }), ["svc-discover"]);
+  assert.deepEqual(kindsNeeded({ kind: "svc-discover", dirs: ["/opt/nifi", { install: "/a", conf: "/b" }] }), ["svc-discover", "svc-discover@2"]);
+  assert.deepEqual(kindsNeeded({ kind: "svc-read", installDir: "/opt/nifi/", bootstrapFile: "/opt/nifi/conf/bootstrap.conf" }), ["svc-read"], "bootstrap.conf where an old executor reads it");
+  assert.deepEqual(kindsNeeded({ kind: "svc-read", installDir: "/opt/nifi", confDir: "/etc/nifi" }), ["svc-read", "svc-read@2"]);
+  assert.deepEqual(kindsNeeded({ kind: "svc-read", installDir: "/opt/nifi", bootstrapFile: "/etc/nifi/bootstrap.conf" }), ["svc-read", "svc-read@2"]);
+
+  // Not known yet (no heartbeat): queued; the executor then says what it runs, and the job never reaches it.
+  handoff.submit("log-read-1", { kind: "log-read", mode: "search" }, "local", "service");
+  handoff.submit("svc-read-1", { kind: "svc-read", installDir: "/opt/nifi" }, "local", "service");
+  handoff.heartbeat("local", { executor: "service", version: "0.7.3", protocols: [PROTOCOL], kinds: ["svc-discover", "svc-read", "executor-upgrade"], project: "", registries: [], databaseBackup: {}, busy: null, at: "" }, "service");
+  assert.equal((await handoff.next("local", 0, undefined, "service"))?.id, "svc-read-1", "the one it can run");
+  const refused = handoff.status("log-read-1")!;
+  assert.equal(refused.state, "refused");
+  assert.match(refused.message!, /service executor 0\.7\.3 on local cannot run this log-read job \(it does not name log-read\)/);
+  assert.equal(await handoff.next("local", 0, undefined, "service"), undefined);
+
+  assert.throws(() => handoff.submit("log-read-2", { kind: "log-read" }, "local", "service"), (e: ExecutorUnsupported) => e.status === 409 && e.code === "executor/unsupported" && e.missing.join() === "log-read");
+  assert.throws(() => handoff.submit("svc-read-2", { kind: "svc-read", installDir: "/opt/nifi", confDir: "/etc/nifi" }, "local", "service"), (e: ExecutorUnsupported) => e.missing.join() === "svc-read@2");
+  assert.equal(store.executorJob("log-read-2"), undefined, "not queued");
+  assert.deepEqual(handoff.missing("elsewhere", { kind: "log-read" }, "service"), [], "no heartbeat: not known");
+  store.close();
 });

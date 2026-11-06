@@ -64,6 +64,9 @@ export interface Config {
   uatKeyFile?: TokenSource;
   secureCookies: boolean;
   webDir: string;
+  /** A local development instance only (DEPLOYER_DEV=1 and DEPLOYER_DEV_SKIP_SETUP=1, never with NODE_ENV=production,
+   *  which the image sets): setup counts as complete, so the pages open on a new state without Workbench. */
+  devSkipSetup?: boolean;
 }
 
 /** `tokens`: tokens pasted on the page (D45), by the *_FILE setting they stand for; a file set in `env` wins. */
@@ -113,7 +116,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, tokens: Record<
     ...(token("DEPLOYER_UAT_KEY_FILE") ? { uatKeyFile: token("DEPLOYER_UAT_KEY_FILE") } : {}),
     secureCookies: (env.DEPLOYER_SECURE_COOKIES ?? "true") !== "false",
     webDir: resolve(env.DEPLOYER_WEB_DIR ?? "dist/web"),
+    ...(devSkipSetup(env) ? { devSkipSetup: true } : {}),
   };
+}
+
+/** The development switch for setup: read only with DEPLOYER_DEV=1, ignored in production (NODE_ENV=production). */
+export function devSkipSetup(env: NodeJS.ProcessEnv): boolean {
+  return env.DEPLOYER_DEV === "1" && env.NODE_ENV !== "production" && env.DEPLOYER_DEV_SKIP_SETUP === "1";
 }
 
 /** D39: one source for the Deployer's versions, written "<kind>:<repository>"; only GitHub is read for now. */

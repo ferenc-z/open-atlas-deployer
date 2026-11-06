@@ -167,20 +167,26 @@ export class Takeover {
     if (used.length) throw new TakeoverError(409, "service/install-used", "An installation is already registered.", used.map(([m, s]) => `${install(m)} is in ${s}`));
     const offline = [...new Set(members.map(({ m }) => m.host))].map((h) => this.o.handoff.executor(h, "service")).filter((e) => !e.online || !e.heartbeat?.kinds?.includes("svc-read"));
     if (offline.length) throw new TakeoverError(409, "confirm/executor", "The service executor of a host is offline or cannot read files (upgrade it).", offline.map((e) => `${e.host}: ${e.online ? `version ${e.heartbeat?.version} has no svc-read` : e.reason}`));
+    // Read where discovery saw the files: the conf directory, and bootstrap.conf where the bootstrap read it. An older
+    // service executor would ignore both and read <installDir>/conf, so one that does not name svc-read@2 gets none (§15.2).
+    const found = new Map(this.foundFor(draft.items).map((d) => [discoveredKey(d), d]));
+    const requests = members.map(({ item, m }) => {
+      const files = (found.get(install(m))?.instance.files ?? []) as { name: string; path?: string }[];
+      const bootstrapFile = files.find((f) => f.name === "bootstrap.conf")?.path;
+      const request = {
+        kind: "svc-read", installDir: m.installDir, ...(m.confDir ? { confDir: m.confDir } : {}), ...(typeof bootstrapFile === "string" ? { bootstrapFile } : {}),
+        timeoutSeconds: 30, requestedBy: actor.id, draft: draftId,
+      };
+      return { item, m, request, missing: this.o.handoff.missing(m.host, request, "service") };
+    });
+    const old = requests.filter((r) => r.missing.length);
+    if (old.length) throw new TakeoverError(409, "confirm/executor", "The service executor of a host cannot read an installation's conf directory where discovery saw it (upgrade it).", old.map((r) => `${install(r.m)}: version ${this.o.handoff.executor(r.m.host, "service").heartbeat?.version} does not name ${r.missing.join(", ")}`));
 
     this.confirming.add(draftId);
     try {
-      const found = new Map(this.foundFor(draft.items).map((d) => [discoveredKey(d), d]));
-      const reads = members.map(({ item, m }) => {
+      const reads = requests.map(({ item, m, request }) => {
         const id = newJobId("svc-read");
-        // Read where discovery saw the files: the conf directory, and bootstrap.conf where the bootstrap read it (an
-        // older service executor ignores both and reads <installDir>/conf, all it could discover).
-        const files = (found.get(install(m))?.instance.files ?? []) as { name: string; path?: string }[];
-        const bootstrapFile = files.find((f) => f.name === "bootstrap.conf")?.path;
-        this.o.handoff.submit(id, {
-          kind: "svc-read", installDir: m.installDir, ...(m.confDir ? { confDir: m.confDir } : {}), ...(typeof bootstrapFile === "string" ? { bootstrapFile } : {}),
-          timeoutSeconds: 30, requestedBy: actor.id, draft: draftId,
-        }, m.host, "service");
+        this.o.handoff.submit(id, request, m.host, "service");
         return { id, item, m };
       });
       this.o.store.audit(actor, "service.draft-reading", draftId, { reads: reads.map((r) => ({ job: r.id, installation: install(r.m) })) });

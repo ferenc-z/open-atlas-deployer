@@ -6,6 +6,7 @@ import { randomBytes, X509Certificate } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
 import { Hono, type Context } from "hono";
+import { HTTPException } from "hono/http-exception";
 import type { Environment, Manifest } from "../compose/generate.ts";
 import { compareVersions, covering } from "../manifest/version.ts";
 import { crossAppConflicts, validateManifest } from "../manifest/validate.ts";
@@ -23,7 +24,7 @@ import { OnboardingError, type Onboarding } from "./onboarding.ts";
 import type { Briefs } from "./brief.ts";
 import type { Drift } from "./drift.ts";
 import { PeerError, type Peer, type PeerStatus } from "./peer.ts";
-import { EXECUTOR_KINDS, EXECUTOR_VERSION, hostIds, hostOf, newJobId, tokenSha256, type ExecutorKind, type Heartbeat } from "./handoff.ts";
+import { EXECUTOR_KINDS, EXECUTOR_VERSION, ExecutorUnsupported, hostIds, hostOf, newJobId, tokenSha256, type ExecutorKind, type Heartbeat } from "./handoff.ts";
 import { lineDiff } from "./ingress.ts";
 import { environmentStatus, hostStateOf, parseDockerPs, type Observer } from "./observe.ts";
 import { StoreError, type Actor, type Store } from "./store.ts";
@@ -339,7 +340,8 @@ export function createApp({ config, store, sessions, observer, deployments, vers
   api.get("/api/setup", async (c) => {
     const p = await authenticate(c, "view");
     if (p instanceof Response) return p;
-    return c.json(await setupStatus(setupContext(), p));
+    const status = await setupStatus(setupContext(), p);
+    return c.json(config.devSkipSetup ? { ...status, complete: true, devSkipped: true } : status);
   });
   // Step 1: the first environment settings from a form, instead of a hand-written environment.json.
   api.post("/api/setup/environment", async (c) => {
@@ -1375,5 +1377,12 @@ export function createApp({ config, store, sessions, observer, deployments, vers
   app.get("/health", (c) => c.json({ status: "ok" }));
   if (config.basePath) app.get("/", (c) => c.redirect(`${config.basePath}/`));
   app.route(config.basePath || "/", api);
+  // §15.2: a job the executor does not name in its heartbeat is refused wherever it is submitted; anything else as Hono does.
+  app.onError((error, c) => {
+    if (error instanceof ExecutorUnsupported) return reject(c, error.status, error.code, error.message, error.missing);
+    if (error instanceof HTTPException) return error.getResponse();
+    console.error(error);
+    return c.text("Internal Server Error", 500);
+  });
   return app;
 }

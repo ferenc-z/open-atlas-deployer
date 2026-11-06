@@ -76,6 +76,7 @@ export function App() {
         {p.via === "emergency" && (setupOnly
           ? <div className="banner bad">First setup with the emergency account. Once Workbench is deployed and answers, this account stops working by itself: sign in with Workbench's initial admin then. Every action is audited.</div>
           : <div className="banner bad">Using the emergency account: Workbench is unreachable. Every action is audited; sign in with Workbench once it is back.</div>)}
+        {setup.devSkipped && <div className="banner warn">Development instance: setup is skipped (DEPLOYER_DEV=1, DEPLOYER_DEV_SKIP_SETUP=1), whatever its steps say.</div>}
         {p.stale && <div className="banner warn">Workbench is not responding; using the last confirmed sign-in (valid for 15 minutes).</div>}
         {p.actAs && <div className="banner info">{p.actAs.administrator} is using Workbench as {p.displayName}, so permissions here are also those of {p.displayName}.</div>}
         <main>

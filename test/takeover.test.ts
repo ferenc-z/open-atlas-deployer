@@ -204,7 +204,7 @@ function harness(o: { box?: boolean; oma?: OmaSessions; alter?: (path: string, t
   const store = new Store(":memory:");
   const handoff = new Handoff(store);
   const box = o.box === false ? undefined : new SecretBox(randomBytes(32).toString("base64"));
-  store.setHeartbeat("local", { executor: "service", version: "0.7.3", protocols: [2], kinds: o.kinds ?? ["svc-discover", "svc-read", "executor-upgrade"] }, "service");
+  store.setHeartbeat("local", { executor: "service", version: "0.7.3", protocols: [2], kinds: o.kinds ?? ["svc-discover", "svc-read", "executor-upgrade", "svc-discover@2", "svc-read@2"] }, "service");
   const found = o.found ?? lab();
   // The discovery as the executor would have stored it, with each nifi.properties hash matching what the read sends.
   const text = (conf: string) => `nifi.sensitive.props.key=s3cret-${conf.length}\nnifi.web.https.port=1\n`;
@@ -241,6 +241,13 @@ function split(): Discovered[] {
 }
 
 test("an installation with its conf directory elsewhere: drafted, read where discovered, registered by host, installation and conf", async () => {
+  // §15.2: a service executor that does not name svc-read@2 would read <install>/conf; refused before any read is queued.
+  const before = harness({ found: split(), kinds: ["svc-discover", "svc-read", "executor-upgrade"] });
+  const early = before.takeover.createDraft(admin).draft;
+  await assert.rejects(before.takeover.confirm(early.id, admin), (e: TakeoverError) => e.code === "confirm/executor" && /svc-read@2/.test(e.details.join()));
+  assert.deepEqual([before.requests.length, before.store.executorJobs().filter((j) => j.id.startsWith("svc-read")).length], [0, 0], "nothing queued");
+  before.store.close();
+
   const { store, takeover, requests } = harness({ found: split() });
   const { draft } = takeover.createDraft(admin);
   assert.deepEqual(draft.items.map((i) => [i.id, (i as DraftStandalone).member.confDir]), [["nifi", "/webapp/deploy/nifi/conf"], ["other", "/webapp/deploy/other/conf"]],

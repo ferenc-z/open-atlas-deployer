@@ -5,8 +5,8 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
 
 ## Unreleased
 
-Managed services, phase 1 (NiFi 1.x and 2.x, read only): every NiFi on the hosts in one place. The executor version
-is still 0.7.3 in the code; it is raised together with `EXECUTOR_VERSION` before the release.
+Managed services, phase 1 (NiFi 1.x and 2.x, read only): every NiFi on the hosts in one place. Executor 0.8.0 (both
+executors; `EXECUTOR_VERSION` with it).
 
 **Service executor**
 - A second executor, installed only where services are managed: `open-atlas-service-executor-<version>.tar.gz` in
@@ -27,6 +27,10 @@ is still 0.7.3 in the code; it is raised together with `EXECUTOR_VERSION` before
   `conf.dir` in bootstrap.conf, so NiFi unpacked in one place with its configuration and repositories elsewhere is
   read right. One installation may run several instances, each with its own conf directory. Directories to read can
   be given as `{install, conf}`; the directories scanned are set with `EXECUTOR_SCAN_DIRS`.
+- The heartbeat's `kinds` say what each read job can do: `svc-discover@2` (`{install, conf}` entries) and
+  `svc-read@2` (`confDir`, `bootstrapFile`). The Deployer checks a job's needs against them: a job the executor
+  does not name is refused when it is submitted (409 `executor/unsupported`), or, queued before the executor said,
+  refused when the executor asks for it, so an older executor never gets a request it would misread.
 
 **Services in the Deployer**
 - Service profiles `nifi-1.x` and `nifi-2.x`: the configuration files and a catalog of keys (cluster or node scope,
@@ -44,6 +48,12 @@ is still 0.7.3 in the code; it is raised together with `EXECUTOR_VERSION` before
 - Read-only MCP tools `list_service_clusters` and `get_cluster_status`.
 - `bin/executor-token.ts <data> <host> <file> service` issues a service executor token, `--revoke deploy|service`
   revokes one, without the page.
+- An `environment.json` without `apps` no longer breaks `GET /api/setup` (500).
+- For a local development instance only: `DEPLOYER_DEV=1` with `DEPLOYER_DEV_SKIP_SETUP=1` counts setup as complete
+  (a banner says so); ignored with `NODE_ENV=production`, as in the image.
+- `dev/nifi-lab`: an nginx of the lab's own (`nginx.conf`, `lab.sh nginx start|stop|status`), bound to 127.0.0.1,
+  holding the lab's `nginx` client certificate, one address per instance or cluster; `lab.sh grant` gives that
+  identity the monitoring reads and `/provenance`.
 - New tables only (`executor_beats`, `service_*`) and a column on `executor_tokens`. 0.2.4 opens the database, but
   would take a service executor token for a deploy executor one: revoke it before going back.
 

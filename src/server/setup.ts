@@ -48,6 +48,8 @@ export interface SetupStatus {
   environment: { name: string; prod: boolean } | null;
   steps: SetupStep[];
   canAct: boolean;
+  /** A development instance skips setup (config devSkipSetup): complete is true whatever the steps say. */
+  devSkipped?: boolean;
 }
 
 export interface SetupContext {
@@ -112,14 +114,14 @@ export async function setupStatus(ctx: SetupContext, principal: Principal): Prom
   const active = store.activeJobs().find((j) => j.app === WORKBENCH);
   // Workbench behind nginx: people reach it only once operations apply the recommended configuration, saved here as a
   // revision (D36); the Ingress page is not open until setup is complete.
-  const behindNginx = registered && env?.apps[WORKBENCH]?.ingress?.kind === "nginx";
+  const behindNginx = registered && env?.apps?.[WORKBENCH]?.ingress?.kind === "nginx";
   const latestNginx = behindNginx ? store.nginxRevision() : undefined;
   const nginx = behindNginx ? { saved: latestNginx?.revision ?? null, changed: latestNginx?.sha256 !== deployments.nginx().sha256 } : undefined;
   const envInfo = {
     envRevisions: wbEnv?.revision ?? 0, envWritten: Boolean(wbEnv && wbEnv.applied === wbEnv.revision),
     ...(active ? { job: { id: active.id, kind: active.kind, state: active.state } } : {}), ...(nginx ? { nginx } : {}),
   };
-  const planned = env?.apps[WORKBENCH]?.version ?? WORKBENCH_MIN_VERSION;
+  const planned = env?.apps?.[WORKBENCH]?.version ?? WORKBENCH_MIN_VERSION;
   const nginxNote = nginx?.changed ? " Save the recommended nginx configuration too and hand it to operations: people reach Workbench through nginx." : "";
   const ready = registered && !offline.length && Boolean(env);
   // An installation from before setup existed can run a Workbench too old for the deploy groups (W1, 1.24.0).

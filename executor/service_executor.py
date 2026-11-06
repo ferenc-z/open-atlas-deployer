@@ -40,7 +40,7 @@ from executor_core import (  # noqa: F401
     FINAL, ID_RE, PROTOCOLS, Failed, ProtocolExecutor, Refused, Restarting, load_env_file, now_iso, write_json)
 # <<< executor_core
 
-VERSION = "0.7.3"
+VERSION = "0.8.0"
 # The executor's release (§8.6): one directory in the archive, holding only these files.
 PACKAGE = "open-atlas-service-executor"
 PACKAGE_FILES = ("service_executor.py", "launch.sh", "switch", "install.sh", "open-atlas-service-executor.service", "service-executor.env.example")
@@ -614,6 +614,10 @@ class ServiceExecutor(ProtocolExecutor):
     EXECUTOR = "service"
     # Read jobs: kind -> method(job) returning the job's result (a dict).
     READ_JOBS = {"svc-discover": "discover", "svc-read": "read_files"}
+    # What the read jobs can do beyond their first form, named "<kind>@<n>" in the heartbeat's kinds (§15.2): the
+    # Deployer looks for one before it sends a request that needs it. svc-discover@2: dirs entries {install, conf};
+    # svc-read@2: confDir (and bootstrapFile), an installation's conf directory kept apart from it (S25).
+    CAPABILITIES = ["svc-discover@2", "svc-read@2"]
     # Where discovery looks (tests point these elsewhere; the directories scanned are the configuration's scan_dirs).
     PROC = "/proc"
     AUTOSTART_DIRS = AUTOSTART_DIRS
@@ -631,7 +635,7 @@ class ServiceExecutor(ProtocolExecutor):
 
     @property
     def KINDS(self):
-        return [*self.READ_JOBS, *ProtocolExecutor.KINDS]
+        return [*self.READ_JOBS, *ProtocolExecutor.KINDS, *self.CAPABILITIES]
 
     @staticmethod
     def user():
