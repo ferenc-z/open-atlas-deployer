@@ -13,8 +13,13 @@ EXECUTOR_READ_TIMEOUT); a job that runs over is reported failed and its late res
 job at a time, after the reads in flight have ended; for now it only has executor-upgrade (the executor's own release,
 §8.6). The read jobs so far: svc-discover (§6 step 2), which finds the NiFi on the machine from their processes and
 from the directories it is given, and svc-read (§6 step 5), which reads an installation's configuration files for the
-Deployer to import; their content goes once over the job's content channel, never into the job's status. The executor
-refuses any kind it does not know, deploy jobs included.
+Deployer to import; their content goes once over the job's content channel, never into the job's status. log-read
+(§9.3, §15.3) lists, tails, searches (by time, level, text or regular expression, .gz included; 5000 lines, 4 MiB, 30
+seconds) or packs (tar.gz, 50 MiB) the logs of a watched NiFi, sending the lines or the archive over the binary content
+channel (PUT …/content); log-tail (§15.2 P7) follows one log file for up to 120 seconds by inode and offset, across a
+rollover, sending a chunk every second or two (POST …/chunk). Both read only below the log directories of what the
+Deployer watches here, compared after realpath (no `..`, no symbolic link out). The executor refuses any kind it does
+not know, deploy jobs included.
 
 Beside the jobs runs the collector (§9.1, §15.3): every EXECUTOR_COLLECT_SECONDS it samples each NiFi the Deployer
 watches on this machine (the watch list comes with every heartbeat reply, §15.2 P5; nothing else is sampled): the
@@ -22,17 +27,22 @@ process and the host from /proc, the disks of the repositories and logs, the NiF
 certificate (EXECUTOR_NIFI_CLIENT_CERT/KEY/CA, S11, P6) and, once an hour, the expiry of the certificates in its
 keystore and truststore (keytool, the password passed in the environment) and of the monitor certificate (S27). The
 samples go to POST /executor/v1/samples, at most 20 at a time; those the Deployer cannot take wait in memory up to 30
-minutes. One NiFi that hangs costs at most 10 seconds of its own sample.
+minutes. One NiFi that hangs costs at most 10 seconds of its own sample. Each sample also carries the WARN/ERROR summary
+of nifi-app.log since the last one (followed by inode and offset kept in the work directory): counts by pattern, the
+first and the newest entry, cut at 2 KiB after passwords, tokens and keys are hidden.
 
 The release holds one file: package.sh puts executor_core's code in place of the import block below (bundle.py).
 
 Standard library only; Python 3.9.
 """
 import base64
+import collections
 import glob
+import gzip
 import hashlib
 import hmac
 import http.client
+import io
 import json
 import os
 import pathlib
@@ -43,6 +53,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 
@@ -1110,7 +1121,18 @@ class Collector:
             out["certs"] = self.certificates(w, where, props, boot, proc)
         except Exception as e:  # never the sample's end
             out["certs"] = {"readAt": now_iso(), "stores": [], "error": str(e)[:300]}
+        # §15.3: the WARN/ERROR summary of nifi-app.log since the last round.
+        try:
+            out["logs"] = self.summary.read(w["member"], w.get("logDir") or os.path.join(w["installDir"], "logs"))
+        except Exception as e:  # never the sample's end
+            out["logs"] = {"error": f"the log summary failed: {e}"[:300]}
         return out
+
+    @property
+    def summary(self):
+        if getattr(self, "_summary", None) is None:
+            self._summary = LogSummary(self.cfg["work"])
+        return self._summary
 
     def round(self, watch):
         """A sample of each watched NiFi."""
@@ -1127,6 +1149,255 @@ class Collector:
         return samples
 
 
+# --- logs (§9.3, §15.3): the WARN/ERROR summary in the samples, log-read and log-tail on the read channel ------------
+
+# NiFi's logback layout: "2026-11-06 21:07:25,721 WARN [thread] o.a.n.c.Logger message"; lines that do not start so
+# continue the entry above (a stack trace).
+LOG_LINE = re.compile(r"^(\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d(?:[,.]\d{1,3})?)\s+(TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\s+(?:\[(.*?)\]\s+)?(\S+)\s?(.*)$")
+LEVELS = ("TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL")
+EXCEPTION = re.compile(r"\b((?:[a-z_$][\w$]*\.)+[A-Z][\w$]*(?:Exception|Error|Throwable))\b")
+# The summary's templates: numbers, UUIDs, IPs, paths and long hex as placeholders, so one message is one pattern.
+TEMPLATE_SUBS = (
+    (re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"), "<uuid>"),
+    (re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b"), "<ip>"),
+    (re.compile(r"(?<![\w.])(?:/[\w.@+~-]+){2,}/?"), "<path>"),
+    (re.compile(r"\b0x[0-9a-fA-F]+\b|\b[0-9a-fA-F]{16,}\b"), "<hex>"),
+    (re.compile(r"\d+(?:\.\d+)?"), "<n>"),
+)
+# What looks like a password, a token or a key is hidden before a line leaves in a summary (§9.3).
+REDACT = (
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)", re.S), "[private key hidden]"),
+    (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}"), r"\1 [hidden]"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}"), "[token hidden]"),
+    (re.compile(r"(?i)((?:pass(?:word|wd|phrase)?|pwd|secret|token|credentials?|api[_-]?key|access[_-]?key|private[_-]?key|sensitive\.props\.key)[\w.-]*[\"']?\s*[=:]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;&]+)"), r"\1[hidden]"),
+    (re.compile(r"(?i)(\w+://[^/\s:@]+:)[^@\s/]+@"), r"\1[hidden]@"),
+)
+SUMMARY_SAMPLE_MAX = 2048
+SUMMARY_READ_MAX = 4 << 20      # per member and round
+SUMMARY_BEHIND_MAX = 32 << 20   # further behind than this: skip to the newest SUMMARY_READ_MAX
+SUMMARY_PATTERNS_MAX = 100
+APP_LOG = "nifi-app.log"
+# §15.3 limits of log-read: search 5000 lines / 4 MiB / 30 seconds; download 50 MiB.
+SEARCH_LINES, SEARCH_BYTES, SEARCH_SECONDS = 5000, 4 << 20, 30
+ENTRY_LINES, ENTRY_BYTES = 60, 16 << 10
+DOWNLOAD_MAX = 50 << 20
+LIST_MAX = 500
+# log-tail (§15.2 P7): at most 120 seconds; a piece every second or two, at most TAIL_CHUNK_MAX; further behind than
+# TAIL_BEHIND_MAX (a log flooding), the rest is skipped and said.
+TAIL_SECONDS, TAIL_EVERY, TAIL_CHUNK_MAX, TAIL_BEHIND_MAX, TAIL_FIRST_LINES = 120, 1.5, 256 << 10, 4 << 20, 500
+
+
+def redact(text):
+    for pattern, repl in REDACT:
+        text = pattern.sub(repl, text)
+    return text
+
+
+def template_of(message):
+    for pattern, repl in TEMPLATE_SUBS:
+        message = pattern.sub(repl, message)
+    return message[:300]
+
+
+def local_iso(stamp):
+    """A log line's local time ("2026-11-06 21:07:25,721", the host's zone as NiFi writes it) in UTC, ISO 8601 with ms."""
+    try:
+        base, _, ms = stamp.replace("T", " ").replace(".", ",").partition(",")
+        t = time.mktime(time.strptime(base, "%Y-%m-%d %H:%M:%S"))
+    except (ValueError, OverflowError):
+        return None
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + f".{(ms or '0').ljust(3, '0')[:3]}Z"
+
+
+def parse_iso(value):
+    """An ISO 8601 UTC time as epoch seconds (None when absent or malformed)."""
+    if not isinstance(value, str) or not value:
+        return None
+    m = re.match(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?Z$", value)
+    if not m:
+        return None
+    import calendar
+    return calendar.timegm(time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S")) + float(f"0.{m.group(2) or 0}")
+
+
+def entries_of(lines):
+    """Log lines grouped into entries: a header line and the lines continuing it (a stack trace). Lines before the first
+    header (the end of an entry read earlier) are an entry without a header."""
+    out, cur = [], None
+    for line in lines:
+        m = LOG_LINE.match(line)
+        if m:
+            cur = {"local": m.group(1), "level": "WARN" if m.group(2) == "WARNING" else m.group(2), "thread": m.group(3), "logger": m.group(4),
+                   "message": m.group(5), "lines": [line]}
+            out.append(cur)
+        elif cur is None:
+            cur = {"local": None, "level": None, "thread": None, "logger": None, "message": line, "lines": [line]}
+            out.append(cur)
+        elif len(cur["lines"]) < ENTRY_LINES:
+            cur["lines"].append(line)
+        else:
+            cur["more"] = cur.get("more", 0) + 1
+    return out
+
+
+def entry_text(e, limit=ENTRY_BYTES):
+    text = "\n".join(e["lines"]) + (f"\n… {e['more']} more line(s)" if e.get("more") else "")
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def exception_of(e):
+    for line in [e["message"] or "", *e["lines"][1:4]]:
+        m = EXCEPTION.search(line)
+        if m:
+            return m.group(1)
+    return None
+
+
+def open_log(path):
+    """A log file for reading: plain, or decompressed when it is a .gz."""
+    return gzip.open(path, "rb") if path.endswith(".gz") else open(path, "rb")
+
+
+class LogSummary:
+    """§15.3: follows each watched NiFi's nifi-app.log by inode and offset (kept in the work directory, so a restart
+    carries on), and sums its WARN/ERROR entries by pattern (level, logger, message template, exception class), with
+    the first and the newest of each, cut at 2 KiB after the secrets are hidden. The first time it starts at the end."""
+
+    def __init__(self, work):
+        self.dir = pathlib.Path(work) / "logsum"
+
+    def state_file(self, member):
+        return self.dir / f"{hashlib.sha256(member.encode()).hexdigest()[:24]}.json"
+
+    def read(self, member, log_dir):
+        path = os.path.join(log_dir, APP_LOG)
+        out = {"file": path}
+        try:
+            st = os.stat(path)
+        except OSError as e:
+            return {**out, "error": f"cannot read {path}: {e.strerror or e}"}
+        sf = self.state_file(member)
+        try:
+            state = json.loads(sf.read_text()) if sf.is_file() else None
+        except (OSError, ValueError):
+            state = None
+        data, skipped = b"", 0
+        if not state or state.get("file") != path:
+            offset = st.st_size  # first look: from the end, history is for log-read
+        else:
+            offset = int(state.get("offset") or 0)
+            if state.get("inode") != st.st_ino:
+                # Rolled over: the rest of the old file (found by its inode beside it), then the new one from the start.
+                try:
+                    names = os.listdir(log_dir)
+                except OSError:
+                    names = []
+                old = next((os.path.join(log_dir, n) for n in names if not n.endswith(".gz") and _inode(os.path.join(log_dir, n)) == state.get("inode")), None)
+                if old:
+                    data, skipped = self.chunk(old, offset)
+                offset = 0
+            elif st.st_size < offset:
+                offset = 0  # truncated
+        more, skip2 = self.chunk(path, offset, SUMMARY_READ_MAX - len(data))
+        cut = more.rfind(b"\n") + 1
+        data += more[:cut]
+        offset += skip2 + cut
+        write_json(sf, {"file": path, "inode": st.st_ino, "offset": offset}, mode=0o600)
+        lines = data.decode("utf-8", "replace").splitlines()
+        patterns = {}
+        for e in entries_of(lines):
+            if e["level"] not in ("WARN", "ERROR", "FATAL"):
+                continue
+            exc = exception_of(e)
+            tpl = template_of(redact(e["message"] or ""))
+            key = hashlib.sha1(f"{e['level']}\0{e['logger']}\0{tpl}\0{exc or ''}".encode()).hexdigest()[:16]
+            at = local_iso(e["local"]) if e["local"] else None
+            sample = redact(entry_text(e, 64 << 10))[:SUMMARY_SAMPLE_MAX]
+            p = patterns.get(key)
+            if not p:
+                if len(patterns) >= SUMMARY_PATTERNS_MAX:
+                    out["patternsDropped"] = out.get("patternsDropped", 0) + 1
+                    continue
+                p = patterns[key] = {"key": key, "level": e["level"], "logger": e["logger"], "template": tpl, "exception": exc, "count": 0,
+                                     "firstAt": at, "first": sample}
+            p["count"] += 1
+            p["lastAt"], p["last"] = at, sample
+        out.update(inode=st.st_ino, offset=offset, lines=len(lines), patterns=list(patterns.values()))
+        if skipped + skip2:
+            out["skippedBytes"] = skipped + skip2
+        return out
+
+    @staticmethod
+    def chunk(path, offset, limit=SUMMARY_READ_MAX):
+        """(bytes from offset, at most limit; bytes skipped): a file further behind than SUMMARY_BEHIND_MAX is read
+        from its newest `limit` bytes."""
+        try:
+            with open(path, "rb") as f:
+                size = os.fstat(f.fileno()).st_size
+                skipped = 0
+                if size - offset > SUMMARY_BEHIND_MAX:
+                    skipped = size - limit - offset
+                    offset = size - limit
+                f.seek(offset)
+                return f.read(max(0, limit)), skipped
+        except OSError:
+            return b"", 0
+
+
+def _inode(path):
+    st = _stat(path)
+    return st.st_ino if st else None
+
+
+def _stat(path):
+    try:
+        return os.stat(path)
+    except OSError:
+        return None
+
+
+class LogFiles:
+    """The log directories a request may read (§9.3): only those of the installations the Deployer watches here, each
+    compared after realpath, so neither `..` nor a symbolic link leaves them."""
+
+    def __init__(self, watch):
+        self.dirs = {w["member"]: w.get("logDir") or os.path.join(w["installDir"], "logs") for w in watch}
+
+    def dir_of(self, member):
+        if not isinstance(member, str) or member not in self.dirs:
+            raise Refused("member is not an installation this executor watches (its log directory is not registered)")
+        return self.dirs[member]
+
+    def resolve(self, member, name):
+        d = self.dir_of(member)
+        if not isinstance(name, str) or not name or "\0" in name or len(name) > 1024:
+            raise Refused("file is a log file's name in the log directory, or its absolute path there")
+        real_dir = os.path.realpath(d)
+        real = os.path.realpath(name if name.startswith("/") else os.path.join(d, name))
+        if not real.startswith(real_dir.rstrip("/") + "/"):
+            raise Refused(f"{name} is not in the log directory {d} (paths are compared after resolving links)")
+        if not os.path.isfile(real):
+            raise Refused(f"{name} is not a file in {d} (or not readable by this executor)")
+        return real
+
+    def listing(self, member):
+        d = self.dir_of(member)
+        real_dir = os.path.realpath(d)
+        out = []
+        try:
+            names = os.listdir(d)
+        except OSError as e:
+            raise Failed(f"cannot list {d}: {e.strerror or e}")
+        for n in names:
+            real = os.path.realpath(os.path.join(d, n))
+            if not real.startswith(real_dir.rstrip("/") + "/") or not os.path.isfile(real):
+                continue
+            st = os.stat(real)
+            out.append({"name": n, "size": st.st_size, "modifiedAt": iso_at(st.st_mtime), "inode": st.st_ino, "gz": n.endswith(".gz")})
+        out.sort(key=lambda f: (f["name"] != APP_LOG, -parse_iso(f["modifiedAt"]) if parse_iso(f["modifiedAt"]) else 0))
+        return {"dir": d, "files": out[:LIST_MAX], "more": max(0, len(out) - LIST_MAX)}
+
+
 class ServiceExecutor(ProtocolExecutor):
     """The service executor: the read channel, and executor-upgrade on the change channel."""
 
@@ -1135,7 +1406,7 @@ class ServiceExecutor(ProtocolExecutor):
     MAIN = "service_executor.py"
     EXECUTOR = "service"
     # Read jobs: kind -> method(job) returning the job's result (a dict).
-    READ_JOBS = {"svc-discover": "discover", "svc-read": "read_files"}
+    READ_JOBS = {"svc-discover": "discover", "svc-read": "read_files", "log-read": "log_read", "log-tail": "log_tail"}
     # What the read jobs can do beyond their first form, named "<kind>@<n>" in the heartbeat's kinds (§15.2): the
     # Deployer looks for one before it sends a request that needs it. svc-discover@2: dirs entries {install, conf};
     # svc-read@2: confDir (and bootstrapFile), an installation's conf directory kept apart from it (S25).
@@ -1312,6 +1583,253 @@ class ServiceExecutor(ProtocolExecutor):
             job.log(f"read {path} ({len(data)} bytes)")
         self.api.put_env_content(job.id, json.dumps({"installDir": str(home), "confDir": where["confDir"], "files": content}))
         return {"installDir": str(home), "confDir": where["confDir"], "files": files, "missing": missing}
+
+    # --- logs: log-read and log-tail (§9.3, §15.2 P7, §15.3) ---
+
+    def log_files(self):
+        with self.watch_lock:
+            return LogFiles(list(self.watch or []))
+
+    def log_read(self, job):
+        """log-read: request.member (a watched installation) and mode. list: the files of its log directory. lines: the
+        last request.lines (≤ 5000) of request.file. search: entries of request.files (names; absent: nifi-app*) between
+        request.from and request.to (ISO, UTC) at request.levels, holding request.query (case-insensitive; request.regex:
+        a regular expression), the newest request.limit (≤ 5000 lines, 4 MiB, 30 seconds). download: request.files as a
+        tar.gz of at most request.maxBytes (≤ 50 MiB). .gz files are read decompressed. The lines and the archive go over
+        the content channel (never into the status), which carries only counts."""
+        r, files = job.request, self.log_files()
+        mode, member = r.get("mode"), r.get("member")
+        if mode not in ("list", "lines", "search", "download"):
+            raise Refused("mode is list, lines, search or download")
+        files.dir_of(member)
+        if mode == "list":
+            out = files.listing(member)
+            self.api.put_content(job.id, json.dumps(out).encode())
+            return {"mode": mode, "files": len(out["files"])}
+        if mode == "lines":
+            return self.log_lines(job, files, member)
+        if mode == "search":
+            return self.log_search(job, files, member)
+        return self.log_download(job, files, member)
+
+    def log_lines(self, job, files, member):
+        r = job.request
+        path = files.resolve(member, r.get("file") or APP_LOG)
+        n = r.get("lines", 200)
+        if not isinstance(n, int) or not 1 <= n <= SEARCH_LINES:
+            raise Refused(f"lines is 1 to {SEARCH_LINES}")
+        kept = collections.deque(maxlen=n)
+        with open_log(path) as f:
+            if not path.endswith(".gz"):
+                end = os.fstat(f.fileno()).st_size
+                f.seek(max(0, end - SEARCH_BYTES))
+                if end > SEARCH_BYTES:
+                    f.readline()  # a partial first line
+            for raw in f:
+                kept.append(raw.decode("utf-8", "replace").rstrip("\r\n"))
+                if job.left() < 1:
+                    break
+        st = os.stat(path)
+        text = "\n".join(kept)
+        size = len(text.encode())
+        self.api.put_content(job.id, json.dumps({"file": os.path.basename(path), "path": path, "inode": st.st_ino, "size": st.st_size, "lines": list(kept)}).encode())
+        return {"mode": "lines", "file": os.path.basename(path), "lines": len(kept), "bytes": size}
+
+    def log_search(self, job, files, member):
+        r = job.request
+        names = r.get("files")
+        if names is None:
+            names = [f["name"] for f in files.listing(member)["files"] if f["name"].startswith("nifi-app")]
+        if not isinstance(names, list) or len(names) > LIST_MAX:
+            raise Refused(f"files is a list of at most {LIST_MAX} log file names")
+        paths = [files.resolve(member, n) for n in names]
+        limit = r.get("limit", 1000)
+        if not isinstance(limit, int) or not 1 <= limit <= SEARCH_LINES:
+            raise Refused(f"limit is 1 to {SEARCH_LINES} lines")
+        levels = r.get("levels") or list(LEVELS)
+        if not isinstance(levels, list) or not all(lv in LEVELS for lv in levels):
+            raise Refused(f"levels are among {', '.join(LEVELS)}")
+        query = r.get("query") or ""
+        if not isinstance(query, str) or len(query) > 500:
+            raise Refused("query is at most 500 characters")
+        try:
+            match = re.compile(query, re.I).search if r.get("regex") else (lambda t, q=query.lower(): q in t.lower())
+        except re.error as e:
+            raise Refused(f"query is not a regular expression: {e}")
+        t_from, t_to = parse_iso(r.get("from")), parse_iso(r.get("to"))
+        if (r.get("from") and t_from is None) or (r.get("to") and t_to is None):
+            raise Refused("from and to are ISO times in UTC (2026-11-06T12:00:00Z)")
+        deadline = time.monotonic() + min(SEARCH_SECONDS, max(1.0, job.left() - 2))
+        # Newest file first; within a file the newest matches are kept, so a search over the limit keeps the newest.
+        paths.sort(key=lambda p: -os.stat(p).st_mtime)
+        found, lines, size, truncated, scanned = [], 0, 0, None, 0
+        for path in paths:
+            if t_from is not None and os.stat(path).st_mtime < t_from:
+                continue  # written to last before the period
+            kept = collections.deque()
+            kept_lines = kept_bytes = 0
+            with open_log(path) as f:
+                for e in entries_of(raw.decode("utf-8", "replace").rstrip("\r\n") for raw in f):
+                    scanned += 1
+                    if scanned % 2000 == 0 and time.monotonic() > deadline:
+                        truncated = f"stopped after {SEARCH_SECONDS} seconds"
+                        break
+                    if e["level"] is None or e["level"] not in levels:
+                        continue
+                    at = local_iso(e["local"])
+                    t = parse_iso(at)
+                    if t is None or (t_from is not None and t < t_from) or (t_to is not None and t >= t_to):
+                        continue
+                    text = entry_text(e)
+                    if query and not match(text):
+                        continue
+                    kept.append({"file": os.path.basename(path), "at": at, "local": e["local"], "level": e["level"], "thread": e["thread"], "logger": e["logger"], "text": text})
+                    kept_lines += text.count("\n") + 1
+                    kept_bytes += len(text)
+                    while kept and (lines + kept_lines > limit or size + kept_bytes > SEARCH_BYTES):
+                        gone = kept.popleft()
+                        kept_lines -= gone["text"].count("\n") + 1
+                        kept_bytes -= len(gone["text"])
+                        truncated = truncated or f"more than {limit} lines or {SEARCH_BYTES >> 20} MiB matched: the newest are kept"
+            found = list(kept) + found
+            lines, size = lines + kept_lines, size + kept_bytes
+            if truncated and truncated.startswith("stopped") or lines >= limit or size >= SEARCH_BYTES:
+                truncated = truncated or f"the limit of {limit} lines was reached: older files were not read"
+                break
+        found.sort(key=lambda x: x["at"])
+        self.api.put_content(job.id, json.dumps({"entries": found, "truncated": truncated, "files": [os.path.basename(p) for p in paths]}).encode())
+        return {"mode": "search", "entries": len(found), "lines": lines, "bytes": size, "truncated": truncated, "scanned": scanned}
+
+    def log_download(self, job, files, member):
+        r = job.request
+        names = r.get("files") or [r.get("file") or APP_LOG]
+        if not isinstance(names, list) or len(names) > LIST_MAX:
+            raise Refused(f"files is a list of at most {LIST_MAX} log file names")
+        cap = r.get("maxBytes", DOWNLOAD_MAX)
+        if not isinstance(cap, int) or not 1 <= cap <= DOWNLOAD_MAX:
+            raise Refused(f"maxBytes is at most {DOWNLOAD_MAX} ({DOWNLOAD_MAX >> 20} MiB)")
+        paths = [files.resolve(member, n) for n in names]
+        buf, added, skipped = io.BytesIO(), [], []
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            for path in paths:
+                size = os.stat(path).st_size
+                # A plain log packs to about a fifth; a .gz does not pack further.
+                if buf.tell() + (size if path.endswith(".gz") else size // 5) > cap or job.left() < 3:
+                    skipped.append(os.path.basename(path))
+                    continue
+                tar.add(path, arcname=os.path.basename(path), recursive=False)
+                added.append(os.path.basename(path))
+        data = buf.getvalue()
+        if len(data) > cap:
+            raise Failed(f"the archive is {len(data)} bytes, over the limit of {cap}: choose fewer files")
+        self.api.put_content(job.id, data)
+        return {"mode": "download", "bytes": len(data), "files": added, "skipped": skipped, "sha256": hashlib.sha256(data).hexdigest()}
+
+    def log_tail(self, job):
+        """log-tail (§15.2 P7): follows request.file (default nifi-app.log) of request.member for request.seconds (≤ 120),
+        by inode and offset: request.cursor {inode, offset} carries on where an earlier tail ended; a file rolled over is
+        read to its end (the open file, or found by its inode) and then the new one from its start. Every second or two
+        what came is sent as a chunk (POST …/chunk); the answer {"stop": true} (nobody follows any more) ends it early.
+        Without a cursor it starts with the last request.lines (≤ 500, default 100). The result is the cursor to go on from."""
+        r, files = job.request, self.log_files()
+        member, name = r.get("member"), r.get("file") or APP_LOG
+        if not isinstance(name, str) or "/" in name:
+            raise Refused("file is a log file's name in the log directory")
+        path = files.resolve(member, name)
+        log_dir = files.dir_of(member)
+        seconds = r.get("seconds", TAIL_SECONDS)
+        if not isinstance(seconds, (int, float)) or not 1 <= seconds <= TAIL_SECONDS:
+            raise Refused(f"seconds is 1 to {TAIL_SECONDS}")
+        if name.endswith(".gz"):
+            raise Refused("a .gz log does not grow: read it with log-read")
+        cursor = r.get("cursor") if isinstance(r.get("cursor"), dict) else None
+        deadline = time.monotonic() + min(seconds, max(1.0, job.left() - 3))
+        state = {"seq": 0, "bytes": 0, "rotated": 0, "stopped": False}
+
+        def push(text, f, **more):
+            state["seq"] += 1
+            st = os.fstat(f.fileno())
+            chunk = {"seq": state["seq"], "file": name, "inode": st.st_ino, "offset": f.tell(), "text": text, **more}
+            try:
+                reply = self.api.post_chunk(job.id, chunk)
+            except Exception as e:
+                job.log(f"cannot send chunk {state['seq']}: {e}")
+                return
+            state["bytes"] += len(text)
+            if isinstance(reply, dict) and reply.get("stop"):
+                state["stopped"] = True
+
+        f = open(path, "rb")
+        try:
+            st = os.fstat(f.fileno())
+            if cursor and cursor.get("inode") == st.st_ino:
+                off = int(cursor.get("offset") or 0)
+                f.seek(off if off <= st.st_size else 0)
+            elif cursor and cursor.get("inode"):
+                # Rolled over since the cursor: the rest of the old file first, when it is still there.
+                old = next((os.path.join(log_dir, n) for n in os.listdir(log_dir) if not n.endswith(".gz") and _inode(os.path.join(log_dir, n)) == cursor["inode"]), None)
+                if old:
+                    with open(old, "rb") as g:
+                        g.seek(int(cursor.get("offset") or 0))
+                        rest = g.read(TAIL_BEHIND_MAX)
+                    if rest:
+                        push(rest.decode("utf-8", "replace"), f, rotated=os.path.basename(old))
+                state["rotated"] += 1
+            else:
+                n = r.get("lines", 100)
+                n = n if isinstance(n, int) and 0 <= n <= TAIL_FIRST_LINES else 100
+                f.seek(max(0, st.st_size - (1 << 20)))
+                if st.st_size > 1 << 20:
+                    f.readline()
+                head = f.read()
+                cut = head.rfind(b"\n") + 1
+                f.seek(f.tell() - (len(head) - cut))
+                lines = head[:cut].decode("utf-8", "replace").splitlines()[-n:] if n else []
+                push("\n".join(lines) + ("\n" if lines else ""), f, first=True)
+            pending, last_push = b"", time.monotonic()
+            while time.monotonic() < deadline and not state["stopped"]:
+                st_now = _stat(path)
+                cur = os.fstat(f.fileno())
+                behind = cur.st_size - f.tell()
+                if behind > TAIL_BEHIND_MAX:
+                    f.seek(cur.st_size - TAIL_CHUNK_MAX)
+                    f.readline()
+                    pending += f"[… {behind - TAIL_CHUNK_MAX} bytes skipped: the log grows faster than it is followed]\n".encode()
+                elif cur.st_size < f.tell():
+                    f.seek(0)  # truncated
+                data = f.read(TAIL_CHUNK_MAX - len(pending))
+                cut = data.rfind(b"\n") + 1
+                if cut < len(data):
+                    f.seek(f.tell() - (len(data) - cut))
+                pending += data[:cut]
+                rolled = st_now is not None and st_now.st_ino != cur.st_ino and not data
+                if pending and (time.monotonic() - last_push >= TAIL_EVERY or len(pending) >= TAIL_CHUNK_MAX or rolled):
+                    push(pending.decode("utf-8", "replace"), f)
+                    pending, last_push = b"", time.monotonic()
+                elif not pending and time.monotonic() - last_push >= 10:
+                    # A quiet log: an empty chunk now and then, so the tail learns when nobody follows any more.
+                    push("", f)
+                    last_push = time.monotonic()
+                if rolled:
+                    # The old file is read to its end: on with the new one from its start.
+                    rest = f.read()
+                    if rest:
+                        push(rest.decode("utf-8", "replace"), f)
+                    old_name = next((n for n in os.listdir(log_dir) if _inode(os.path.join(log_dir, n)) == cur.st_ino), None)
+                    f.close()
+                    f = open(path, "rb")
+                    state["rotated"] += 1
+                    push("", f, rotated=old_name or "(gone)")
+                    continue
+                if len(data) < TAIL_CHUNK_MAX // 2:
+                    time.sleep(0.25)
+            if pending:
+                push(pending.decode("utf-8", "replace"), f)
+            st = os.fstat(f.fileno())
+            return {"file": name, "inode": st.st_ino, "offset": f.tell(), "chunks": state["seq"], "bytes": state["bytes"], "rotated": state["rotated"],
+                    "stopped": state["stopped"]}
+        finally:
+            f.close()
 
     def beat_body(self, busy):
         body = super().beat_body(busy)

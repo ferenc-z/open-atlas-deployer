@@ -11,6 +11,7 @@ import type { ExecutorInfo } from "../handoff.ts";
 import type { AlertLevel, ServiceAlert, Store } from "../store.ts";
 import type { Thresholds } from "./profiles.ts";
 import { serviceStatus, thresholdsOf, type MemberStatus, type ServiceStatus } from "./status.ts";
+import { bucketOf } from "./logs.ts";
 
 export type RuleId =
   | "executor-lost" | "no-samples" | "process-down" | "node-disconnected" | "no-coordinator" | "backpressure" | "repo-disk" | "heap"
@@ -27,7 +28,7 @@ export const RULES: Record<RuleId, { label: string; scope: "member" | "service";
   "repo-disk": { label: "Repository disk full", scope: "member", levels: ["WARN", "CRIT"], description: "The disk of a FlowFile, content or provenance repository is fuller than the warning or critical threshold." },
   "heap": { label: "Heap high", scope: "member", levels: ["WARN"], description: "The JVM heap has stayed above the threshold for longer than the threshold minutes." },
   "error-bulletins": { label: "ERROR bulletins", scope: "service", levels: ["WARN"], description: "At least the threshold number of ERROR bulletins within the window." },
-  "zk-errors": { label: "ZooKeeper errors", scope: "service", levels: ["WARN"], description: "Bulletins about the ZooKeeper connection (ZooKeeper, Curator, ConnectionLoss) keep coming: at least the threshold within the window. The log summary joins in step 4." },
+  "zk-errors": { label: "ZooKeeper errors", scope: "service", levels: ["WARN"], description: "Messages about the ZooKeeper connection (ZooKeeper, Curator, ConnectionLoss) keep coming, in bulletins and in nifi-app.log's WARN/ERROR summary: at least the threshold within the window (the log's counts are per 5 minutes, so the window is widened to whole 5-minute buckets)." },
   "version-mismatch": { label: "Versions differ", scope: "service", levels: ["WARN"], description: "The cluster's running nodes report different NiFi versions." },
   "no-certificate": { label: "No monitor certificate", scope: "member", levels: ["WARN"], description: "The service executor has no monitor certificate (EXECUTOR_NIFI_CLIENT_CERT and _KEY): only the process and the host are sampled, not NiFi." },
   "cert-expiry": { label: "Certificate expiring", scope: "member", levels: ["WARN", "CRIT"], description: "A certificate of the keystore, the truststore or the monitor certificate expires within the warning or critical number of days, or has expired." },
@@ -55,6 +56,8 @@ export interface Condition { rule: RuleId; member: string; level: AlertLevel; te
 
 const DOWN = new Set(["DISCONNECTED", "DISCONNECTING", "OFFLOADED", "OFFLOADING"]);
 const ZK = /zookeeper|curator|connectionloss|keeperexception/i;
+/** In the log summary NiFi abbreviates the logger (o.a.z.ClientCnxn is ZooKeeper's client). */
+const ZK_LOG = /zookeeper|curator|connectionloss|keeperexception|\bo\.a\.z\.|ClientCnxn/i;
 const MIN = 60_000, DAY = 86_400_000;
 const keyOf = (rule: string, member: string) => `${rule}\0${member}`;
 
@@ -162,7 +165,15 @@ export function evaluate(store: Store, s: ServiceStatus, t: Thresholds, now: Dat
   const errors = store.serviceBulletins(s.id, { from: iso(nowMs - t.errorBulletinMinutes * MIN), level: "ERROR", limit: 1000 });
   if (errors.length >= t.errorBulletins) add("error-bulletins", "*", "WARN", `${errors.length} ERROR bulletins in ${t.errorBulletinMinutes} min (newest: ${errors[0]?.source ?? "?"}: ${(errors[0]?.message ?? "").slice(0, 200)})`, { count: errors.length, minutes: t.errorBulletinMinutes });
   const zk = store.serviceBulletins(s.id, { from: iso(nowMs - t.zkMinutes * MIN), limit: 1000 }).filter((b) => b.level !== "INFO" && b.level !== "DEBUG" && ZK.test(b.message ?? ""));
-  if (zk.length >= t.zkErrors) add("zk-errors", "*", "WARN", `${zk.length} ZooKeeper connection messages in ${t.zkMinutes} min (newest: ${(zk[0]?.message ?? "").slice(0, 200)})`, { count: zk.length, minutes: t.zkMinutes });
+  // Step 4: and nifi-app.log's WARN/ERROR summary (5-minute counts: the window is widened to whole buckets).
+  const logs = store.serviceLogCounts(s.id, bucketOf(iso(nowMs - t.zkMinutes * MIN)))
+    .filter((c) => c.level !== "INFO" && c.level !== "DEBUG" && ZK_LOG.test(`${c.logger ?? ""} ${c.template} ${c.exception ?? ""}`));
+  const fromLogs = logs.reduce((n, c) => n + c.count, 0);
+  if (zk.length + fromLogs >= t.zkErrors) {
+    const newest = logs.length ? logs[logs.length - 1]! : null;
+    const example = zk[0]?.message ?? (newest ? `${newest.logger ?? ""} ${newest.template}` : "");
+    add("zk-errors", "*", "WARN", `${zk.length + fromLogs} ZooKeeper connection messages in ${t.zkMinutes} min (${zk.length} bulletins, ${fromLogs} in nifi-app.log; e.g. ${example.slice(0, 200)})`, { count: zk.length + fromLogs, bulletins: zk.length, log: fromLogs, minutes: t.zkMinutes });
+  }
   return { active, held };
 }
 

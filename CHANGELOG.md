@@ -43,6 +43,14 @@ executors; `EXECUTOR_VERSION` with it).
   and of the monitor certificate, with their expiry. Without the certificate only `/proc` and the disks are sampled.
   One NiFi costs at most 10 seconds of a round; samples go to `POST /executor/v1/samples`, 20 at a time, and wait in
   memory up to 30 minutes while the Deployer cannot take them.
+- Phase 2 logs: each sample carries the WARN/ERROR summary of `nifi-app.log` since the last one (followed by inode
+  and offset kept in the work directory; counts by pattern, with the first and newest entry cut at 2 KiB after
+  passwords, tokens and keys are hidden). New read jobs `log-read` (list, last lines, search by time, level, text or
+  regular expression including `.gz` files: 5000 lines / 4 MiB / 30 s; download as tar.gz up to 50 MiB) and
+  `log-tail` (up to 120 s, by inode and offset across a rollover, a chunk every second or two to
+  `POST /executor/v1/jobs/:id/chunk`, ended early when nobody follows). Lines and archives go over the binary
+  `PUT /executor/v1/jobs/:id/content`. Only files below the log directories of watched installations, compared
+  after realpath (no `..`, no symbolic link out).
 
 **Services in the Deployer**
 - Service profiles `nifi-1.x` and `nifi-2.x`: the configuration files and a catalog of keys (cluster or node scope,
@@ -101,8 +109,15 @@ executors; `EXECUTOR_VERSION` with it).
 - New tables only (`executor_beats`, `service_*`) and a column on `executor_tokens`. 0.2.4 opens the database, but
   would take a service executor token for a deploy executor one: revoke it before going back.
 
+- Phase 2 logs: `service_log_patterns` and 5-minute counts from the samples (the ZooKeeper rule counts them with
+  the bulletins); `GET /api/services/:id/logs` (members, summary), `…/logs/files`, `…/logs/lines`,
+  `POST …/logs/search` (every node in parallel, merged by time), `GET …/logs/download` (audited), `GET …/logs/tail`
+  (Server-Sent Events; one tail per node and file, shared, renewed from its cursor while someone follows). A Logs
+  tab on the service page: follow, search, download, the WARN/ERROR summary. Log jobs only go to an executor whose
+  heartbeat names them.
+
 **Known limits**
-- Alerts are not pushed (S13). ZooKeeper errors come only from bulletins until the log summary (phase 2 step 4).
+- Alerts are not pushed (S13).
 - Not yet: alert thresholds, removing a service, turning a standalone instance into a cluster, a cluster's common
   layer and node overrides, starting and stopping, logs (later phases).
 - The service executor cannot be upgraded from the Hosts page or the Overview yet, and the setup package does not

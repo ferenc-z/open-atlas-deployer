@@ -103,7 +103,7 @@ class DeployerApi:
         f = self.cfg["executor_token_file"]
         return pathlib.Path(f).read_text().strip() if f and pathlib.Path(f).is_file() else ""
 
-    def call(self, method, path, body=None, text=None, timeout=30):
+    def call(self, method, path, body=None, text=None, timeout=30, raw=None):
         if not self.cfg["deployer_url"]:
             raise Failed("EXECUTOR_DEPLOYER_URL is not set")
         data, headers = None, {"authorization": f"Bearer {self.token()}", "user-agent": self.agent}
@@ -111,6 +111,8 @@ class DeployerApi:
             data, headers["content-type"] = json.dumps(body).encode(), "application/json"
         elif text is not None:
             data, headers["content-type"] = text.encode(), "text/plain; charset=utf-8"
+        elif raw is not None:
+            data, headers["content-type"] = bytes(raw), "application/octet-stream"
         req = urllib.request.Request(self.cfg["deployer_url"] + path, data=data, method=method, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=timeout, context=self.context) as r:
@@ -143,6 +145,14 @@ class DeployerApi:
     def post_samples(self, samples):
         """The service executor's collected samples (§15.3), at most 20 at a time."""
         return self.call("POST", "/executor/v1/samples", body={"samples": samples})
+
+    def put_content(self, job_id, data):
+        """A job's binary content (§15.3: a log search's matches, a download's tar.gz); the Deployer cuts it at the job's limit."""
+        self.call("PUT", f"/executor/v1/jobs/{job_id}/content", raw=data, timeout=120)
+
+    def post_chunk(self, job_id, chunk):
+        """A log-tail's next piece (§15.2 P7); the answer says whether anyone still follows ({"stop": true}: nobody)."""
+        return self.call("POST", f"/executor/v1/jobs/{job_id}/chunk", body=chunk)
 
 
 class ProtocolExecutor:

@@ -92,7 +92,7 @@ class RegistrationTest(Base):
         beat = self.api.beats[-1]
         self.assertEqual(beat["executor"], "service")
         self.assertEqual(beat["protocols"], [2])
-        self.assertEqual(beat["kinds"], ["svc-discover", "svc-read", "executor-upgrade", "svc-discover@2", "svc-read@2"],
+        self.assertEqual(beat["kinds"], ["svc-discover", "svc-read", "log-read", "log-tail", "executor-upgrade", "svc-discover@2", "svc-read@2"],
                          "the service jobs and what they can do (§15.2); never the deploy ones")
         name, root = sx.ServiceExecutor.user()
         self.assertEqual((beat["user"], beat["isRoot"]), (name, root))
@@ -950,6 +950,221 @@ class CollectorTest(Base):
 
 
 @unittest.skipUnless(all(shutil.which(c) for c in ("sh", "tar", "sha256sum")) and hasattr(os, "symlink"), "needs sh, tar, sha256sum")
+class LogApi(WatchApi):
+    """The Deployer's side of the logs: the content channel and the tail's chunks (answering stop once told to)."""
+
+    def __init__(self):
+        super().__init__()
+        self.content, self.chunks, self.stop_after = {}, [], None
+
+    def put_content(self, job_id, data):
+        self.content[job_id] = bytes(data)
+
+    def post_chunk(self, job_id, chunk):
+        self.chunks.append(json.loads(json.dumps(chunk)))
+        return {"ok": True, "stop": self.stop_after is not None and len(self.chunks) >= self.stop_after}
+
+
+def log_line(stamp, level, logger, message):
+    return f"2026-11-06 {stamp},123 {level} [Timer-Driven Process Thread-3] {logger} {message}\n"
+
+
+class LogsTest(Base):
+    def setUp(self):
+        super().setUp()
+        # The log's local times read as UTC here, whatever zone the machine running the tests is in.
+        old = os.environ.get("TZ")
+        os.environ["TZ"] = "UTC"
+        time.tzset()
+
+        def back():
+            if old is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old
+            time.tzset()
+        self.addCleanup(back)
+        self.api = LogApi()
+        self.logs = self.root / "nifi" / "logs"
+        self.logs.mkdir(parents=True)
+        self.app = self.logs / "nifi-app.log"
+        self.app.write_text(log_line("10:00:00", "INFO", "o.a.n.NiFi", "Started"))
+        self.member = "local:/opt/nifi"
+        self.watch = [{"service": "n1", "member": self.member, "installDir": str(self.root / "nifi"), "confDir": None, "https": {}, "logDir": str(self.logs)}]
+
+    def ex(self):
+        e = self.executor()
+        e.watch = sx.watch_entries(self.watch)
+        return e
+
+    def read(self, ex, request, kind="log-read", timeout=10):
+        job = sx.ReadJob({"id": "log-read-0001", "kind": kind, **request}, timeout)
+        result = getattr(ex, ex.READ_JOBS[kind])(job)
+        return result, json.loads(self.api.content.pop(job.id)) if job.id in self.api.content and request.get("mode") != "download" else self.api.content.pop(job.id, None)
+
+    def test_the_heartbeat_names_the_log_jobs(self):
+        self.assertTrue({"log-read", "log-tail"} <= set(self.executor().KINDS))
+
+    def test_the_summary_counts_warn_and_error_by_pattern_and_hides_secrets(self):
+        s = sx.LogSummary(self.root / "work")
+        first = s.read(self.member, str(self.logs))
+        self.assertEqual((first["patterns"], first["lines"]), ([], 0), "the first look starts at the end")
+        with self.app.open("a") as f:
+            f.write(log_line("10:00:01", "WARN", "o.a.n.c.NodeClusterCoordinator", "Problem encountered issuing reconnection request to node localhost:18446"))
+            f.write(log_line("10:00:06", "WARN", "o.a.n.c.NodeClusterCoordinator", "Problem encountered issuing reconnection request to node localhost:18447"))
+            f.write(log_line("10:00:07", "ERROR", "o.a.c.f.i.CuratorFrameworkImpl", "Background exception was not retry-able for 4f6a7c1e-1111-2222-3333-444455556666 password=hunter2"))
+            f.write("org.apache.zookeeper.KeeperException$ConnectionLossException: KeeperErrorCode = ConnectionLoss\n\tat org.apache.zookeeper.KeeperException.create(KeeperException.java:102)\n")
+            f.write(log_line("10:00:08", "INFO", "o.a.n.NiFi", "ignored"))
+            f.write("2026-11-06 10:00:09,000 WARN [half a line")
+        got = s.read(self.member, str(self.logs))
+        by = {p["level"]: p for p in got["patterns"]}
+        self.assertEqual(len(got["patterns"]), 2)
+        warn = by["WARN"]
+        self.assertEqual((warn["count"], warn["template"]), (2, "Problem encountered issuing reconnection request to node localhost:<n>"))
+        self.assertEqual((warn["firstAt"], warn["lastAt"]), ("2026-11-06T10:00:01.123Z", "2026-11-06T10:00:06.123Z"))
+        self.assertIn("18446", warn["first"])
+        self.assertIn("18447", warn["last"])
+        err = by["ERROR"]
+        self.assertEqual(err["exception"], "org.apache.zookeeper.KeeperException$ConnectionLossException")
+        self.assertEqual(err["template"], "Background exception was not retry-able for <uuid> password=[hidden]")
+        self.assertNotIn("hunter2", err["first"])
+        self.assertIn("password=[hidden]", err["first"])
+        self.assertIn("ConnectionLoss", err["first"], "the stack trace is part of the sample")
+        # The half line waits for its end; a new executor (a restart) carries on from the kept offset.
+        with self.app.open("a") as f:
+            f.write("] o.a.n.c.X second half\n" + log_line("10:00:10", "ERROR", "o.a.n.c.X", "x" * 5000))
+        again = sx.LogSummary(self.root / "work").read(self.member, str(self.logs))
+        self.assertEqual(sorted((p["level"], p["count"]) for p in again["patterns"]), [("ERROR", 1), ("WARN", 1)])
+        self.assertTrue(all(len(p["first"]) <= 2048 for p in again["patterns"]), "samples cut at 2 KiB")
+
+    def test_the_summary_follows_a_rollover_by_inode(self):
+        s = sx.LogSummary(self.root / "work")
+        s.read(self.member, str(self.logs))
+        with self.app.open("a") as f:
+            f.write(log_line("10:01:00", "ERROR", "o.a.n.A", "before the rollover"))
+        os.rename(self.app, self.logs / "nifi-app_2026-11-06_10.0.log")
+        self.app.write_text(log_line("10:02:00", "ERROR", "o.a.n.B", "after the rollover"))
+        got = s.read(self.member, str(self.logs))
+        self.assertEqual(sorted(p["logger"] for p in got["patterns"]), ["o.a.n.A", "o.a.n.B"])
+        self.assertEqual(got["inode"], os.stat(self.app).st_ino)
+
+    def test_paths_outside_the_log_directory_are_refused(self):
+        ex = self.ex()
+        files = ex.log_files()
+        (self.root / "secret.txt").write_text("no")
+        os.symlink(self.root / "secret.txt", self.logs / "escape.log")
+        os.symlink(self.app, self.logs / "inside.log")
+        for name in ("../secret.txt", str(self.root / "secret.txt"), "escape.log", "/etc/passwd", "nothere.log"):
+            with self.assertRaises(sx.Refused, msg=name):
+                files.resolve(self.member, name)
+        self.assertEqual(files.resolve(self.member, "inside.log"), os.path.realpath(self.app), "a link inside the directory is fine")
+        with self.assertRaises(sx.Refused):
+            files.resolve("local:/elsewhere", "nifi-app.log")
+        names = [f["name"] for f in files.listing(self.member)["files"]]
+        self.assertEqual(names[0], "nifi-app.log")
+        self.assertNotIn("escape.log", names, "a link out of the directory is not listed")
+        with self.assertRaises(sx.Refused):
+            self.read(ex, {"member": self.member, "mode": "lines", "file": "../../secret.txt"})
+
+    def test_search_reads_rolled_and_gz_files_by_time_level_and_text(self):
+        import gzip
+        old = self.logs / "nifi-app_2026-11-06_09.0.log.gz"
+        with gzip.open(old, "wt") as f:
+            f.write(log_line("09:10:00", "ERROR", "o.a.n.Old", "ZooKeeper connection lost") + "java.net.ConnectException: refused\n\tat x.y(Z.java:1)\n")
+            f.write(log_line("09:20:00", "WARN", "o.a.n.Old", "something else"))
+        os.utime(old, (time.time() - 3600, time.time() - 3600))
+        with self.app.open("a") as f:
+            f.write(log_line("10:30:00", "ERROR", "o.a.n.New", "ZooKeeper connection lost again"))
+            f.write(log_line("10:31:00", "INFO", "o.a.n.New", "ZooKeeper info line"))
+        ex = self.ex()
+        result, body = self.read(ex, {"member": self.member, "mode": "search", "query": "zookeeper", "levels": ["WARN", "ERROR"]})
+        self.assertEqual([(e["file"], e["at"], e["level"]) for e in body["entries"]],
+                         [("nifi-app_2026-11-06_09.0.log.gz", "2026-11-06T09:10:00.123Z", "ERROR"), ("nifi-app.log", "2026-11-06T10:30:00.123Z", "ERROR")])
+        self.assertIn("ConnectException", body["entries"][0]["text"], "an entry keeps its stack trace")
+        self.assertEqual((result["entries"], result["truncated"]), (2, None))
+        self.assertNotIn("text", json.dumps(result), "the status carries only counts")
+        _, body = self.read(ex, {"member": self.member, "mode": "search", "query": r"conn\w+ lost again$", "regex": True, "from": "2026-11-06T10:00:00Z", "to": "2026-11-06T11:00:00Z"})
+        self.assertEqual([e["logger"] for e in body["entries"]], ["o.a.n.New"])
+        result, body = self.read(ex, {"member": self.member, "mode": "search", "limit": 2})
+        self.assertEqual([e["at"][11:19] for e in body["entries"]], ["10:30:00", "10:31:00"], "over the limit: the newest kept")
+        self.assertTrue(result["truncated"])
+        for bad in ({"mode": "search", "query": "(", "regex": True}, {"mode": "search", "limit": 9999}, {"mode": "search", "levels": ["LOUD"]}, {"mode": "nope"}):
+            with self.assertRaises(sx.Refused, msg=bad):
+                self.read(ex, {"member": self.member, **bad})
+
+    def test_lines_and_the_listing(self):
+        with self.app.open("a") as f:
+            for i in range(50):
+                f.write(log_line("10:00:%02d" % i, "INFO", "o.a.n.X", f"line {i}"))
+        ex = self.ex()
+        result, body = self.read(ex, {"member": self.member, "mode": "lines", "lines": 3})
+        self.assertEqual([x.rsplit(" ", 1)[1] for x in body["lines"]], ["47", "48", "49"])
+        self.assertEqual((result["lines"], body["inode"]), (3, os.stat(self.app).st_ino))
+        result, body = self.read(ex, {"member": self.member, "mode": "list"})
+        self.assertEqual((body["dir"], [f["name"] for f in body["files"]]), (str(self.logs), ["nifi-app.log"]))
+
+    def test_download_packs_the_files_as_a_tar_gz_within_the_limit(self):
+        import tarfile
+        (self.logs / "nifi-bootstrap.log").write_text("bootstrap\n")
+        ex = self.ex()
+        job = sx.ReadJob({"id": "log-read-0002", "kind": "log-read", "member": self.member, "mode": "download", "files": ["nifi-app.log", "nifi-bootstrap.log"]}, 10)
+        result = ex.log_read(job)
+        data = self.api.content[job.id]
+        self.assertEqual((result["bytes"], result["files"]), (len(data), ["nifi-app.log", "nifi-bootstrap.log"]))
+        with tarfile.open(fileobj=__import__("io").BytesIO(data), mode="r:gz") as tar:
+            self.assertEqual(sorted(tar.getnames()), ["nifi-app.log", "nifi-bootstrap.log"])
+            self.assertEqual(tar.extractfile("nifi-bootstrap.log").read(), b"bootstrap\n")
+        (self.logs / "big.log").write_bytes(os.urandom(200_000))
+        result = ex.log_read(sx.ReadJob({"id": "log-read-0003", "kind": "log-read", "member": self.member, "mode": "download", "files": ["big.log", "nifi-bootstrap.log"], "maxBytes": 30_000}, 10))
+        self.assertEqual((result["files"], result["skipped"]), (["nifi-bootstrap.log"], ["big.log"]))
+        with self.assertRaises(sx.Refused):
+            ex.log_read(sx.ReadJob({"id": "log-read-0004", "kind": "log-read", "member": self.member, "mode": "download", "files": ["../x"]}, 10))
+
+    def test_tail_follows_by_inode_across_a_rollover_and_carries_on_from_its_cursor(self):
+        ex = self.ex()
+        old_every = sx.TAIL_EVERY
+        sx.TAIL_EVERY = 0.1
+        self.addCleanup(setattr, sx, "TAIL_EVERY", old_every)
+        out = {}
+        job = sx.ReadJob({"id": "log-tail-0001", "kind": "log-tail", "member": self.member, "seconds": 3, "lines": 5}, 30)
+        t = threading.Thread(target=lambda: out.update(result=ex.log_tail(job)))
+        t.start()
+        self.assertTrue(wait_until(lambda: self.api.chunks))
+        self.assertTrue(self.api.chunks[0]["first"])
+        self.assertIn("Started", self.api.chunks[0]["text"], "it starts with the last lines")
+        with self.app.open("a") as f:
+            f.write(log_line("10:00:01", "INFO", "o.a.n.X", "one"))
+        self.assertTrue(wait_until(lambda: "one" in "".join(c["text"] for c in self.api.chunks)))
+        with self.app.open("a") as f:
+            f.write(log_line("10:00:02", "INFO", "o.a.n.X", "last of the old file"))
+        os.rename(self.app, self.logs / "nifi-app_2026-11-06_10.0.log")
+        self.app.write_text(log_line("10:00:03", "INFO", "o.a.n.X", "first of the new file"))
+        t.join(10)
+        text = "".join(c["text"] for c in self.api.chunks)
+        self.assertLess(text.index("last of the old file"), text.index("first of the new file"))
+        self.assertTrue(any(c.get("rotated") == "nifi-app_2026-11-06_10.0.log" for c in self.api.chunks))
+        result = out["result"]
+        self.assertEqual((result["inode"], result["offset"], result["rotated"]), (os.stat(self.app).st_ino, os.path.getsize(self.app), 1))
+        # The next tail carries on from the cursor: nothing again, only what came since.
+        with self.app.open("a") as f:
+            f.write(log_line("10:00:04", "INFO", "o.a.n.X", "while nobody followed"))
+        self.api.chunks.clear()
+        self.api.stop_after = 1
+        again = ex.log_tail(sx.ReadJob({"id": "log-tail-0002", "kind": "log-tail", "member": self.member, "seconds": 5, "cursor": {"inode": result["inode"], "offset": result["offset"]}}, 30))
+        self.assertEqual("".join(c["text"] for c in self.api.chunks), log_line("10:00:04", "INFO", "o.a.n.X", "while nobody followed"))
+        self.assertTrue(again["stopped"], "nobody follows any more: it ends early")
+        with self.assertRaises(sx.Refused):
+            ex.log_tail(sx.ReadJob({"id": "log-tail-0003", "kind": "log-tail", "member": self.member, "file": "../x.log"}, 5))
+        with self.assertRaises(sx.Refused):
+            ex.log_tail(sx.ReadJob({"id": "log-tail-0004", "kind": "log-tail", "member": self.member, "seconds": 600}, 5))
+
+    def test_the_sample_carries_the_summary(self):
+        c = sx.Collector(cfg(self.root), proc=self.root / "noproc", uid=os.geteuid())
+        w = sx.watch_entries(self.watch)[0]
+        s = c.sample(w, {}, {}, None, "no certificate")
+        self.assertEqual((s["logs"]["file"], s["logs"]["patterns"]), (str(self.app), []))
+
+
 class ReleaseTest(Base):
     """The release: its own archive beside the deploy executor's, installed without root and upgraded like it."""
 

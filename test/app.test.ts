@@ -2309,3 +2309,82 @@ test("§15.2 P5, §15.3: a service executor's heartbeat reply carries its watch 
   assert.equal(all.open, 1);
   assert.equal((await t.request("/api/alerts?state=nope", { as: "viewer" })).status, 400);
 });
+
+test("phase 2 step 4: a service's logs over the API: members and summary, files, search, download, a tail as SSE, the executor's content and chunks", async () => {
+  const t = setup({ services: fakeState() });
+  setEnvironment(t, ({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", hosts, registries: { ghcr: "ghcr.io/acme" }, apps: { shop: { version: "1.2.0", host: "app2" } } }));
+  const call = (path: string, token: string, init: RequestInit & { type?: string } = {}) => t.app.request(`/deploy${path}`, { ...init, headers: { authorization: `Bearer ${token}`, ...(init.type ? { "content-type": init.type } : typeof init.body === "string" && init.body.startsWith("{") ? { "content-type": "application/json" } : {}) } });
+  const service = (await (await post(t, "/api/hosts/app2/token", "admin", { executor: "service" })).json()).token as string;
+  await call("/executor/v1/heartbeat", service, { method: "POST", body: JSON.stringify({ executor: "service", version: EXECUTOR_VERSION, protocols: [2], kinds: ["svc-discover", "svc-read", "log-read", "log-tail", "executor-upgrade"], busy: null, user: "ferenc", isRoot: false, reading: [], readSlots: 4 }) });
+  const member = (installDir: string, https: number) => ({ host: "app2", installDir, serviceUser: "nifi", startEnvironment: null, ports: { https }, nodeAddress: `node-${https}`, discovery: null });
+  t.store.addCluster({ kind: "cluster", id: "flow", service: "nifi", profile: "nifi-2.x", version: "2.5.0", webUrl: null, zookeeper: "zk:2181", zookeeperRoot: "/flow", nodes: [member("/opt/a", 8443), member("/opt/b", 9443)] }, "uat", { id: "admin", via: "cli" });
+  /** Plays the executor: takes the next job and answers it with content and a status. */
+  const answer = async (reply: (job: Record<string, any>) => { content?: Buffer | string; result?: Record<string, unknown>; state?: string; message?: string }) => {
+    for (let i = 0; i < 200; i++) {
+      const r = await call("/executor/v1/jobs/next", service);
+      if (r.status === 200) {
+        const job = (await r.json()).job;
+        const a = reply(job);
+        if (a.content !== undefined) {
+          const put = await call(`/executor/v1/jobs/${job.id}/content`, service, { method: "PUT", body: typeof a.content === "string" ? a.content : new Uint8Array(a.content), type: "application/octet-stream" });
+          assert.equal(put.status, 200);
+        }
+        await call(`/executor/v1/jobs/${job.id}/status`, service, { method: "PUT", body: JSON.stringify({ protocol: 2, id: job.id, kind: job.kind, state: a.state ?? "succeeded", steps: [], result: a.result ?? {}, ...(a.message ? { message: a.message } : {}) }) });
+        return job;
+      }
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    throw new Error("no job came");
+  };
+
+  const overview = await (await t.request("/api/services/flow/logs", { as: "viewer" })).json();
+  assert.deepEqual(overview.members.map((m: { key: string; label: string; logDir: string; canTail: boolean }) => [m.key, m.label, m.logDir, m.canTail]), [["app2:/opt/a", "node-8443:8443", "/opt/a/logs", true], ["app2:/opt/b", "node-9443:9443", "/opt/b/logs", true]]);
+  assert.deepEqual(overview.patterns, []);
+  assert.equal((await t.request("/api/services/none/logs", { as: "viewer" })).status, 404);
+  assert.equal((await t.request("/api/services/flow/logs", { as: "nobody" })).status, 403);
+
+  const files = t.request("/api/services/flow/logs/files?member=app2:/opt/a", { as: "viewer" });
+  const listJob = await answer(() => ({ content: JSON.stringify({ dir: "/opt/a/logs", files: [{ name: "nifi-app.log", size: 10, modifiedAt: "2026-11-06T01:00:00Z", gz: false }], more: 0 }), result: { mode: "list", files: 1 } }));
+  assert.deepEqual([listJob.kind, listJob.mode, listJob.member], ["log-read", "list", "app2:/opt/a"]);
+  assert.deepEqual((await (await files).json()).files.map((f: { name: string }) => f.name), ["nifi-app.log"]);
+
+  assert.equal((await post(t, "/api/services/flow/logs/search", "viewer", { regex: true, query: "(" })).status, 400);
+  const search = post(t, "/api/services/flow/logs/search", "viewer", { query: "boom", from: "2026-11-06T00:00:00Z", to: "2026-11-06T02:00:00Z" });
+  const entry = (at: string) => ({ file: "nifi-app.log", at, local: at, level: "ERROR", logger: "o.a.n.X", thread: "t", text: `boom ${at}` });
+  const at = (job: Record<string, any>) => (job.member === "app2:/opt/a" ? "2026-11-06T01:00:02.000Z" : "2026-11-06T01:00:01.000Z");
+  await answer((job) => ({ content: JSON.stringify({ entries: [entry(at(job))], truncated: null }), result: { mode: "search", entries: 1 } }));
+  await answer((job) => ({ content: JSON.stringify({ entries: [entry(at(job))], truncated: null }), result: { mode: "search", entries: 1 } }));
+  const found = await (await search).json();
+  assert.deepEqual(found.entries.map((e: { label: string; at: string }) => [e.label, e.at]), [["node-9443:9443", "2026-11-06T01:00:01.000Z"], ["node-8443:8443", "2026-11-06T01:00:02.000Z"]]);
+
+  const download = t.request("/api/services/flow/logs/download?member=app2:/opt/b&files=nifi-app.log,nifi-bootstrap.log", { as: "viewer" });
+  const dl = await answer(() => ({ content: Buffer.from([0x1f, 0x8b, 1, 2, 3]), result: { mode: "download", files: ["nifi-app.log", "nifi-bootstrap.log"], bytes: 5 } }));
+  assert.deepEqual([dl.mode, dl.files, dl.maxBytes], ["download", ["nifi-app.log", "nifi-bootstrap.log"], 50 << 20]);
+  const got = await download;
+  assert.equal(got.headers.get("content-type"), "application/gzip");
+  assert.match(got.headers.get("content-disposition") ?? "", /attachment; filename="flow-node-9443_9443-logs-\d{8}T\d{6}\.tar\.gz"/);
+  assert.deepEqual([...new Uint8Array(await got.arrayBuffer())], [0x1f, 0x8b, 1, 2, 3]);
+  assert.equal(t.store.listAudit(5, { action: "service.logs.download" }).length, 1, "a download is audited");
+  const refused = t.request("/api/services/flow/logs/download?member=app2:/opt/b&files=x.log", { as: "viewer" });
+  await answer(() => ({ state: "refused", message: "x.log is not in the log directory /opt/b/logs" }));
+  const r = await refused;
+  assert.deepEqual([r.status, (await r.json()).message], [400, "node-9443:9443: x.log is not in the log directory /opt/b/logs"]);
+  assert.equal((await t.request("/api/services/flow/logs/download?member=app2:/opt/b&files=../x", { as: "viewer" })).status, 400);
+
+  // A tail as Server-Sent Events: the executor's chunks reach the page; the answer to a chunk says whether anyone follows.
+  const res = await t.request("/api/services/flow/logs/tail?member=app2:/opt/a&file=nifi-app.log", { as: "viewer" });
+  assert.equal(res.headers.get("content-type"), "text/event-stream");
+  const reader = res.body!.getReader();
+  const tail = (await (await call("/executor/v1/jobs/next", service)).json()).job;
+  assert.deepEqual([tail.kind, tail.member, tail.seconds], ["log-tail", "app2:/opt/a", 120]);
+  const chunk = await call(`/executor/v1/jobs/${tail.id}/chunk`, service, { method: "POST", body: JSON.stringify({ seq: 1, inode: 3, offset: 9, text: "hello\n", first: true }) });
+  assert.deepEqual(await chunk.json(), { ok: true, stop: false });
+  let text = "";
+  while (!text.includes("hello")) text += new TextDecoder().decode((await reader.read()).value);
+  assert.match(text, /event: lines\ndata: \{"type":"lines","text":"hello\\n","first":true\}/);
+  await reader.cancel();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual(await (await call(`/executor/v1/jobs/${tail.id}/chunk`, service, { method: "POST", body: JSON.stringify({ seq: 2, inode: 3, offset: 9, text: "" }) })).json(), { ok: true, stop: true }, "the page went away");
+  assert.equal((await call(`/executor/v1/jobs/${tail.id}/chunk`, "dpe_nope", { method: "POST", body: "{}" })).status, 401);
+  assert.equal((await t.request("/api/services/flow/logs/tail?member=app2:/opt/a&file=old.log.gz", { as: "viewer" })).status, 400);
+});

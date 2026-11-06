@@ -213,6 +213,51 @@ export class Handoff {
     return job?.host === host && job.executor === kind;
   }
 
+  // §15.3: a job's binary content (a log search's matches, a download's tar.gz) and a log-tail's chunks. Both stay in
+  // memory only: the content until it is taken or for 10 minutes, the chunks go straight to whoever listens.
+  private contents = new Map<string, { data: Buffer; at: number; truncated: boolean }>();
+  private chunkListeners = new Map<string, (chunk: Record<string, unknown>) => boolean>();
+
+  /** Keeps a job's content, cut at the request's maxBytes (default 4 MiB). */
+  putContent(id: string, data: Buffer): { bytes: number; truncated: boolean } {
+    const now = this.now();
+    for (const [k, v] of this.contents) if (now - v.at > 600_000) this.contents.delete(k);
+    const max = Number(this.store.executorJob(id)?.request.maxBytes) || 4 << 20;
+    const truncated = data.length > max;
+    this.contents.set(id, { data: truncated ? data.subarray(0, max) : data, at: now, truncated });
+    return { bytes: Math.min(data.length, max), truncated };
+  }
+
+  /** The content a job sent, handed over once. */
+  takeContent(id: string): { data: Buffer; truncated: boolean } | undefined {
+    const c = this.contents.get(id);
+    this.contents.delete(id);
+    return c;
+  }
+
+  /** Who gets a job's chunks; the listener says whether anyone still follows. */
+  onChunk(id: string, listener: ((chunk: Record<string, unknown>) => boolean) | null) {
+    if (listener) this.chunkListeners.set(id, listener); else this.chunkListeners.delete(id);
+  }
+
+  /** A chunk of a job: {stop: true} when nobody listens (the executor ends the job early). */
+  putChunk(id: string, chunk: Record<string, unknown>): { stop: boolean } {
+    const listener = this.chunkListeners.get(id);
+    return { stop: !listener || !listener(chunk) };
+  }
+
+  /** The job's status once final, or undefined after `ms`. */
+  async awaitJob(id: string, ms: number, pollMs = 200, background = false): Promise<ExecutorStatus | undefined> {
+    const end = Date.now() + ms;
+    for (;;) {
+      const s = this.status(id);
+      if (s && ["succeeded", "failed", "rolled-back", "refused"].includes(s.state)) return s;
+      if (Date.now() >= end) return undefined;
+      // background: nobody awaits it (a tail's end), so it never keeps the process alive by itself.
+      await new Promise((r) => { const t = setTimeout(r, pollMs); if (background) t.unref(); });
+    }
+  }
+
   putStatus(id: string, status: ExecutorStatus) { this.store.setExecutorStatus(id, status); }
   appendLog(id: string, text: string) { this.store.appendExecutorLog(id, text); }
   putEnvContent(id: string, content: string) { this.store.setExecutorEnvContent(id, content); }

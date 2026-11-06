@@ -282,3 +282,16 @@ export const serviceEvents = (id: string, limit = 200) => call<{ events: Timelin
 export const putThresholds = (id: string, thresholds: Partial<Record<keyof Thresholds, number | null>>) => call<{ thresholds: ThresholdsView }>("PUT", `services/${encodeURIComponent(id)}/thresholds`, { thresholds });
 export type GlobalAlert = AlertView & { kind: "standalone" | "cluster"; environment: string; profile: string };
 export const alerts = (state: "open" | "all" = "open") => call<{ alerts: GlobalAlert[]; open: number; rules: Record<RuleId, RuleInfo> }>("GET", `alerts?state=${state}`);
+// Phase 2 step 4 (§9.3, §15.3): a service's logs through its service executors.
+import type { LogEntry, LogMember, SearchResult } from "../server/services/logs.ts";
+import type { LogPattern } from "../server/store.ts";
+export type { LogEntry, LogMember, LogPattern, SearchResult };
+export type LogFile = { name: string; size: number; modifiedAt: string; gz: boolean };
+export type LogSearch = { members?: string[]; files?: string[]; from: string; to: string; levels?: string[]; query?: string; regex?: boolean; limit?: number };
+const logsPath = (id: string, rest = "") => `services/${encodeURIComponent(id)}/logs${rest}`;
+export const serviceLogs = (id: string, hours = 24) => call<{ members: LogMember[]; hours: number; patterns: LogPattern[]; tails: { member: string; file: string; followers: number }[] }>("GET", logsPath(id, `?hours=${hours}`));
+export const logFiles = (id: string, member: string) => call<{ dir: string; files: LogFile[]; more: number }>("GET", logsPath(id, `/files?member=${encodeURIComponent(member)}`));
+export const searchLogs = (id: string, q: LogSearch) => call<SearchResult>("POST", logsPath(id, "/search"), q);
+/** Opened by the page itself (a link, an EventSource): the session cookie goes along, a GET needs no CSRF token. */
+export const logDownloadUrl = (id: string, member: string, files: string[]) => `${BASE}api/${logsPath(id, `/download?member=${encodeURIComponent(member)}&files=${files.map(encodeURIComponent).join(",")}`)}`;
+export const logTailUrl = (id: string, member: string, file: string) => `${BASE}api/${logsPath(id, `/tail?member=${encodeURIComponent(member)}&file=${encodeURIComponent(file)}`)}`;

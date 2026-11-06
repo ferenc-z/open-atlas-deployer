@@ -151,7 +151,7 @@ test("rollups every 5 minutes, retention, the metrics view from samples or rollu
   assert.equal(trend(store, "c250", new Date("2026-11-06T11:21:00Z")).heapPct.filter((v) => v !== null).length, 4);
 
   // Two days on, the raw samples go; the rollups stay 30 days.
-  assert.deepEqual(prune(store, new Date("2026-11-08T11:30:00Z")), { samples: 20, bulletins: 0, rollups: 0 });
-  assert.deepEqual(prune(store, new Date("2026-12-06T11:30:00Z")), { samples: 0, bulletins: 0, rollups: 4 });
+  assert.deepEqual(prune(store, new Date("2026-11-08T11:30:00Z")), { samples: 20, bulletins: 0, rollups: 0, logCounts: 0, logPatterns: 0 });
+  assert.deepEqual(prune(store, new Date("2026-12-06T11:30:00Z")), { samples: 0, bulletins: 0, rollups: 4, logCounts: 0, logPatterns: 0 });
   store.close();
 });

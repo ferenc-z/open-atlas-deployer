@@ -6,6 +6,7 @@
 import type { Point, ServiceBulletin, ServiceCert, Store } from "../store.ts";
 import type { ServiceSample } from "./watch.ts";
 import { installKey, type ServiceMember } from "./draft.ts";
+import { ingestLogs } from "./logs.ts";
 
 export const RAW_DAYS = 2;
 export const ROLLUP_DAYS = 30;
@@ -197,10 +198,12 @@ export function ingest(store: Store, samples: ServiceSample[]): { bulletins: num
     bulletins += store.addServiceBulletins(bulletinsOf(s, s.service, s.member));
     const c = s.certs as Any | undefined;
     if (c && typeof c.readAt === "string" && store.putServiceCerts(s.service, s.member, c.readAt, certRows(c))) certs++;
+    // Step 4: the log summary's patterns to service_log_patterns.
+    const logs = ingestLogs(store, s);
     // The raw body without what went to its own tables.
     const { certs: _c, ...rest } = s;
     const nifi = rest.nifi as Any | undefined;
-    kept.push({ ...rest, ...(nifi ? { nifi: { ...nifi, bulletins: undefined } } : {}), point } as ServiceSample & { point: Point });
+    kept.push({ ...rest, ...(nifi ? { nifi: { ...nifi, bulletins: undefined } } : {}), ...(logs ? { logs } : {}), point } as ServiceSample & { point: Point });
   }
   store.addServiceSamples(kept);
   return { bulletins, certs };

@@ -36,6 +36,8 @@ import { alertView, check, parseThresholds, RULES, THRESHOLDS } from "./services
 import { TakeoverError, type Takeover } from "./services/takeover.ts";
 import { acceptSamples, watchList } from "./services/watch.ts";
 import { FIELDS, ingest, metrics, RANGES, trend, type Field, type Range } from "./services/metrics.ts";
+import { DOWNLOAD_MAX, LogsError, parseSearch, ServiceLogs } from "./services/logs.ts";
+import { streamSSE } from "hono/streaming";
 import { DEPLOYER_VERSION } from "./version.ts";
 import { validateEnvironment } from "./environment.ts";
 import { applyPatch, changedPaths, PatchError } from "./jsonpatch.ts";
@@ -73,6 +75,8 @@ export interface Dependencies {
   omaFetcher?: typeof fetch;
   /** Service ops §6: taking over discovered services (drafts, confirmation). */
   takeover?: Takeover;
+  /** Phase 2 step 4: reading and following services' logs through their service executors (tests pass their own timings). */
+  logs?: ServiceLogs;
 }
 
 const reject = (c: Context, status: 400 | 401 | 403 | 404 | 409 | 429 | 503, code: string, message: string, details: string[] = []) =>
@@ -134,6 +138,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
   // D35: the executors. Each host's executor calls in with its own token (dpe_); the Deployer never calls a host.
   // S18: the token also says which of the host's executors calls (deploy or service); each gets only its own jobs.
   const handoff = deployments.handoff;
+  const serviceLogs = deps.logs ?? new ServiceLogs(store, handoff);
   const executorOf = (c: Context): { host: string; executor: ExecutorKind } | undefined => {
     const bearer = /^Bearer (dpe_\S+)$/.exec(c.req.header("authorization") ?? "")?.[1];
     return bearer ? store.executorOf(tokenSha256(bearer)) : undefined;
@@ -178,6 +183,17 @@ export function createApp({ config, store, sessions, observer, deployments, vers
   api.put("/executor/v1/jobs/:id/status", ownJob(async (c, id) => { handoff.putStatus(id, await c.req.json()); return c.json({ ok: true }); }));
   api.post("/executor/v1/jobs/:id/log", ownJob(async (c, id) => { handoff.appendLog(id, await c.req.text()); return c.json({ ok: true }); }));
   api.put("/executor/v1/jobs/:id/env-content", ownJob(async (c, id) => { handoff.putEnvContent(id, await c.req.text()); return c.json({ ok: true }); }));
+  // §15.3: a job's binary content (cut at the request's maxBytes), and a log-tail's chunks (§15.2 P7; {stop: true} when
+  // nobody follows any more). Both stay in memory.
+  api.put("/executor/v1/jobs/:id/content", ownJob(async (c, id) => {
+    if (Number(c.req.header("content-length") ?? 0) > (DOWNLOAD_MAX + (1 << 20))) return reject(c, 400, "content/too-large", "At most 50 MiB of content.");
+    return c.json({ ok: true, ...handoff.putContent(id, Buffer.from(await c.req.arrayBuffer())) });
+  }));
+  api.post("/executor/v1/jobs/:id/chunk", ownJob(async (c, id) => {
+    const chunk = await c.req.json().catch(() => null);
+    if (!chunk || typeof chunk !== "object") return reject(c, 400, "chunk/invalid", "A chunk is a JSON object.");
+    return c.json({ ok: true, ...handoff.putChunk(id, chunk as Record<string, unknown>) });
+  }));
   api.post("/executor/v1/state", executorRoute(async (c, host, kind) => {
     if (kind !== "deploy") return reject(c, 409, "executor/deploy-only", "Only a deploy executor reports containers and managed files.");
     const body = await c.req.json() as { containers?: string; files?: Record<string, string> };
@@ -767,6 +783,71 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     const q = (k: string) => c.req.query(k) || undefined;
     const level = q("level")?.toUpperCase();
     return c.json({ bulletins: store.serviceBulletins(id, { ...(q("from") ? { from: q("from")! } : {}), ...(q("to") ? { to: q("to")! } : {}), ...(level ? { level } : {}), ...(q("limit") ? { limit: Number(q("limit")) } : {}) }) });
+  });
+  // Phase 2 step 4 (§9.3, §15.3): a service's logs, read through its members' service executors (deploy-viewer, §13):
+  // the members with their log directories and the WARN/ERROR summary; a member's files; a search of all (or some)
+  // members in parallel, merged by time; a member's files as a tar.gz; following one file (SSE, shared per file).
+  api.get("/api/services/:id/logs", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    const id = c.req.param("id");
+    const members = serviceLogs.members(id);
+    if (!members) return reject(c, 404, "service/unknown", `No standalone instance or cluster ${id}.`);
+    const hours = Math.min(720, Math.max(1, Number(c.req.query("hours") ?? 24) || 24));
+    const since = new Date(Date.now() - hours * 3600_000).toISOString();
+    return c.json({ members, hours, patterns: store.serviceLogPatterns(id, { since, limit: Number(c.req.query("limit") ?? 100) || 100 }), tails: serviceLogs.tailing().filter((t) => t.service === id) });
+  });
+  api.get("/api/services/:id/logs/files", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    return c.json(await serviceLogs.files(c.req.param("id"), c.req.query("member") ?? ""));
+  });
+  api.get("/api/services/:id/logs/lines", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    const lines = Number(c.req.query("lines") ?? 200);
+    if (!(Number.isInteger(lines) && lines >= 1 && lines <= 5000)) return reject(c, 400, "logs/lines", "lines is 1 to 5000.");
+    return c.json(await serviceLogs.lines(c.req.param("id"), c.req.query("member") ?? "", c.req.query("file") || "nifi-app.log", lines));
+  });
+  api.post("/api/services/:id/logs/search", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    const q = parseSearch(await c.req.json().catch(() => ({})));
+    if ("error" in q) return reject(c, 400, "logs/search", q.error);
+    return c.json(await serviceLogs.search(c.req.param("id"), q));
+  });
+  api.get("/api/services/:id/logs/download", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    const id = c.req.param("id"), member = c.req.query("member") ?? "";
+    const files = (c.req.query("files") ?? "nifi-app.log").split(",").filter(Boolean);
+    const got = await serviceLogs.download(id, member, files);
+    store.audit(actorOf(p), "service.logs.download", id, { member, files: got.result.files ?? files, bytes: got.data.length });
+    return c.body(new Uint8Array(got.data), 200, { "content-type": "application/gzip", "content-disposition": `attachment; filename="${got.name}"`, "cache-control": "no-store" });
+  });
+  // §15.2 P7: Server-Sent Events of one member's file: "lines" (text; first the recent lines, backlog) and "state".
+  api.get("/api/services/:id/logs/tail", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    const id = c.req.param("id"), member = c.req.query("member") ?? "", file = c.req.query("file") || "nifi-app.log";
+    const events: { event: string; data: string }[] = [];
+    let wake: (() => void) | null = null;
+    // Checked before the stream starts, so a refusal is an ordinary error answer.
+    const stop = serviceLogs.tail(id, member, file, (e) => { events.push({ event: e.type, data: JSON.stringify(e) }); wake?.(); });
+    c.header("x-accel-buffering", "no");
+    c.header("cache-control", "no-store");
+    return streamSSE(c, async (stream) => {
+      let open = true;
+      stream.onAbort(() => { open = false; stop(); wake?.(); });
+      try {
+        while (open) {
+          while (events.length) await stream.writeSSE(events.shift()!);
+          await new Promise<void>((resolve) => { const t = setTimeout(resolve, 15_000); wake = () => { clearTimeout(t); resolve(); }; });
+          wake = null;
+          if (open && !events.length) await stream.writeSSE({ event: "ping", data: "{}" });
+        }
+      } finally { stop(); }
+    });
   });
   // Phase 2 step 3 (§15.3): a service's alerts (open first, then resolved; state=open|resolved, limit), with the rules and
   // the thresholds in effect; its timeline; an admin's threshold overrides; every service's alerts.
@@ -1480,6 +1561,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
   // §15.2: a job the executor does not name in its heartbeat is refused wherever it is submitted; anything else as Hono does.
   app.onError((error, c) => {
     if (error instanceof ExecutorUnsupported) return reject(c, error.status, error.code, error.message, error.missing);
+    if (error instanceof LogsError) return reject(c, error.status, error.code, error.message);
     if (error instanceof HTTPException) return error.getResponse();
     console.error(error);
     return c.text("Internal Server Error", 500);

@@ -408,3 +408,17 @@ p.page-note { margin: -4px 0 14px; }
 .service-health .findings { margin-top: 8px; }
 .thresholds td { vertical-align: top; }
 .nowrap { white-space: nowrap; }
+/* Phase 2 step 4: the Logs tab. */
+.row.wrap { align-items: center; }
+.field { display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
+.field > input, .field > select { min-width: 0; }
+.row .field { flex: none; }
+.row input[type="checkbox"], .check input { flex: none; min-width: 0; }
+.check { display: inline-flex; align-items: center; gap: 4px; }
+.form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; align-items: start; margin-top: 8px; }
+.form-grid > .row { grid-column: 1 / -1; }
+.file-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 4px 12px; margin: 8px 0; }
+a.button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+pre.log.tail { max-height: 560px; min-height: 120px; white-space: pre-wrap; }
+.log-results td { vertical-align: top; }
+.log-results pre.log { max-height: 320px; }

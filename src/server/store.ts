@@ -134,6 +134,15 @@ CREATE TABLE IF NOT EXISTS service_events (
 CREATE INDEX IF NOT EXISTS service_events_at ON service_events (service, at);
 CREATE TABLE IF NOT EXISTS service_facts (
   service TEXT NOT NULL, member TEXT NOT NULL, key TEXT NOT NULL, value TEXT, at TEXT NOT NULL, PRIMARY KEY (service, member, key));
+CREATE TABLE IF NOT EXISTS service_log_patterns (
+  service TEXT NOT NULL, member TEXT NOT NULL, pattern TEXT NOT NULL, level TEXT NOT NULL, logger TEXT, template TEXT NOT NULL,
+  exception TEXT, first_at TEXT NOT NULL, last_at TEXT NOT NULL, count INTEGER NOT NULL, first_sample TEXT, last_sample TEXT,
+  PRIMARY KEY (service, member, pattern));
+CREATE INDEX IF NOT EXISTS service_log_patterns_at ON service_log_patterns (service, last_at);
+CREATE TABLE IF NOT EXISTS service_log_counts (
+  service TEXT NOT NULL, member TEXT NOT NULL, pattern TEXT NOT NULL, bucket TEXT NOT NULL, count INTEGER NOT NULL,
+  PRIMARY KEY (service, member, pattern, bucket));
+CREATE INDEX IF NOT EXISTS service_log_counts_at ON service_log_counts (service, bucket);
 `;
 
 /** queued: waiting for the host's executor to claim it; the rest are the executor's states. */
@@ -1158,14 +1167,56 @@ export class Store {
   }
 
   /** §15.3 retention: raw samples and bulletins before one time, rollups before another. */
-  pruneServiceData(samplesBefore: string, rollupsBefore: string): { samples: number; bulletins: number; rollups: number } {
-    const out = { samples: 0, bulletins: 0, rollups: 0 };
+  pruneServiceData(samplesBefore: string, rollupsBefore: string): { samples: number; bulletins: number; rollups: number; logCounts: number; logPatterns: number } {
+    const out = { samples: 0, bulletins: 0, rollups: 0, logCounts: 0, logPatterns: 0 };
     this.inTransaction(() => {
       out.samples = Number(this.db.prepare("DELETE FROM service_samples WHERE at < ?").run(samplesBefore).changes);
       out.bulletins = Number(this.db.prepare("DELETE FROM service_bulletins WHERE at < ?").run(samplesBefore).changes);
       out.rollups = Number(this.db.prepare("DELETE FROM service_rollups WHERE bucket < ?").run(rollupsBefore).changes);
+      // Phase 2 step 4: the log summary's 5-minute counts as long as the raw samples, its patterns as long as the rollups.
+      out.logCounts = Number(this.db.prepare("DELETE FROM service_log_counts WHERE bucket < ?").run(samplesBefore).changes);
+      out.logPatterns = Number(this.db.prepare("DELETE FROM service_log_patterns WHERE last_at < ?").run(rollupsBefore).changes);
     });
     return out;
+  }
+
+  // Phase 2 step 4 (§15.3): the WARN/ERROR summary of each member's nifi-app.log, by pattern (level, logger, message
+  // template, exception), with the first and the newest sample (cut and with secrets hidden by the executor), and
+  // the counts per 5-minute bucket for the rules.
+
+  /** Adds one sample's patterns: counts summed, the first sample kept, the newest replaced. */
+  addLogPatterns(service: string, member: string, rows: LogPatternIn[]) {
+    if (!rows.length) return;
+    const upsert = this.db.prepare(`INSERT INTO service_log_patterns (service, member, pattern, level, logger, template, exception, first_at, last_at, count, first_sample, last_sample)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+      ON CONFLICT (service, member, pattern) DO UPDATE SET count = count + ?10, last_at = MAX(last_at, ?9), last_sample = CASE WHEN ?9 >= last_at THEN ?12 ELSE last_sample END,
+        first_at = MIN(first_at, ?8)`);
+    const count = this.db.prepare(`INSERT INTO service_log_counts (service, member, pattern, bucket, count) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT (service, member, pattern, bucket) DO UPDATE SET count = count + excluded.count`);
+    this.inTransaction(() => {
+      for (const r of rows) {
+        upsert.run(service, member, r.pattern, r.level, r.logger, r.template, r.exception, r.firstAt, r.lastAt, r.count, r.first, r.last);
+        count.run(service, member, r.pattern, r.bucket, r.count);
+      }
+    });
+  }
+
+  /** A service's patterns seen since a time, the most frequent in that period first (count: since then, total: ever). */
+  serviceLogPatterns(service: string, options: { since?: string; member?: string; limit?: number } = {}): LogPattern[] {
+    const since = options.since ?? "";
+    return (this.db.prepare(`SELECT p.*, COALESCE((SELECT SUM(c.count) FROM service_log_counts c WHERE c.service = p.service AND c.member = p.member AND c.pattern = p.pattern AND c.bucket >= ?2), 0) AS recent
+      FROM service_log_patterns p WHERE p.service = ?1 AND p.last_at >= ?2 AND (?3 IS NULL OR p.member = ?3) ORDER BY recent DESC, p.last_at DESC LIMIT ?4`)
+      .all(service, since, options.member ?? null, Math.min(1000, Math.max(1, options.limit ?? 200))) as Row[]).map((r) => ({
+      member: r.member, pattern: r.pattern, level: r.level, logger: r.logger ?? null, template: r.template, exception: r.exception ?? null,
+      firstAt: r.first_at, lastAt: r.last_at, total: r.count, count: Number(r.recent), firstSample: r.first_sample ?? null, lastSample: r.last_sample ?? null,
+    }));
+  }
+
+  /** The 5-minute counts of a service's patterns from a bucket on, with what each pattern is (for the rules). */
+  serviceLogCounts(service: string, fromBucket: string): { member: string; pattern: string; bucket: string; count: number; level: string; logger: string | null; template: string; exception: string | null }[] {
+    return (this.db.prepare(`SELECT c.member, c.pattern, c.bucket, c.count, p.level, p.logger, p.template, p.exception FROM service_log_counts c
+      JOIN service_log_patterns p ON p.service = c.service AND p.member = c.member AND p.pattern = c.pattern WHERE c.service = ? AND c.bucket >= ? ORDER BY c.bucket`)
+      .all(service, fromBucket) as Row[]).map((r) => ({ member: r.member, pattern: r.pattern, bucket: r.bucket, count: Number(r.count), level: r.level, logger: r.logger ?? null, template: r.template, exception: r.exception ?? null }));
   }
 
   // Phase 2 step 3 (§15.3): alerts (one open per service, member and rule; resolved when the rule no longer holds), the
@@ -1264,6 +1315,10 @@ export type AlertLevel = "WARN" | "CRIT";
 export interface ServiceAlert { id: number; service: string; member: string; rule: string; level: AlertLevel; state: "open" | "resolved"; openedAt: string; resolvedAt: string | null; updatedAt: string; detail: Record<string, unknown> }
 export interface ServiceEvent { id: number; service: string; member: string | null; at: string; kind: string; detail: Record<string, unknown> }
 const toAlert = (r: Row): ServiceAlert => ({ id: r.id, service: r.service, member: r.member, rule: r.rule, level: r.level, state: r.state, openedAt: r.opened_at, resolvedAt: r.resolved_at ?? null, updatedAt: r.updated_at, detail: parse(r.detail) ?? {} });
+
+/** One pattern of a sample's log summary as it is stored (services/logs.ts). */
+export interface LogPatternIn { pattern: string; level: string; logger: string | null; template: string; exception: string | null; firstAt: string; lastAt: string; count: number; first: string | null; last: string | null; bucket: string }
+export interface LogPattern { member: string; pattern: string; level: string; logger: string | null; template: string; exception: string | null; firstAt: string; lastAt: string; total: number; count: number; firstSample: string | null; lastSample: string | null }
 
 /** A sample's flat numbers (services/metrics.ts). */
 export type Point = Record<string, number | null>;
