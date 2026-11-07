@@ -14,7 +14,7 @@
           "name": "open-atlas-deployer",
           "type": "http",
           "url": "{{mcpUrl}}",
-          "allowed_tools": ["get_status", "list_apps", "get_app", "list_versions", "plan_deploy", "list_jobs", "get_job", "list_artifacts", "get_env", "plan_env", "get_env_fingerprint", "compare_env_with_uat", "list_service_clusters", "get_cluster_status", "get_metrics", "list_alerts", "list_events", "get_bulletins", "search_logs", "tail_logs", "get_service_config", "diff_service_config", "lookup_property"]
+          "allowed_tools": ["get_status", "list_apps", "get_app", "list_versions", "plan_deploy", "list_jobs", "get_job", "list_artifacts", "get_env", "plan_env", "get_env_fingerprint", "compare_env_with_uat", "list_service_clusters", "get_cluster_status", "get_metrics", "list_alerts", "list_events", "get_bulletins", "search_logs", "tail_logs", "search_provenance", "get_lineage", "get_provenance_event", "get_service_config", "diff_service_config", "lookup_property"]
         }
       ],
       "tools": [

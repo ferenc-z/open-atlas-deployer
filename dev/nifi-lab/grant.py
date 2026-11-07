@@ -5,7 +5,9 @@ grant.py BASE_URL CERT_PEM KEY_PEM CA_PEM 'resource|action|identity' ...
 
 Runs as the operator (initial admin) certificate. For every triple it makes
 sure the global policy exists and contains that user; the user must already
-exist (they are seeded as "Initial User Identity" in authorizers.xml).
+exist (they are seeded as "Initial User Identity" in authorizers.xml). A resource
+may name the root process group as @root (e.g. /provenance-data/process-groups/@root,
+"view provenance" on the whole flow): it is looked up on each instance.
 Works on NiFi 1.x and 2.x; on a cluster any node replicates the change.
 """
 import json
@@ -43,9 +45,16 @@ def main():
     if status != 200:
         sys.exit(f"list users failed: {status} {users}")
     ids = {u["component"]["identity"]: u["id"] for u in users["users"]}
+    root = None
+    if any("@root" in g for g in grants):
+        status, flow = call("GET", "/flow/process-groups/root")
+        if status != 200:
+            sys.exit(f"root process group: {status} {flow}")
+        root = flow["processGroupFlow"]["id"]
 
     for g in grants:
         resource, action, identity = g.split("|", 2)
+        resource = resource.replace("@root", root or "@root")
         uid = ids.get(identity)
         if uid is None:
             sys.exit(f"user not found: {identity}")

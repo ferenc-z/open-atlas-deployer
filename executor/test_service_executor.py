@@ -2,6 +2,7 @@
 
     python3 -m unittest test_service_executor        (from executor/)
 """
+import calendar
 import json
 import os
 import pathlib
@@ -92,7 +93,7 @@ class RegistrationTest(Base):
         beat = self.api.beats[-1]
         self.assertEqual(beat["executor"], "service")
         self.assertEqual(beat["protocols"], [2])
-        self.assertEqual(beat["kinds"], ["svc-discover", "svc-read", "log-read", "log-tail", "executor-upgrade", "svc-discover@2", "svc-read@2"],
+        self.assertEqual(beat["kinds"], ["svc-discover", "svc-read", "log-read", "log-tail", "nifi-provenance", "executor-upgrade", "svc-discover@2", "svc-read@2", "nifi-provenance@1"],
                          "the service jobs and what they can do (§15.2); never the deploy ones")
         name, root = sx.ServiceExecutor.user()
         self.assertEqual((beat["user"], beat["isRoot"]), (name, root))
@@ -1163,6 +1164,257 @@ class LogsTest(Base):
         w = sx.watch_entries(self.watch)[0]
         s = c.sample(w, {}, {}, None, "no certificate")
         self.assertEqual((s["logs"]["file"], s["logs"]["patterns"]), (str(self.app), []))
+
+
+class FakeNifi:
+    """NiFi's provenance API as 1.12.1 and 2.x answer it (shapes recorded from the lab, ids made up): search options,
+    about, queries that finish on the second look, lineage, events. On a cluster the dates a query runs with are moved
+    by `shift` hours (the zone name read back as another zone on replication) and echoed moved twice."""
+
+    OFFSET = 8 * 3600_000  # the lab's NiFi run in China Standard Time
+
+    def __init__(self, version="2.5.0", cluster=False, shift=0, events=(), status=None, never_finish=False, poll_fails=False, big=False):
+        self.version, self.cluster, self.shift, self.events = version, cluster, shift, list(events)
+        self.status, self.never_finish, self.poll_fails, self.big = status, never_finish, poll_fails, big
+        self.calls, self.bodies, self.jobs, self.n = [], [], {}, 0
+        self.old = sx.old_terms(version)  # what this NiFi really takes, whatever the executor thinks
+
+    @staticmethod
+    def local(ms, millis=True):
+        t = time.gmtime((ms + FakeNifi.OFFSET) / 1000)
+        return time.strftime("%m/%d/%Y %H:%M:%S", t) + (f".{ms % 1000:03d}" if millis else "") + " CST"
+
+    @staticmethod
+    def parse(text):
+        if text.endswith(" UTC"):
+            return calendar.timegm(time.strptime(text[:-4], "%m/%d/%Y %H:%M:%S")) * 1000
+        return calendar.timegm(time.strptime(text[:-4], "%m/%d/%Y %H:%M:%S")) * 1000 - FakeNifi.OFFSET
+
+    def event(self, e, full=False):
+        out = {"id": f"{e.get('node', '')}{e['eventId']}", "eventId": e["eventId"], "eventTime": self.local(e["ms"]), "eventType": e["type"], "flowFileUuid": e["uuid"],
+               "fileSize": "1,024 bytes", "fileSizeBytes": 1024, "groupId": "g-1", "componentId": e.get("component", "c-gen"), "componentType": e.get("ctype", "GenerateFlowFile"),
+               "componentName": e.get("name", "Generate"), "parentUuids": [], "childUuids": [], "replayAvailable": False,
+               "inputContentClaimIdentifier": "claim-1", "outputContentClaimSection": "1"}
+        if e.get("relationship"):
+            out["relationship"] = e["relationship"]
+        if self.cluster:
+            out.update(clusterNodeId=e["node"], clusterNodeAddress=f"localhost:{18445 if e['node'] == 'node-1' else 18446}")
+        if full and e.get("attributes") is not None:
+            out["attributes"] = e["attributes"]
+        return out
+
+    def __call__(self, method, path, body, timeout):
+        self.calls.append(f"{method} {path}")
+        if body is not None:
+            self.bodies.append(json.loads(json.dumps(body)))
+        if self.status:
+            return self.status, b"Unable to view provenance. Contact the system administrator."
+        bare, _, query = path.partition("?")
+        node = query.split("=", 1)[1] if query else None
+        if bare == "provenance/search-options":
+            fields = [{"id": i, "field": f, "label": lab, "type": "STRING"} for i, f, lab in (("EventType", "eventType", "Event Type"), ("FlowFileUUID", "uuid", "FlowFile UUID"),
+                                                                                         ("Filename", "filename", "Filename"), ("ProcessorID", "processorId", "Component ID"))]
+            return 200, json.dumps({"provenanceOptions": {"searchableFields": fields}}).encode()
+        if bare == "flow/about":
+            return 200, json.dumps({"about": {"title": "NiFi", "version": self.version, "timezone": "CST"}}).encode()
+        if method == "POST" and bare == "provenance":
+            req = body["provenance"]["request"]
+            term = next(iter(req["searchTerms"].values()))
+            if self.old and isinstance(term, dict):
+                return 400, b"Cannot deserialize instance of `java.lang.String` out of START_OBJECT token"
+            if not self.old and not isinstance(term, dict):
+                return 400, b"Cannot deserialize value of type `ProvenanceSearchValueDTO` from String"
+            self.n += 1
+            qid = f"q{self.n:04d}-01a1-1000"
+            moved = self.shift * 3600_000 if self.cluster else 0
+            start, end = self.parse(req["startDate"]) + moved, self.parse(req["endDate"]) + moved
+            value = term["value"] if isinstance(term, dict) else term
+            field = next(iter(req["searchTerms"]))
+            hits = [e for e in self.events if start <= e["ms"] <= end and (field != "FlowFileUUID" or e["uuid"] == value) and (field != "EventType" or e["type"] == value)
+                    and (not req.get("clusterNodeId") or e.get("node") == req["clusterNodeId"])]
+            hits.sort(key=lambda e: -e["ms"])
+            echo = {**req, "startDate": self.local(start + moved, millis=False), "endDate": self.local(end + moved, millis=False)}
+            self.jobs[qid] = {"id": qid, "finished": False, "percentCompleted": 0, "request": echo,
+                              "results": {"provenanceEvents": [self.event(e) for e in hits[:req["maxResults"]]], "totalCount": len(hits), "total": str(len(hits)), "timeOffset": self.OFFSET}}
+            return 201, json.dumps({"provenance": {k: v for k, v in self.jobs[qid].items() if k != "results"}}).encode()
+        if method == "POST" and bare == "provenance/lineage":
+            req = body["lineage"]["request"]
+            if self.cluster and not req.get("clusterNodeId"):
+                return 400, b"The cluster node identifier must be specified."
+            self.n += 1
+            qid = f"l{self.n:04d}-01a1-1000"
+            mine = [e for e in self.events if e["uuid"] == req.get("uuid") and (not self.cluster or e.get("node") == req.get("clusterNodeId"))]
+            nodes = [{"id": req.get("uuid"), "flowFileUuid": req.get("uuid"), "type": "FLOWFILE", "millis": mine[0]["ms"] if mine else 0, "timestamp": "x"}]
+            nodes += [{"id": str(e["eventId"]), "flowFileUuid": e["uuid"], "parentUuids": [], "childUuids": [], "type": "EVENT", "eventType": e["type"], "millis": e["ms"], "timestamp": "x",
+                       **({"clusterNodeIdentifier": e["node"]} if self.cluster else {})} for e in mine]
+            links = [{"sourceId": str(e["eventId"]), "targetId": req.get("uuid"), "flowFileUuid": e["uuid"], "millis": e["ms"], "timestamp": "x"} for e in mine]
+            self.jobs[qid] = {"id": qid, "finished": False, "request": req, "results": {"nodes": nodes, "links": links}}
+            return 201, json.dumps({"lineage": {"id": qid, "finished": False}}).encode()
+        for prefix, key in (("provenance/lineage/", "lineage"), ("provenance/", "provenance")):
+            if bare.startswith(prefix) and "/" not in bare[len(prefix):]:
+                qid = bare[len(prefix):]
+                if method == "DELETE":
+                    self.jobs.pop(qid, None)
+                    return 200, b"{}"
+                if self.poll_fails:
+                    return 500, b"the node went away"
+                job = self.jobs[qid]
+                if not self.never_finish:
+                    job["finished"], job["percentCompleted"] = True, 100
+                answer = dict(job) if job["finished"] else {k: v for k, v in job.items() if k != "results"}
+                data = json.dumps({key: answer}).encode()
+                return 200, (data + b" " * (sx.PROV_BYTES + 1) if self.big else data)
+        if bare.startswith("provenance-events/"):
+            if self.cluster and not node:
+                return 400, b"The cluster node identifier must be specified."
+            eid = int(bare.split("/")[1])
+            e = next((x for x in self.events if x["eventId"] == eid and (not self.cluster or x.get("node") == node)), None)
+            if e is None:
+                return 404, b"Unable to find the specified provenance event."
+            return 200, json.dumps({"provenanceEvent": self.event(e, full=True)}).encode()
+        return 404, b"not found"
+
+
+AT = calendar.timegm((2026, 11, 6, 15, 20, 0, 0, 0, 0)) * 1000
+UUID_A, UUID_B = "11111111-2222-4333-8444-555555555555", "66666666-7777-4888-8999-aaaaaaaaaaaa"
+
+
+class ProvenanceTest(Base):
+    def query(self, nifi, request, cluster=False, seconds=30, offset=None):
+        q = sx.ProvenanceQuery(nifi, time.monotonic() + seconds, cluster, offset_ms=offset, sleep=lambda s: time.sleep(0.01))
+        return q.run(request)
+
+    def window(self, minutes=60):
+        return {"from": sx.iso_ms(AT - 30 * 60_000), "to": sx.iso_ms(AT - 30 * 60_000 + minutes * 60_000)}
+
+    def test_the_heartbeat_names_the_job_and_its_form(self):
+        self.assertTrue({"nifi-provenance", "nifi-provenance@1"} <= set(self.executor().KINDS))
+
+    def test_by_uuid_on_1_12_plain_terms_utc_dates_events_in_order_and_the_query_deleted(self):
+        events = [{"eventId": 0, "uuid": UUID_A, "type": "CREATE", "ms": AT}, {"eventId": 3, "uuid": UUID_A, "type": "DROP", "ms": AT + 5000, "name": "Log", "ctype": "LogAttribute", "relationship": "success"},
+                  {"eventId": 1, "uuid": UUID_B, "type": "CREATE", "ms": AT + 1000}, {"eventId": 9, "uuid": UUID_A, "type": "DROP", "ms": AT + 7200_000}]
+        nifi = FakeNifi("1.12.1", events=events)
+        out = self.query(nifi, {"op": "provenance", "uuid": UUID_A, **self.window()})
+        req = nifi.bodies[0]["provenance"]["request"]
+        self.assertEqual(req["searchTerms"], {"FlowFileUUID": UUID_A}, "1.12 takes plain strings")
+        self.assertEqual([req["startDate"], req["endDate"]], ["11/06/2026 14:50:00 UTC", "11/06/2026 15:50:00 UTC"])
+        self.assertEqual(req["maxResults"], 100)
+        self.assertEqual([(e["eventId"], e["eventType"], e["at"]) for e in out["events"]], [(0, "CREATE", "2026-11-06T15:20:00.000Z"), (3, "DROP", "2026-11-06T15:20:05.000Z")])
+        self.assertEqual(out["events"][1]["relationship"], "success")
+        self.assertFalse(any("ContentClaim" in k or "contentClaim" in k for e in out["events"] for k in e), "nothing of the content")
+        self.assertEqual([out["scope"], out["timeOffset"], out["total"], out["limitReached"], out["nifiVersion"]], ["standalone", 8 * 3600_000, 2, False, "1.12.1"])
+        self.assertEqual(nifi.calls[-1], f"DELETE provenance/{out['query']}")
+        self.assertEqual(nifi.jobs, {}, "nothing left on NiFi")
+
+    def test_on_a_2x_cluster_the_whole_cluster_through_one_node_and_dates_read_back_wrong_are_corrected(self):
+        events = [{"eventId": 1, "uuid": UUID_A, "type": "CREATE", "ms": AT, "node": "node-1"}, {"eventId": 1, "uuid": UUID_B, "type": "CREATE", "ms": AT + 30, "node": "node-2"}]
+        nifi = FakeNifi("2.5.0", cluster=True, shift=14, events=events)
+        out = self.query(nifi, {"op": "provenance", "field": "EventType", "value": "CREATE", **self.window()}, cluster=True)
+        self.assertEqual(nifi.bodies[0]["provenance"]["request"]["searchTerms"], {"EventType": {"value": "CREATE", "inverse": False}})
+        self.assertNotIn("clusterNodeId", nifi.bodies[0]["provenance"]["request"], "the cluster as a whole")
+        self.assertEqual([(e["clusterNodeId"], e["clusterNodeAddress"]) for e in out["events"]], [("node-1", "localhost:18445"), ("node-2", "localhost:18446")])
+        self.assertEqual([out["scope"], out["shiftedHours"]], ["cluster", 14])
+        self.assertEqual(nifi.bodies[1]["provenance"]["request"]["startDate"], "11/06/2026 00:50:00 UTC", "asked again 14 h earlier")
+        self.assertIn("28 h off", out["notes"][0])
+        self.assertEqual([c for c in nifi.calls if c.startswith("DELETE")], [f"DELETE provenance/q0001-01a1-1000", f"DELETE provenance/q0002-01a1-1000"])
+        # One node only: its events.
+        nifi = FakeNifi("2.5.0", cluster=True, events=events)
+        out = self.query(nifi, {"op": "provenance", "field": "EventType", "value": "CREATE", "node": "node-2", **self.window()}, cluster=True)
+        self.assertEqual([e["flowFileUuid"] for e in out["events"]], [UUID_B])
+        self.assertEqual([out["scope"], nifi.calls[-1]], ["node node-2", "DELETE provenance/q0001-01a1-1000?clusterNodeId=node-2"])
+
+    def test_a_version_whose_term_form_is_not_known_gets_the_other_one(self):
+        nifi = FakeNifi("1.12.1", events=[{"eventId": 0, "uuid": UUID_A, "type": "CREATE", "ms": AT}])
+        real = sx.old_terms
+        try:
+            sx.old_terms = lambda v: False  # as if this executor thought 1.12 took {value, inverse}
+            out = self.query(nifi, {"op": "provenance", "uuid": UUID_A, **self.window()})
+        finally:
+            sx.old_terms = real
+        self.assertEqual(len(out["events"]), 1)
+        self.assertIn("plain", out["notes"][0])
+
+    def test_refusals_before_nifi_is_asked(self):
+        nifi = FakeNifi()
+        for request, said in [({"op": "replay"}, "op is one of"), ({"op": "provenance", "uuid": UUID_A}, "from and to are required"),
+                              ({"op": "provenance", "uuid": UUID_A, "from": "2026-11-06T16:00:00Z", "to": "2026-11-06T15:00:00Z"}, "from before to"),
+                              ({"op": "provenance", "uuid": "nope", **self.window()}, "FlowFile UUID"), ({"op": "provenance", **self.window()}, "give uuid, or field"),
+                              ({"op": "provenance", "uuid": UUID_A, "maxResults": 101, **self.window()}, "maxResults is 1 to 100"),
+                              ({"op": "provenance", "uuid": UUID_A, "node": "../x", **self.window()}, "node is a cluster node id"),
+                              ({"op": "provenance", "uuid": UUID_A, "node": "node-1", **self.window()}, "only for a cluster"),
+                              ({"op": "lineage", "eventId": 3, "direction": "SIDEWAYS"}, "direction is")]:
+            with self.subTest(said):
+                with self.assertRaisesRegex(sx.Refused, said):
+                    self.query(nifi, request)
+        with self.assertRaisesRegex(sx.Refused, "is not searchable"):
+            self.query(nifi, {"op": "provenance", "field": "Details", "value": "x", **self.window()})
+        for request in ({"op": "lineage", "uuid": UUID_A}, {"op": "event", "eventId": 1}):
+            with self.assertRaisesRegex(sx.Refused, "node .* is required"):
+                self.query(FakeNifi(cluster=True), request, cluster=True)
+        self.assertFalse(any(c.startswith("POST") for c in nifi.calls), "nothing submitted")
+
+    def test_polled_until_finished_and_deleted_whatever_happens(self):
+        nifi = FakeNifi(events=[{"eventId": 0, "uuid": UUID_A, "type": "CREATE", "ms": AT}])
+        self.query(nifi, {"op": "provenance", "uuid": UUID_A, **self.window()})
+        self.assertEqual([c for c in nifi.calls if "q0001" in c], ["GET provenance/q0001-01a1-1000", "DELETE provenance/q0001-01a1-1000"])
+        for kw, said in [({"never_finish": True}, "did not finish within"), ({"poll_fails": True}, "HTTP 500"), ({"big": True}, "larger than 4 MiB")]:
+            with self.subTest(said):
+                nifi = FakeNifi(**kw)
+                with self.assertRaisesRegex(Exception, said):
+                    self.query(nifi, {"op": "provenance", "uuid": UUID_A, **self.window()}, seconds=1.0)
+                self.assertEqual(nifi.calls[-1], "DELETE provenance/q0001-01a1-1000")
+                self.assertEqual(nifi.jobs, {})
+
+    def test_refused_certificate_says_which_policies(self):
+        with self.assertRaisesRegex(sx.Failed, "query provenance.*view provenance"):
+            self.query(FakeNifi(status=403), {"op": "search-options"})
+
+    def test_lineage_its_components_and_the_node_on_a_cluster(self):
+        events = [{"eventId": 1, "uuid": UUID_A, "type": "CREATE", "ms": AT, "node": "node-1"},
+                  {"eventId": 2, "uuid": UUID_A, "type": "DROP", "ms": AT + 900, "node": "node-1", "name": "Log", "ctype": "LogAttribute", "component": "c-log", "relationship": "success"}]
+        nifi = FakeNifi(cluster=True, events=events)
+        out = self.query(nifi, {"op": "lineage", "uuid": UUID_A, "node": "node-1"}, cluster=True)
+        self.assertEqual(nifi.bodies[0], {"lineage": {"request": {"lineageRequestType": "FLOWFILE", "uuid": UUID_A, "clusterNodeId": "node-1"}}})
+        self.assertEqual([(n["type"], n.get("componentName"), n["at"]) for n in out["nodes"]],
+                         [("FLOWFILE", None, "2026-11-06T15:20:00.000Z"), ("EVENT", "Generate", "2026-11-06T15:20:00.000Z"), ("EVENT", "Log", "2026-11-06T15:20:00.900Z")])
+        self.assertEqual(out["nodes"][2]["relationship"], "success")
+        self.assertEqual([out["enriched"], len(out["links"]), out["node"]], [2, 2, "node-1"])
+        self.assertIn("DELETE provenance/lineage/l0001-01a1-1000?clusterNodeId=node-1", nifi.calls)
+        self.assertEqual(nifi.jobs, {})
+        # An event's parents or children.
+        self.query(nifi, {"op": "lineage", "eventId": 2, "direction": "PARENTS", "node": "node-1"}, cluster=True)
+        self.assertEqual(nifi.bodies[-1]["lineage"]["request"], {"lineageRequestType": "PARENTS", "eventId": 2, "clusterNodeId": "node-1"})
+
+    def test_an_event_with_its_attributes_when_nifi_shows_them_never_content(self):
+        attrs = [{"name": "filename", "value": "a.csv", "previousValue": "a.csv"}, {"name": "big", "value": "x" * 10_000}]
+        nifi = FakeNifi("1.12.1", events=[{"eventId": 7, "uuid": UUID_A, "type": "ATTRIBUTES_MODIFIED", "ms": AT, "attributes": attrs}, {"eventId": 8, "uuid": UUID_A, "type": "DROP", "ms": AT}])
+        out = self.query(nifi, {"op": "event", "eventId": 7}, offset=8 * 3600_000)
+        e = out["event"]
+        self.assertEqual([e["eventId"], e["at"], e["attributes"][0]], [7, "2026-11-06T15:20:00.000Z", {"name": "filename", "value": "a.csv", "previousValue": "a.csv"}])
+        self.assertEqual(len(e["attributes"][1]["value"]), sx.PROV_VALUE_MAX)
+        self.assertNotIn("inputContentClaimIdentifier", e)
+        self.assertTrue(self.query(nifi, {"op": "event", "eventId": 8})["event"]["attributesHidden"], "no view-the-data policy: no attributes")
+        with self.assertRaisesRegex(sx.Refused, "no provenance event 99"):
+            self.query(nifi, {"op": "event", "eventId": 99})
+
+    def test_the_job_reads_the_watched_nifi_and_sends_the_answer_over_the_content_channel(self):
+        api = LogApi()
+        self.api = api
+        ex = self.executor()
+        home = self.root / "nifi"
+        (home / "conf").mkdir(parents=True)
+        (home / "conf" / "nifi.properties").write_text("nifi.web.https.port=18443\nnifi.web.https.host=localhost\n")
+        ex.watch = sx.watch_entries([{"service": "n1", "member": "local:/opt/nifi", "installDir": str(home), "confDir": str(home / "conf"), "https": {}}])
+        job = sx.ReadJob({"id": "nifi-provenance-0001", "kind": "nifi-provenance", "member": "nope", "op": "search-options"}, 30)
+        with self.assertRaisesRegex(sx.Refused, "not an installation this executor watches"):
+            ex.nifi_provenance(job)
+        with self.assertRaisesRegex(sx.Failed, "monitor certificate"):
+            ex.nifi_provenance(sx.ReadJob({**job.request, "member": "local:/opt/nifi"}, 30))
+        nifi = FakeNifi()
+        ex.nifi_call = lambda w, props: (nifi, props.get("nifi.cluster.is.node") == "true")
+        result = ex.nifi_provenance(sx.ReadJob({**job.request, "member": "local:/opt/nifi"}, 30))
+        self.assertEqual(result, {"op": "search-options", "fields": 4})
+        self.assertEqual(len(json.loads(api.content[job.id])["fields"]), 4)
 
 
 class ReleaseTest(Base):

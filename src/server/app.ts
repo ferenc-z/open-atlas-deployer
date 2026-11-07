@@ -38,6 +38,7 @@ import { TakeoverError, type Takeover } from "./services/takeover.ts";
 import { acceptSamples, watchList } from "./services/watch.ts";
 import { FIELDS, ingest, metrics, RANGES, trend, type Field, type Range } from "./services/metrics.ts";
 import { DOWNLOAD_MAX, LogsError, parseSearch, ServiceLogs } from "./services/logs.ts";
+import { parseLineage, parseProvenance, ServiceProvenance } from "./services/provenance.ts";
 import { checkNginx, graphServices, NifiOpsGraph } from "./services/graph-publish.ts";
 import { checkNginxUrl } from "./services/graph.ts";
 import { streamSSE } from "hono/streaming";
@@ -80,6 +81,8 @@ export interface Dependencies {
   takeover?: Takeover;
   /** Phase 2 step 4: reading and following services' logs through their service executors (tests pass their own timings). */
   logs?: ServiceLogs;
+  /** Phase 2 step 7 (S28): provenance through the service executors (tests pass their own timings). */
+  provenance?: ServiceProvenance;
   /** Phase 2 step 6: the nifi-ops Studio graph, published after takeovers and nginx address changes. */
   graph?: NifiOpsGraph;
   /** How the Deployer checks an nginx address (tests pass a fake). */
@@ -146,6 +149,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
   // S18: the token also says which of the host's executors calls (deploy or service); each gets only its own jobs.
   const handoff = deployments.handoff;
   const serviceLogs = deps.logs ?? new ServiceLogs(store, handoff);
+  const provenance = deps.provenance ?? new ServiceProvenance(store, handoff, serviceLogs);
   const graph = deps.graph ?? new NifiOpsGraph(store, { studio: undefined, graph: config.nifiOpsGraph });
   const executorOf = (c: Context): { host: string; executor: ExecutorKind } | undefined => {
     const bearer = /^Bearer (dpe_\S+)$/.exec(c.req.header("authorization") ?? "")?.[1];
@@ -816,6 +820,40 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     const q = (k: string) => c.req.query(k) || undefined;
     const level = q("level")?.toUpperCase();
     return c.json({ bulletins: store.serviceBulletins(id, { ...(q("from") ? { from: q("from")! } : {}), ...(q("to") ? { to: q("to")! } : {}), ...(level ? { level } : {}), ...(q("limit") ? { limit: Number(q("limit")) } : {}) }) });
+  });
+  // Phase 2 step 7 (§9.5, S28): the FlowFile trace, read by a member's service executor from its NiFi (deploy-viewer,
+  // §13): whether this version and the executors can; the searchable fields; events of a FlowFile UUID or a field's
+  // value in a time range (required); a FlowFile's lineage or an event's parents and children; one event's details.
+  api.get("/api/services/:id/provenance", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    return c.json(provenance.info(c.req.param("id")));
+  });
+  api.get("/api/services/:id/provenance/options", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    return c.json(await provenance.options(c.req.param("id")));
+  });
+  api.post("/api/services/:id/provenance", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    const q = parseProvenance(await c.req.json().catch(() => ({})));
+    if ("error" in q) return reject(c, 400, "provenance/search", q.error);
+    return c.json(await provenance.search(c.req.param("id"), q));
+  });
+  api.post("/api/services/:id/lineage", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    const q = parseLineage(await c.req.json().catch(() => ({})));
+    if ("error" in q) return reject(c, 400, "provenance/lineage", q.error);
+    return c.json(await provenance.lineage(c.req.param("id"), q));
+  });
+  api.get("/api/services/:id/provenance/events/:eventId", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    const eventId = Number(c.req.param("eventId"));
+    if (!/^\d{1,15}$/.test(c.req.param("eventId"))) return reject(c, 400, "provenance/event", "The event id is a number.");
+    return c.json(await provenance.event(c.req.param("id"), eventId, c.req.query("node") || undefined));
   });
   // Phase 2 step 4 (§9.3, §15.3): a service's logs, read through its members' service executors (deploy-viewer, §13):
   // the members with their log directories and the WARN/ERROR summary; a member's files; a search of all (or some)

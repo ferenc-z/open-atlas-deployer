@@ -2557,7 +2557,7 @@ test("phase 2 step 6: a service's nginx address (admin), its check, the status, 
   const set = await (await put(t, "/api/services/n112/nginx", "admin", { nginxUrl: "http://nginx.lab:18543/nifi-api" })).json();
   assert.deepEqual([set.nginxUrl, set.changed, set.check.ok, set.check.version], ["http://nginx.lab:18543", true, true, "1.12.1"]);
   await graph!.idle();
-  assert.deepEqual(published, ["declare_source", "declare_source", "list_graphs", "get_graph", "upload_graph", "publish_graph"]);
+  assert.deepEqual(published, ["declare_source", "list_graphs", "get_graph", "upload_graph", "publish_graph"], "one api source, no nifi source (S28)");
   const status = await (await get("/api/services/n112/status")).json();
   assert.deepEqual([status.nginxUrl, status.nginxCheck.ok], ["http://nginx.lab:18543", true]);
   const g = await (await get("/api/services/graph")).json();
@@ -2579,4 +2579,58 @@ test("phase 2 step 6: a service's nginx address (admin), its check, the status, 
   assert.deepEqual(ev.events.filter((e: { kind: string }) => e.kind === "nginx-url").map((e: { text: string }) => e.text), ["nginx address removed", "nginx address set to http://other:1", "nginx address set to http://nginx.lab:18543"]);
   assert.equal((await (await get("/api/services/graph")).json()).runs[0].state, "skipped", "no service left: the graph in Studio is left alone");
   assert.equal((await post(t, "/api/services/graph/publish", "viewer", {})).status, 403);
+});
+
+test("phase 2 step 7: provenance through the service executor (deploy-viewer): the routes, a time range required, the MCP tools, attributes redacted for the AI", async () => {
+  const t = setup({ services: fakeState() });
+  setEnvironment(t, ({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", hosts, registries: { ghcr: "ghcr.io/acme" }, apps: { shop: { version: "1.2.0", host: "app2" } } }));
+  const call = (path: string, token: string, init: RequestInit & { type?: string } = {}) => t.app.request(`/deploy${path}`, { ...init, headers: { authorization: `Bearer ${token}`, ...(init.type ? { "content-type": init.type } : typeof init.body === "string" && init.body.startsWith("{") ? { "content-type": "application/json" } : {}) } });
+  const service = (await (await post(t, "/api/hosts/app2/token", "admin", { executor: "service" })).json()).token as string;
+  await call("/executor/v1/heartbeat", service, { method: "POST", body: JSON.stringify({ executor: "service", version: EXECUTOR_VERSION, protocols: [2], kinds: ["svc-discover", "svc-read", "log-read", "log-tail", "nifi-provenance", "nifi-provenance@1", "executor-upgrade"], busy: null, user: "ferenc", isRoot: false, reading: [], readSlots: 4 }) });
+  t.store.addStandalone({ kind: "standalone", id: "n1", service: "nifi", profile: "nifi-1.x", version: "1.12.1", webUrl: null, member: { host: "app2", installDir: "/opt/n1", serviceUser: "nifi", startEnvironment: null, ports: { https: 18443 }, discovery: null } }, "uat", { id: "admin", via: "cli" });
+  const answer = async (reply: (job: Record<string, any>) => unknown) => {
+    for (let i = 0; i < 200; i++) {
+      const r = await call("/executor/v1/jobs/next", service);
+      if (r.status === 200) {
+        const job = (await r.json()).job;
+        await call(`/executor/v1/jobs/${job.id}/content`, service, { method: "PUT", body: JSON.stringify(reply(job)), type: "application/octet-stream" });
+        await call(`/executor/v1/jobs/${job.id}/status`, service, { method: "PUT", body: JSON.stringify({ protocol: 2, id: job.id, kind: job.kind, state: "succeeded", steps: [], result: { op: job.op } }) });
+        return job;
+      }
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    throw new Error("no job came");
+  };
+  const UUID = "11111111-2222-4333-8444-555555555555";
+  const info = await (await t.request("/api/services/n1/provenance", { as: "viewer" })).json();
+  assert.deepEqual([info.supported, info.ready, info.members[0].canQuery], [true, true, true]);
+  assert.equal((await t.request("/api/services/n1/provenance", { as: "nobody" })).status, 403);
+  assert.equal((await t.request("/api/services/none/provenance", { as: "viewer" })).status, 404);
+  const noRange = await post(t, "/api/services/n1/provenance", "viewer", { uuid: UUID });
+  assert.deepEqual([noRange.status, (await noRange.json()).error], [400, "provenance/search"]);
+  assert.equal((await t.request("/api/services/n1/provenance/events/x", { as: "viewer" })).status, 400);
+
+  // The page: events as NiFi gave them.
+  const searching = post(t, "/api/services/n1/provenance", "viewer", { uuid: UUID, from: "2026-11-06T15:00:00Z", to: "2026-11-06T16:00:00Z" });
+  const job = await answer(() => ({ op: "provenance", events: [{ eventId: 0, eventType: "CREATE", flowFileUuid: UUID, details: "password=hunter2" }], total: 1, timeOffset: 28800000, scope: "standalone" }));
+  assert.deepEqual([job.kind, job.op, job.member, job.uuid, job.from], ["nifi-provenance", "provenance", "app2:/opt/n1", UUID, "2026-11-06T15:00:00.000Z"]);
+  const found = await (await searching).json();
+  assert.deepEqual([found.events[0].details, found.events[0].member], ["password=hunter2", "app2:/opt/n1"]);
+
+  // The AI: the three tools are read-only and see the service key; attributes and details redacted.
+  const key = (await makeKey(t, "admin", { kind: "service", name: "deploy-assistant", days: 30 })).body.key as string;
+  const names = ((await mcp(t, key, "tools/list")).body.result.tools as { name: string; annotations: { readOnlyHint: boolean } }[]);
+  for (const n of ["search_provenance", "get_lineage", "get_provenance_event"]) assert.equal(names.find((x) => x.name === n)?.annotations.readOnlyHint, true, n);
+  const aiSearch = tool(t, key, "search_provenance", { id: "n1", field: "Filename", value: "a.csv", from: "2026-11-06T15:00:00Z", to: "2026-11-06T16:00:00Z" });
+  await answer(() => ({ op: "provenance", events: [{ eventId: 0, details: "password=hunter2" }] }));
+  assert.equal((await aiSearch).value.events[0].details, "password=[hidden]");
+  const aiEvent = tool(t, key, "get_provenance_event", { id: "n1", eventId: 0 });
+  const eventJob = await answer(() => ({ op: "event", event: { eventId: 0, attributes: [{ name: "filename", value: "a.csv" }, { name: "db.password", value: "hunter2" }] } }));
+  assert.deepEqual([eventJob.op, eventJob.eventId, eventJob.timeOffset], ["event", 0, 28800000]);
+  assert.deepEqual((await aiEvent).value.event.attributes.map((a: { value: string }) => a.value), ["a.csv", "[hidden]"]);
+  assert.equal((await tool(t, key, "search_provenance", { id: "n1", uuid: UUID })).value.finding.code, "mcp/arguments", "a time range is required (from and to are required arguments)");
+  const aiLineage = tool(t, key, "get_lineage", { id: "n1", uuid: UUID });
+  const lineageJob = await answer(() => ({ op: "lineage", nodes: [{ id: UUID, type: "FLOWFILE" }], links: [] }));
+  assert.deepEqual([lineageJob.op, lineageJob.direction, lineageJob.uuid], ["lineage", "FLOWFILE", UUID]);
+  assert.equal((await aiLineage).value.nodes.length, 1);
 });

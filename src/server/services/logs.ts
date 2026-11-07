@@ -62,6 +62,8 @@ export interface LogMember {
   /** Whether the member's service executor names log-read / log-tail in its heartbeat (§15.2: by kind, not version). */
   canRead: boolean;
   canTail: boolean;
+  /** Whether it names nifi-provenance@1 (S28: the FlowFile trace, services/provenance.ts). */
+  canProvenance: boolean;
 }
 
 export interface SearchQuery { members?: string[]; files?: string[]; from: string; to: string; levels?: LogLevel[]; query?: string; regex?: boolean; limit: number }
@@ -133,7 +135,7 @@ export class ServiceLogs {
         key, host: m.host, label: cluster ? `${m.nodeAddress ?? m.host}:${port ?? "?"}` : m.host,
         logDir: w?.logDir ?? `${m.installDir.replace(/\/+$/, "")}/logs`,
         executor: { online: info.online, ...(info.reason ? { reason: info.reason } : {}), ...(info.heartbeat?.version ? { version: info.heartbeat.version } : {}) },
-        canRead: kinds.includes("log-read"), canTail: kinds.includes("log-tail"),
+        canRead: kinds.includes("log-read"), canTail: kinds.includes("log-tail"), canProvenance: kinds.includes("nifi-provenance@1"),
       };
     });
   }

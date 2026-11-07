@@ -422,3 +422,6 @@ a.button.primary { background: var(--accent); color: #fff; border-color: var(--a
 pre.log.tail { max-height: 560px; min-height: 120px; white-space: pre-wrap; }
 .log-results td { vertical-align: top; }
 .log-results pre.log { max-height: 320px; }
+/* FlowFile trace (phase 2 step 7): a lineage as a list of events in time order. */
+ol.lineage { margin: 0.5rem 0 0; padding-left: 1.5rem; }
+ol.lineage li { padding: 0.25rem 0; border-bottom: 1px solid var(--border, rgba(127,127,127,0.2)); line-height: 1.6; }

@@ -25,3 +25,21 @@ export function redactStrings<T>(value: T): T {
   if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, redactStrings(v)])) as T;
   return value;
 }
+
+/** S28: names of FlowFile attributes whose values are hidden from the AI (the value says nothing about its secrecy). */
+const SECRET_NAME = /pass(word|wd|phrase)?|pwd|secret|token|credential|api[_.-]?key|access[_.-]?key|private|auth|session|cookie|\.key$|^key$/i;
+
+/** A provenance answer for the AI: attributes ({name, value, previousValue}) with secret-looking names hidden, then
+ *  every string as redactStrings does. */
+export function redactProvenance<T>(value: T): T {
+  const walk = (v: unknown): unknown => {
+    if (Array.isArray(v)) return v.map(walk);
+    if (v && typeof v === "object") {
+      const o = v as Record<string, unknown>;
+      const hide = typeof o.name === "string" && ("value" in o || "previousValue" in o) && SECRET_NAME.test(o.name);
+      return Object.fromEntries(Object.entries(o).map(([k, x]) => [k, hide && (k === "value" || k === "previousValue") && x !== null && x !== undefined ? "[hidden]" : walk(x)]));
+    }
+    return v;
+  };
+  return redactStrings(walk(value) as T);
+}

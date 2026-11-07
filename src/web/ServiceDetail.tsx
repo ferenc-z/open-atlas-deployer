@@ -9,6 +9,7 @@ import type { Field, MemberStatus, MetricsView, Range, ServiceBulletin, ServiceC
 import { LineChart, type Series } from "./Charts.tsx";
 import { ServiceConfig } from "./ServiceConfig.tsx";
 import { Logs } from "./Logs.tsx";
+import { FlowFileTrace } from "./Trace.tsx";
 import { NginxAddress } from "./Nginx.tsx";
 import { AlertBadge, EventsAndAlerts, OpenAlerts, Timeline } from "./Alerts.tsx";
 import { ago, CertBadge, certTone, ConfCell, daysLeft, daysText, fmtBytes, fmtNumber, memberKey, serviceName, SEVERITY, STATE, StatusNotes, UpBadge, webPort, when } from "./svc.tsx";
@@ -20,6 +21,7 @@ const TABS: Tab[] = [
   { id: "overview", label: "Overview", shown: () => true, render: (l) => <Overview {...l} /> },
   { id: "metrics", label: "Metrics", shown: (l) => l.s.members.some((m) => m.live), render: (l) => <Metrics s={l.s} /> },
   { id: "logs", label: "Logs", shown: (l) => l.s.members.length > 0, render: (l) => <Logs s={l.s} /> },
+  { id: "trace", label: "FlowFile trace", shown: (l) => l.s.members.length > 0, render: (l) => <FlowFileTrace s={l.s} /> },
   { id: "events", label: "Events and alerts", shown: () => true, render: (l) => <EventsAndAlerts s={l.s} /> },
   { id: "nodes", label: "Nodes", shown: () => true, render: (l) => <Nodes s={l.s} /> },
   { id: "configuration", label: "Configuration", shown: () => true, render: (l) => <ServiceConfig cfg={l.cfg} status={l.s} /> },

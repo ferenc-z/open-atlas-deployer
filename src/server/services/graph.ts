@@ -1,9 +1,10 @@
 // Service ops §9.4, §9.5, §15.3: the `nifi-ops` Studio graph. The Deployer writes it from the registered standalone
 // instances and clusters that have an nginx address (nginxUrl): per service one `api` source for monitoring (GET only,
-// 2 at a time, 5 s, no retries) and one `nifi` source for provenance, both at <nginxUrl>/nifi-api — nginx holds the
-// NiFi client certificate and puts every node of a cluster behind the one address (S20); Studio authenticates to nginx
-// only. Entities follow NiFi's objects: the flow controller (instance or cluster), nodes and their JVMs, process
-// groups, connections, processors, bulletins, provenance events.
+// 2 at a time, 5 s, no retries) at <nginxUrl>/nifi-api — nginx holds the NiFi client certificate and puts every node of
+// a cluster behind the one address (S20); Studio authenticates to nginx only. Entities follow NiFi's objects: the flow
+// controller (instance or cluster), nodes and their JVMs, process groups, connections, processors, bulletins.
+// Provenance is not in the graph (S28): Studio 2.11 removed its `nifi` source type, and the Deployer queries provenance
+// itself through the service executor (services/provenance.ts).
 //
 // One graph for every version line (§9.4 item 3, checked on 1.12.1 and the 2.5.0 cluster in step 6, §15.5): the
 // endpoints used here answer the same shapes on both lines; fields only 2.x has are nullable.
@@ -35,7 +36,7 @@ export function slug(id: string): string {
   return /^[a-z]/.test(s) ? s : `s${s}`;
 }
 
-export const sourceIds = (service: string) => ({ api: `nifi-ops-${slug(service)}`, provenance: `nifi-ops-${slug(service)}-provenance` });
+export const sourceIds = (service: string) => ({ api: `nifi-ops-${slug(service)}` });
 
 /** nginxUrl as the API root the sources call: no trailing slash, /nifi-api appended once. */
 export function apiRoot(nginxUrl: string): string {
@@ -150,30 +151,13 @@ const BULLETIN: Field[] = [
   ["message", "Message", "string", "$.bulletin.message"],
   ["time", "Time of day (NiFi's time zone)", "string", "$.timestamp"],
 ];
-const EVENT: Field[] = [
-  ["id", "Event id", "integer", "$.eventId", false],
-  ["flowfile", "FlowFile UUID", "string", "$.flowFileUuid"],
-  ["type", "Event type (RECEIVE, CREATE, ROUTE, DROP …)", "string", "$.eventType"],
-  ["time", "Event time (NiFi's format and time zone)", "string", "$.eventTime"],
-  ["component-id", "Component id", "string", "$.componentId"],
-  ["component-name", "Component name", "string", "$.componentName"],
-  ["component-type", "Component type", "string", "$.componentType"],
-  ["group-id", "Process group id", "string", "$.groupId"],
-  ["relationship", "Relationship", "string", "$.relationship"],
-  ["details", "Details", "string", "$.details"],
-  ["node", "Cluster node id (standalone: standalone)", "string", "$.nodeScope"],
-  ["size", "FlowFile size, bytes", "integer", "$.fileSizeBytes"],
-  ["duration", "Event duration, ms", "integer", "$.eventDuration"],
-];
-
 const COLLECTION = (maxItems: number) => ({
   ":ordering": kw("source-defined"), ":paging": kw("none"), ":completeness": kw("not-guaranteed"),
   ":bounds": { ":max-items": maxItems, ":max-response-bytes": 4194304, ":timeout-ms": 5000 },
 });
 
 /** Builds the contract for these services. `workspace` and `graph` are placeholders the publisher replaces. */
-export function generateGraph(services: GraphService[], opts: { workspace?: string; graph?: string; label?: string; release?: string; provenance?: boolean } = {}): GeneratedGraph {
-  const withProvenance = opts.provenance ?? true;
+export function generateGraph(services: GraphService[], opts: { workspace?: string; graph?: string; label?: string; release?: string } = {}): GeneratedGraph {
   const list = [...services].sort((a, b) => a.id.localeCompare(b.id));
   const seen = new Set<string>();
   for (const s of list) { const k = slug(s.id); if (seen.has(k)) throw new Error(`two services make the same graph name ${k}`); seen.add(k); }
@@ -208,13 +192,13 @@ export function generateGraph(services: GraphService[], opts: { workspace?: stri
     };
     const mapping = (e: string, fields: Field[], strip = "") => map(fields.map(([n, , , path]) => [attr(e, n), strip ? path.replace(strip, "$") : path]));
     const outMap = (pairs: ReturnType<typeof kw>[]) => map(pairs.map((a) => [a, slot(a)]));
-    const resolver = (id: string, def: Record<string, unknown>, impl: Record<string, unknown>, inputMap: [ReturnType<typeof kw>, string][], outputs: ReturnType<typeof kw>[], source = ids.api, extra: Record<string, unknown> = {}) => {
+    const resolver = (id: string, def: Record<string, unknown>, impl: Record<string, unknown>, inputMap: [ReturnType<typeof kw>, string][], outputs: ReturnType<typeof kw>[]) => {
       const rid = `${slug(s.id)}-${id}`;
       resolvers[rid] = { ":effect": kw("read"), ...def };
       bindings[`${rid}-api`] = {
-        ":binding/for": [kw("resolver"), rid], ":binding/source": source, ":binding/effect": kw("read"),
+        ":binding/for": [kw("resolver"), rid], ":binding/source": ids.api, ":binding/effect": kw("read"),
         ":binding/implementation": impl,
-        ":binding/input-map": map(inputMap), ":binding/output-map": outMap(outputs), ...extra,
+        ":binding/input-map": map(inputMap), ":binding/output-map": outMap(outputs),
       };
       selection.push([[kw("resolver"), rid], `${rid}-api`]);
     };
@@ -277,31 +261,10 @@ export function generateGraph(services: GraphService[], opts: { workspace?: stri
     resolver("bulletins", { ":label": `Bulletins of ${s.id}`, ":result/cardinality": kw("many"), ":input": [], ":collection": COLLECTION(50), ":output": [map([[recent, BULLETIN.map((f) => attr("bulletin", f[0]))]])] },
       { ":method": "GET", ":endpoint": "/flow/bulletin-board", ":query_params": { limit: "50" }, ":data_path": "$.bulletinBoard.bulletins", ":result-root": recent, ":field_mapping": mapping("bulletin", BULLETIN) }, [], [recent, ...BULLETIN.map((f) => attr("bulletin", f[0]))]);
 
-    // Provenance (§9.5) through Studio's nifi source: the events of one FlowFile UUID. Step 7 builds the trace on it.
-    // Left out (provenance: false) when Studio cannot take the nifi source; monitoring stands on its own.
-    if (withProvenance) {
-    const ffId = attr("flowfile", "uuid");
-    addEntity("flowfile", "NiFi FlowFile", ["uuid"], [["uuid", "FlowFile UUID", "string", "$.flowFileUuid", false]], [["events", ref("event", "Provenance events")]]);
-    addEntity("event", "NiFi provenance event", ["id"], EVENT);
-    const evAttrs = EVENT.map((f) => attr("event", f[0]));
-    resolver("provenance", {
-      ":label": `Provenance events of a FlowFile in ${s.id}`, ":result/cardinality": kw("one"), ":input": [ffId],
-      ":params": { ":start": { ":type": kw("string"), ":description": "Earliest event, NiFi's format MM/dd/yyyy HH:mm:ss z" }, ":end": { ":type": kw("string"), ":description": "Latest event, same format" } },
-      ":output": [map([[attr("flowfile", "events"), evAttrs]])],
-    }, {
-      ":operation": kw("provenance"),
-      ":field_mapping": map([[attr("flowfile", "events"), map([[kw("_from"), "$.events[*]"], ...EVENT.map(([n, , , p]) => [attr("event", n), p] as [unknown, unknown])])]]),
-    }, [[ffId, "uuid"]], [attr("flowfile", "events"), ...evAttrs], ids.provenance, { ":binding/parameter-map": { ":start": "start-date", ":end": "end-date" } });
-    }
-
     execSources[ids.api] = { ":source/kind": "api", ":source/effects": set([kw("read")]), ":source/policy": { ":max_retries": 0 } };
     usedKinds.add("api");
-    if (withProvenance) { execSources[ids.provenance] = { ":source/kind": "nifi", ":source/effects": set([kw("read")]) }; usedKinds.add("nifi"); }
     const base = apiRoot(s.nginxUrl);
     sources.push({ id: ids.api, service: s.id, entry: { type: "api", label: `NiFi monitoring: ${s.id}`, base_url: base, health_endpoint: "/flow/about", resilience: SOURCE_RESILIENCE } });
-    if (withProvenance) sources.push(
-      { id: ids.provenance, service: s.id, entry: { type: "nifi", label: `NiFi provenance: ${s.id}`, base_url: base, health_endpoint: "/flow/about", resilience: SOURCE_RESILIENCE } },
-    );
   }
 
   const entityIds = Object.keys(entities);
@@ -313,7 +276,7 @@ export function generateGraph(services: GraphService[], opts: { workspace?: stri
       ":graph/id": graphId, ":graph/label": opts.label ?? "NiFi operations", ":graph/exposure": kw("restricted"),
       ":graph/entities": entityIds, ":graph/resolvers": resolverIds, ":graph/operations": [], ":graph/terms": [], ":graph/dependencies": [],
       ":graph/usage-guide": {
-        ":guide/purpose": "Live details of the NiFi instances and clusters the Open Atlas Deployer manages: flow status, nodes, JVMs, process groups, queues, processors, bulletins, provenance.",
+        ":guide/purpose": "Live details of the NiFi instances and clusters the Open Atlas Deployer manages: flow status, nodes, JVMs, process groups, queues, processors, bulletins. Provenance (FlowFile trace) is not here: ask the Deployer's search_provenance and get_lineage tools.",
         ":guide/asset-scope": `Services: ${list.map((s) => `${s.id} (${s.kind}, NiFi ${s.version}) as nifi.${slug(s.id)}.*`).join("; ")}.`,
         ":guide/applicability": "Drill down to a component when the Deployer's samples point at one. Process groups are named by an ident join, [{[:nifi.<service>.pg/id \"root\"] [...]}] for the top, and answer one level: their child groups, processors and connections.",
         ":guide/limitations": ["Read only: nothing here starts, stops or changes NiFi", "Each call goes to NiFi through nginx, two at a time per service, 5 seconds each; history and alerts are in the Deployer", "Times are in NiFi's own time zone (controller timezone)", "Fields marked 2.x only are empty on NiFi 1.x"],
@@ -330,7 +293,7 @@ export function generateGraph(services: GraphService[], opts: { workspace?: stri
       ":required-capabilities": set([
         kw("semantic/core-v1"), kw("graph/single-owner-v1"), kw("deployment/source-slot-v1"), kw("artifact/embedded-closure-v1"),
         ...[...usedKinds].sort().map((k) => kw(`connector/${k}`)),
-        kw("query/source-collection-v1"), ...(withProvenance ? [kw("execution/params-v2")] : []), kw("source/policy-v1"),
+        kw("query/source-collection-v1"), kw("source/policy-v1"),
       ]),
     },
   };

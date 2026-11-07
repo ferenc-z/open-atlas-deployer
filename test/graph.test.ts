@@ -72,24 +72,24 @@ test("nginx addresses: checked and cleaned; the API root is <address>/nifi-api; 
   for (const bad of ["", "ftp://x", "https://u:p@x", "https://x/?a=1", "nope", 7]) assert.ok("error" in checkNginxUrl(bad), String(bad));
   assert.equal(apiRoot("http://h:1/"), "http://h:1/nifi-api");
   assert.equal(apiRoot("http://h:1/nifi-api"), "http://h:1/nifi-api");
-  assert.deepEqual([slug("NiFi_Prod.C1"), slug("112"), sourceIds("n112")], ["nifi-prod-c1", "s112", { api: "nifi-ops-n112", provenance: "nifi-ops-n112-provenance" }]);
+  assert.deepEqual([slug("NiFi_Prod.C1"), slug("112"), sourceIds("n112")], ["nifi-prod-c1", "s112", { api: "nifi-ops-n112" }]);
   assert.throws(() => slug("__"));
   assert.throws(() => generateGraph([LAB[0]!, { ...LAB[0]!, id: "N112" }]), /same graph name/);
 });
 
-test("the generated contract: per service an api and a nifi source at the nginx address (2 at a time, 5 s, no retries), its entities and resolvers", () => {
+test("the generated contract: per service one api source at the nginx address (no nifi source, S28) (2 at a time, 5 s, no retries), its entities and resolvers", () => {
   const g = generateGraph(LAB, { workspace: "ws", graph: "nifi-ops-dev" });
   assert.deepEqual(g.services, ["n112", "nifi-lab-c250"]);
   assert.deepEqual(g.sources.map((s) => [s.id, s.entry.type, s.entry.base_url]), [
-    ["nifi-ops-n112", "api", "http://127.0.0.1:18543/nifi-api"], ["nifi-ops-n112-provenance", "nifi", "http://127.0.0.1:18543/nifi-api"],
-    ["nifi-ops-nifi-lab-c250", "api", "http://127.0.0.1:18545/nifi-api"], ["nifi-ops-nifi-lab-c250-provenance", "nifi", "http://127.0.0.1:18545/nifi-api"],
+    ["nifi-ops-n112", "api", "http://127.0.0.1:18543/nifi-api"], ["nifi-ops-nifi-lab-c250", "api", "http://127.0.0.1:18545/nifi-api"],
   ]);
   assert.deepEqual(g.sources[0]!.entry.resilience, SOURCE_RESILIENCE);
   assert.deepEqual([SOURCE_RESILIENCE.timeout_ms, SOURCE_RESILIENCE.max_retries, SOURCE_RESILIENCE.bulkhead.concurrency], [5000, 0, 2]);
   const doc = readEdn(g.text);
   assert.equal(get(doc, ":graph", ":graph/id"), "nifi-ops-dev");
   const entities = get(doc, ":graph", ":graph/entities") as string[];
-  assert.deepEqual(entities.filter((e) => e.startsWith("nifi.n112.")), ["nifi.n112.controller", "nifi.n112.pg", "nifi.n112.processor", "nifi.n112.connection", "nifi.n112.bulletin", "nifi.n112.flowfile", "nifi.n112.event"]);
+  assert.deepEqual(entities.filter((e) => e.startsWith("nifi.n112.")), ["nifi.n112.controller", "nifi.n112.pg", "nifi.n112.processor", "nifi.n112.connection", "nifi.n112.bulletin"]);
+  assert.ok(!g.text.includes(":connector/nifi") && !g.text.includes(":operation :provenance") && !g.text.includes("provenance-api") && !g.text.includes("nifi.n112.event"), "no provenance in the graph (S28)");
   assert.ok(entities.includes("nifi.nifi-lab-c250.node") && entities.includes("nifi.nifi-lab-c250.jvm"), "a cluster has nodes and per-node JVMs");
   assert.equal(entities.length, g.entities);
   const bindings = get(doc, ":execution", ":bindings") as Map<string, Map<string, unknown>>;
@@ -98,8 +98,7 @@ test("the generated contract: per service an api and a nifi source at the nginx 
   assert.ok(!g.text.includes("recursive"), "process groups one level at a time");
   const pg = bindings.get("n112-pg-status-api")!;
   assert.equal((pg.get(":binding/implementation") as Map<string, unknown>).get(":endpoint"), "/flow/process-groups/{nifi.n112.pg/id}/status");
-  const prov = bindings.get("nifi-lab-c250-provenance-api")!;
-  assert.deepEqual([pg.get(":binding/source"), prov.get(":binding/source"), (prov.get(":binding/implementation") as Map<string, unknown>).get(":operation")], ["nifi-ops-n112", "nifi-ops-nifi-lab-c250-provenance", ":provenance"]);
+  assert.equal(pg.get(":binding/source"), "nifi-ops-n112");
   const sources = get(doc, ":execution", ":sources") as Map<string, Map<string, unknown>>;
   assert.deepEqual([...sources.keys()], g.sources.map((s) => s.id), "the source slots are the declared sources' ids");
   assert.equal(get(doc, ":ownership", ":resolvers").size, g.resolvers);
@@ -145,7 +144,7 @@ test("the field mappings against the responses recorded through the lab's nginx 
 });
 
 /** A Builder MCP that remembers the calls and answers like Studio 2.8. */
-function fakeStudio(opts: { graphExists?: boolean; refuse?: string; noNifi?: boolean } = {}) {
+function fakeStudio(opts: { graphExists?: boolean; refuse?: string } = {}) {
   const calls: [string, Record<string, any>][] = [];
   let sources: { id: string; revision: number }[] = [];
   let graphs = opts.graphExists ? [{ "graph/name": "nifi-ops-dev", "graph/qualified-name": "ws/nifi-ops-dev" }] : [];
@@ -156,7 +155,6 @@ function fakeStudio(opts: { graphExists?: boolean; refuse?: string; noNifi?: boo
       if (name === opts.refuse) return { findings: [{ code: "x/refused", severity: "error", message: "no" }] };
       switch (name) {
         case "declare_source": {
-          if (opts.noNifi && args.entry.type === "nifi") throw new Error("declare_source: the tool failed with an internal server error (reference 4c42c446)");
           const had = sources.find((s) => s.id === args.id);
           // Studio 2.8: no upsert; a taken id is refused (an MCP error, EDN) with its revision.
           if (had && args.expected_revision === undefined) throw new Error(`declare_source: {:error {:source "${args.id}" :findings [{:code :pool.action/id-taken, :severity :error, :message "an object with this id already exists", :got {:revision ${had.revision}}}]}}`);
@@ -187,33 +185,25 @@ test("publishing: sources declared, the graph made the first time, the contract 
   assert.deepEqual(graphServices(store), [{ id: "n112", kind: "standalone", version: "1.12.1", nginxUrl: "http://127.0.0.1:18543" }]);
   const run = await g.publish("nginx address of n112 set", admin);
   assert.equal(run.state, "published", run.message);
-  assert.deepEqual(calls.map(([n]) => n), ["declare_source", "declare_source", "list_graphs", "create_graph", "get_graph", "upload_graph", "publish_graph"]);
+  assert.deepEqual(calls.map(([n]) => n), ["declare_source", "list_graphs", "create_graph", "get_graph", "upload_graph", "publish_graph"]);
   assert.deepEqual(calls[0]![1], { id: "nifi-ops-n112", entry: generateGraph(graphServices(store)).sources[0]!.entry, verify: false, apply: true });
   const upload = calls.find(([n]) => n === "upload_graph")![1];
   assert.deepEqual([upload.graph, upload.expected_revision], ["ws/nifi-ops-dev", 3]);
   assert.ok(upload.text.includes(':graph/id "uuid-1"') && upload.text.includes(':workspace/id "ws"') && !upload.text.includes('"nifi-ops"'), "Studio's own ids");
   assert.deepEqual([run.graph, run.services, run.detail.version], ["ws/nifi-ops-dev", ["n112"], 2]);
-  assert.equal(run.detail.provenance, true);
+  assert.deepEqual(run.detail.sources, ["nifi-ops-n112"]);
   // Again: each source is refused as taken and replaced at its revision; the graph is not made twice.
   calls.length = 0;
   assert.equal((await g.publish("again", admin)).state, "published");
-  assert.deepEqual(calls.filter(([n]) => n === "declare_source").map(([, a]) => [a.id, a.expected_revision]), [["nifi-ops-n112", undefined], ["nifi-ops-n112", 1], ["nifi-ops-n112-provenance", undefined], ["nifi-ops-n112-provenance", 1]]);
+  assert.deepEqual(calls.filter(([n]) => n === "declare_source").map(([, a]) => [a.id, a.expected_revision]), [["nifi-ops-n112", undefined], ["nifi-ops-n112", 1]]);
   assert.ok(!calls.some(([n]) => n === "create_graph"));
   assert.deepEqual(store.graphRuns().map((r) => r.state), ["published", "published", "skipped", "skipped"]);
-  // A Studio that cannot take the nifi source (2.8.0): published without provenance, and the run says so.
-  const noNifi = fakeStudio({ noNifi: true });
-  const partial = await new NifiOpsGraph(store, { studio: noNifi.studio, graph: "nifi-ops-dev" }).publish("x", admin);
-  assert.deepEqual([partial.state, partial.detail.provenance, partial.detail.sources], ["published", false, ["nifi-ops-n112"]]);
-  assert.match(partial.message, /provenance left out/);
-  const text = noNifi.calls.find(([n]) => n === "upload_graph")![1].text as string;
-  assert.ok(!text.includes("provenance") || !text.includes(":connector/nifi"), "no nifi source in the contract");
-  assert.ok(!text.includes("nifi.n112.event"));
   // A refusal is recorded as failed with what was done before it.
   const refusing = fakeStudio({ graphExists: true, refuse: "upload_graph" });
   const failed = await new NifiOpsGraph(store, { studio: refusing.studio, graph: "nifi-ops-dev" }).publish("x", admin);
   assert.equal(failed.state, "failed");
   assert.match(failed.message, /refused the contract/);
-  assert.equal((failed.detail.log as string[]).length, 2, "the two sources were declared");
+  assert.equal((failed.detail.log as string[]).length, 1, "the source was declared");
   // schedule(): a request while one runs makes one more run afterwards, not one each.
   const before = store.graphRuns(50).length;
   g.schedule("a", admin); g.schedule("b", admin); g.schedule("c", admin);

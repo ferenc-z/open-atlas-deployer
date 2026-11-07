@@ -73,6 +73,8 @@ export function kindsNeeded(request: Record<string, unknown>): string[] {
   const kind = String(request.kind ?? "");
   const out = [kind];
   if (kind === "svc-discover" && Array.isArray(request.dirs) && request.dirs.some((d) => d !== null && typeof d === "object")) out.push("svc-discover@2");
+  // S28: provenance reads as ProvenanceQuery does them (the job's first form is @1, so the plain kind alone never counts).
+  if (kind === "nifi-provenance") out.push("nifi-provenance@1");
   if (kind === "svc-read") {
     const home = String(request.installDir ?? "").replace(/\/+$/, "");
     if (request.confDir || (typeof request.bootstrapFile === "string" && request.bootstrapFile !== `${home}/conf/bootstrap.conf`)) out.push("svc-read@2");

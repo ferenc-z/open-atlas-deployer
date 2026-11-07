@@ -101,7 +101,8 @@ export class NifiOpsGraph {
     const studio = this.studio;
     let graph = this.graph;
     try {
-      let generated = generateGraph(services, { workspace: "deployer", graph: "nifi-ops", label: "NiFi operations" });
+      // Only `api` sources (S28): provenance is the Deployer's own (services/provenance.ts), not Studio's.
+      const generated = generateGraph(services, { workspace: "deployer", graph: "nifi-ops", label: "NiFi operations" });
       // The sources, declared as they should be now. declare_source has no upsert: a new id is declared without a
       // revision; a taken one is refused with its revision, and declared again at that revision (replaced).
       const declare = async (id: string, entry: Record<string, unknown>): Promise<string> => {
@@ -116,18 +117,7 @@ export class NifiOpsGraph {
         if (failed(answer)) throw new Error(`declare_source ${id}: ${JSON.stringify(answer.findings).slice(0, 400)}`);
         return how;
       };
-      for (const s of generated.sources.filter((x) => x.entry.type === "api")) log.push(`Studio: source ${s.id} ${await declare(s.id, s.entry)} (${String(s.entry.base_url)})`);
-      // Provenance needs Studio's nifi sources; a Studio that cannot declare them (2.8.0 fails its health check with an
-      // internal error, §15.5) still gets the monitoring half, and the run says provenance was left out.
-      let provenance: string | null = null;
-      for (const s of generated.sources.filter((x) => x.entry.type === "nifi")) {
-        try { log.push(`Studio: source ${s.id} ${await declare(s.id, s.entry)} (${String(s.entry.base_url)})`); } catch (error) {
-          provenance = `provenance left out: Studio did not take the nifi source ${s.id} (${(error as Error).message.slice(0, 300)})`;
-          log.push(provenance);
-          generated = generateGraph(services, { workspace: "deployer", graph: "nifi-ops", label: "NiFi operations", provenance: false });
-          break;
-        }
-      }
+      for (const s of generated.sources) log.push(`Studio: source ${s.id} ${await declare(s.id, s.entry)} (${String(s.entry.base_url)})`);
       // The graph, made the first time (a name, or workspace/name in this token's workspace).
       const graphs = await studio.call("list_graphs", {});
       const name = graph.includes("/") ? graph.split("/").slice(1).join("/") : graph;
@@ -139,8 +129,8 @@ export class NifiOpsGraph {
         log.push(`Studio: graph ${graph} created`);
       } else graph = found["graph/qualified-name"] ?? graph;
       const { revision, version } = await publishContract(studio, graph, generated.text, (line) => log.push(line));
-      return this.record(reason, actor, graph, ids, "published", `${graph} published${version != null ? ` as version ${version}` : ""}: ${ids.length} service(s), ${generated.entities} entities, ${generated.resolvers} resolvers${provenance ? `; ${provenance.split(" (")[0]}` : ""}`,
-        { revision, version, sources: generated.sources.map((s) => s.id), provenance: !provenance, log });
+      return this.record(reason, actor, graph, ids, "published", `${graph} published${version != null ? ` as version ${version}` : ""}: ${ids.length} service(s), ${generated.entities} entities, ${generated.resolvers} resolvers`,
+        { revision, version, sources: generated.sources.map((s) => s.id), log });
     } catch (error) {
       return this.record(reason, actor, graph, ids, "failed", (error as Error).message.slice(0, 1000), { log });
     }

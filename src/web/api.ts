@@ -303,3 +303,24 @@ export const putServiceNginx = (id: string, nginxUrl: string | null) => call<{ n
 export const checkServiceNginx = (id: string) => call<{ nginxUrl: string; check: NginxCheck }>("POST", `services/${encodeURIComponent(id)}/nginx/check`);
 export const serviceGraph = () => call<GraphState>("GET", "services/graph");
 export const publishServiceGraph = () => call<GraphRun>("POST", "services/graph/publish");
+// Phase 2 step 7 (§9.5, S28): the FlowFile trace, read by the service executors from NiFi's provenance.
+import type { ProvenanceMember } from "../server/services/provenance.ts";
+export type { ProvenanceMember };
+export type ProvenanceInfo = { kind: string; version: string; supported: boolean; note: string; members: ProvenanceMember[]; ready: boolean };
+export type ProvEvent = {
+  id?: string; eventId: number; eventTime?: string; at: string | null; eventType: string; flowFileUuid: string; fileSizeBytes?: number;
+  clusterNodeId?: string; clusterNodeAddress?: string; member?: string | null; groupId?: string; componentId?: string; componentType?: string; componentName?: string;
+  relationship?: string; details?: string; eventDuration?: number; lineageDuration?: number; parentUuids?: string[]; childUuids?: string[]; transitUri?: string;
+  attributes?: { name: string; value?: string; previousValue?: string }[]; attributesHidden?: boolean;
+};
+export type ProvenanceResult = { from: string; to: string; events: ProvEvent[]; total: number; totalText?: string; limit: number; limitReached: boolean; scope: string; shiftedHours: number; notes?: string[]; errors: string[]; nifiVersion: string; via: { member: string; label: string } };
+export type LineageNode = { id: string; type: "FLOWFILE" | "EVENT"; flowFileUuid?: string; eventType?: string; at: string | null; parentUuids?: string[]; childUuids?: string[]; clusterNodeIdentifier?: string; componentId?: string; componentName?: string; componentType?: string; relationship?: string; details?: string; error?: string };
+export type LineageResult = { nodes: LineageNode[]; links: { sourceId: string; targetId: string; flowFileUuid?: string; at: string | null }[]; enriched: number; notes?: string[]; errors: string[]; direction: string };
+export type ProvenanceSearchAsk = { uuid?: string; field?: string; value?: string; from: string; to: string; maxResults?: number; node?: string };
+const provPath = (id: string, rest = "") => `services/${encodeURIComponent(id)}${rest}`;
+export const provenanceInfo = (id: string) => call<ProvenanceInfo>("GET", provPath(id, "/provenance"));
+export const provenanceOptions = (id: string) => call<{ fields: { id: string; field: string; label: string; type: string }[] }>("GET", provPath(id, "/provenance/options"));
+export const searchProvenance = (id: string, q: ProvenanceSearchAsk) => call<ProvenanceResult>("POST", provPath(id, "/provenance"), q);
+export const lineage = (id: string, q: { uuid?: string; eventId?: number; direction?: string; node?: string }) => call<LineageResult>("POST", provPath(id, "/lineage"), q);
+export const provenanceEvent = (id: string, eventId: number, node?: string) => call<{ event: ProvEvent; member: string | null }>("GET", provPath(id, `/provenance/events/${eventId}${node ? `?node=${encodeURIComponent(node)}` : ""}`));
+export const bulletinsBetween = (id: string, from: string, to: string, limit = 200) => call<{ bulletins: ServiceBulletin[] }>("GET", `services/${encodeURIComponent(id)}/bulletins?limit=${limit}&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`);

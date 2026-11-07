@@ -13,7 +13,7 @@
 import type { Principal } from "./auth.ts";
 import type { Store } from "./store.ts";
 import { installKey } from "./services/draft.ts";
-import { redactStrings, redactText } from "./services/redact.ts";
+import { redactProvenance, redactStrings, redactText } from "./services/redact.ts";
 
 interface Property { type: "string" | "integer" | "boolean" | "array" | "object"; description: string; items?: { type: "object" | "string" } }
 type Method = "GET" | "POST" | "PUT" | "DELETE";
@@ -105,6 +105,7 @@ const FROM = s("Optional ISO time (UTC), from.");
 const TO = s("Optional ISO time (UTC), to; now by default.");
 const strs = (description: string): Property => ({ type: "array", items: { type: "string" }, description });
 const redacted = (body: unknown) => redactStrings(body);
+const provenanceRedacted = (body: unknown) => redactProvenance(body);
 type Any = Record<string, any>;
 
 /** get_metrics: per member and field the last, min, max and average over the range; the series only when asked for. */
@@ -172,6 +173,16 @@ const SERVICE_TOOLS: Tool[] = [
   { name: "tail_logs", readOnly: true, description: "The last lines of one member's log file (nifi-app.log by default): a snapshot, not a stream. member can be left out for a standalone instance. Secret-looking parts are hidden.",
     properties: { id: SERVICE, member: MEMBER, file: s("Optional file name in the member's log directory, default nifi-app.log."), lines: n("Optional, 1 to 5000, default 200.") }, required: ["id"],
     request: (a) => ({ method: "GET", path: `/api/services/${enc(a.id)}/logs/lines`, query: { member: a.member, file: a.file, lines: a.lines } }), shape: redacted },
+  // S28 (§9.5): provenance, read by a member's service executor from its NiFi (Studio no longer has a NiFi source).
+  { name: "search_provenance", readOnly: true, description: "A NiFi service's provenance events (FlowFile trace) in a time range, both ends required (keep it tight, e.g. the hour around a problem): by a FlowFile's uuid, or by a searchable field and value (field ids from the service's search options, usually EventType, FlowFileUUID, Filename, ProcessorID, Relationship). At most 100 events, oldest first: time, type (RECEIVE, CREATE, ROUTE, DROP …), component, relationship, details, the node (clusterNodeId, member) on a cluster. A cluster is searched as a whole; node narrows it to one node. Then get_lineage for where a FlowFile went, get_provenance_event for one event's attributes. Secret-looking parts are hidden.",
+    properties: { id: SERVICE, uuid: s("A FlowFile UUID."), field: s("Instead of uuid: a searchable field's id, e.g. Filename or ProcessorID."), value: s("The field's value."), from: s("Required ISO time."), to: s("Required ISO time."), maxResults: n("Optional, 1 to 100 (default 100)."), node: s("Optional on a cluster: one node's clusterNodeId.") }, required: ["id", "from", "to"],
+    request: (a) => { const { id, ...body } = a; return { method: "POST", path: `/api/services/${enc(id)}/provenance`, body }; }, shape: provenanceRedacted },
+  { name: "get_lineage", readOnly: true, description: "A FlowFile's lineage (uuid) or one event's parents or children (eventId with direction PARENTS or CHILDREN): the FlowFile and event nodes with time, event type and component, and the links between them. On a cluster node is required: the clusterNodeId of the event search_provenance found (lineage is per node).",
+    properties: { id: SERVICE, uuid: s("A FlowFile UUID (direction FLOWFILE)."), eventId: n("Instead of uuid: an event id."), direction: s("Optional: FLOWFILE (default with uuid), PARENTS or CHILDREN."), node: s("On a cluster: the event's clusterNodeId.") }, required: ["id"],
+    request: (a) => { const { id, ...body } = a; return { method: "POST", path: `/api/services/${enc(id)}/lineage`, body }; }, shape: provenanceRedacted },
+  { name: "get_provenance_event", readOnly: true, description: "One provenance event's details: type, time, component, relationship, details, sizes, and the FlowFile's attributes (with their previous values) when NiFi lets the monitoring identity see them (attributesHidden: it may not). Never content. On a cluster node (the event's clusterNodeId) is required. Secret-looking parts are hidden.",
+    properties: { id: SERVICE, eventId: n("The event id."), node: s("On a cluster: the event's clusterNodeId.") }, required: ["id", "eventId"],
+    request: (a) => ({ method: "GET", path: `/api/services/${enc(a.id)}/provenance/events/${enc(String(a.eventId))}`, query: { node: a.node } }), shape: provenanceRedacted },
   { name: "get_service_config", readOnly: true, description: "A service's configuration as the Deployer keeps it (the newest revision, or the one given): per member its files (nifi.properties, bootstrap.conf, …) as text, secret values reading (hidden) and named in hidden. member and file narrow it.",
     properties: { id: SERVICE, revision: n("Optional revision; the newest by default."), member: s("Optional: a member key or host."), file: s("Optional: one file name, e.g. nifi.properties.") }, required: ["id"],
     request: (a) => ({ method: "GET", path: `/api/services/${enc(a.id)}/config`, query: { revision: a.revision } }), shape: configShape },

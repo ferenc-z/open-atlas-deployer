@@ -115,9 +115,12 @@ except Exception as e: print("unavailable", e)')"
   grant)
     gr=(
       "/flow|read|$CLIENT_MONITOR" "/system|read|$CLIENT_MONITOR" "/controller|read|$CLIENT_MONITOR"
+      # S28: the service executor queries provenance with the monitor certificate: "query provenance" and "view
+      # provenance" of the whole flow (the root process group; components inherit it).
+      "/provenance|read|$CLIENT_MONITOR" "/provenance-data/process-groups/@root|read|$CLIENT_MONITOR"
       "/proxy|read|$CLIENT_NGINX" "/proxy|write|$CLIENT_NGINX"
-      # P8: nginx calls NiFi as itself for Studio (S20, S21): monitoring reads and provenance queries.
-      "/flow|read|$CLIENT_NGINX" "/system|read|$CLIENT_NGINX" "/controller|read|$CLIENT_NGINX" "/provenance|read|$CLIENT_NGINX"
+      # P8: nginx calls NiFi as itself for Studio (S20): monitoring reads (provenance is the Deployer's own since S28).
+      "/flow|read|$CLIENT_NGINX" "/system|read|$CLIENT_NGINX" "/controller|read|$CLIENT_NGINX"
       "/system|read|$CLIENT_OPERATOR" "/provenance|read|$CLIENT_OPERATOR"
     )
     done_cluster=""

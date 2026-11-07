@@ -18,8 +18,11 @@ Deployer to import; their content goes once over the job's content channel, neve
 seconds) or packs (tar.gz, 50 MiB) the logs of a watched NiFi, sending the lines or the archive over the binary content
 channel (PUT …/content); log-tail (§15.2 P7) follows one log file for up to 120 seconds by inode and offset, across a
 rollover, sending a chunk every second or two (POST …/chunk). Both read only below the log directories of what the
-Deployer watches here, compared after realpath (no `..`, no symbolic link out). The executor refuses any kind it does
-not know, deploy jobs included.
+Deployer watches here, compared after realpath (no `..`, no symbolic link out). nifi-provenance (S28, §9.5) reads a
+watched NiFi's provenance with the monitor certificate: events of a FlowFile UUID or a searchable field in a time range,
+a lineage, one event, the searchable fields; NiFi's queries are submitted, polled and always deleted, within 100 events,
+4 MiB per answer and 30 seconds; never replay, content or a flow change. The executor refuses any kind it does not
+know, deploy jobs included.
 
 Beside the jobs runs the collector (§9.1, §15.3): every EXECUTOR_COLLECT_SECONDS it samples each NiFi the Deployer
 watches on this machine (the watch list comes with every heartbeat reply, §15.2 P5; nothing else is sampled): the
@@ -36,6 +39,7 @@ The release holds one file: package.sh puts executor_core's code in place of the
 Standard library only; Python 3.9.
 """
 import base64
+import calendar
 import collections
 import glob
 import gzip
@@ -956,11 +960,10 @@ class Collector:
         no-certificate (only /proc and the disks), no-https."""
         if ctx is None:
             return {"state": "no-certificate", "error": why_not}
-        port = w["https"]["port"] or as_port(props.get("nifi.web.https.port"))
-        if not port:
+        target = nifi_target(w, props)
+        if not target:
             return {"state": "no-https", "error": "nifi.web.https.port is not set: the collector only calls NiFi over HTTPS"}
-        connect, sni = endpoint(w["https"]["host"] if w["https"]["host"] is not None else props.get("nifi.web.https.host"),
-                                w.get("nodeAddress") or props.get("nifi.cluster.node.address"))
+        connect, sni, port = target
         node = props.get("nifi.cluster.is.node", "false").strip().lower() == "true"
         calls = [("about", "flow/about"), ("diagnostics", "system-diagnostics?nodewise=true" if node else "system-diagnostics"), ("status", "flow/status"),
                  *([("cluster", "controller/cluster")] if node else []), ("bulletins", f"flow/bulletin-board?limit={BULLETINS}"),
@@ -1398,6 +1401,318 @@ class LogFiles:
         return {"dir": d, "files": out[:LIST_MAX], "more": max(0, len(out) - LIST_MAX)}
 
 
+# --- provenance (S28, §9.5): the Deployer's FlowFile trace, read from the local NiFi with the monitor certificate ------
+
+# Limits (as Studio's former nifi source had them): at most 100 events, 4 MiB per answer, 30 seconds per job; every
+# provenance and lineage query NiFi keeps is deleted when the job ends (finally), whatever happened.
+PROV_RESULTS_MAX = 100
+PROV_BYTES = 4 << 20
+PROV_SECONDS = 30.0
+PROV_POLL = 0.25
+PROV_CLEANUP_TIMEOUT = 2.0
+PROV_ENRICH_MAX = 100          # lineage: the event nodes given their component, at most
+PROV_ATTRS_MAX, PROV_VALUE_MAX = 500, 4096
+PROV_OPS = ("provenance", "lineage", "event", "search-options")
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+NIFI_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+# What of an event leaves the host: never content claims (no content is read) or replay details.
+EVENT_FIELDS = ("id", "eventId", "eventTime", "eventType", "flowFileUuid", "fileSizeBytes", "clusterNodeId", "clusterNodeAddress", "groupId",
+                "componentId", "componentType", "componentName", "relationship", "details", "eventDuration", "lineageDuration",
+                "parentUuids", "childUuids", "transitUri", "alternateIdentifierUri", "sourceSystemFlowFileId")
+NIFI_TIME = re.compile(r"^(\d\d)/(\d\d)/(\d{4}) (\d\d):(\d\d):(\d\d)(?:\.(\d{1,3}))?(?: (\S+))?$")
+
+
+def nifi_target(w, props):
+    """(where to connect, the TLS name, port) of a watched NiFi's HTTPS API, or None without nifi.web.https.port."""
+    https = w.get("https") or {}
+    port = https.get("port") or as_port(props.get("nifi.web.https.port"))
+    if not port:
+        return None
+    host = https.get("host")
+    connect, sni = endpoint(host if host is not None else props.get("nifi.web.https.host"), w.get("nodeAddress") or props.get("nifi.cluster.node.address"))
+    return connect, sni, port
+
+
+def nifi_date(seconds):
+    """A time (seconds since the epoch) as NiFi takes a provenance date: MM/dd/yyyy HH:mm:ss in UTC, a zone name NiFi
+    cannot mistake."""
+    return time.strftime("%m/%d/%Y %H:%M:%S UTC", time.gmtime(seconds))
+
+
+def nifi_time_ms(text, offset_ms):
+    """NiFi's MM/dd/yyyy HH:mm:ss[.SSS] <zone> as milliseconds since the epoch: UTC and GMT as such, other zone names
+    by the offset NiFi gave (results.timeOffset, its zone's offset from UTC); None without one."""
+    m = NIFI_TIME.match(text.strip()) if isinstance(text, str) else None
+    if not m:
+        return None
+    mo, d, y, hh, mi, ss, ms, zone = m.groups()
+    naive = calendar.timegm((int(y), int(mo), int(d), int(hh), int(mi), int(ss), 0, 0, 0)) * 1000 + int((ms or "0").ljust(3, "0"))
+    if zone in ("UTC", "GMT", "Z", None):
+        return naive
+    if offset_ms is None:
+        return None
+    return naive - int(offset_ms)
+
+
+def iso_ms(ms):
+    return None if ms is None else time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ms / 1000)) + f".{int(ms) % 1000:03d}Z"
+
+
+def local_offset_ms(zone):
+    """This host's offset for a zone name NiFi printed, when it is this host's own zone (NiFi runs here); else None."""
+    if zone in ("UTC", "GMT"):
+        return 0
+    if zone and zone in time.tzname:
+        return -(time.altzone if time.daylight and zone == time.tzname[1] else time.timezone) * 1000
+    return None
+
+
+def trim_event(e, offset_ms):
+    e = e if isinstance(e, dict) else {}
+    out = {k: e[k] for k in EVENT_FIELDS if e.get(k) is not None}
+    if isinstance(out.get("details"), str):
+        out["details"] = out["details"][:PROV_VALUE_MAX]
+    out["at"] = iso_ms(nifi_time_ms(e.get("eventTime"), offset_ms))
+    return out
+
+
+def old_terms(version):
+    """NiFi before 1.14 takes a search term as a plain string; later versions as {value, inverse}."""
+    m = re.match(r"^(\d+)\.(\d+)", version or "")
+    return bool(m) and (int(m.group(1)), int(m.group(2))) < (1, 14)
+
+
+class NifiAnswer(Exception):
+    """NiFi answered a provenance call with an HTTP error (other than 401/403)."""
+
+    def __init__(self, status, text):
+        super().__init__(f"NiFi answered HTTP {status}: {text}")
+        self.status, self.text = status, text
+
+
+class ProvenanceQuery:
+    """One provenance read on a watched NiFi (S28, §9.5), with the monitor certificate, straight to the local node.
+    op provenance: events of a FlowFile UUID, or of a searchable field's value, between from and to (both required),
+    at most 100; lineage: a FlowFile's lineage (uuid) or an event's parents or children (eventId, direction), its
+    event nodes given their component; event: one event's details (attributes included when NiFi shows them to this
+    identity); search-options: the searchable fields. Provenance and lineage are submitted, polled and deleted (always,
+    in finally). Only reads: no replay, no content, no flow change.
+    On a cluster a provenance query without node asks the cluster as a whole through this node (NiFi replicates it
+    and merges the nodes' events, each with its clusterNodeId); lineage and event need the node (event ids are per
+    node). `call(method, path, body, timeout)` -> (status, bytes) is replaced in tests."""
+
+    def __init__(self, call, deadline, cluster, offset_ms=None, sleep=time.sleep):
+        self.call_raw, self.deadline, self.cluster, self.sleep = call, deadline, cluster, sleep
+        self.offset_ms = offset_ms
+        self.notes = []
+
+    def left(self):
+        return self.deadline - time.monotonic()
+
+    def call(self, method, path, body=None, cleanup=False):
+        timeout = PROV_CLEANUP_TIMEOUT if cleanup else min(REQUEST_TIMEOUT, self.left())
+        if timeout <= 0.05:
+            raise Failed(f"the provenance query ran out of its {PROV_SECONDS:g} seconds")
+        try:
+            status, data = self.call_raw(method, path, body, timeout)
+        except (OSError, ssl.SSLError, http.client.HTTPException) as e:
+            raise Failed(f"NiFi did not answer {method} {path.split('?')[0]}: {str(e) or type(e).__name__}"[:300])
+        if len(data) > PROV_BYTES:
+            raise Failed(f"NiFi's answer to {path.split('?')[0]} is larger than {PROV_BYTES >> 20} MiB: narrow the time range or the search")
+        if not 200 <= status < 300:
+            text = data[:300].decode("utf-8", "replace").strip()
+            if status in (401, 403):
+                raise Failed(f"NiFi refused the monitor certificate (HTTP {status}: {text}); its identity needs \"query provenance\" "
+                             "(/provenance, read) and \"view provenance\" on the components (/provenance-data/..., read)")
+            raise NifiAnswer(status, text)
+        try:
+            return json.loads(data) if data else {}
+        except ValueError:
+            raise Failed(f"NiFi's answer to {path.split('?')[0]} is not JSON")
+
+    @staticmethod
+    def node_query(node):
+        return f"?clusterNodeId={node}" if node else ""
+
+    def node_of(self, request, needed):
+        node = request.get("node")
+        if node is not None and (not isinstance(node, str) or not NIFI_ID_RE.match(node)):
+            raise Refused("node is a cluster node id (letters, digits, - and _)")
+        if node and not self.cluster:
+            raise Refused("node is only for a cluster; this NiFi is standalone")
+        if needed and self.cluster and not node:
+            raise Refused("on a cluster, node (the event's clusterNodeId) is required: event ids are per node")
+        return node or None
+
+    def run(self, request):
+        op = request.get("op")
+        if op not in PROV_OPS:
+            raise Refused(f"op is one of {', '.join(PROV_OPS)}")
+        out = getattr(self, op.replace("-", "_"))(request)
+        if self.notes:
+            out["notes"] = self.notes
+        return out
+
+    def search_options(self, request):
+        fields = (self.call("GET", "provenance/search-options").get("provenanceOptions") or {}).get("searchableFields") or []
+        return {"op": "search-options", "fields": [{k: f.get(k) for k in ("id", "field", "label", "type")} for f in fields if isinstance(f, dict)]}
+
+    def job(self, path, key, body, node):
+        """Submit, poll until finished, delete (always). Returns (the finished job, its id)."""
+        submitted = self.call("POST", path, body).get(key) or {}
+        qid = submitted.get("id")
+        if not isinstance(qid, str) or not NIFI_ID_RE.match(qid):
+            raise Failed(f"NiFi gave no usable id for the {key} query")
+        job_path = f"{path}/{qid}{self.node_query(node)}"
+        try:
+            job = submitted
+            while not job.get("finished"):
+                if self.left() < PROV_POLL + 0.1:
+                    raise Failed(f"the {key} query did not finish within {PROV_SECONDS:g} seconds ({job.get('percentCompleted', 0)} % done): narrow it")
+                self.sleep(PROV_POLL)
+                job = self.call("GET", job_path).get(key) or {}
+            return job, qid
+        finally:
+            try:
+                self.call("DELETE", job_path, cleanup=True)
+            except Exception as e:  # said in the result; NiFi drops it on its own after its expiration (30 minutes)
+                self.notes.append(f"could not delete the {key} query {qid} on NiFi ({e}); NiFi expires it on its own")
+
+    def provenance(self, request):
+        r = request
+        s0, e0 = parse_iso(r.get("from")), parse_iso(r.get("to"))
+        if not s0 or not e0 or s0 >= e0:
+            raise Refused("from and to are required ISO times, from before to")
+        maximum = r.get("maxResults", PROV_RESULTS_MAX)
+        if not isinstance(maximum, int) or isinstance(maximum, bool) or not 1 <= maximum <= PROV_RESULTS_MAX:
+            raise Refused(f"maxResults is 1 to {PROV_RESULTS_MAX}")
+        uuid, field, value = r.get("uuid"), r.get("field"), r.get("value")
+        if uuid is not None:
+            if not isinstance(uuid, str) or not UUID_RE.match(uuid):
+                raise Refused("uuid is a FlowFile UUID")
+            field, value = "FlowFileUUID", uuid
+        elif not isinstance(field, str) or not isinstance(value, str) or not 1 <= len(value) <= 256:
+            raise Refused("give uuid, or field (a searchable field's id, see search-options) and value (1 to 256 characters)")
+        node = self.node_of(r, False)
+        allowed = {f["id"] for f in self.search_options(r)["fields"]}
+        if field not in allowed:
+            raise Refused(f"{field} is not searchable on this NiFi (it can search {', '.join(sorted(allowed)) or 'nothing'}; nifi.provenance.repository.indexed.fields)")
+        version = (self.call("GET", "flow/about").get("about") or {}).get("version") or ""
+        old = old_terms(version)
+        shift = 0.0
+
+        def body(old_form):
+            req = {"maxResults": maximum, "summarize": True, "incrementalResults": False,
+                   "startDate": nifi_date(s0 - shift), "endDate": nifi_date(e0 - shift),
+                   "searchTerms": {field: value if old_form else {"value": value, "inverse": False}}}
+            if node:
+                req["clusterNodeId"] = node
+            return {"provenance": {"request": req}}
+
+        for attempt in range(2):
+            try:
+                job, qid = self.job("provenance", "provenance", body(old), node)
+            except NifiAnswer as e:
+                # The other form of search terms, once (a version this executor does not know).
+                if e.status != 400 or attempt or "deserialize" not in e.text.lower():
+                    raise
+                old = not old
+                self.notes.append("NiFi took the search terms in the " + ("plain" if old else "{value, inverse}") + " form")
+                job, qid = self.job("provenance", "provenance", body(old), node)
+            results = job.get("results") or {}
+            if isinstance(results.get("timeOffset"), (int, float)) and not isinstance(results.get("timeOffset"), bool):
+                self.offset_ms = results["timeOffset"]
+            # A NiFi 2.x cluster reads the dates back through the zone name it prints ("CST" on nodes in China is taken
+            # for US Central) when it replicates the query to the nodes, and once more when it merges their answers:
+            # the nodes search hours off and the echoed request shows twice that (§15.5). When the echo is off, ask
+            # again with the nodes' share (half of it on a cluster) taken out, and check the echo once more.
+            echoed = nifi_time_ms((job.get("request") or {}).get("startDate"), self.offset_ms)
+            expected = (s0 + (shift if self.cluster else 0)) * 1000
+            off = None if echoed is None else echoed - expected
+            if attempt == 0 and off is not None and abs(off) >= 60_000:
+                shift = off / 1000 / (2 if self.cluster else 1)
+                self.notes.append(f"NiFi read the dates back {round(off / 3600_000, 2):g} h off (its zone name taken for another zone); asked again with {round(shift / 3600, 2):g} h taken out")
+                continue
+            if off is not None and abs(off) >= 60_000:
+                self.notes.append(f"NiFi still reads the dates {round(off / 3600_000, 2):g} h off: the events may not cover the time range asked")
+            break
+        events = [trim_event(e, self.offset_ms) for e in (results.get("provenanceEvents") or [])[:maximum]]
+        events.sort(key=lambda e: (e.get("at") or "", e.get("eventId") or 0))
+        return {"op": "provenance", "query": qid, "nifiVersion": version, "events": events, "total": results.get("totalCount", len(events)),
+                "totalText": results.get("total"), "limit": maximum, "limitReached": len(events) >= maximum, "timeOffset": self.offset_ms,
+                "shiftedHours": round(shift / 3600, 2) if shift else 0, "errors": [str(x)[:300] for x in results.get("errors") or []][:20],
+                "scope": f"node {node}" if node else ("cluster" if self.cluster else "standalone")}
+
+    def lineage(self, request):
+        r = request
+        direction = r.get("direction", "FLOWFILE")
+        if direction not in ("FLOWFILE", "PARENTS", "CHILDREN"):
+            raise Refused("direction is FLOWFILE (a FlowFile's lineage, by uuid), PARENTS or CHILDREN (of an event, by eventId)")
+        node = self.node_of(r, True)
+        req = {"lineageRequestType": direction}
+        if direction == "FLOWFILE":
+            if not isinstance(r.get("uuid"), str) or not UUID_RE.match(r["uuid"]):
+                raise Refused("uuid is a FlowFile UUID")
+            req["uuid"] = r["uuid"]
+        else:
+            eid = r.get("eventId")
+            if not isinstance(eid, int) or isinstance(eid, bool) or eid < 0:
+                raise Refused("eventId is an event's id (a number)")
+            req["eventId"] = eid
+        if node:
+            req["clusterNodeId"] = node
+        job, qid = self.job("provenance/lineage", "lineage", {"lineage": {"request": req}}, node)
+        results = job.get("results") or {}
+        stamp = lambda x: iso_ms(x["millis"]) if isinstance(x.get("millis"), (int, float)) else None  # noqa: E731
+        nodes = [{**{k: n[k] for k in ("id", "type", "flowFileUuid", "eventType", "parentUuids", "childUuids", "clusterNodeIdentifier") if n.get(k) is not None}, "at": stamp(n)}
+                 for n in results.get("nodes") or [] if isinstance(n, dict)]
+        links = [{**{k: x[k] for k in ("sourceId", "targetId", "flowFileUuid") if x.get(k) is not None}, "at": stamp(x)}
+                 for x in results.get("links") or [] if isinstance(x, dict)]
+        # The event nodes' components (lineage gives only the event type): one detail call each, while time is left.
+        enriched, events = 0, [n for n in nodes if n.get("type") == "EVENT"]
+        for n in events:
+            if enriched >= PROV_ENRICH_MAX or self.left() < 2:
+                break
+            try:
+                e = self.call("GET", f"provenance-events/{int(n['id'])}{self.node_query(node)}").get("provenanceEvent") or {}
+            except (NifiAnswer, Failed, ValueError) as err:
+                n["error"] = str(err)[:200]
+                continue
+            n.update({k: e[k] for k in ("componentId", "componentName", "componentType", "relationship", "groupId", "details") if e.get(k) is not None})
+            enriched += 1
+        if enriched < len(events):
+            self.notes.append(f"{len(events) - enriched} of {len(events)} events not given their component (time, errors or the limit of {PROV_ENRICH_MAX})")
+        return {"op": "lineage", "query": qid, "direction": direction, "nodes": nodes, "links": links, "enriched": enriched,
+                "errors": [str(x)[:300] for x in results.get("errors") or []][:20], **({"node": node} if node else {})}
+
+    def event(self, request):
+        eid = request.get("eventId")
+        if not isinstance(eid, int) or isinstance(eid, bool) or eid < 0:
+            raise Refused("eventId is an event's id (a number)")
+        node = self.node_of(request, True)
+        try:
+            e = self.call("GET", f"provenance-events/{eid}{self.node_query(node)}").get("provenanceEvent")
+        except NifiAnswer as err:
+            if err.status == 404:
+                raise Refused(f"NiFi has no provenance event {eid}" + (f" on node {node}" if node else "") + " (or it aged out of the repository)")
+            raise
+        if not isinstance(e, dict) or e.get("eventId") != eid:
+            raise Failed("NiFi's answer is not that event")
+        offset = self.offset_ms
+        if offset is None:
+            m = NIFI_TIME.match(e.get("eventTime") or "")
+            offset = local_offset_ms(m.group(8)) if m else None
+        out = trim_event(e, offset)
+        attrs = e.get("attributes")
+        if isinstance(attrs, list):
+            out["attributes"] = [{"name": str(a.get("name"))[:256], **({"value": str(a["value"])[:PROV_VALUE_MAX]} if a.get("value") is not None else {}),
+                                  **({"previousValue": str(a["previousValue"])[:PROV_VALUE_MAX]} if a.get("previousValue") is not None else {})}
+                                 for a in attrs[:PROV_ATTRS_MAX] if isinstance(a, dict)]
+        else:
+            out["attributesHidden"] = True  # NiFi shows attributes only to identities that may view the data (§15.5)
+        return {"op": "event", "event": out, "timeOffset": offset, **({"node": node} if node else {})}
+
+
 class ServiceExecutor(ProtocolExecutor):
     """The service executor: the read channel, and executor-upgrade on the change channel."""
 
@@ -1406,11 +1721,13 @@ class ServiceExecutor(ProtocolExecutor):
     MAIN = "service_executor.py"
     EXECUTOR = "service"
     # Read jobs: kind -> method(job) returning the job's result (a dict).
-    READ_JOBS = {"svc-discover": "discover", "svc-read": "read_files", "log-read": "log_read", "log-tail": "log_tail"}
+    READ_JOBS = {"svc-discover": "discover", "svc-read": "read_files", "log-read": "log_read", "log-tail": "log_tail",
+                 "nifi-provenance": "nifi_provenance"}
     # What the read jobs can do beyond their first form, named "<kind>@<n>" in the heartbeat's kinds (§15.2): the
     # Deployer looks for one before it sends a request that needs it. svc-discover@2: dirs entries {install, conf};
     # svc-read@2: confDir (and bootstrapFile), an installation's conf directory kept apart from it (S25).
-    CAPABILITIES = ["svc-discover@2", "svc-read@2"]
+    # nifi-provenance@1: provenance, lineage, event and search-options as ProvenanceQuery reads them (S28).
+    CAPABILITIES = ["svc-discover@2", "svc-read@2", "nifi-provenance@1"]
     # Where discovery looks (tests point these elsewhere; the directories scanned are the configuration's scan_dirs).
     PROC = "/proc"
     AUTOSTART_DIRS = AUTOSTART_DIRS
@@ -1830,6 +2147,56 @@ class ServiceExecutor(ProtocolExecutor):
                     "stopped": state["stopped"]}
         finally:
             f.close()
+
+    # --- provenance (S28, §9.5) ---
+
+    def nifi_call(self, w, props):
+        """(call(method, path, body, timeout) -> (status, bytes), whether it is a cluster node) for a watched NiFi's
+        REST API with the monitor certificate, the TLS name and Host header as the collector uses them."""
+        ctx, why_not = nifi_context(self.cfg)
+        if ctx is None:
+            raise Failed(f"provenance needs the monitor certificate: {why_not}")
+        target = nifi_target(w, props)
+        if not target:
+            raise Failed("nifi.web.https.port is not set: provenance is only read over HTTPS")
+        connect, sni, port = target
+
+        def call(method, path, body, timeout):
+            conn = SniConnection(connect, port, sni, ctx, timeout)
+            try:
+                data = json.dumps(body).encode() if body is not None else None
+                conn.request(method, f"/nifi-api/{path}", body=data, headers={"Host": f"{sni}:{port}", "Accept": "application/json", "User-Agent": f"{PACKAGE}/{VERSION}",
+                                                                          **({"Content-Type": "application/json"} if data is not None else {})})
+                r = conn.getresponse()
+                return r.status, r.read(PROV_BYTES + 1)
+            finally:
+                conn.close()
+        return call, props.get("nifi.cluster.is.node", "false").strip().lower() == "true"
+
+    def nifi_provenance(self, job):
+        """nifi-provenance (S28): request.member (a watched installation) and request.op (ProvenanceQuery: provenance,
+        lineage, event, search-options) with its parameters; request.timeOffset (ms) is the NiFi zone's offset when the
+        Deployer knows it from an earlier search. At most 100 events, 4 MiB per answer, 30 seconds; NiFi's queries are
+        deleted when done. The answer goes over the content channel (attributes may hold anything); the status has counts."""
+        r = job.request
+        with self.watch_lock:
+            w = next((x for x in self.watch or [] if x["member"] == r.get("member")), None)
+        if w is None:
+            raise Refused("member is not an installation this executor watches")
+        where = Discovery.layout(w["installDir"], conf=w["confDir"])
+        try:
+            props = read_properties(where["propertiesFile"])
+        except OSError as e:
+            raise Failed(f"cannot read {where['propertiesFile']}: {e.strerror or e}")
+        call, cluster = self.nifi_call(w, props)
+        offset = r.get("timeOffset")
+        q = ProvenanceQuery(call, time.monotonic() + min(PROV_SECONDS, max(1.0, job.left() - 3)), cluster,
+                            offset_ms=offset if isinstance(offset, int) and not isinstance(offset, bool) and abs(offset) <= 18 * 3600_000 else None)
+        out = q.run(r)
+        self.api.put_content(job.id, json.dumps(out).encode())
+        counts = {k: len(out[k]) for k in ("events", "nodes", "links", "fields") if isinstance(out.get(k), list)}
+        job.log(f"{r.get('op')}: " + (", ".join(f"{v} {k}" for k, v in counts.items()) or "1 event") + (f" ({'; '.join(out['notes'])})" if out.get("notes") else ""))
+        return {"op": r.get("op"), **counts, **({"notes": out["notes"]} if out.get("notes") else {})}
 
     def beat_body(self, busy):
         body = super().beat_body(busy)

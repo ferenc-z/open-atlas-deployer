@@ -129,14 +129,29 @@ executors; `EXECUTOR_VERSION` with it).
   Overview (`PUT /api/services/:id/nginx`; operations put every node behind it, nginx holds the NiFi client
   certificate); the Deployer checks `/flow/about` through it and shows the result. The Deployer writes the graph
   (`services/graph.ts`): per service an `api` source at `<nginx>/nifi-api` (GET only, 2 at a time, 5 s, no retries)
-  and a `nifi` source for provenance; entities per service `nifi.<service>.*` (flow controller, nodes and their JVMs,
-  process groups one level at a time, processors, connections, bulletins, provenance events). It is published through
+  only (Studio 2.11 removed the `nifi` source type; provenance is the Deployer's own, below); entities per service
+  `nifi.<service>.*` (flow controller, nodes and their JVMs, process groups one level at a time, processors,
+  connections, bulletins). It is published through
   the studio-graph path (sources declared, the graph made the first time, uploaded, published) after a takeover and
   an nginx address change, into `DEPLOYER_NIFI_OPS_GRAPH` (default `nifi-ops`); every run is recorded
   (`GET /api/services/graph`, `POST /api/services/graph/publish`). One graph serves 1.x and 2.x (checked against
-  responses recorded from 1.12.1 and a 2.5.0 cluster, `testdata/nifi-graph`). A Studio that cannot take the `nifi`
-  source still gets the monitoring half. `bin/publish-assistant.ts` with `NIFI_OPS_MCP_URL` adds the graph's read
+  responses recorded from 1.12.1 and a 2.5.0 cluster, `testdata/nifi-graph`). `bin/publish-assistant.ts` with `NIFI_OPS_MCP_URL` adds the graph's read
   tools to the Deploy Assistant.
+- FlowFile trace (S28, §9.5): the service executor's new read job `nifi-provenance` (heartbeat `nifi-provenance@1`)
+  reads a watched NiFi's provenance with the monitor certificate — events of a FlowFile UUID or a searchable field
+  in a time range, a lineage (an event's parents and children too), one event, the searchable fields; NiFi's queries
+  are submitted, polled and always deleted, at most 100 events, 4 MiB per answer, 30 seconds; never replay, content
+  or a flow change. A cluster is searched as a whole through one node (the next member if that one fails); lineage and
+  events go to the event's node. NiFi before 1.14 takes plain search terms; a 2.x cluster in a zone printed as "CST"
+  runs the dates hours off on replication, which the executor detects from the echoed request and corrects.
+  `GET /api/services/:id/provenance` (support and members), `…/provenance/options`, `POST …/provenance` (time range
+  required), `POST …/lineage`, `GET …/provenance/events/:eventId` (deploy-viewer; two queries per service at a
+  time). A **FlowFile trace** tab: search, events by time with component and relationship, lineage, event details,
+  the logs and bulletins around an event; versions other than 1.12+ and 2.x are marked not supported. MCP read-only
+  tools `search_provenance`, `get_lineage`, `get_provenance_event` (attributes with secret-looking names and every
+  text redacted), allowed for the Deploy Assistant and in its NiFi skill. The monitor certificate's identity needs
+  "query provenance" and "view provenance" on the flow (`lab.sh grant` gives them in the lab; `grant.py` takes
+  `@root` for the root process group).
 
 **Known limits**
 - Alerts are not pushed (S13).
