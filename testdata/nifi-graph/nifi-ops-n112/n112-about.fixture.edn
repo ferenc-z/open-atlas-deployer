@@ -1,0 +1,31 @@
+{:api-kit/version 1,
+ :api-kit/provenance
+ {:connector-version "v1",
+  :contract "api-v1",
+  :operation "n112-about",
+  :recorded-at "2026-11-07T12:43:45.143876073Z",
+  :redaction-rules "sha256:42a9eedc68fc808a",
+  :source "nifi-ops-n112"},
+ :api-kit/samples [{}],
+ :api-kit/rules
+ {:detectors [:email :jwt :bearer :api-key-prefix :private-key :unresolved-var :high-entropy],
+  :keep-paths [["timezone"] ["version"]],
+  :max-string 64,
+  :secret-paths []},
+ :api-kit/exchanges
+ [{:method "GET",
+   :endpoint "/flow/about",
+   :query-param-names [],
+   :body-param-names [],
+   :match {:method "GET", :path "/nifi-api/flow/about", :query {}},
+   :status 200,
+   :headers {"Content-Type" "application/json"},
+   :body
+   {:about
+    {:buildTag "nifi-1.12.1-RC2",
+     :buildTimestamp "09/23/2020 14:27:38 CST",
+     :contentViewerUrl "../nifi-content-viewer/",
+     :timezone "CST",
+     :title "NiFi",
+     :uri "https://localhost/nifi-api/",
+     :version "1.12.1"}}}]}

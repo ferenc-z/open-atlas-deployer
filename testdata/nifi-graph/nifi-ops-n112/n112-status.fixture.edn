@@ -1,0 +1,47 @@
+{:api-kit/version 1,
+ :api-kit/provenance
+ {:connector-version "v1",
+  :contract "api-v1",
+  :operation "n112-status",
+  :recorded-at "2026-11-07T12:43:45.507216059Z",
+  :redaction-rules "sha256:f5d269b8c9b77220",
+  :source "nifi-ops-n112"},
+ :api-kit/samples [{}],
+ :api-kit/rules
+ {:detectors [:email :jwt :bearer :api-key-prefix :private-key :unresolved-var :high-entropy],
+  :keep-paths
+  [["activeThreadCount"]
+   ["bytesQueued"]
+   ["disabledCount"]
+   ["flowFilesQueued"]
+   ["invalidCount"]
+   ["runningCount"]
+   ["stoppedCount"]],
+  :max-string 64,
+  :secret-paths []},
+ :api-kit/exchanges
+ [{:method "GET",
+   :endpoint "/flow/status",
+   :query-param-names [],
+   :body-param-names [],
+   :match {:method "GET", :path "/nifi-api/flow/status", :query {}},
+   :status 200,
+   :headers {"Content-Type" "application/json"},
+   :body
+   {:controllerStatus
+    {:activeRemotePortCount 0,
+     :activeThreadCount 0,
+     :bytesQueued 2048,
+     :disabledCount 0,
+     :flowFilesQueued 2,
+     :inactiveRemotePortCount 0,
+     :invalidCount 0,
+     :locallyModifiedAndStaleCount 0,
+     :locallyModifiedCount 0,
+     :queued "2 / 2 KB",
+     :runningCount 0,
+     :staleCount 0,
+     :stoppedCount 2,
+     :syncFailureCount 0,
+     :terminatedThreadCount 0,
+     :upToDateCount 0}}}]}

@@ -5,7 +5,7 @@
 // A cluster's node connections come from the coordinator's view (/controller/cluster is complete only there).
 
 import type { ExecutorInfo } from "../handoff.ts";
-import type { Point, ServiceCert, Store } from "../store.ts";
+import type { NginxCheck, Point, ServiceCert, Store } from "../store.ts";
 import { confDirOf, installKey, type DraftItem, type ServiceMember, type ServicePorts } from "./draft.ts";
 import { discoveredKey, type Finding } from "./assess.ts";
 import { ownNode } from "./metrics.ts";
@@ -72,6 +72,9 @@ export interface ServiceStatus {
   profile: string;
   version: string;
   webUrl: string | null;
+  /** Phase 2 step 6: where operations put it behind nginx (the nifi-ops graph) and the last check through it. */
+  nginxUrl: string | null;
+  nginxCheck: NginxCheck | null;
   zookeeper?: string | null;
   zookeeperRoot?: string | null;
   environment: string;
@@ -193,7 +196,7 @@ export function serviceStatus(store: Store, executor: (host: string) => Executor
   const open = store.serviceAlerts({ service: item.id, state: "open" });
   const asOfs = statuses.map((m) => m.asOf).filter((a): a is string => Boolean(a)).sort();
   return {
-    id: item.id, kind: item.kind, service: item.service, profile: item.profile, version: item.version, webUrl: item.webUrl,
+    id: item.id, kind: item.kind, service: item.service, profile: item.profile, version: item.version, webUrl: item.webUrl, nginxUrl: item.nginxUrl ?? null, nginxCheck: item.nginxCheck ?? null,
     ...(c ? { zookeeper: c.zookeeper, zookeeperRoot: c.zookeeperRoot } : {}),
     environment: item.environment, draft: item.draft, createdAt: item.createdAt, createdBy: item.createdBy,
     configRevision: revisions[0]?.revision ?? null,

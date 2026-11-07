@@ -44,6 +44,7 @@ export const SETTINGS: SettingDef[] = [
   { key: "DEPLOYER_OMA_BUILDER_KEY_FILE", kind: "secret", group: "OMA", help: "The key for OMA's Builder MCP." },
   { key: "DEPLOYER_STUDIO_BUILDER_URL", kind: "url", group: "Studio", help: "Studio's Builder MCP, for deploying Studio graphs." },
   { key: "DEPLOYER_STUDIO_TOKEN_FILE", kind: "secret", group: "Studio", help: "Studio workspace token (oaw_v1., read and write)." },
+  { key: "DEPLOYER_NIFI_OPS_GRAPH", kind: "text", group: "Studio", help: "The Studio graph the Deployer publishes its NiFi services to (name, or workspace/name).", default: "nifi-ops" },
   { key: "DEPLOYER_UAT_URL", kind: "url", group: "Promotion", help: "PROD only: UAT's Deployer as this one reaches it." },
   { key: "DEPLOYER_UAT_KEY_FILE", kind: "secret", group: "Promotion", help: "PROD only: the read-only key UAT's Deployer gave this one." },
   { key: "DEPLOYER_BRIEF_HOUR", kind: "hour", group: "Daily brief", help: "The daily brief is made after this hour, server time (0-23).", default: "8" },

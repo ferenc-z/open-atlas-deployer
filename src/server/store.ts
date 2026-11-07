@@ -143,6 +143,9 @@ CREATE TABLE IF NOT EXISTS service_log_counts (
   service TEXT NOT NULL, member TEXT NOT NULL, pattern TEXT NOT NULL, bucket TEXT NOT NULL, count INTEGER NOT NULL,
   PRIMARY KEY (service, member, pattern, bucket));
 CREATE INDEX IF NOT EXISTS service_log_counts_at ON service_log_counts (service, bucket);
+CREATE TABLE IF NOT EXISTS service_graph_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, by TEXT NOT NULL, reason TEXT NOT NULL, graph TEXT, services TEXT NOT NULL,
+  state TEXT NOT NULL, message TEXT NOT NULL, detail TEXT);
 `;
 
 /** queued: waiting for the host's executor to claim it; the rest are the executor's states. */
@@ -289,6 +292,11 @@ export class Store {
     }
     // Phase 2 step 2: each sample's flat numbers (the Metrics tab, the rollups), next to step 1's raw body.
     if (!(this.db.prepare("PRAGMA table_info(service_samples)").all() as Row[]).some((c) => c.name === "point")) this.db.exec("ALTER TABLE service_samples ADD COLUMN point TEXT");
+    // Phase 2 step 6: the nginx address operations put a service behind (Studio's nifi-ops graph) and its last check.
+    for (const table of ["service_standalones", "service_clusters"]) {
+      const have = (this.db.prepare(`PRAGMA table_info(${table})`).all() as Row[]).map((c) => c.name);
+      for (const column of ["nginx_url", "nginx_check"]) if (!have.includes(column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} TEXT`);
+    }
     // Phase 2 step 3: services registered before the timeline get their takeover and imported configurations on it.
     this.db.exec(`INSERT INTO service_events (service, member, at, kind, detail)
       SELECT id, NULL, created_at, 'taken-over', json_object('text', 'Taken over' || CASE WHEN draft IS NULL THEN '' ELSE ' from draft ' || draft END, 'by', created_by)
@@ -1056,16 +1064,18 @@ export class Store {
     return { host: r.host, installDir: r.install_dir, confDir: r.conf_dir ?? confDirOf({ installDir: r.install_dir }), serviceUser: r.service_user ?? null, startEnvironment: parse(r.start_env), ports: JSON.parse(r.ports), ...(r.node_address !== undefined ? { nodeAddress: r.node_address ?? null } : {}), discovery: parse(r.discovery), ...(r.control ? { control: r.control } : {}) };
   }
 
-  standalones(): (DraftStandalone & { environment: string; draft: string | null; createdAt: string; createdBy: string })[] {
+  standalones(): (DraftStandalone & Registered)[] {
     return (this.db.prepare("SELECT * FROM service_standalones WHERE removed_at IS NULL ORDER BY id").all() as Row[]).map((r) => ({
       kind: "standalone", id: r.id, service: r.service, profile: r.profile, version: r.version, webUrl: r.web_url ?? null, member: this.toMember(r),
+      nginxUrl: r.nginx_url ?? null, nginxCheck: parse(r.nginx_check ?? null),
       environment: r.environment, draft: r.draft ?? null, createdAt: r.created_at, createdBy: r.created_by,
     }));
   }
 
-  clusters(): (DraftCluster & { environment: string; draft: string | null; createdAt: string; createdBy: string })[] {
+  clusters(): (DraftCluster & Registered)[] {
     return (this.db.prepare("SELECT * FROM service_clusters WHERE removed_at IS NULL ORDER BY id").all() as Row[]).map((r) => ({
       kind: "cluster", id: r.id, service: r.service, profile: r.profile, version: r.version, webUrl: r.web_url ?? null, zookeeper: r.zookeeper ?? null, zookeeperRoot: r.zookeeper_root ?? null,
+      nginxUrl: r.nginx_url ?? null, nginxCheck: parse(r.nginx_check ?? null),
       nodes: (this.db.prepare("SELECT * FROM service_nodes WHERE cluster = ? AND removed_at IS NULL ORDER BY host, install_dir").all(r.id) as Row[]).map((n) => this.toMember(n)),
       environment: r.environment, draft: r.draft ?? null, createdAt: r.created_at, createdBy: r.created_by,
     }));
@@ -1290,6 +1300,33 @@ export class Store {
     this.db.prepare("INSERT OR REPLACE INTO service_facts (service, member, key, value, at) VALUES (?, ?, ?, ?, ?)").run(service, member, key, value, this.stamp());
   }
 
+  /** Sets (or with null clears) the nginx address of a standalone instance or cluster: audited, on the timeline. */
+  setServiceNginxUrl(service: string, url: string | null, actor: Actor) {
+    this.inTransaction(() => {
+      const was = (this.db.prepare("SELECT nginx_url FROM service_standalones WHERE id = ?1 AND removed_at IS NULL UNION ALL SELECT nginx_url FROM service_clusters WHERE id = ?1 AND removed_at IS NULL").get(service) as Row | undefined);
+      if (!was) throw new StoreError("service/unknown", `No standalone instance or cluster ${service}.`);
+      for (const table of ["service_standalones", "service_clusters"]) this.db.prepare(`UPDATE ${table} SET nginx_url = ?, nginx_check = NULL WHERE id = ? AND removed_at IS NULL`).run(url, service);
+      this.insertAudit(actor, "service.nginx-url", service, { from: was.nginx_url ?? null, to: url });
+      this.insertServiceEvent({ service, member: null, at: this.stamp(), kind: "nginx-url", detail: { text: url ? `nginx address set to ${url}` : "nginx address removed", by: actor.id } });
+    });
+  }
+
+  /** The last check of a service's nginx address (GET /flow/about through it). */
+  setServiceNginxCheck(service: string, check: NginxCheck) {
+    for (const table of ["service_standalones", "service_clusters"]) this.db.prepare(`UPDATE ${table} SET nginx_check = ? WHERE id = ? AND removed_at IS NULL`).run(JSON.stringify(check), service);
+  }
+
+  /** Records one generation and publication of the nifi-ops graph (services/graph.ts). */
+  addGraphRun(run: Omit<GraphRun, "id">): number {
+    return Number(this.db.prepare("INSERT INTO service_graph_runs (at, by, reason, graph, services, state, message, detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(run.at, run.by, run.reason, run.graph, JSON.stringify(run.services), run.state, run.message, JSON.stringify(run.detail)).lastInsertRowid);
+  }
+
+  graphRuns(limit = 20): GraphRun[] {
+    return (this.db.prepare("SELECT * FROM service_graph_runs ORDER BY id DESC LIMIT ?").all(limit) as Row[])
+      .map((r) => ({ id: r.id, at: r.at, by: r.by, reason: r.reason, graph: r.graph ?? null, services: JSON.parse(r.services), state: r.state, message: r.message, detail: parse(r.detail) ?? {} }));
+  }
+
   /** A service's threshold overrides (the profile's defaults apply to the rest). */
   serviceThresholds(service: string): Record<string, number> {
     const r = this.db.prepare("SELECT thresholds FROM service_standalones WHERE id = ?1 AND removed_at IS NULL UNION ALL SELECT thresholds FROM service_clusters WHERE id = ?1 AND removed_at IS NULL").get(service) as Row | undefined;
@@ -1310,6 +1347,12 @@ export class Store {
     });
   }
 }
+
+/** What a registered standalone instance or cluster carries besides its draft shape. */
+export interface Registered { environment: string; draft: string | null; createdAt: string; createdBy: string; nginxUrl: string | null; nginxCheck: NginxCheck | null }
+/** GET /flow/about through a service's nginx address, as the Deployer last tried it. */
+export interface NginxCheck { url: string; at: string; ok: boolean; status: number | null; version: string | null; ms: number | null; error: string | null }
+export interface GraphRun { id: number; at: string; by: string; reason: string; graph: string | null; services: string[]; state: "published" | "failed" | "skipped"; message: string; detail: Record<string, unknown> }
 
 export type AlertLevel = "WARN" | "CRIT";
 export interface ServiceAlert { id: number; service: string; member: string; rule: string; level: AlertLevel; state: "open" | "resolved"; openedAt: string; resolvedAt: string | null; updatedAt: string; detail: Record<string, unknown> }

@@ -50,7 +50,7 @@ Node 22.18 起直接运行 `.ts`（类型剥离），服务端不需要构建；
 | `DEPLOYER_PEER_KEY_SHA256` | 无 | UAT 设：PROD 的 Deployer 所持只读 key 的 SHA-256（可多个，空格分隔）；不设就没有 `/api/peer/*` |
 | `DEPLOYER_UAT_URL` / `DEPLOYER_UAT_KEY_FILE` | 无 | PROD 设：UAT 的 Deployer 地址（含 base path，如 `http://uat-host:8095/deploy`），以及存只读 key 的文件（600）。key 用 `node bin/peer-key.ts` 生成 |
 | `DEPLOYER_WORKBENCH_API_KEY_FILE` | 无 | Workbench Administration → API keys 里的一把 key（文件 600），`workbench-app`、`oma-agent` 用它装应用包、把 Business Agent 指向新 agent；个人 key、维护提示、Setup 的检查也用它。也可以不设，在 Setup 页贴入（加密存进状态库）；两者都有时以文件为准 |
-| `DEPLOYER_STUDIO_BUILDER_URL` / `DEPLOYER_STUDIO_TOKEN_FILE` | 无 | Studio Builder MCP（如 `https://studio:9631/mcp`）和 workspace token（`oaw_v1.`，read + write），给 `studio-graph`。Studio 是自签证书时用 `NODE_EXTRA_CA_CERTS` 指向它的证书 |
+| `DEPLOYER_STUDIO_BUILDER_URL` / `DEPLOYER_STUDIO_TOKEN_FILE` | 无 | Studio Builder MCP（如 `https://studio:9631/mcp`）和 workspace token（`oaw_v1.`，read + write），给 `studio-graph`，也用来发布受管 NiFi 的 `nifi-ops` 图（`DEPLOYER_NIFI_OPS_GRAPH`，默认 `nifi-ops`）。Studio 是自签证书时用 `NODE_EXTRA_CA_CERTS` 指向它的证书 |
 | `DEPLOYER_OMA_BUILDER_URL` / `DEPLOYER_OMA_BUILDER_KEY_FILE` | 无 | OMA Builder MCP 和它的 `BUILDER_MCP_API_KEY`，给 `oma-agent` |
 | `DEPLOYER_OMA_URL` / `DEPLOYER_OMA_API_KEY_FILE` | 无 | 可选：OMA 的 API 和 key，发布后归档更早的同名 agent；不设就不归档 |
 | `DEPLOYER_OMA_APPLICATION_ID` / `DEPLOYER_OMA_AGENT` / `DEPLOYER_OMA_ENVIRONMENT` / `DEPLOYER_OMA_VAULTS` | 无 | 接法 B：Deployer 自己开 OMA Session（失败诊断）用的 Application、Agent（Deploy Assistant 的 agent id）、Environment、Vault（放只读服务 key）。配了 `DEPLOYER_OMA_URL`、`DEPLOYER_OMA_API_KEY_FILE`、`DEPLOYER_OMA_AGENT` 才诊断 |
@@ -447,6 +447,7 @@ node bin/publish-assistant.ts <OMA Builder MCP 地址> <builder key 文件> <模
 ```
 
   打印新的 agent id；把 Workbench 的 Business Agent "Deploy Assistant" 指向它，并设为 `DEPLOYER_OMA_AGENT`。OMA Vault 里按 MCP 地址存服务 key。
+  要让助手下钻到 NiFi 组件，加环境变量 `NIFI_OPS_MCP_URL=<Studio 数据面>/mcp/<nifi-ops 图的 uuid>`，包里会多一个 MCP 服务器（只读的六个工具）；OMA Vault 里按这个地址存该图的只读 graph token（`oat_v1.`）。
 - 用例：[docs/golden-cases.md](docs/golden-cases.md)（读、卡片、越权）。
 
 ### 部署失败后的自动诊断（接法 B，D24）

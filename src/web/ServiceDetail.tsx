@@ -9,10 +9,11 @@ import type { Field, MemberStatus, MetricsView, Range, ServiceBulletin, ServiceC
 import { LineChart, type Series } from "./Charts.tsx";
 import { ServiceConfig } from "./ServiceConfig.tsx";
 import { Logs } from "./Logs.tsx";
+import { NginxAddress } from "./Nginx.tsx";
 import { AlertBadge, EventsAndAlerts, OpenAlerts, Timeline } from "./Alerts.tsx";
 import { ago, CertBadge, certTone, ConfCell, daysLeft, daysText, fmtBytes, fmtNumber, memberKey, serviceName, SEVERITY, STATE, StatusNotes, UpBadge, webPort, when } from "./svc.tsx";
 
-type Loaded = { s: ServiceStatus; cfg: ServiceConfigView | null | undefined };
+type Loaded = { s: ServiceStatus; cfg: ServiceConfigView | null | undefined; reload: () => void };
 type Tab = { id: string; label: string; shown: (l: Loaded) => boolean; render: (l: Loaded) => ReactNode };
 
 const TABS: Tab[] = [
@@ -38,7 +39,7 @@ export function ServiceDetail({ id, onBack }: { id: string; onBack: () => void }
   const back = <button className="link" onClick={onBack}>← Services</button>;
   if (!s) return <>{back}{error ? <p className="error">{error}</p> : <p className="muted">Loading…</p>}</>;
   const cluster = s.kind === "cluster";
-  const loaded = { s, cfg };
+  const loaded = { s, cfg, reload: load };
   const tabs = TABS.filter((t) => t.shown(loaded));
   const current = tabs.find((t) => t.id === tab) ?? tabs[0]!;
   const f = s.summary.findings;
@@ -90,7 +91,7 @@ function StateBadge({ m }: { m: MemberStatus }) {
 }
 
 // Overview: key numbers, the nodes, certificates, what the takeover found, the newest bulletins, the timeline.
-function Overview({ s }: Loaded) {
+function Overview({ s, reload }: Loaded) {
   const cluster = s.kind === "cluster";
   const [bulletins, setBulletins] = useState<ServiceBulletin[] | undefined>();
   useEffect(() => { api.serviceBulletins(s.id, 10).then((r) => setBulletins(r.bulletins), () => setBulletins([])); }, [s.id, s.summary.asOf]);
@@ -127,6 +128,7 @@ function Overview({ s }: Loaded) {
         </table>
       </div>
       <Certificates s={s} />
+      <NginxAddress s={s} onChanged={reload} />
       {s.findings.length > 0 && <div>
         <h3>Found at takeover</h3>
         <ul className="findings card">{s.findings.map((f, i) => (

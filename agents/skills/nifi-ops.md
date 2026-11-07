@@ -21,7 +21,11 @@ How to look into the NiFi clusters and standalone instances the Deployer manages
 ## The overall picture first, then drill down (design §9.4)
 
 - "How is it doing / 整体怎么样", "which cluster has the worst queue / 哪个集群积压最严重": answer from the Deployer's **samples**: `list_service_clusters`, `get_cluster_status`, `list_alerts`, `get_metrics` (fields `queuedCount`, `bpFull`, `bpMaxPct`, `heapPct`, `repoContentPct`, `diskPct`). They are at most a minute or two old and cost NiFi nothing.
-- Only when the question is about **one component** (a queue, a processor, a process group, a provenance event) go further: through Studio's `nifi-ops` Graph, when you have that tool. Without it, say the Deployer does not show components yet and name what the samples do show (e.g. how many connections are at back pressure and the fullest one's percentage).
+- Only when the question is about **one component** (a queue, a processor, a process group, a provenance event) go further: through Studio's `nifi-ops` graph, the `mcp__open-atlas-nifi-ops__*` tools. Each service has its own entities, `nifi.<service>.<object>` (e.g. `nifi.n112.processor`, `nifi.prod-c1.connection`); `list_entities` shows them. Then `execute_eql`:
+  - the flow controller (no input): `[:nifi.<s>.controller/queued-count :nifi.<s>.controller/running :nifi.<s>.controller/invalid]`;
+  - one process group, one level at a time, `"root"` for the top, named by an ident join: `[{[:nifi.<s>.pg/id "root"] [:nifi.<s>.pg/name {:nifi.<s>.pg/groups [:nifi.<s>.pg/id :nifi.<s>.pg/name :nifi.<s>.pg/queued-count]} {:nifi.<s>.pg/connections [:nifi.<s>.connection/name :nifi.<s>.connection/queued-count :nifi.<s>.connection/percent-use-count]} {:nifi.<s>.pg/processors [:nifi.<s>.processor/name :nifi.<s>.processor/run-status]}]}]`, then the child group's id to go down;
+  - cluster nodes `{:nifi.<s>.node/all [...]}`, each node's JVM and disks `{:nifi.<s>.jvm/nodes [...]}` (a standalone's are on the controller), the bulletin board `{:nifi.<s>.bulletin/recent [...]}`.
+  Each call goes to NiFi through nginx (two at a time, 5 seconds): walk down from the group the samples or bulletins point at, not the whole flow. Times are in NiFi's time zone (`controller/timezone`). Without these tools (the package was published without the graph), say the Deployer does not show components and name what the samples do show (e.g. how many connections are at back pressure and the fullest one's percentage).
 - Never query NiFi component by component to answer an overall question.
 
 ## Typical investigations

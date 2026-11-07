@@ -1,0 +1,180 @@
+{:api-kit/version 1,
+ :api-kit/provenance
+ {:connector-version "v1",
+  :contract "api-v1",
+  :operation "nifi-lab-c250-bulletins",
+  :recorded-at "2026-11-07T12:43:45.628023662Z",
+  :redaction-rules "sha256:9852e6257a7f229a",
+  :source "nifi-ops-nifi-lab-c250"},
+ :api-kit/samples [{}],
+ :api-kit/rules
+ {:detectors [:email :jwt :bearer :api-key-prefix :private-key :unresolved-var :high-entropy],
+  :keep-paths
+  [["id"]
+   ["nodeAddress"]
+   ["timestamp"]
+   ["bulletin" "category"]
+   ["bulletin" "groupId"]
+   ["bulletin" "level"]
+   ["bulletin" "message"]
+   ["bulletin" "sourceId"]
+   ["bulletin" "sourceName"]
+   ["bulletin" "sourceType"]],
+  :max-string 64,
+  :secret-paths []},
+ :api-kit/exchanges
+ [{:method "GET",
+   :endpoint "/flow/bulletin-board",
+   :query-param-names ["limit"],
+   :body-param-names [],
+   :match {:method "GET", :path "/nifi-api/flow/bulletin-board", :query {"limit" "50"}},
+   :status 200,
+   :headers {"Content-Type" "application/json"},
+   :body
+   {:bulletinBoard
+    {:bulletins
+     [{:bulletin
+       {:category "Cluster Coordinator",
+        :id 10,
+        :level "INFO",
+        :message "<len:67>",
+        :nodeAddress "localhost:18445",
+        :sourceType "FLOW_CONTROLLER",
+        :timestamp "20:40:34 CST"},
+       :canRead true,
+       :id 10,
+       :nodeAddress "localhost:18445",
+       :timestamp "20:40:34 CST"}
+      {:bulletin
+       {:category "Clustering",
+        :id 6,
+        :level "INFO",
+        :message "<len:146>",
+        :nodeAddress "localhost:18445",
+        :sourceType "FLOW_CONTROLLER",
+        :timestamp "20:40:34 CST"},
+       :canRead true,
+       :id 6,
+       :nodeAddress "localhost:18445",
+       :timestamp "20:40:34 CST"}
+      {:bulletin
+       {:category "Clustering",
+        :id 7,
+        :level "INFO",
+        :message "<len:77>",
+        :nodeAddress "localhost:18445",
+        :sourceType "FLOW_CONTROLLER",
+        :timestamp "20:40:34 CST"},
+       :canRead true,
+       :id 7,
+       :nodeAddress "localhost:18445",
+       :timestamp "20:40:34 CST"}
+      {:bulletin
+       {:category "Clustering",
+        :id 8,
+        :level "INFO",
+        :message "<len:146>",
+        :nodeAddress "localhost:18445",
+        :sourceType "FLOW_CONTROLLER",
+        :timestamp "20:40:34 CST"},
+       :canRead true,
+       :id 8,
+       :nodeAddress "localhost:18445",
+       :timestamp "20:40:34 CST"}
+      {:bulletin
+       {:category "Clustering",
+        :id 9,
+        :level "INFO",
+        :message "<len:77>",
+        :nodeAddress "localhost:18445",
+        :sourceType "FLOW_CONTROLLER",
+        :timestamp "20:40:34 CST"},
+       :canRead true,
+       :id 9,
+       :nodeAddress "localhost:18445",
+       :timestamp "20:40:34 CST"}
+      {:bulletin
+       {:category "Cluster Coordinator",
+        :id 0,
+        :level "INFO",
+        :message "localhost:11446 has been elected Active Cluster Coordinator",
+        :nodeAddress "localhost:18446",
+        :sourceType "FLOW_CONTROLLER",
+        :timestamp "20:40:34 CST"},
+       :canRead true,
+       :id 0,
+       :nodeAddress "localhost:18446",
+       :timestamp "20:40:34 CST"}
+      {:bulletin
+       {:category "Primary Node",
+        :id 3,
+        :level "INFO",
+        :message "This node is no longer Primary Node",
+        :nodeAddress "All Nodes",
+        :sourceType "FLOW_CONTROLLER",
+        :timestamp "20:40:35 CST"},
+       :canRead true,
+       :id 3,
+       :nodeAddress "All Nodes",
+       :timestamp "20:40:35 CST"}
+      {:bulletin
+       {:category "Cluster Coordinator",
+        :id 2,
+        :level "INFO",
+        :message "<len:67>",
+        :nodeAddress "localhost:18446",
+        :sourceType "FLOW_CONTROLLER",
+        :timestamp "20:40:35 CST"},
+       :canRead true,
+       :id 2,
+       :nodeAddress "localhost:18446",
+       :timestamp "20:40:35 CST"}
+      {:bulletin
+       {:category "Primary Node",
+        :id 13,
+        :level "INFO",
+        :message "This node has been elected Primary Node",
+        :nodeAddress "All Nodes",
+        :sourceType "FLOW_CONTROLLER",
+        :timestamp "20:41:41 CST"},
+       :canRead true,
+       :id 13,
+       :nodeAddress "All Nodes",
+       :timestamp "20:41:41 CST"}
+      {:bulletin
+       {:category "Cluster Coordinator",
+        :id 12,
+        :level "INFO",
+        :message "localhost:11445 has been elected Active Cluster Coordinator",
+        :nodeAddress "localhost:18445",
+        :sourceType "FLOW_CONTROLLER",
+        :timestamp "20:41:41 CST"},
+       :canRead true,
+       :id 12,
+       :nodeAddress "localhost:18445",
+       :timestamp "20:41:41 CST"}
+      {:bulletin
+       {:category "Clustering",
+        :id 14,
+        :level "INFO",
+        :message "<len:100>",
+        :nodeAddress "localhost:18445",
+        :sourceType "FLOW_CONTROLLER",
+        :timestamp "20:41:46 CST"},
+       :canRead true,
+       :id 14,
+       :nodeAddress "localhost:18445",
+       :timestamp "20:41:46 CST"}
+      {:bulletin
+       {:category "Clustering",
+        :id 15,
+        :level "INFO",
+        :message "<len:100>",
+        :nodeAddress "localhost:18445",
+        :sourceType "FLOW_CONTROLLER",
+        :timestamp "20:41:51 CST"},
+       :canRead true,
+       :id 15,
+       :nodeAddress "localhost:18445",
+       :timestamp "20:41:51 CST"}],
+     :generated "20:43:45 CST"}}}]}

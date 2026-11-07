@@ -1,0 +1,296 @@
+{:api-kit/version 1,
+ :api-kit/provenance
+ {:connector-version "v1",
+  :contract "api-v1",
+  :operation "nifi-lab-c250-pg-status",
+  :recorded-at "2026-11-07T12:43:45.899906894Z",
+  :redaction-rules "sha256:46710e684efc804e",
+  :source "nifi-ops-nifi-lab-c250"},
+ :api-kit/samples
+ [{:inputs [{:nifi.nifi-lab-c250.pg/id "root"}]}
+  {:inputs [{:nifi.nifi-lab-c250.pg/id "b1726f15-01a1-1000-0000-000075c220a1"}]}],
+ :api-kit/rules
+ {:detectors [:email :jwt :bearer :api-key-prefix :private-key :unresolved-var :high-entropy],
+  :keep-paths
+  [["activeThreadCount"]
+   ["bytesIn"]
+   ["bytesOut"]
+   ["bytesQueued"]
+   ["bytesRead"]
+   ["bytesWritten"]
+   ["flowFilesIn"]
+   ["flowFilesOut"]
+   ["flowFilesQueued"]
+   ["name"]
+   ["connectionStatusSnapshots" "*" "connectionStatusSnapshot" "bytesQueued"]
+   ["connectionStatusSnapshots" "*" "connectionStatusSnapshot" "destinationName"]
+   ["connectionStatusSnapshots" "*" "connectionStatusSnapshot" "flowFileAvailability"]
+   ["connectionStatusSnapshots" "*" "connectionStatusSnapshot" "flowFilesIn"]
+   ["connectionStatusSnapshots" "*" "connectionStatusSnapshot" "flowFilesOut"]
+   ["connectionStatusSnapshots" "*" "connectionStatusSnapshot" "flowFilesQueued"]
+   ["connectionStatusSnapshots" "*" "connectionStatusSnapshot" "groupId"]
+   ["connectionStatusSnapshots" "*" "connectionStatusSnapshot" "id"]
+   ["connectionStatusSnapshots" "*" "connectionStatusSnapshot" "name"]
+   ["connectionStatusSnapshots" "*" "connectionStatusSnapshot" "percentUseBytes"]
+   ["connectionStatusSnapshots" "*" "connectionStatusSnapshot" "percentUseCount"]
+   ["connectionStatusSnapshots" "*" "connectionStatusSnapshot" "sourceName"]
+   ["processGroupStatusSnapshots" "*" "processGroupStatusSnapshot" "activeThreadCount"]
+   ["processGroupStatusSnapshots" "*" "processGroupStatusSnapshot" "bytesIn"]
+   ["processGroupStatusSnapshots" "*" "processGroupStatusSnapshot" "bytesOut"]
+   ["processGroupStatusSnapshots" "*" "processGroupStatusSnapshot" "bytesQueued"]
+   ["processGroupStatusSnapshots" "*" "processGroupStatusSnapshot" "bytesRead"]
+   ["processGroupStatusSnapshots" "*" "processGroupStatusSnapshot" "bytesWritten"]
+   ["processGroupStatusSnapshots" "*" "processGroupStatusSnapshot" "flowFilesIn"]
+   ["processGroupStatusSnapshots" "*" "processGroupStatusSnapshot" "flowFilesOut"]
+   ["processGroupStatusSnapshots" "*" "processGroupStatusSnapshot" "flowFilesQueued"]
+   ["processGroupStatusSnapshots" "*" "processGroupStatusSnapshot" "id"]
+   ["processGroupStatusSnapshots" "*" "processGroupStatusSnapshot" "name"]
+   ["processorStatusSnapshots" "*" "processorStatusSnapshot" "activeThreadCount"]
+   ["processorStatusSnapshots" "*" "processorStatusSnapshot" "bytesRead"]
+   ["processorStatusSnapshots" "*" "processorStatusSnapshot" "bytesWritten"]
+   ["processorStatusSnapshots" "*" "processorStatusSnapshot" "executionNode"]
+   ["processorStatusSnapshots" "*" "processorStatusSnapshot" "flowFilesIn"]
+   ["processorStatusSnapshots" "*" "processorStatusSnapshot" "flowFilesOut"]
+   ["processorStatusSnapshots" "*" "processorStatusSnapshot" "groupId"]
+   ["processorStatusSnapshots" "*" "processorStatusSnapshot" "id"]
+   ["processorStatusSnapshots" "*" "processorStatusSnapshot" "name"]
+   ["processorStatusSnapshots" "*" "processorStatusSnapshot" "runStatus"]
+   ["processorStatusSnapshots" "*" "processorStatusSnapshot" "taskCount"]
+   ["processorStatusSnapshots" "*" "processorStatusSnapshot" "type"]],
+  :max-string 64,
+  :secret-paths []},
+ :api-kit/exchanges
+ [{:method "GET",
+   :endpoint "/flow/process-groups/{nifi.nifi-lab-c250.pg/id}/status",
+   :query-param-names [],
+   :body-param-names [],
+   :match
+   {:method "GET",
+    :path "/nifi-api/flow/process-groups/b1726f15-01a1-1000-0000-000075c220a1/status",
+    :query {}},
+   :status 200,
+   :headers {"Content-Type" "application/json"},
+   :body
+   {:canRead true,
+    :processGroupStatus
+    {:aggregateSnapshot
+     {:activeThreadCount 0,
+      :bytesIn 0,
+      :bytesOut 0,
+      :bytesQueued 4096,
+      :bytesRead 0,
+      :bytesReceived 0,
+      :bytesSent 0,
+      :bytesTransferred 0,
+      :bytesWritten 0,
+      :connectionStatusSnapshots
+      [{:canRead true,
+        :connectionStatusSnapshot
+        {:bytesIn 0,
+         :bytesOut 0,
+         :bytesQueued 4096,
+         :destinationName "Log",
+         :flowFileAvailability "FLOWFILE_AVAILABLE",
+         :flowFilesIn 0,
+         :flowFilesOut 0,
+         :flowFilesQueued 4,
+         :groupId "b1726f15-01a1-1000-0000-000075c220a1",
+         :id "b1727048-01a1-1000-ffff-ffffb51d33c1",
+         :input "0 (0 bytes)",
+         :name "to-log",
+         :output "0 (0 bytes)",
+         :percentUseBytes 0,
+         :percentUseCount 0,
+         :queued "4 (4 KB)",
+         :queuedCount "4",
+         :queuedSize "4 KB",
+         :sourceName "Generate"},
+        :id "b1727048-01a1-1000-ffff-ffffb51d33c1"}],
+      :flowFilesIn 0,
+      :flowFilesOut 0,
+      :flowFilesQueued 4,
+      :flowFilesReceived 0,
+      :flowFilesSent 0,
+      :flowFilesTransferred 0,
+      :id "b1726f15-01a1-1000-0000-000075c220a1",
+      :input "0 (0 bytes)",
+      :inputPortStatusSnapshots [],
+      :name "ops-lab",
+      :output "0 (0 bytes)",
+      :outputPortStatusSnapshots [],
+      :processGroupStatusSnapshots [],
+      :processingNanos 0,
+      :processingPerformanceStatus
+      {:contentReadDuration 0,
+       :contentWriteDuration 0,
+       :cpuDuration 0,
+       :garbageCollectionDuration 0,
+       :identifier "b1726f15-01a1-1000-0000-000075c220a1",
+       :sessionCommitDuration 0},
+      :processorStatusSnapshots
+      [{:canRead true,
+        :id "b1727014-01a1-1000-ffff-ffffe17150ad",
+        :processorStatusSnapshot
+        {:activeThreadCount 0,
+         :bytesIn 0,
+         :bytesOut 0,
+         :bytesRead 0,
+         :bytesWritten 0,
+         :executionNode "ALL",
+         :flowFilesIn 0,
+         :flowFilesOut 0,
+         :groupId "b1726f15-01a1-1000-0000-000075c220a1",
+         :id "b1727014-01a1-1000-ffff-ffffe17150ad",
+         :input "0 (0 bytes)",
+         :name "Log",
+         :output "0 (0 bytes)",
+         :read "0 bytes",
+         :runStatus "Stopped",
+         :taskCount 0,
+         :tasks "0",
+         :tasksDuration "00:00:00.000",
+         :tasksDurationNanos 0,
+         :terminatedThreadCount 0,
+         :type "LogAttribute",
+         :written "0 bytes"}}
+       {:canRead true,
+        :id "b1726f77-01a1-1000-0000-00000d0e647e",
+        :processorStatusSnapshot
+        {:activeThreadCount 0,
+         :bytesIn 0,
+         :bytesOut 0,
+         :bytesRead 0,
+         :bytesWritten 0,
+         :executionNode "ALL",
+         :flowFilesIn 0,
+         :flowFilesOut 0,
+         :groupId "b1726f15-01a1-1000-0000-000075c220a1",
+         :id "b1726f77-01a1-1000-0000-00000d0e647e",
+         :input "0 (0 bytes)",
+         :name "Generate",
+         :output "0 (0 bytes)",
+         :read "0 bytes",
+         :runStatus "Stopped",
+         :taskCount 0,
+         :tasks "0",
+         :tasksDuration "00:00:00.000",
+         :tasksDurationNanos 0,
+         :terminatedThreadCount 0,
+         :type "GenerateFlowFile",
+         :written "0 bytes"}}],
+      :queued "4 (4 KB)",
+      :queuedCount "4",
+      :queuedSize "4 KB",
+      :read "0 bytes",
+      :received "0 (0 bytes)",
+      :remoteProcessGroupStatusSnapshots [],
+      :sent "0 (0 bytes)",
+      :statelessActiveThreadCount 0,
+      :terminatedThreadCount 0,
+      :transferred "0 (0 bytes)",
+      :written "0 bytes"},
+     :id "b1726f15-01a1-1000-0000-000075c220a1",
+     :name "ops-lab",
+     :statsLastRefreshed "20:43:45 CST"}}}
+  {:method "GET",
+   :endpoint "/flow/process-groups/{nifi.nifi-lab-c250.pg/id}/status",
+   :query-param-names [],
+   :body-param-names [],
+   :match {:method "GET", :path "/nifi-api/flow/process-groups/root/status", :query {}},
+   :status 200,
+   :headers {"Content-Type" "application/json"},
+   :body
+   {:canRead true,
+    :processGroupStatus
+    {:aggregateSnapshot
+     {:activeThreadCount 0,
+      :bytesIn 0,
+      :bytesOut 0,
+      :bytesQueued 4096,
+      :bytesRead 0,
+      :bytesReceived 0,
+      :bytesSent 0,
+      :bytesTransferred 0,
+      :bytesWritten 0,
+      :connectionStatusSnapshots [],
+      :flowFilesIn 0,
+      :flowFilesOut 0,
+      :flowFilesQueued 4,
+      :flowFilesReceived 0,
+      :flowFilesSent 0,
+      :flowFilesTransferred 0,
+      :id "a705575f-01a1-1000-4095-1bc4e37fbbf5",
+      :input "0 (0 bytes)",
+      :inputPortStatusSnapshots [],
+      :name "NiFi Flow",
+      :output "0 (0 bytes)",
+      :outputPortStatusSnapshots [],
+      :processGroupStatusSnapshots
+      [{:canRead true,
+        :id "b1726f15-01a1-1000-0000-000075c220a1",
+        :processGroupStatusSnapshot
+        {:activeThreadCount 0,
+         :bytesIn 0,
+         :bytesOut 0,
+         :bytesQueued 4096,
+         :bytesRead 0,
+         :bytesReceived 0,
+         :bytesSent 0,
+         :bytesTransferred 0,
+         :bytesWritten 0,
+         :connectionStatusSnapshots [],
+         :flowFilesIn 0,
+         :flowFilesOut 0,
+         :flowFilesQueued 4,
+         :flowFilesReceived 0,
+         :flowFilesSent 0,
+         :flowFilesTransferred 0,
+         :id "b1726f15-01a1-1000-0000-000075c220a1",
+         :input "0 (0 bytes)",
+         :inputPortStatusSnapshots [],
+         :name "ops-lab",
+         :output "0 (0 bytes)",
+         :outputPortStatusSnapshots [],
+         :processingNanos 0,
+         :processingPerformanceStatus
+         {:contentReadDuration 0,
+          :contentWriteDuration 0,
+          :cpuDuration 0,
+          :garbageCollectionDuration 0,
+          :identifier "b1726f15-01a1-1000-0000-000075c220a1",
+          :sessionCommitDuration 0},
+         :processorStatusSnapshots [],
+         :queued "4 (4 KB)",
+         :queuedCount "4",
+         :queuedSize "4 KB",
+         :read "0 bytes",
+         :received "0 (0 bytes)",
+         :remoteProcessGroupStatusSnapshots [],
+         :sent "0 (0 bytes)",
+         :statelessActiveThreadCount 0,
+         :terminatedThreadCount 0,
+         :transferred "0 (0 bytes)",
+         :written "0 bytes"}}],
+      :processingNanos 0,
+      :processingPerformanceStatus
+      {:contentReadDuration 0,
+       :contentWriteDuration 0,
+       :cpuDuration 0,
+       :garbageCollectionDuration 0,
+       :identifier "a705575f-01a1-1000-4095-1bc4e37fbbf5",
+       :sessionCommitDuration 0},
+      :processorStatusSnapshots [],
+      :queued "4 (4 KB)",
+      :queuedCount "4",
+      :queuedSize "4 KB",
+      :read "0 bytes",
+      :received "0 (0 bytes)",
+      :remoteProcessGroupStatusSnapshots [],
+      :sent "0 (0 bytes)",
+      :statelessActiveThreadCount 0,
+      :terminatedThreadCount 0,
+      :transferred "0 (0 bytes)",
+      :written "0 bytes"},
+     :id "a705575f-01a1-1000-4095-1bc4e37fbbf5",
+     :name "NiFi Flow",
+     :statsLastRefreshed "20:43:45 CST"}}}]}

@@ -295,3 +295,11 @@ export const searchLogs = (id: string, q: LogSearch) => call<SearchResult>("POST
 /** Opened by the page itself (a link, an EventSource): the session cookie goes along, a GET needs no CSRF token. */
 export const logDownloadUrl = (id: string, member: string, files: string[]) => `${BASE}api/${logsPath(id, `/download?member=${encodeURIComponent(member)}&files=${files.map(encodeURIComponent).join(",")}`)}`;
 export const logTailUrl = (id: string, member: string, file: string) => `${BASE}api/${logsPath(id, `/tail?member=${encodeURIComponent(member)}&file=${encodeURIComponent(file)}`)}`;
+// Phase 2 step 6 (§9.4, §15.3): a service's nginx address for Studio's nifi-ops graph, its check, the graph's runs.
+import type { GraphRun, NginxCheck } from "../server/store.ts";
+export type { GraphRun, NginxCheck };
+export type GraphState = { graph: string; configured: boolean; services: { id: string; kind: string; version: string; nginxUrl: string }[]; runs: GraphRun[]; canPublish: boolean };
+export const putServiceNginx = (id: string, nginxUrl: string | null) => call<{ nginxUrl: string | null; check: NginxCheck | null; changed: boolean; graph: { name: string; configured: boolean } }>("PUT", `services/${encodeURIComponent(id)}/nginx`, { nginxUrl });
+export const checkServiceNginx = (id: string) => call<{ nginxUrl: string; check: NginxCheck }>("POST", `services/${encodeURIComponent(id)}/nginx/check`);
+export const serviceGraph = () => call<GraphState>("GET", "services/graph");
+export const publishServiceGraph = () => call<GraphRun>("POST", "services/graph/publish");

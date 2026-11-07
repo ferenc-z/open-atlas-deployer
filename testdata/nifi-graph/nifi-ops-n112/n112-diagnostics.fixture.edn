@@ -1,0 +1,104 @@
+{:api-kit/version 1,
+ :api-kit/provenance
+ {:connector-version "v1",
+  :contract "api-v1",
+  :operation "n112-diagnostics",
+  :recorded-at "2026-11-07T12:43:45.288837520Z",
+  :redaction-rules "sha256:cf45e2ade05db3b9",
+  :source "nifi-ops-n112"},
+ :api-kit/samples [{}],
+ :api-kit/rules
+ {:detectors [:email :jwt :bearer :api-key-prefix :private-key :unresolved-var :high-entropy],
+  :keep-paths
+  [["availableProcessors"]
+   ["contentRepositoryStorageUsage"]
+   ["garbageCollection"]
+   ["heapUtilization"]
+   ["maxHeapBytes"]
+   ["processorLoadAverage"]
+   ["provenanceRepositoryStorageUsage"]
+   ["totalThreads"]
+   ["uptime"]
+   ["usedHeapBytes"]
+   ["usedNonHeapBytes"]
+   ["flowFileRepositoryStorageUsage" "utilization"]],
+  :max-string 64,
+  :secret-paths []},
+ :api-kit/exchanges
+ [{:method "GET",
+   :endpoint "/system-diagnostics",
+   :query-param-names [],
+   :body-param-names [],
+   :match {:method "GET", :path "/nifi-api/system-diagnostics", :query {}},
+   :status 200,
+   :headers {"Content-Type" "application/json"},
+   :body
+   {:systemDiagnostics
+    {:aggregateSnapshot
+     {:availableProcessors 32,
+      :contentRepositoryStorageUsage
+      [{:freeSpace "923.25 GB",
+        :freeSpaceBytes 991328055296,
+        :identifier "default",
+        :totalSpace "1,006.85 GB",
+        :totalSpaceBytes 1081101176832,
+        :usedSpace "83.61 GB",
+        :usedSpaceBytes 89773121536,
+        :utilization "8.0%"}],
+      :daemonThreads 33,
+      :flowFileRepositoryStorageUsage
+      {:freeSpace "923.25 GB",
+       :freeSpaceBytes 991328055296,
+       :totalSpace "1,006.85 GB",
+       :totalSpaceBytes 1081101176832,
+       :usedSpace "83.61 GB",
+       :usedSpaceBytes 89773121536,
+       :utilization "8.0%"},
+      :freeHeap "559.75 MB",
+      :freeHeapBytes 586944608,
+      :freeNonHeap "11.74 MB",
+      :freeNonHeapBytes 12308016,
+      :garbageCollection
+      [{:collectionCount 17,
+        :collectionMillis 397,
+        :collectionTime "00:00:00.397",
+        :name "G1 Young Generation"}
+       {:collectionCount 0,
+        :collectionMillis 0,
+        :collectionTime "00:00:00.000",
+        :name "G1 Old Generation"}],
+      :heapUtilization "45.0%",
+      :maxHeap "1,024 MB",
+      :maxHeapBytes 1073741824,
+      :maxNonHeap "-1 bytes",
+      :maxNonHeapBytes -1,
+      :processorLoadAverage 0.73486328125,
+      :provenanceRepositoryStorageUsage
+      [{:freeSpace "923.25 GB",
+        :freeSpaceBytes 991328055296,
+        :identifier "default",
+        :totalSpace "1,006.85 GB",
+        :totalSpaceBytes 1081101176832,
+        :usedSpace "83.61 GB",
+        :usedSpaceBytes 89773121536,
+        :utilization "8.0%"}],
+      :statsLastRefreshed "20:43:45 CST",
+      :totalHeap "1,024 MB",
+      :totalHeapBytes 1073741824,
+      :totalNonHeap "194.57 MB",
+      :totalNonHeapBytes 204025856,
+      :totalThreads 85,
+      :uptime "00:10:41.349",
+      :usedHeap "464.25 MB",
+      :usedHeapBytes 486797216,
+      :usedNonHeap "182.84 MB",
+      :usedNonHeapBytes 191717840,
+      :versionInfo
+      {:buildTag "nifi-1.12.1-RC2",
+       :buildTimestamp "09/23/2020 14:27:38 CST",
+       :javaVendor "Eclipse Adoptium",
+       :javaVersion "11.0.32.1",
+       :niFiVersion "1.12.1",
+       :osArchitecture "amd64",
+       :osName "Linux",
+       :osVersion "6.6.87.2-microsoft-standard-WSL2"}}}}}]}

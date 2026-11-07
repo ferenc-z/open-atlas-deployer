@@ -41,6 +41,7 @@ import { Onboarding } from "../src/server/onboarding.ts";
 import { Drift } from "../src/server/drift.ts";
 import { Briefs, collectFacts, type BriefFacts } from "../src/server/brief.ts";
 import { fakeServices, fakeState, sha256, tarGz, type FakeState } from "./fakes.ts";
+import { NifiOpsGraph } from "../src/server/services/graph-publish.ts";
 
 const SESSION = "open_atlas_workbench_session";
 
@@ -68,6 +69,9 @@ interface SetupOptions {
   environment?: unknown;
   /** More settings, e.g. a development instance's devSkipSetup. */
   config?: Partial<Config>;
+  /** Phase 2 step 6: the nifi-ops graph publisher and how nginx addresses are checked. */
+  graph?: (store: Store) => NifiOpsGraph;
+  nginxFetcher?: typeof fetch;
 }
 
 function setup(options: SetupOptions = {}) {
@@ -160,7 +164,7 @@ function setup(options: SetupOptions = {}) {
   const deployerSettings = new DeployerSettings(store, box, options.deployerEnv ?? {});
   const restarts = { count: 0 };
   const takeover = new Takeover({ store, handoff, box, environment: () => deployments.environment().env.name, hosts: () => hostIds(deployments.environment().env), readTimeoutMs: 5000, pollMs: 5 });
-  const app = createApp({ config, store, takeover, sessions, observer, deployments, versions, env, workbench: workbenchAdmin, workbenchKey, deployerSettings, restart: () => { restarts.count++; }, ...(phase5 ? { omaFetcher: phase5.fetcher } : {}), ...(peer ? { peer } : {}), ...(keys ? { keys } : {}), ...(onboarding ? { onboarding } : {}) });
+  const app = createApp({ config, store, takeover, sessions, observer, deployments, versions, env, workbench: workbenchAdmin, workbenchKey, deployerSettings, restart: () => { restarts.count++; }, ...(phase5 ? { omaFetcher: phase5.fetcher } : {}), ...(peer ? { peer } : {}), ...(keys ? { keys } : {}), ...(onboarding ? { onboarding } : {}), ...(options.graph ? { graph: options.graph(store) } : {}), ...(options.nginxFetcher ? { nginxFetcher: options.nginxFetcher } : {}) });
   const request = (path: string, init: RequestInit & { as?: string; cookie?: string } = {}) => {
     const headers = new Headers(init.headers);
     const cookies = [init.as ? `${SESSION}=${init.as}` : "", init.cookie ?? ""].filter(Boolean).join("; ");
@@ -2533,4 +2537,46 @@ test("phase 2 step 5: the read-only service tools over /mcp: metrics, alerts, ev
   assert.equal((await tool(t, key, "lookup_property", { profile: "nifi-2.x", file: "x.conf" })).value.finding.code, "properties/file");
   assert.equal((await tool(t, key, "lookup_property", { service: "nothing" })).value.finding.code, "service/unknown");
   assert.equal((await t.request("/api/service-properties?profile=nifi-2.x", { as: "nobody" })).status, 403);
+});
+
+test("phase 2 step 6: a service's nginx address (admin), its check, the status, the nifi-ops graph published again and recorded", async () => {
+  const published: string[] = [];
+  const studio = { async call(name: string) { published.push(name); return name === "list_graphs" ? { graphs: [{ "graph/name": "nifi-ops", "graph/qualified-name": "ws/nifi-ops" }] } : name === "get_graph" ? { revision: 1, text: '{:graph {:graph/id "g"} :workspace {:workspace/id "ws"}}' } : { findings: [] }; } };
+  let graph: NifiOpsGraph | undefined;
+  const t = setup({
+    graph: (store) => (graph = new NifiOpsGraph(store, { studio: studio as never })),
+    nginxFetcher: async (url) => (String(url).startsWith("http://nginx.lab:18543/") ? new Response(JSON.stringify({ about: { version: "1.12.1" } })) : new Response("no", { status: 502 })),
+  });
+  const single = { host: "app2", installDir: "/opt/n112", serviceUser: "nifi", startEnvironment: null, ports: { https: 8443 }, discovery: null };
+  t.store.addStandalone({ kind: "standalone", id: "n112", service: "nifi", profile: "nifi-1.x", version: "1.12.1", webUrl: null, member: single }, "uat", { id: "admin", via: "cli" });
+  const get = (path: string) => t.request(path, { as: "viewer" });
+  assert.equal((await put(t, "/api/services/n112/nginx", "viewer", { nginxUrl: "http://nginx.lab:18543" })).status, 403);
+  assert.equal((await put(t, "/api/services/none/nginx", "admin", { nginxUrl: "http://nginx.lab:18543" })).status, 404);
+  assert.equal((await put(t, "/api/services/n112/nginx", "admin", { nginxUrl: "ftp://x" })).status, 400);
+  assert.equal((await put(t, "/api/services/n112/nginx", "admin", {})).status, 400);
+  const set = await (await put(t, "/api/services/n112/nginx", "admin", { nginxUrl: "http://nginx.lab:18543/nifi-api" })).json();
+  assert.deepEqual([set.nginxUrl, set.changed, set.check.ok, set.check.version], ["http://nginx.lab:18543", true, true, "1.12.1"]);
+  await graph!.idle();
+  assert.deepEqual(published, ["declare_source", "declare_source", "list_graphs", "get_graph", "upload_graph", "publish_graph"]);
+  const status = await (await get("/api/services/n112/status")).json();
+  assert.deepEqual([status.nginxUrl, status.nginxCheck.ok], ["http://nginx.lab:18543", true]);
+  const g = await (await get("/api/services/graph")).json();
+  assert.deepEqual([g.graph, g.configured, g.canPublish, g.services.map((s: { id: string }) => s.id), g.runs[0].state, g.runs[0].reason], ["nifi-ops", true, false, ["n112"], "published", "nginx address of n112 set"]);
+  // The same address again: checked, nothing changed, nothing published.
+  published.length = 0;
+  assert.equal((await (await put(t, "/api/services/n112/nginx", "admin", { nginxUrl: "http://nginx.lab:18543" })).json()).changed, false);
+  assert.equal((await (await post(t, "/api/services/n112/nginx/check", "admin", {})).json()).check.ok, true);
+  await graph!.idle();
+  assert.deepEqual(published, []);
+  // A failing address is shown failing; null clears it; the timeline says each.
+  const bad = await (await put(t, "/api/services/n112/nginx", "admin", { nginxUrl: "http://other:1" })).json();
+  assert.deepEqual([bad.check.ok, bad.check.error], [false, "HTTP 502"]);
+  await graph!.idle();
+  assert.equal((await (await put(t, "/api/services/n112/nginx", "admin", { nginxUrl: null })).json()).nginxUrl, null);
+  await graph!.idle();
+  assert.equal((await post(t, "/api/services/n112/nginx/check", "admin", {})).status, 409);
+  const ev = await (await get("/api/services/n112/events")).json();
+  assert.deepEqual(ev.events.filter((e: { kind: string }) => e.kind === "nginx-url").map((e: { text: string }) => e.text), ["nginx address removed", "nginx address set to http://other:1", "nginx address set to http://nginx.lab:18543"]);
+  assert.equal((await (await get("/api/services/graph")).json()).runs[0].state, "skipped", "no service left: the graph in Studio is left alone");
+  assert.equal((await post(t, "/api/services/graph/publish", "viewer", {})).status, 403);
 });

@@ -1,0 +1,84 @@
+{:api-kit/version 1,
+ :api-kit/provenance
+ {:connector-version "v1",
+  :contract "api-v1",
+  :operation "nifi-lab-c250-nodes",
+  :recorded-at "2026-11-07T12:43:45.814673147Z",
+  :redaction-rules "sha256:894e7d6026f703d5",
+  :source "nifi-ops-nifi-lab-c250"},
+ :api-kit/samples [{}],
+ :api-kit/rules
+ {:detectors [:email :jwt :bearer :api-key-prefix :private-key :unresolved-var :high-entropy],
+  :keep-paths
+  [["activeThreadCount"]
+   ["address"]
+   ["apiPort"]
+   ["bytesQueued"]
+   ["flowFilesQueued"]
+   ["heartbeat"]
+   ["nodeId"]
+   ["nodeStartTime"]
+   ["roles"]
+   ["status"]],
+  :max-string 64,
+  :secret-paths []},
+ :api-kit/exchanges
+ [{:method "GET",
+   :endpoint "/controller/cluster",
+   :query-param-names [],
+   :body-param-names [],
+   :match {:method "GET", :path "/nifi-api/controller/cluster", :query {}},
+   :status 200,
+   :headers {"Content-Type" "application/json"},
+   :body
+   {:cluster
+    {:generated "20:43:45 CST",
+     :nodes
+     [{:activeThreadCount 0,
+       :address "localhost",
+       :apiPort 18445,
+       :bytesQueued 2048,
+       :events
+       [{:category "INFO",
+         :message "Received first heartbeat from connecting node. Node connected.",
+         :timestamp "11/07/2026 20:41:46 CST"}
+        {:category "INFO",
+         :message "Requesting that node connect to cluster",
+         :timestamp "11/07/2026 20:40:34 CST"}
+        {:category "INFO", :message "<len:108>", :timestamp "11/07/2026 20:40:34 CST"}
+        {:category "WARNING", :message "<len:93>", :timestamp "11/06/2026 23:55:42 CST"}
+        {:category "INFO",
+         :message "Received first heartbeat from connecting node. Node connected.",
+         :timestamp "11/06/2026 23:18:35 CST"}
+        {:category "INFO", :message "<len:70>", :timestamp "11/06/2026 23:18:32 CST"}],
+       :flowFilesQueued 2,
+       :heartbeat "11/07/2026 20:43:44 CST",
+       :nodeId "ee7f1559-9790-4a86-a141-2acfaaa601fb",
+       :nodeStartTime "11/06/2026 23:18:22 CST",
+       :queued "2 / 2 KB",
+       :roles ["Primary Node" "Cluster Coordinator"],
+       :status "CONNECTED"}
+      {:activeThreadCount 0,
+       :address "localhost",
+       :apiPort 18446,
+       :bytesQueued 2048,
+       :events
+       [{:category "INFO",
+         :message "Received first heartbeat from connecting node. Node connected.",
+         :timestamp "11/07/2026 20:41:51 CST"}
+        {:category "INFO", :message "<len:108>", :timestamp "11/07/2026 20:40:34 CST"}
+        {:category "INFO",
+         :message "Requesting that node connect to cluster",
+         :timestamp "11/07/2026 20:40:34 CST"}
+        {:category "WARNING", :message "<len:93>", :timestamp "11/06/2026 23:55:42 CST"}
+        {:category "INFO",
+         :message "Received first heartbeat from connecting node. Node connected.",
+         :timestamp "11/06/2026 23:18:40 CST"}
+        {:category "INFO", :message "<len:70>", :timestamp "11/06/2026 23:18:37 CST"}],
+       :flowFilesQueued 2,
+       :heartbeat "11/07/2026 20:43:42 CST",
+       :nodeId "c8eb1e12-7ff3-47d7-9da6-90e876e4f383",
+       :nodeStartTime "11/06/2026 23:18:24 CST",
+       :queued "2 / 2 KB",
+       :roles [],
+       :status "CONNECTED"}]}}}]}

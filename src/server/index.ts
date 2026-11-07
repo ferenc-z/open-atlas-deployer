@@ -17,6 +17,7 @@ import { environmentStatus, hostStateOf } from "./observe.ts";
 import { Onboarding } from "./onboarding.ts";
 import { OmaAgentDriver } from "./drivers/oma-agent.ts";
 import { StudioGraphDriver } from "./drivers/studio-graph.ts";
+import { NifiOpsGraph } from "./services/graph-publish.ts";
 import { WorkbenchAdmin } from "./drivers/workbench.ts";
 import { WorkbenchAppDriver } from "./drivers/workbench-app.ts";
 import { McpClient } from "./mcp-client.ts";
@@ -94,7 +95,9 @@ const briefWriter = config.omaUrl && config.omaApiKeyFile && config.omaAgent
 const briefs = new Briefs(store, () => collectFacts({ store, deployments, status: statusOf, versions, ...(peer.configured ? { peer: () => peer.status() } : {}), drift: () => drift.check() }), briefWriter, { hour: config.briefHour });
 // Service ops §6: taking over discovered NiFi (drafts, confirmation); the AI review uses the Onboarding Assessor.
 const takeover = new Takeover({ store, handoff: deployments.handoff, box, oma: assessor, environment: () => deployments.environment().env.name, hosts: () => hostIds(deployments.environment().env) });
-const app = createApp({ config, store, takeover, sessions: new WorkbenchSessions(config.workbenchUrl), observer, deployments, versions, env, peer, onboarding, drift, briefs, keys, workbench, workbenchKey, deployerSettings,
+// Phase 2 step 6: the nifi-ops Studio graph, published through the same Builder MCP as studio-graph.
+const nifiOpsGraph = new NifiOpsGraph(store, { studio, graph: config.nifiOpsGraph });
+const app = createApp({ config, store, takeover, graph: nifiOpsGraph, sessions: new WorkbenchSessions(config.workbenchUrl), observer, deployments, versions, env, peer, onboarding, drift, briefs, keys, workbench, workbenchKey, deployerSettings,
   // D45: the image sets DEPLOYER_RESTART_BY_EXIT; the container's restart policy starts it again with the new settings.
   ...(process.env.DEPLOYER_RESTART_BY_EXIT === "true" ? { restart: () => setTimeout(() => { store.close(); process.exit(75); }, 300) } : {}) });
 // Job records follow the executor's status files even while nobody has the page open.

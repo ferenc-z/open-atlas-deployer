@@ -3,7 +3,7 @@
 // the package definition is templates/<agent>.oma.json, the prompt agents/<agent>.md. The state file keeps the
 // package id and the agents published so far; each publish makes a new agent id, which the next step points at.
 //
-// Usage: node bin/publish-assistant.ts <builder MCP url> <builder key file> <model> <Deployer MCP url> <state file> [deploy-assistant | onboarding-assessor]
+// Usage: [NIFI_OPS_MCP_URL=<Studio data plane MCP of the nifi-ops graph>] node bin/publish-assistant.ts <builder MCP url> <builder key file> <model> <Deployer MCP url> <state file> [deploy-assistant | onboarding-assessor]
 //   e.g. node bin/publish-assistant.ts https://oma:3008/mcp /etc/oa/oma-builder.key claude-x https://wb.example/deploy/mcp ./assistant-uat.json
 
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -32,6 +32,17 @@ const filled = JSON.parse(readFileSync(join(root, "templates", `${agentName}.oma
   return r.text;
 });
 if (missing.size) { console.error(`the package names ${[...missing].join(", ")} with no value`); process.exit(2); }
+// Service ops §9.4 (phase 2 step 6): with NIFI_OPS_MCP_URL (Studio's data plane MCP of the nifi-ops graph, e.g.
+// https://studio:9632/mcp/<graph uuid>) the Deploy Assistant also gets that graph's read tools, for drilling down to one
+// queue, processor or process group; its graph token (oat_v1.) is a second credential, kept in OMA's Vault.
+const NIFI_OPS_TOOLS = ["list_entities", "list_attributes", "search_attributes", "execute_eql", "list_saved_queries", "run_saved_query"];
+const nifiOps = process.env.NIFI_OPS_MCP_URL;
+if (nifiOps && agentName === "deploy-assistant") {
+  const agent = filled.agents[0];
+  agent.mcp_servers.push({ name: "open-atlas-nifi-ops", type: "http", url: nifiOps, allowed_tools: NIFI_OPS_TOOLS });
+  agent.tools.push({ type: "mcp_toolset", mcp_server_name: "open-atlas-nifi-ops", default_config: { permission_policy: { type: "always_allow" } } });
+  filled.credential_requirements.push({ key: "nifi-ops-graph-token", description: "A read-only Studio graph token (oat_v1.) of the nifi-ops graph, stored for the URL above.", required_scopes: ["read"] });
+}
 
 const state = existsSync(stateFile) ? JSON.parse(readFileSync(stateFile, "utf8")) as { packageId?: string; agents?: string[] } : {};
 const builder = new McpClient(builderUrl, () => ({ authorization: `Bearer ${readToken(keyFile)}` }));

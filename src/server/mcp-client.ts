@@ -50,7 +50,7 @@ export class McpClient {
     await this.init();
     const result = await this.rpc("tools/call", { name, arguments: args });
     const text = ((result?.content ?? []) as { type: string; text?: string }[]).map((c) => c.text ?? "").join("");
-    if (result?.isError) throw new McpError(`${name}: ${text.slice(0, 600)}`);
+    if (result?.isError) throw new McpError(`${name}: ${text.slice(0, 2000)}`);
     if (result?.structuredContent) return result.structuredContent;
     try { return JSON.parse(text); } catch { return text; }
   }

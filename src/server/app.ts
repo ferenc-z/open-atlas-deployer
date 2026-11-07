@@ -38,6 +38,8 @@ import { TakeoverError, type Takeover } from "./services/takeover.ts";
 import { acceptSamples, watchList } from "./services/watch.ts";
 import { FIELDS, ingest, metrics, RANGES, trend, type Field, type Range } from "./services/metrics.ts";
 import { DOWNLOAD_MAX, LogsError, parseSearch, ServiceLogs } from "./services/logs.ts";
+import { checkNginx, graphServices, NifiOpsGraph } from "./services/graph-publish.ts";
+import { checkNginxUrl } from "./services/graph.ts";
 import { streamSSE } from "hono/streaming";
 import { DEPLOYER_VERSION } from "./version.ts";
 import { validateEnvironment } from "./environment.ts";
@@ -78,6 +80,10 @@ export interface Dependencies {
   takeover?: Takeover;
   /** Phase 2 step 4: reading and following services' logs through their service executors (tests pass their own timings). */
   logs?: ServiceLogs;
+  /** Phase 2 step 6: the nifi-ops Studio graph, published after takeovers and nginx address changes. */
+  graph?: NifiOpsGraph;
+  /** How the Deployer checks an nginx address (tests pass a fake). */
+  nginxFetcher?: typeof fetch;
 }
 
 const reject = (c: Context, status: 400 | 401 | 403 | 404 | 409 | 429 | 503, code: string, message: string, details: string[] = []) =>
@@ -140,6 +146,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
   // S18: the token also says which of the host's executors calls (deploy or service); each gets only its own jobs.
   const handoff = deployments.handoff;
   const serviceLogs = deps.logs ?? new ServiceLogs(store, handoff);
+  const graph = deps.graph ?? new NifiOpsGraph(store, { studio: undefined, graph: config.nifiOpsGraph });
   const executorOf = (c: Context): { host: string; executor: ExecutorKind } | undefined => {
     const bearer = /^Bearer (dpe_\S+)$/.exec(c.req.header("authorization") ?? "")?.[1];
     return bearer ? store.executorOf(tokenSha256(bearer)) : undefined;
@@ -913,6 +920,53 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     const result = check(store, (h) => handoff.executor(h, "service"), id);
     return c.json({ thresholds: { ...thresholdsOf(store, id, s.profile), info: THRESHOLDS }, check: result ?? null });
   });
+  // Phase 2 step 6 (§9.4, §15.3): where operations put a service behind nginx (all nodes of a cluster behind one
+  // address; nginx holds the NiFi client certificate). Setting it checks /flow/about through it once and generates the
+  // nifi-ops graph again, published to Studio in the background (recorded); clearing it (null) takes the service out.
+  api.put("/api/services/:id/nginx", async (c) => {
+    const p = await authenticate(c, "admin");
+    if (p instanceof Response) return p;
+    const id = c.req.param("id");
+    const s = registeredService(id);
+    if (!s) return reject(c, 404, "service/unknown", `No standalone instance or cluster ${id}.`);
+    const body = await c.req.json().catch(() => null) as { nginxUrl?: unknown } | null;
+    if (!body || !("nginxUrl" in body)) return reject(c, 400, "nginx/invalid", "The body is {\"nginxUrl\": \"http(s)://…\"}, or null to clear it.");
+    let url: string | null = null;
+    if (body.nginxUrl !== null && body.nginxUrl !== "") {
+      const checked = checkNginxUrl(body.nginxUrl);
+      if ("error" in checked) return reject(c, 400, "nginx/invalid", checked.error);
+      url = checked.url;
+    }
+    const changed = url !== (s.nginxUrl ?? null);
+    if (changed) store.setServiceNginxUrl(id, url, actorOf(p));
+    const check = url ? await checkNginx(url, deps.nginxFetcher) : null;
+    if (check) store.setServiceNginxCheck(id, check);
+    if (changed) graph.schedule(url ? `nginx address of ${id} set` : `nginx address of ${id} removed`, actorOf(p));
+    return c.json({ nginxUrl: url, check, changed, graph: { name: graph.graph, configured: graph.configured } });
+  });
+  api.post("/api/services/:id/nginx/check", async (c) => {
+    const p = await authenticate(c, "admin");
+    if (p instanceof Response) return p;
+    const id = c.req.param("id");
+    const s = registeredService(id);
+    if (!s) return reject(c, 404, "service/unknown", `No standalone instance or cluster ${id}.`);
+    if (!s.nginxUrl) return reject(c, 409, "nginx/none", `${id} has no nginx address.`);
+    const check = await checkNginx(s.nginxUrl, deps.nginxFetcher);
+    store.setServiceNginxCheck(id, check);
+    return c.json({ nginxUrl: s.nginxUrl, check });
+  });
+  // The nifi-ops graph: its name, whether Studio is configured, the services in it and the last runs; an admin may
+  // publish it again now (e.g. after Studio was unreachable).
+  api.get("/api/services/graph", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    return c.json({ graph: graph.graph, configured: graph.configured, services: graphServices(store), runs: store.graphRuns(Number(c.req.query("limit") ?? 10) || 10), canPublish: p.permissions.includes("admin") });
+  });
+  api.post("/api/services/graph/publish", async (c) => {
+    const p = await authenticate(c, "admin");
+    if (p instanceof Response) return p;
+    return c.json(await graph.publish("published again by hand", actorOf(p)));
+  });
   // Every service's open alerts, and with state=all also those resolved in the last day (since=ISO for longer).
   api.get("/api/alerts", async (c) => {
     const p = await authenticate(c, "view");
@@ -974,7 +1028,11 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     const p = await authenticate(c, "admin");
     if (p instanceof Response) return p;
     if (!takeover) return noTakeover(c);
-    try { return c.json(await takeover.confirm(c.req.param("id"), actorOf(p))); } catch (error) { return takeoverFailed(c, error); }
+    try {
+      const done = await takeover.confirm(c.req.param("id"), actorOf(p));
+      graph.schedule(`takeover of draft ${c.req.param("id")}`, actorOf(p));
+      return c.json(done);
+    } catch (error) { return takeoverFailed(c, error); }
   });
 
   // D36: how each app is reached, the recommended nginx configuration with its revisions, and the internal CA.

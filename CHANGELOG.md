@@ -125,6 +125,18 @@ executors; `EXECUTOR_VERSION` with it).
   prompt carries the NiFi operations skill (`agents/skills/nifi-ops.md`: the overall picture from the samples,
   components only through Studio).
 - `/mcp` answers a refused log read or an executor that cannot run a job with its error code (was a 500).
+- Studio's `nifi-ops` graph (§9.4): an admin gives a standalone instance or cluster its **nginx address** on the
+  Overview (`PUT /api/services/:id/nginx`; operations put every node behind it, nginx holds the NiFi client
+  certificate); the Deployer checks `/flow/about` through it and shows the result. The Deployer writes the graph
+  (`services/graph.ts`): per service an `api` source at `<nginx>/nifi-api` (GET only, 2 at a time, 5 s, no retries)
+  and a `nifi` source for provenance; entities per service `nifi.<service>.*` (flow controller, nodes and their JVMs,
+  process groups one level at a time, processors, connections, bulletins, provenance events). It is published through
+  the studio-graph path (sources declared, the graph made the first time, uploaded, published) after a takeover and
+  an nginx address change, into `DEPLOYER_NIFI_OPS_GRAPH` (default `nifi-ops`); every run is recorded
+  (`GET /api/services/graph`, `POST /api/services/graph/publish`). One graph serves 1.x and 2.x (checked against
+  responses recorded from 1.12.1 and a 2.5.0 cluster, `testdata/nifi-graph`). A Studio that cannot take the `nifi`
+  source still gets the monitoring half. `bin/publish-assistant.ts` with `NIFI_OPS_MCP_URL` adds the graph's read
+  tools to the Deploy Assistant.
 
 **Known limits**
 - Alerts are not pushed (S13).

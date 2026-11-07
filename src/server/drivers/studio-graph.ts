@@ -17,6 +17,32 @@ const GRAPH = /(:graph\/id\s+)"((?:[^"\\]|\\.)*)"/;
 
 interface SavedQuery { name: string; description: string; params?: unknown[]; eql: string }
 
+/**
+ * What studio-graph does to a graph that exists in Studio: read its draft for the workspace and graph ids, put them in
+ * the contract in place of the contract's own, upload it at the draft's revision, save the saved queries, publish.
+ * Also used for the generated nifi-ops graph (services/graph.ts).
+ */
+export async function publishContract(studio: McpClient, graph: string, contractText: string, log: (line: string) => void, queries: SavedQuery[] = []): Promise<{ revision: number | null; version: number | null }> {
+  const own = { workspace: contractText.match(WORKSPACE)?.[2], graph: contractText.match(GRAPH)?.[2] };
+  if (!own.workspace || !own.graph) throw new Error("The contract has no :workspace/id or :graph/id");
+  const draft = await studio.call("get_graph", { graph });
+  const current = String(draft.text ?? "");
+  const ws = current.match(WORKSPACE)?.[2];
+  const gid = current.match(GRAPH)?.[2];
+  if (!ws || !gid) throw new Error(`Cannot read the workspace id or graph id from the draft of graph ${graph}`);
+  const text = contractText.split(`"${own.workspace}"`).join(`"${ws}"`).split(`"${own.graph}"`).join(`"${gid}"`);
+  const saved = await studio.call("upload_graph", { graph, text, expected_revision: Number(draft.revision ?? 0) });
+  if (saved?.findings?.length) throw new Error(`Studio refused the contract: ${JSON.stringify(saved.findings).slice(0, 600)}`);
+  log(`Studio: ${graph} draft saved (revision ${saved?.revision ?? "?"})`);
+  for (const q of queries) await studio.call("save_saved_query", { graph, name: q.name, description: q.description, eql: q.eql, ...(q.params ? { params: q.params } : {}) });
+  if (queries.length) log(`Studio: ${queries.length} saved queries saved`);
+  const published = await studio.call("publish_graph", { graph, apply: true });
+  if (published?.findings?.some((f: { severity?: string }) => f.severity !== "info" && f.severity !== "warning")) throw new Error(`Studio did not publish ${graph}: ${JSON.stringify(published.findings).slice(0, 600)}`);
+  const version = published?.version ?? published?.["to-version"] ?? published?.to_version ?? null;
+  log(`Studio: ${graph} published${version != null ? ` as version ${version}` : ""}`);
+  return { revision: saved?.revision ?? null, version };
+}
+
 export class StudioGraphDriver implements DeployDriver {
   readonly type = "studio-graph";
   private studio: McpClient | undefined;
@@ -66,23 +92,10 @@ export class StudioGraphDriver implements DeployDriver {
 
   async apply(ctx: StepContext): Promise<StepResult> {
     const graph = ctx.settings.graph!;
-    const studio = this.studio!;
-    const draft = await studio.call("get_graph", { graph });
-    const current = String(draft.text ?? "");
-    const ws = current.match(WORKSPACE)?.[2];
-    const gid = current.match(GRAPH)?.[2];
-    if (!ws || !gid) throw new Error(`Cannot read the workspace id or graph id from the draft of graph ${graph}`);
     const contract = this.contract(ctx);
-    const text = contract.text.split(`"${contract.workspace}"`).join(`"${ws}"`).split(`"${contract.graph}"`).join(`"${gid}"`);
-    const saved = await studio.call("upload_graph", { graph, text, expected_revision: Number(draft.revision ?? 0) });
-    ctx.log(`Studio: ${graph} draft saved (revision ${saved?.revision ?? "?"})`);
     const queries = this.queries(ctx);
-    for (const q of queries) await studio.call("save_saved_query", { graph, name: q.name, description: q.description, eql: q.eql, ...(q.params ? { params: q.params } : {}) });
-    if (queries.length) ctx.log(`Studio: ${queries.length} saved queries saved`);
-    const published = await studio.call("publish_graph", { graph, apply: true });
-    const version = published?.version ?? published?.["to-version"] ?? published?.to_version ?? null;
-    ctx.log(`Studio: ${graph} published${version != null ? ` as version ${version}` : ""}`);
-    return { message: `Studio graph ${graph} uploaded, ${queries.length} saved queries saved, and published${version != null ? ` (version ${version})` : ""}`, detail: { graph, revision: saved?.revision ?? null, version } };
+    const { revision, version } = await publishContract(this.studio!, graph, contract.text, ctx.log, queries);
+    return { message: `Studio graph ${graph} uploaded, ${queries.length} saved queries saved, and published${version != null ? ` (version ${version})` : ""}`, detail: { graph, revision, version } };
   }
 
   async verify(): Promise<string | null> { return null; }
