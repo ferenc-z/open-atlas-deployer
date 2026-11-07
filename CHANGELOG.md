@@ -5,8 +5,10 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
 
 ## Unreleased
 
-Managed services, phase 1 (NiFi 1.x and 2.x, read only): every NiFi on the hosts in one place. Executor 0.8.0 (both
-executors; `EXECUTOR_VERSION` with it).
+Managed services, phases 1 and 2 (NiFi 1.x and 2.x, read only): every NiFi on the hosts in one place (phase 1), and
+looking into them without logging on to a server (phase 2: samples and metrics, health rules, alerts and a timeline,
+logs, the AI's read-only tools, Studio's `nifi-ops` graph, the FlowFile trace). Executor 0.8.0 (both executors;
+`EXECUTOR_VERSION` with it).
 
 **Service executor**
 - A second executor, installed only where services are managed: `open-atlas-service-executor-<version>.tar.gz` in
@@ -122,8 +124,8 @@ executors; `EXECUTOR_VERSION` with it).
   `GET /api/service-properties`). Log lines, bulletins and the texts of alerts, events and configuration are
   redacted before they reach the AI (`services/redact.ts`, the service executor's rules); the pages still show
   people with deploy-viewer the raw logs and bulletins. The Deploy Assistant's package allows these tools and its
-  prompt carries the NiFi operations skill (`agents/skills/nifi-ops.md`: the overall picture from the samples,
-  components only through Studio).
+  NiFi operations skill (`agents/skills/nifi-ops.md`: the overall picture from the samples, components only through
+  Studio) is an OMA Skill of its own (below).
 - `/mcp` answers a refused log read or an executor that cannot run a job with its error code (was a 500).
 - Studio's `nifi-ops` graph (§9.4): an admin gives a standalone instance or cluster its **nginx address** on the
   Overview (`PUT /api/services/:id/nginx`; operations put every node behind it, nginx holds the NiFi client
@@ -152,11 +154,24 @@ executors; `EXECUTOR_VERSION` with it).
   text redacted), allowed for the Deploy Assistant and in its NiFi skill. The monitor certificate's identity needs
   "query provenance" and "view provenance" on the flow (`lab.sh grant` gives them in the lab; `grant.py` takes
   `@root` for the root process group).
+- The Deploy Assistant's Skills are kept in OMA (owner 2026-11-07): `bin/publish-assistant.ts` creates each
+  `agents/skills/*.md` as an OMA Skill (one SKILL.md; the files now start with OMA's `name`/`description`
+  frontmatter), adds a version only when its text changed, and the package references that version instead of
+  pasting the text into `system`. It needs `OMA_URL` and `OMA_API_KEY_FILE` (OMA's Skills API: the Builder MCP can
+  create a Skill but not add a version); the state file keeps the Skills' ids. The Assistant gets OMA's `read` tool
+  alone, to open the SKILL.md OMA mounts in its sandbox (OMA puts only a summary in the prompt unless it runs with
+  `OMA_SKILL_EAGER_PROMPT=1`).
+- An nginx address may carry a path (`https://nginx.example/nifi-prod-a`): one nginx telling the NiFi apart by path,
+  as at the company; the Deployer appends `/nifi-api`, so nginx passes `<prefix>/nifi-api/` on. The lab's nginx has
+  such an entry (127.0.0.1:18546, `/n112`, `/n200`, `/c250`); a 404 names the path nginx should pass.
 
 **Known limits**
 - Alerts are not pushed (S13).
-- Not yet: alert thresholds, removing a service, turning a standalone instance into a cluster, a cluster's common
-  layer and node overrides, starting and stopping, logs (later phases).
+- Not yet: removing a service, turning a standalone instance into a cluster, a cluster's common layer and node
+  overrides, configuration changes, starting and stopping (phase 3); alert diagnosis and briefs (phase 4).
+- Alerts, events and the facts behind them are not pruned yet; the collector's back pressure reads the root group's
+  recursive status every round (large on a large flow); FlowFile attributes need NiFi's "view the data" policy, which
+  the monitor identity does not have by default.
 - The service executor cannot be upgraded from the Hosts page or the Overview yet, and the setup package does not
   include it.
 

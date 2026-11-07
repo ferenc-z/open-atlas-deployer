@@ -77,6 +77,22 @@ test("nginx addresses: checked and cleaned; the API root is <address>/nifi-api; 
   assert.throws(() => generateGraph([LAB[0]!, { ...LAB[0]!, id: "N112" }]), /same graph name/);
 });
 
+test("§15.5 company nginx: one nginx, a path prefix per NiFi — nginxUrl keeps the prefix, /nifi-api goes after it", async () => {
+  assert.deepEqual(checkNginxUrl("https://nginx.corp/nifi-prod-a"), { url: "https://nginx.corp/nifi-prod-a" });
+  assert.deepEqual(checkNginxUrl("http://127.0.0.1:18546/c250/nifi-api/"), { url: "http://127.0.0.1:18546/c250" });
+  assert.equal(apiRoot("https://nginx.corp/nifi-prod-a/"), "https://nginx.corp/nifi-prod-a/nifi-api");
+  assert.equal(apiRoot("https://nginx.corp/a/b/nifi-api"), "https://nginx.corp/a/b/nifi-api");
+  const g = generateGraph([{ ...LAB[1]!, nginxUrl: "http://127.0.0.1:18546/c250" }], { workspace: "ws", graph: "nifi-ops-dev" });
+  assert.deepEqual(g.sources.map((s) => s.entry.base_url), ["http://127.0.0.1:18546/c250/nifi-api"]);
+  const asked: string[] = [];
+  const fetcher = (async (url: string) => { asked.push(url); return url.endsWith("/c250/nifi-api/flow/about") ? new Response(JSON.stringify({ about: { version: "2.5.0" } })) : new Response("no", { status: 404 }); }) as unknown as typeof fetch;
+  const ok = await checkNginx("http://127.0.0.1:18546/c250", fetcher);
+  assert.deepEqual([ok.ok, ok.version], [true, "2.5.0"]);
+  const missing = await checkNginx("http://127.0.0.1:18546/nope", fetcher);
+  assert.equal(missing.error, "HTTP 404: not found (does nginx pass /nope/nifi-api/ to NiFi?)");
+  assert.deepEqual(asked, ["http://127.0.0.1:18546/c250/nifi-api/flow/about", "http://127.0.0.1:18546/nope/nifi-api/flow/about"]);
+});
+
 test("the generated contract: per service one api source at the nginx address (no nifi source, S28) (2 at a time, 5 s, no retries), its entities and resolvers", () => {
   const g = generateGraph(LAB, { workspace: "ws", graph: "nifi-ops-dev" });
   assert.deepEqual(g.services, ["n112", "nifi-lab-c250"]);

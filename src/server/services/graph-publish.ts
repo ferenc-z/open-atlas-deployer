@@ -26,7 +26,7 @@ export async function checkNginx(url: string, fetcher: typeof fetch = fetch, now
     const ms = Date.now() - started;
     const text = await r.text();
     if (!r.ok) {
-      const hint = r.status === 401 || r.status === 403 ? ": refused (nginx's client certificate, or NiFi's /flow read policy for nginx's identity)" : r.status === 404 ? ": not found (does nginx pass /nifi-api/ to NiFi?)" : "";
+      const hint = r.status === 401 || r.status === 403 ? ": refused (nginx's client certificate, or NiFi's /flow read policy for nginx's identity)" : r.status === 404 ? `: not found (does nginx pass ${new URL(apiRoot(url)).pathname}/ to NiFi?)` : "";
       return { url, at, ok: false, status: r.status, version: null, ms, error: `HTTP ${r.status}${hint}` };
     }
     let version: string | null = null;

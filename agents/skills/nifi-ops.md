@@ -1,3 +1,8 @@
+---
+name: nifi-ops
+description: Looking into the NiFi clusters and standalone instances the Deployer manages - status, alerts, events, metrics, bulletins, logs, configuration, node differences, FlowFile provenance and property meanings - with the Deployer's read-only service tools.
+---
+
 # Skill: NiFi operations
 
 How to look into the NiFi clusters and standalone instances the Deployer manages. Answer in the person's language, conclusion first, then a short table, then one `Source / 来源` line naming the tools and the key evidence (an alert, a log line with its node and time, a metric with its value).
@@ -43,5 +48,5 @@ How to look into the NiFi clusters and standalone instances the Deployer manages
 
 - Say "as of" with every state: the samples have a time (`asOf`); an executor offline means you do not know the current state.
 - Quote log lines and bulletins with node and time, a few at most; summarize the rest by count.
-- `[hidden]` and `(hidden)` are redacted secrets: never ask for them, guess them or tell people how to read them.
+- `[hidden]` and `(hidden)` are redacted secrets. Never ask for them, guess them or tell people how to read them.
 - Nothing can be changed from here: configuration changes, restarts and threshold changes are done on the page by people with the right role. Do not offer cards for services.

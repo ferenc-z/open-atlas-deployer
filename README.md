@@ -439,14 +439,14 @@ claude mcp add --transport http open-atlas-deployer https://<域名>/deploy/mcp 
 
 ### Deploy Assistant 的发布
 
-- 提示词 [agents/deploy-assistant.md](agents/deploy-assistant.md)，包定义 [templates/deploy-assistant.oma.json](templates/deploy-assistant.oma.json)（只开 Deployer 的 MCP，`allowed_tools` 只列只读工具，沙箱工具关闭，表格渲染器），随 Deployer 一起发版。`agents/skills/*.md`（如 NiFi 运维）发布时接在提示词后面。
+- 提示词 [agents/deploy-assistant.md](agents/deploy-assistant.md)，包定义 [templates/deploy-assistant.oma.json](templates/deploy-assistant.oma.json)（只开 Deployer 的 MCP，`allowed_tools` 只列只读工具，沙箱工具关闭，表格渲染器），随 Deployer 一起发版。`agents/skills/*.md`（如 NiFi 运维 `nifi-ops`，文件开头带 OMA 要的 `name`/`description` frontmatter）是 OMA 里单独的 Skill：发布时经 OMA 的 Skills API 创建，内容变了才加新版本（没变不出新版本），包里按版本引用，不再拼进提示词；助手因此多开一个只读的 `read` 工具，用来打开沙箱里的 SKILL.md（OMA 默认只把 Skill 的摘要放进提示词，`OMA_SKILL_EAGER_PROMPT=1` 时才放全文）。
 - 发布：
 
 ```bash
-node bin/publish-assistant.ts <OMA Builder MCP 地址> <builder key 文件> <模型名> https://<域名>/deploy/mcp ./assistant-uat.json
+OMA_URL=<OMA API 地址> OMA_API_KEY_FILE=<能建 Skill 的 OMA key 文件> \n  node bin/publish-assistant.ts <OMA Builder MCP 地址> <builder key 文件> <模型名> https://<域名>/deploy/mcp ./assistant-uat.json
 ```
 
-  打印新的 agent id；把 Workbench 的 Business Agent "Deploy Assistant" 指向它，并设为 `DEPLOYER_OMA_AGENT`。OMA Vault 里按 MCP 地址存服务 key。
+  打印每个 Skill 的 id、版本和是否新建/更新/未变，以及新的 agent id（状态文件另记 Skill 的 id）；把 Workbench 的 Business Agent "Deploy Assistant" 指向它，并设为 `DEPLOYER_OMA_AGENT`。OMA Vault 里按 MCP 地址存服务 key。
   要让助手下钻到 NiFi 组件，加环境变量 `NIFI_OPS_MCP_URL=<Studio 数据面>/mcp/<nifi-ops 图的 uuid>`，包里会多一个 MCP 服务器（只读的六个工具）；OMA Vault 里按这个地址存该图的只读 graph token（`oat_v1.`）。
 - 用例：[docs/golden-cases.md](docs/golden-cases.md)（读、卡片、越权）。
 

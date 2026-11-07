@@ -45,7 +45,7 @@ export function NginxAddress({ s, onChanged }: { s: ServiceStatus; onChanged: ()
         Studio's <span className="mono">{graph?.graph ?? "nifi-ops"}</span> graph reads this {s.kind === "cluster" ? "cluster" : "instance"}'s queues, processors and bulletins live,
         only through nginx (provenance is not in the graph: the FlowFile trace tab asks NiFi through the service executor). Operations configure that nginx: it holds the NiFi client certificate (NiFi grants its identity read on /flow, /system,
         /controller and the process groups){s.kind === "cluster" ? ", and puts every node of the cluster behind this one address so that it moves on when a node is down" : ""}.
-        Give the address without <span className="mono">/nifi-api</span>, e.g. <span className="mono">https://nifi-ops.example.internal:8443</span>.
+        Give the address without <span className="mono">/nifi-api</span>, e.g. <span className="mono">https://nifi-ops.example.internal:8443</span>, or, when one nginx tells the NiFi apart by path, with the path: <span className="mono">https://nginx.example.internal/nifi-prod-a</span> (nginx then passes <span className="mono">/nifi-prod-a/nifi-api/</span> to that NiFi's <span className="mono">/nifi-api/</span>).
       </p>
       {canEdit
         ? <div className="row">

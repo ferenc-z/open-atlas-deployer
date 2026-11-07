@@ -10,7 +10,7 @@
 #                             operator their policies, using the operator cert
 #   lab.sh curl NAME PATH [cert]   GET https://localhost:PORT/nifi-api/PATH
 #                             with cert monitor (default) | operator | nginx
-#   lab.sh nginx start|stop|status  the lab's nginx (nginx.conf, 127.0.0.1:18543-18545)
+#   lab.sh nginx start|stop|status  the lab's nginx (nginx.conf, 127.0.0.1:18543-18546)
 #                             as this user; status asks each address for flow/about
 #
 # Names: n112 n200 c250-1 c250-2 (lab.conf); none = all.
@@ -27,7 +27,10 @@ NGX="$LAB/nginx"
 # address|what it fronts (nginx.conf)
 NGINX_TABLE="18543|n112
 18544|n200
-18545|c250-1 c250-2"
+18545|c250-1 c250-2
+18546/n112|n112 (by path)
+18546/n200|n200 (by path)
+18546/c250|c250 (by path)"
 
 nginx_run() { nginx -p "$NGX" -e "$NGX/logs/error.log" -c "$NGX/nginx.conf" "$@"; }
 
@@ -145,7 +148,7 @@ except Exception as e: print("unavailable", e)')"
       status)
         if [ -f "$NGX/run/nginx.pid" ] && kill -0 "$(cat "$NGX/run/nginx.pid")" 2>/dev/null; then echo "nginx pid $(cat "$NGX/run/nginx.pid")"; else echo "nginx stopped"; fi
         echo "$NGINX_TABLE" | while IFS='|' read -r port what; do
-          printf '%-6s %-14s %s
+          printf '%-11s %-16s %s
 ' "$port" "$what" "$(curl -sS --max-time 10 -w ' HTTP %{http_code}' "http://127.0.0.1:$port/nifi-api/flow/about" 2>&1 | python3 -I -c '
 import json,sys
 t=sys.stdin.read(); body,_,code=t.rpartition(" HTTP ")

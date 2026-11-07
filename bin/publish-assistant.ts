@@ -1,29 +1,40 @@
 // Publishes the next revision of the Deploy Assistant (design §10.4), or with a 6th argument onboarding-assessor the
 // Onboarding Assessor (§10.5), to one environment's OMA through its Builder MCP, as Logbook's publish-oma.py does:
 // the package definition is templates/<agent>.oma.json, the prompt agents/<agent>.md. The state file keeps the
-// package id and the agents published so far; each publish makes a new agent id, which the next step points at.
+// package id, the agents published so far and the Skills' ids; each publish makes a new agent id, which the next step
+// points at.
 //
-// Usage: [NIFI_OPS_MCP_URL=<Studio data plane MCP of the nifi-ops graph>] node bin/publish-assistant.ts <builder MCP url> <builder key file> <model> <Deployer MCP url> <state file> [deploy-assistant | onboarding-assessor]
-//   e.g. node bin/publish-assistant.ts https://oma:3008/mcp /etc/oa/oma-builder.key claude-x https://wb.example/deploy/mcp ./assistant-uat.json
+// The Deploy Assistant's Skills (agents/skills/*.md, e.g. nifi-ops) are OMA Skills of their own (service ops §15.5,
+// owner 2026-11-07): each is created, or given a new version when its text changed, through OMA's Skills API, and the
+// package references that version. That needs OMA_URL and OMA_API_KEY_FILE (OMA's API and a key that may create Skills,
+// the same pair as DEPLOYER_OMA_URL / DEPLOYER_OMA_API_KEY_FILE): OMA's Builder MCP can create a Skill but not add a
+// version to one.
+//
+// Usage: OMA_URL=<OMA API> OMA_API_KEY_FILE=<key file> [NIFI_OPS_MCP_URL=<Studio data plane MCP of the nifi-ops graph>] node bin/publish-assistant.ts <builder MCP url> <builder key file> <model> <Deployer MCP url> <state file> [deploy-assistant | onboarding-assessor]
+//   e.g. OMA_URL=https://oma:3000 OMA_API_KEY_FILE=/etc/oa/oma-api.key node bin/publish-assistant.ts https://oma:3008/mcp /etc/oa/oma-builder.key claude-x https://wb.example/deploy/mcp ./assistant-uat.json
 
-import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fill } from "../src/server/drivers/types.ts";
 import { McpClient } from "../src/server/mcp-client.ts";
+import { attachSkills, OmaSkills, readSkillSources, skillReferences, type PublishedSkill } from "../src/server/oma-skills.ts";
 import { readToken } from "../src/server/versions.ts";
 
 const [builderUrl, keyFile, model, mcpUrl, stateFile, agentName = "deploy-assistant"] = process.argv.slice(2);
 if (!["deploy-assistant", "onboarding-assessor"].includes(agentName)) { console.error(`unknown agent ${agentName}`); process.exit(2); }
 if (!builderUrl || !keyFile || !model || !mcpUrl || !stateFile) {
-  console.error("usage: node bin/publish-assistant.ts <builder MCP url> <builder key file> <model> <Deployer MCP url> <state file>");
+  console.error("usage: OMA_URL=<OMA API> OMA_API_KEY_FILE=<key file> node bin/publish-assistant.ts <builder MCP url> <builder key file> <model> <Deployer MCP url> <state file>");
   process.exit(2);
 }
 const root = join(import.meta.dirname, "..");
-// The Deploy Assistant's skills (agents/skills/*.md, e.g. NiFi operations) go into its system prompt: an OMA package carries
-// only references to Skills published on their own, and OMA injects a Skill into the prompt anyway.
-const skillsDir = join(root, "agents", "skills");
-const skills = agentName === "deploy-assistant" && existsSync(skillsDir) ? readdirSync(skillsDir).filter((f) => f.endsWith(".md")).sort().map((f) => readFileSync(join(skillsDir, f), "utf8")) : [];
-const values = { model, mcpUrl, system: [readFileSync(join(root, "agents", `${agentName}.md`), "utf8"), ...skills].join("\n\n") };
+const sources = agentName === "deploy-assistant" ? readSkillSources(join(root, "agents", "skills")) : [];
+const omaUrl = process.env.OMA_URL;
+const omaKeyFile = process.env.OMA_API_KEY_FILE;
+if (sources.length && (!omaUrl || !omaKeyFile)) {
+  console.error(`the Skills ${sources.map((s) => s.name).join(", ")} go to OMA's Skills API: set OMA_URL and OMA_API_KEY_FILE`);
+  process.exit(2);
+}
+const values = { model, mcpUrl, system: readFileSync(join(root, "agents", `${agentName}.md`), "utf8") };
 const missing = new Set<string>();
 const filled = JSON.parse(readFileSync(join(root, "templates", `${agentName}.oma.json`), "utf8"), (_k, v) => {
   if (typeof v !== "string") return v;
@@ -44,7 +55,18 @@ if (nifiOps && agentName === "deploy-assistant") {
   filled.credential_requirements.push({ key: "nifi-ops-graph-token", description: "A read-only Studio graph token (oat_v1.) of the nifi-ops graph, stored for the URL above.", required_scopes: ["read"] });
 }
 
-const state = existsSync(stateFile) ? JSON.parse(readFileSync(stateFile, "utf8")) as { packageId?: string; agents?: string[] } : {};
+const state = existsSync(stateFile) ? JSON.parse(readFileSync(stateFile, "utf8")) as { packageId?: string; agents?: string[]; skills?: Record<string, string> } : {};
+if (sources.length) {
+  const oma = new OmaSkills(omaUrl!, readToken(omaKeyFile!));
+  const published: PublishedSkill[] = [];
+  for (const source of sources) {
+    const skill = await oma.ensure(source, state.skills?.[source.name]);
+    console.log(`skill ${skill.name} ${skill.skill_id} version ${skill.version} (${skill.action})`);
+    published.push(skill);
+  }
+  state.skills = { ...(state.skills ?? {}), ...Object.fromEntries(published.map((s) => [s.name, s.skill_id])) };
+  attachSkills(filled.agents[0], skillReferences(published));
+}
 const builder = new McpClient(builderUrl, () => ({ authorization: `Bearer ${readToken(keyFile)}` }));
 if (!state.packageId) {
   const draft = await builder.call("create_package_draft", filled);

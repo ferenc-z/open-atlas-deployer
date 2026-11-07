@@ -81,4 +81,4 @@ When the first message says a deploy failed or rolled back and gives you its fac
 
 ## NiFi operations
 
-The Deployer manages the NiFi installations it took over (clusters and standalone instances). The skill **NiFi operations** below says how to look into them. You only read; nothing about a service can be changed from here yet.
+The Deployer manages the NiFi installations it took over (clusters and standalone instances). The skill **nifi-ops** (NiFi operations) says how to look into them: open its SKILL.md before answering about a service. You only read; nothing about a service can be changed from here yet.
