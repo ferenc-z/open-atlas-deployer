@@ -28,7 +28,9 @@ Beside the jobs runs the collector (§9.1, §15.3): every EXECUTOR_COLLECT_SECON
 watches on this machine (the watch list comes with every heartbeat reply, §15.2 P5; nothing else is sampled): the
 process and the host from /proc, the disks of the repositories and logs, the NiFi's REST API with the monitor
 certificate (EXECUTOR_NIFI_CLIENT_CERT/KEY/CA, S11, P6) and, once an hour, the expiry of the certificates in its
-keystore and truststore (keytool, the password passed in the environment) and of the monitor certificate (S27). The
+keystore and truststore (keytool, the password passed in the environment) and of the monitor certificate (S27). Back
+pressure (the root group's recursive status, large on a large flow) is read only every EXECUTOR_BACKPRESSURE_SECONDS
+(default 300) and sent as a summary: how many connections are at their threshold and the fullest few. The
 samples go to POST /executor/v1/samples, at most 20 at a time; those the Deployer cannot take wait in memory up to 30
 minutes. One NiFi that hangs costs at most 10 seconds of its own sample. Each sample also carries the WARN/ERROR summary
 of nifi-app.log since the last one (followed by inode and offset kept in the work directory): counts by pattern, the
@@ -101,6 +103,11 @@ def config(env_file=None, environ=None):
         "nifi_client_key": e.get("EXECUTOR_NIFI_CLIENT_KEY", "").strip(),
         "nifi_ca": e.get("EXECUTOR_NIFI_CA", "").strip(),
         "nifi_ca_relaxed": e.get("EXECUTOR_NIFI_CA_RELAXED", "").strip().lower() in ("1", "true", "yes"),
+        # Back pressure (owner 2026-11-07): the root group's recursive status every this many seconds (default 300,
+        # from 30 up to 3600), summed up to the connections at their threshold and the fullest N queues
+        # (EXECUTOR_BACKPRESSURE_TOP, default 5, 1 to 50); the samples between carry none.
+        "backpressure_seconds": min(BACKPRESSURE_MAX, max(COLLECT_MIN, int(e.get("EXECUTOR_BACKPRESSURE_SECONDS", str(BACKPRESSURE_DEFAULT))))),
+        "backpressure_top": min(BACKPRESSURE_TOP_MAX, max(1, int(e.get("EXECUTOR_BACKPRESSURE_TOP", str(BACKPRESSURE_TOP))))),
         # §8.6: where the installed releases are, and the only place a newer one may come from.
         "base": pathlib.Path(e.get("EXECUTOR_BASE", "/opt/open-atlas-deployer/service-executor")),
         "upgrade_from": e.get("EXECUTOR_UPGRADE_FROM", "").strip(),
@@ -645,6 +652,9 @@ class Discovery:
 # --- the collector (§9.1, §15.3): a sample of every NiFi the Deployer watches on this machine, every minute ----------
 
 COLLECT_DEFAULT, COLLECT_MIN, COLLECT_MAX = 60, 30, 300
+# Back pressure (owner 2026-11-07): read less often than the rest and sent only as a summary.
+BACKPRESSURE_DEFAULT, BACKPRESSURE_MAX = 300, 3600
+BACKPRESSURE_TOP, BACKPRESSURE_TOP_MAX = 5, 50
 # Per NiFi and round, and per REST request: a NiFi that hangs costs its own sample at most this, never the others'.
 NIFI_BUDGET = 10.0
 REQUEST_TIMEOUT = 5.0
@@ -847,12 +857,10 @@ def trim_bulletins(d):
     return out
 
 
-BACKPRESSURE_TOP = 5
-
-
-def trim_backpressure(d):
-    """Back pressure from the root process group's recursive status (§15.4 step 2): how many connections there are,
-    how many are at their threshold (object count or size at 100 %), the fullest percentage and the fullest few."""
+def trim_backpressure(d, top=BACKPRESSURE_TOP):
+    """Back pressure from the root process group's recursive status (§15.4 step 2), only as a summary (owner
+    2026-11-07): how many connections there are, how many are at their threshold (object count or size at 100 %), the
+    fullest percentage and the fullest `top` queues that hold anything; never the whole list."""
     conns = []
 
     def walk(snap, group):
@@ -871,10 +879,10 @@ def trim_backpressure(d):
     fill = lambda c: max(c.get("percentUseCount") or 0, c.get("percentUseBytes") or 0)
     conns.sort(key=fill, reverse=True)
     return {"connections": len(conns), "full": sum(1 for c in conns if fill(c) >= 100), "maxPercent": fill(conns[0]) if conns else 0,
-            "top": [c for c in conns[:BACKPRESSURE_TOP] if fill(c) > 0]}
+            "top": [c for c in conns[:top] if fill(c) > 0]}
 
 
-TRIM = {"about": trim_about, "diagnostics": trim_diagnostics, "status": trim_status, "cluster": trim_cluster, "bulletins": trim_bulletins, "backpressure": trim_backpressure}
+TRIM = {"about": trim_about, "diagnostics": trim_diagnostics, "status": trim_status, "cluster": trim_cluster, "bulletins": trim_bulletins}
 
 
 class Collector:
@@ -889,6 +897,7 @@ class Collector:
         self.certs = {}      # member -> {"at": monotonic, "signature": ..., "stores": [...]}
         self.keytools = {}   # member -> the keytool last found for it (a stopped NiFi has no JAVA_HOME to look at)
         self.bulletins = {}  # member -> the bulletin keys of its last sample: only new ones are sent
+        self.backpressure_next = {}  # member -> monotonic time its back pressure is read next
 
     # --- host and processes ---
 
@@ -966,8 +975,12 @@ class Collector:
         connect, sni, port = target
         node = props.get("nifi.cluster.is.node", "false").strip().lower() == "true"
         calls = [("about", "flow/about"), ("diagnostics", "system-diagnostics?nodewise=true" if node else "system-diagnostics"), ("status", "flow/status"),
-                 *([("cluster", "controller/cluster")] if node else []), ("bulletins", f"flow/bulletin-board?limit={BULLETINS}"),
-                 ("backpressure", "flow/process-groups/root/status?recursive=true")]
+                 *([("cluster", "controller/cluster")] if node else []), ("bulletins", f"flow/bulletin-board?limit={BULLETINS}")]
+        # Back pressure only every backpressure_seconds, with half a sampling period of slack: rounds do not start
+        # exactly a period apart, and one a little early must not push the reading a whole round later.
+        every = int(self.cfg.get("backpressure_seconds", BACKPRESSURE_DEFAULT))
+        if time.monotonic() >= self.backpressure_next.get(w["member"], 0):
+            calls.append(("backpressure", "flow/process-groups/root/status?recursive=true"))
         out, errors = {"state": "ok", "url": f"https://{sni}:{port}"}, {}
         deadline = time.monotonic() + NIFI_BUDGET
         for name, path in calls:
@@ -975,6 +988,9 @@ class Collector:
             if left < 0.5:
                 errors[name] = f"skipped: {NIFI_BUDGET:g} seconds were used up"
                 continue
+            if name == "backpressure":
+                # Tried once per interval, answered or not: a flow too large to answer is not asked every round.
+                self.backpressure_next[w["member"]] = time.monotonic() + every - min(every, int(self.cfg.get("collect_seconds", COLLECT_DEFAULT))) / 2
             try:
                 status, body = self.fetch(ctx, connect, port, sni, path, min(REQUEST_TIMEOUT, left))
             except (OSError, ssl.SSLError, http.client.HTTPException) as e:
@@ -987,6 +1003,10 @@ class Collector:
                 errors[name] = f"HTTP {status}: {body[:200].decode('utf-8', 'replace').strip()}"
                 continue
             try:
+                if name == "backpressure":
+                    out[name] = {"at": now_iso(), "everySeconds": every,
+                                 **trim_backpressure(json.loads(body), int(self.cfg.get("backpressure_top", BACKPRESSURE_TOP)))}
+                    continue
                 out[name] = TRIM[name](json.loads(body))
             except (ValueError, AttributeError, TypeError) as e:
                 errors[name] = f"unexpected answer: {e}"[:300]
@@ -2209,7 +2229,9 @@ class ServiceExecutor(ProtocolExecutor):
         with self.backlog_lock:
             backlog = len(self.backlog)
         # §15.3: what the collector does (never the certificate's paths).
-        body["collector"] = {"seconds": self.cfg.get("collect_seconds", COLLECT_DEFAULT), "watching": watching, "backlog": backlog,
+        body["collector"] = {"seconds": self.cfg.get("collect_seconds", COLLECT_DEFAULT),
+                             "backpressureSeconds": self.cfg.get("backpressure_seconds", BACKPRESSURE_DEFAULT),
+                             "watching": watching, "backlog": backlog,
                              "certificate": bool(self.cfg.get("nifi_client_cert") and self.cfg.get("nifi_client_key"))}
         return body
 

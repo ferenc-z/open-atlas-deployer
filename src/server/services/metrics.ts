@@ -79,12 +79,15 @@ export function pointOf(sample: Any, m: Pick<ServiceMember, "ports" | "nodeAddre
     activeThreads: num(clusterSelf?.activeThreadCount) ?? (Array.isArray(diag.nodes) ? null : num(nifi.status?.activeThreadCount)),
     queuedCount: num(clusterSelf?.flowFilesQueued) ?? (Array.isArray(diag.nodes) ? null : num(nifi.status?.flowFilesQueued)),
     queuedBytes: num(clusterSelf?.bytesQueued) ?? (Array.isArray(diag.nodes) ? null : num(nifi.status?.bytesQueued)),
+    // Back pressure is read every few minutes (owner 2026-11-07): only some samples carry it; _bpEvery says how often
+    // (an executor from before sends it every round without saying: null, the sampling period).
     bpFull: num(nifi.backpressure?.full), bpMaxPct: num(nifi.backpressure?.maxPercent),
     repoFlowfilePct: repo("flowfile"), repoContentPct: repo("content"), repoProvenancePct: repo("provenance"),
     cpuPct: null, rss: num(proc.rssBytes),
     load1: num(sample.host?.load?.[0]), memPct: pct(num(mem.totalBytes) !== null && num(mem.availableBytes) !== null ? mem.totalBytes - mem.availableBytes : null, mem.totalBytes),
     diskPct: disks.length ? Math.max(...disks) : null,
     _cpuSeconds: num(proc.cpuSeconds), _gcMillis: gcMillis, _gcCount: gcCount, _startedAt: Number.isNaN(startedAt) ? null : startedAt,
+    ...(nifi.backpressure ? { _bpEvery: num(nifi.backpressure.everySeconds) } : {}),
   };
   if (previous && previousAt) {
     const minutes = (Date.parse(sample.at) - Date.parse(previousAt)) / 60_000;

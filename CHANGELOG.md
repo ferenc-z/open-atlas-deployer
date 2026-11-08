@@ -164,14 +164,25 @@ logs, the AI's read-only tools, Studio's `nifi-ops` graph, the FlowFile trace). 
 - An nginx address may carry a path (`https://nginx.example/nifi-prod-a`): one nginx telling the NiFi apart by path,
   as at the company; the Deployer appends `/nifi-api`, so nginx passes `<prefix>/nifi-api/` on. The lab's nginx has
   such an entry (127.0.0.1:18546, `/n112`, `/n200`, `/c250`); a 404 names the path nginx should pass.
+- FlowFile attributes in the trace (owner 2026-11-07): the monitor identity is given NiFi's "view the data" on the
+  root group (`/data/process-groups/<root>`, read; on a cluster every node's identity too, as NiFi checks the proxy
+  chain), so event details carry the attributes. The page shows them as they are; the AI gets them redacted as
+  before. The Takeover page lists every policy the monitor identity needs; `lab.sh grant` gives them in the lab. The
+  redaction cases are shared by the Deployer's and the service executor's tests (`testdata/redact/cases.json`).
+- Back pressure less often and only as a summary (owner 2026-11-07): the service executor reads the root group's
+  recursive status every `EXECUTOR_BACKPRESSURE_SECONDS` (default 300, 30-3600) instead of every sample and sends
+  the connections at their threshold, the fullest percentage and the fullest `EXECUTOR_BACKPRESSURE_TOP` queues
+  (default 5, 1-50). The service status carries the newest reading (`summary.backpressure`, stale after 3
+  intervals); the Overview shows it and the most congested queues, the Metrics charts join the readings, and the
+  back pressure rule looks 3 intervals back (a stale reading cannot tell). Samples of an executor that sent it every
+  round still read as before.
 
 **Known limits**
 - Alerts are not pushed (S13).
 - Not yet: removing a service, turning a standalone instance into a cluster, a cluster's common layer and node
   overrides, configuration changes, starting and stopping (phase 3); alert diagnosis and briefs (phase 4).
-- Alerts, events and the facts behind them are not pruned yet; the collector's back pressure reads the root group's
-  recursive status every round (large on a large flow); FlowFile attributes need NiFi's "view the data" policy, which
-  the monitor identity does not have by default.
+- Alerts, events and the facts behind them are not pruned yet; the back pressure reading is still the root group's
+  whole recursive status (only less often), large on a large flow.
 - The service executor cannot be upgraded from the Hosts page or the Overview yet, and the setup package does not
   include it.
 

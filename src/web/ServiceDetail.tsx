@@ -86,6 +86,47 @@ const live = (m: MemberStatus, f: Field) => m.live?.point?.[f] ?? null;
 const sum = (s: ServiceStatus, f: Field) => { const v = s.members.map((m) => live(m, f)).filter((x): x is number => x !== null); return v.length ? v.reduce((a, b) => a + b, 0) : null; };
 const highest = (s: ServiceStatus, f: Field) => { const v = s.members.map((m) => live(m, f)).filter((x): x is number => x !== null); return v.length ? Math.max(...v) : null; };
 
+const everyText = (seconds: number) => (seconds % 60 === 0 ? `${seconds / 60} min` : `${seconds} s`);
+
+// Back pressure (owner 2026-11-07): read every few minutes and kept as a summary (summary.backpressure), not per sample.
+function BackpressureMetric({ s }: { s: ServiceStatus }) {
+  const bp = s.summary.backpressure;
+  const title = `Connections at their back pressure threshold, flow-wide. Read every ${everyText(bp?.everySeconds ?? 300)} by the service executor (EXECUTOR_BACKPRESSURE_SECONDS).`;
+  if (!bp) return <div className="metric" title={title}><span className="muted small">Back pressure</span><strong>—</strong><span className="small muted">not read yet</span></div>;
+  return (
+    <div className="metric" title={`${title} As of ${when(bp.at)}.`}>
+      <span className="muted small">Back pressure</span>
+      <strong>{fmtNumber(bp.full, 0)}{bp.connections !== null && <span className="muted small"> of {fmtNumber(bp.connections, 0)}</span>}</strong>
+      <span className={`small ${bp.stale ? "error" : "muted"}`}>fullest {pctText(bp.maxPercent)} · {ago(bp.at)}{bp.stale ? " (stale)" : ""}</span>
+    </div>
+  );
+}
+
+const queuePct = (q: { percentUseCount?: number; percentUseBytes?: number }) => Math.max(q.percentUseCount ?? 0, q.percentUseBytes ?? 0);
+
+function Congested({ s }: { s: ServiceStatus }) {
+  const bp = s.summary.backpressure;
+  if (!bp?.top.length) return null;
+  return (
+    <div>
+      <h3>Most congested queues</h3>
+      <table>
+        <thead><tr><th>Connection</th><th>Group</th><th>From → to</th><th>Full</th><th>Queued</th></tr></thead>
+        <tbody>{bp.top.map((q, i) => (
+          <tr key={q.id ?? i}>
+            <td>{q.name || <span className="muted mono small">{q.id ?? "?"}</span>}</td>
+            <td>{q.group ?? "—"}</td>
+            <td className="small">{q.sourceName ?? "?"} → {q.destinationName ?? "?"}</td>
+            <td className="mono small"><span className={`badge ${queuePct(q) >= 100 ? "bad" : queuePct(q) >= 80 ? "warn" : "muted"}`} title={`objects ${q.percentUseCount ?? 0} %, size ${q.percentUseBytes ?? 0} %`}>{queuePct(q)} %</span></td>
+            <td className="mono small">{fmtNumber(q.flowFilesQueued ?? null, 0)} · {fmtBytes(q.bytesQueued ?? null)}</td>
+          </tr>
+        ))}</tbody>
+      </table>
+      <p className="muted small">The fullest {bp.top.length} of {fmtNumber(bp.connections, 0)} connections (flow-wide), as of {when(bp.at)}; read every {everyText(bp.everySeconds)}, only this summary is kept.</p>
+    </div>
+  );
+}
+
 function StateBadge({ m }: { m: MemberStatus }) {
   const st = STATE[m.state];
   const why = m.source === "discovery" ? " (as of the host's newest discovery: no sample yet)" : m.source === "executor" ? ` (${m.executor.reason ?? "executor offline"})` : "";
@@ -107,7 +148,7 @@ function Overview({ s, reload }: Loaded) {
         {sampled && <>
           <div className="metric" title="The fullest node's heap"><span className="muted small">Heap used</span><strong>{pctText(highest(s, "heapPct"))}</strong><span className="small muted">highest node</span></div>
           <div className="metric"><span className="muted small">Queued</span><strong>{fmtNumber(sum(s, "queuedCount"), 0)}</strong><span className="small muted">{fmtBytes(sum(s, "queuedBytes"))}</span></div>
-          <div className="metric" title="Connections at their back pressure threshold, flow-wide"><span className="muted small">Back pressure</span><strong>{fmtNumber(highest(s, "bpFull"), 0)}</strong><span className="small muted">fullest {pctText(highest(s, "bpMaxPct"))}</span></div>
+          <BackpressureMetric s={s} />
           <div className="metric"><span className="muted small">Threads</span><strong>{fmtNumber(sum(s, "threads"), 0)}</strong><span className="small muted">{fmtNumber(sum(s, "activeThreads"), 0)} active</span></div>
           <div className="metric" title="The fullest repository disk of any node"><span className="muted small">Repository disk</span><strong>{pctText(Math.max(highest(s, "repoContentPct") ?? 0, highest(s, "repoFlowfilePct") ?? 0, highest(s, "repoProvenancePct") ?? 0))}</strong><span className="small muted">fullest</span></div>
         </>}
@@ -129,6 +170,7 @@ function Overview({ s, reload }: Loaded) {
           ))}</tbody>
         </table>
       </div>
+      <Congested s={s} />
       <Certificates s={s} />
       <NginxAddress s={s} onChanged={reload} />
       {s.findings.length > 0 && <div>
@@ -198,9 +240,10 @@ function Certificates({ s }: { s: ServiceStatus }) {
 
 // Metrics (§15.3): one chart per number, a line per node, over 1 hour / 6 hours / 2 days (raw samples) or 30 days (5-minute rollups).
 const RANGES: { id: Range; label: string }[] = [{ id: "1h", label: "1 hour" }, { id: "6h", label: "6 hours" }, { id: "2d", label: "2 days" }, { id: "30d", label: "30 days" }];
-const CHARTS: { group: string; charts: { field: Field; title: string; max?: number; note?: string }[] }[] = [
+// sparse: read only every few minutes (back pressure), so the points that have it are joined and the gaps skipped.
+const CHARTS: { group: string; charts: { field: Field; title: string; max?: number; note?: string; sparse?: boolean }[] }[] = [
   { group: "JVM", charts: [{ field: "heapPct", title: "Heap used", max: 100 }, { field: "heapUsed", title: "Heap used (bytes)" }, { field: "gcMsPerMin", title: "GC time" }, { field: "threads", title: "JVM threads" }] },
-  { group: "Flow", charts: [{ field: "queuedCount", title: "Queued flowfiles" }, { field: "queuedBytes", title: "Queued bytes" }, { field: "bpFull", title: "Connections at back pressure", note: "No back pressure data (an executor before step 2 does not collect it)" }, { field: "activeThreads", title: "Active threads" }] },
+  { group: "Flow", charts: [{ field: "queuedCount", title: "Queued flowfiles" }, { field: "queuedBytes", title: "Queued bytes" }, { field: "bpFull", title: "Connections at back pressure", note: "No back pressure read in this range (it is read every 5 minutes by default)", sparse: true }, { field: "bpMaxPct", title: "Fullest queue", max: 100, note: "No back pressure read in this range", sparse: true }, { field: "activeThreads", title: "Active threads" }] },
   { group: "Repositories", charts: [{ field: "repoContentPct", title: "Content repository disk", max: 100 }, { field: "repoFlowfilePct", title: "FlowFile repository disk", max: 100 }, { field: "repoProvenancePct", title: "Provenance repository disk", max: 100 }] },
   { group: "Host", charts: [{ field: "cpuPct", title: "Process CPU (100 % = one core)" }, { field: "rss", title: "Process RSS" }, { field: "load1", title: "Host load (1 min)" }, { field: "memPct", title: "Host memory used", max: 100 }, { field: "diskPct", title: "Fullest disk", max: 100 }] },
 ];
@@ -212,9 +255,12 @@ function Metrics({ s }: { s: ServiceStatus }) {
   const load = useCallback(() => { api.serviceMetrics(s.id, range).then((v) => { setView(v); setError(""); }, (e: Error) => setError(e.message)); }, [s.id, range]);
   useEffect(() => { setView(undefined); load(); const t = setInterval(load, 30_000); return () => clearInterval(t); }, [load]);
   const from = view ? Date.parse(view.from) : 0, to = view ? Date.parse(view.to) : 0;
-  const series = (f: Field): Series[] => !view ? [] : s.members.map((m) => {
+  const series = (f: Field, sparse = false): Series[] => !view ? [] : s.members.map((m) => {
     const got = view.members.find((x) => x.member === m.key);
-    return { name: memberLabel(s, m), at: got ? got.at.map((a) => Date.parse(a)) : [], values: got?.values[f] ?? [] };
+    const at = got ? got.at.map((a) => Date.parse(a)) : [], values = got?.values[f] ?? [];
+    if (!sparse) return { name: memberLabel(s, m), at, values };
+    const keep = values.map((v, i) => (v === null ? -1 : i)).filter((i) => i >= 0);
+    return { name: memberLabel(s, m), at: keep.map((i) => at[i]!), values: keep.map((i) => values[i]!) };
   });
   return (
     <div className="panel">
@@ -230,11 +276,11 @@ function Metrics({ s }: { s: ServiceStatus }) {
         <section key={g.group} className="chart-section">
           <h3>{g.group}</h3>
           <div className="charts">{g.charts.map((c) => (
-            <LineChart key={c.field} title={c.title} unit={view.fields[c.field].unit} series={series(c.field)} from={from} to={to} {...(c.max ? { max: c.max } : {})} {...(c.note ? { note: c.note } : {})} />
+            <LineChart key={c.field} title={c.title} unit={view.fields[c.field].unit} series={series(c.field, c.sparse)} from={from} to={to} {...(c.max ? { max: c.max } : {})} {...(c.note ? { note: c.note } : {})} />
           ))}</div>
         </section>
       ))}
-      {view && s.kind === "cluster" && <p className="muted small">Back pressure is flow-wide (the root group's status), so every node shows the same. A node's queue and active threads are its share in the coordinator's view.</p>}
+      {view && <p className="muted small">Back pressure is read every {everyText(s.summary.backpressure?.everySeconds ?? 300)} (the service executor's EXECUTOR_BACKPRESSURE_SECONDS), not every sample; its points are joined.{s.kind === "cluster" ? " It is flow-wide (the root group's status), so every node shows the same. A node's queue and active threads are its share in the coordinator's view." : ""}</p>}
     </div>
   );
 }

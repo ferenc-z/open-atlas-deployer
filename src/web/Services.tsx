@@ -145,6 +145,30 @@ function ServiceTable({ services, onOpen }: { services: RegisteredService[]; onO
 }
 
 // Takeover.
+
+// The manual step of a takeover (S11, S28): what operations give the monitor certificate's identity in each NiFi.
+const MONITOR_POLICIES: [string, string, string][] = [
+  ["/flow", "view the user interface", "versions, flow status, bulletins, back pressure"],
+  ["/system", "view system diagnostics", "heap, GC, threads, repositories"],
+  ["/controller", "view the controller", "cluster nodes and the coordinator"],
+  ["/provenance", "query provenance", "FlowFile trace"],
+  ["/provenance-data/process-groups/<root group id>", "view provenance (root group, inherited)", "FlowFile trace events"],
+  ["/data/process-groups/<root group id>", "view the data (root group, inherited)", "the FlowFile attributes of trace events (on a cluster also every node's identity, see below)"],
+];
+
+function MonitorPolicies() {
+  return (
+    <details className="card">
+      <summary>Before the takeover: NiFi policies for each host's monitor certificate (done by operations)</summary>
+      <p className="muted small">Each NiFi server's service executor calls its local NiFi with that host's monitor certificate (EXECUTOR_NIFI_CLIENT_CERT). In NiFi, add the certificate's identity as a user and give it these policies, all <strong>read</strong> only (on a cluster once, any node passes it on). Without them the matching numbers or the FlowFile trace stay empty; nothing here writes to NiFi, and content is never read.</p>
+      <table>
+        <thead><tr><th>Resource</th><th>Policy in the NiFi UI</th><th>For</th></tr></thead>
+        <tbody>{MONITOR_POLICIES.map(([resource, policy, why]) => <tr key={resource}><td className="mono small">{resource}</td><td>{policy}</td><td className="muted small">{why}</td></tr>)}</tbody>
+      </table>
+      <p className="muted small">On a cluster, also give every node's own identity (its certificate's, e.g. CN=node1, OU=NIFI) <strong>view the data</strong> on the root group: a node passes the request on to the node that holds the event as a proxy, and NiFi checks that policy for every identity on the way; without it the attributes stay hidden.</p>
+    </details>
+  );
+}
 const FINAL = new Set(["succeeded", "failed", "refused", "rolled-back"]);
 
 export function TakeoverPage({ isAdmin, onRegistered }: { isAdmin: boolean; onRegistered: () => void }) {
@@ -186,6 +210,7 @@ export function TakeoverPage({ isAdmin, onRegistered }: { isAdmin: boolean; onRe
         <span className="muted">1. Discover on each host's service executor (it only reads). 2. Make a draft: the Deployer groups what it found into clusters and standalone instances and lists differences between nodes and risks. 3. Edit the draft and confirm it: each installation's configuration files are read and kept as revision 1. Nothing on the hosts changes.</span>
       </div>
       <ProblemLine problem={problem} />
+      <MonitorPolicies />
       <h2>1 · Discover</h2>
       {!hosts.length ? <p className="muted">No host has a service executor yet: install one on the NiFi servers and issue its token on the Hosts page.</p> : (
         <table>

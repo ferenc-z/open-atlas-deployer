@@ -2191,7 +2191,7 @@ test("service ops step 6: a registered service's status is its members' executor
   await discover("failed", []);
   flow = (await status("flow")).body;
   assert.deepEqual(flow.members.map((m: { state: string; seen: { version: string; pid: number | null } }) => [m.state, m.seen.version, m.seen.pid]), [["running", "2.5.0", 11], ["stopped", "2.5.1", null]]);
-  assert.deepEqual(flow.summary, { members: 2, running: 1, executorsOnline: 2, versionsSeen: ["2.5.1"], differences: 0, findings: { error: 0, warning: 0, info: 0 }, asOf: "2026-11-05T01:00:00Z", period: 60, cert: null, certErrors: 0, certDays: { warn: 30, crit: 7 }, alerts: { open: 0, CRIT: 0, WARN: 0 } });
+  assert.deepEqual(flow.summary, { members: 2, running: 1, executorsOnline: 2, versionsSeen: ["2.5.1"], differences: 0, findings: { error: 0, warning: 0, info: 0 }, asOf: "2026-11-05T01:00:00Z", period: 60, cert: null, certErrors: 0, certDays: { warn: 30, crit: 7 }, alerts: { open: 0, CRIT: 0, WARN: 0 }, backpressure: null });
   assert.deepEqual(flow.members.map((m: { source: string }) => m.source), ["discovery", "discovery"], "never sampled: as of the discovery");
   assert.deepEqual([flow.findings, flow.events.map((e: { kind: string }) => e.kind)], [[], ["taken-over"]], "registered without a draft or a configuration");
   assert.equal(flow.zookeeperRoot, "/flow");
@@ -2241,6 +2241,8 @@ test("§15.2: a job the executor does not name in its heartbeat is refused when 
 });
 
 test("§15.2 P5, §15.3: a service executor's heartbeat reply carries its watch list; its samples are kept for what it watches", async () => {
+  // Yesterday: the samples stay within the 2 days the metrics read raw, whenever the test runs.
+  const DAY = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
   const t = setup({ services: fakeState() });
   setEnvironment(t, ({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", hosts, registries: { ghcr: "ghcr.io/acme" }, apps: { shop: { version: "1.2.0", host: "app2" } } }));
   const call = (path: string, token: string, init: RequestInit = {}) => t.app.request(`/deploy${path}`, { ...init, headers: { authorization: `Bearer ${token}`, ...(typeof init.body === "string" && init.body.startsWith("{") ? { "content-type": "application/json" } : {}) } });
@@ -2255,7 +2257,7 @@ test("§15.2 P5, §15.3: a service executor's heartbeat reply carries its watch 
   const { id: job } = await (await post(t, "/api/hosts/app2/discover", "admin", {})).json();
   await call("/executor/v1/jobs/next", service);
   const instance = (dir: string, conf?: string) => ({ installDir: dir, ...(conf ? { confDir: conf } : {}), running: true, version: "2.5.0", properties: { "nifi.web.https.host": "nifi.app2" }, storage: { logs: { path: `${dir}/logs`, device: 1 } } });
-  await call(`/executor/v1/jobs/${job}/status`, service, { method: "PUT", body: JSON.stringify({ protocol: 2, id: job, kind: "svc-discover", state: "succeeded", steps: [], result: { scannedAt: "2026-11-06T01:00:00Z", instances: [instance("/opt/a"), instance("/opt/b", "/etc/nifi-b")], dirs: [], skipped: [] } }) });
+  await call(`/executor/v1/jobs/${job}/status`, service, { method: "PUT", body: JSON.stringify({ protocol: 2, id: job, kind: "svc-discover", state: "succeeded", steps: [], result: { scannedAt: `${DAY}T01:00:00Z`, instances: [instance("/opt/a"), instance("/opt/b", "/etc/nifi-b")], dirs: [], skipped: [] } }) });
   const member = (installDir: string, https: number, confDir?: string) => ({ host: "app2", installDir, ...(confDir ? { confDir } : {}), serviceUser: "nifi", startEnvironment: null, ports: { https }, nodeAddress: `node-${https}`, discovery: { job, host: "app2", installDir, ...(confDir ? { confDir } : {}) } });
   const actor = { id: "admin", via: "workbench" as const };
   t.store.addCluster({ kind: "cluster", id: "flow", service: "nifi", profile: "nifi-2.x", version: "2.5.0", webUrl: null, zookeeper: "zk:2181", zookeeperRoot: "/flow", nodes: [member("/opt/a", 8443), member("/opt/b", 9443, "/etc/nifi-b")] }, "uat", actor);
@@ -2270,32 +2272,32 @@ test("§15.2 P5, §15.3: a service executor's heartbeat reply carries its watch 
   // Samples: only those of what the host watches are kept; at most 20 a request; only from the service executor.
   const send = (token: string, samples: unknown[]) => call("/executor/v1/samples", token, { method: "POST", body: JSON.stringify({ samples }) });
   const sample = (member: string, at: string, more: Record<string, unknown> = {}) => ({ service: "flow", member, at, process: { running: true, pid: 7 }, ...more });
-  const r = await send(service, [sample("app2:/opt/a", "2026-11-06T01:00:00Z"), sample("app2:/opt/a", "2026-11-06T01:01:00Z", { nifi: { state: "ok" } }), sample("app1:/opt/n200", "2026-11-06T01:00:00Z"), { service: "flow" }]);
+  const r = await send(service, [sample("app2:/opt/a", `${DAY}T01:00:00Z`), sample("app2:/opt/a", `${DAY}T01:01:00Z`, { nifi: { state: "ok" } }), sample("app1:/opt/n200", `${DAY}T01:00:00Z`), { service: "flow" }]);
   assert.deepEqual([r.status, await r.json()], [200, { ok: true, accepted: 2, dropped: 2 }]);
   const latest = t.store.latestServiceSamples("flow");
-  assert.deepEqual(latest.map((s) => [s.member, s.at, (s.body.nifi as { state: string }).state]), [["app2:/opt/a", "2026-11-06T01:01:00Z", "ok"]]);
+  assert.deepEqual(latest.map((s) => [s.member, s.at, (s.body.nifi as { state: string }).state]), [["app2:/opt/a", `${DAY}T01:01:00Z`, "ok"]]);
   assert.equal(t.store.latestServiceSamples("n200").length, 0, "another host's service is not this executor's to report");
-  assert.equal((await send(service, Array.from({ length: 21 }, () => sample("app2:/opt/a", "2026-11-06T01:02:00Z")))).status, 400);
+  assert.equal((await send(service, Array.from({ length: 21 }, () => sample("app2:/opt/a", `${DAY}T01:02:00Z`)))).status, 400);
   assert.equal((await call("/executor/v1/samples", service, { method: "POST", body: "{\"nope\":1}" })).status, 400);
-  assert.equal((await send(deploy, [sample("app2:/opt/a", "2026-11-06T01:03:00Z")])).status, 409);
+  assert.equal((await send(deploy, [sample("app2:/opt/a", `${DAY}T01:03:00Z`)])).status, 409);
   assert.equal((await send("dpe_unknown", [])).status, 401);
 
   // Step 2: the numbers and bulletins of what was kept, over the API.
-  await send(service, [sample("app2:/opt/a", "2026-11-06T01:04:00Z", { nifi: { state: "ok", about: { timezone: "UTC" }, bulletins: [{ id: 3, timestamp: "01:03:30 UTC", nodeAddress: "node-8443", level: "ERROR", message: "boom" }] } })]);
-  const m = await (await t.request("/api/services/flow/metrics?from=2026-11-06T00:30:00Z&to=2026-11-06T01:30:00Z&fields=up,heapPct", { as: "viewer" })).json();
+  await send(service, [sample("app2:/opt/a", `${DAY}T01:04:00Z`, { nifi: { state: "ok", about: { timezone: "UTC" }, bulletins: [{ id: 3, timestamp: "01:03:30 UTC", nodeAddress: "node-8443", level: "ERROR", message: "boom" }] } })]);
+  const m = await (await t.request(`/api/services/flow/metrics?from=${DAY}T00:30:00Z&to=${DAY}T01:30:00Z&fields=up,heapPct`, { as: "viewer" })).json();
   assert.deepEqual(m.members.map((x: { member: string; values: { up: number[] } }) => [x.member, x.values.up.filter((v) => v === 1).length]), [["app2:/opt/a", 3]]);
   assert.deepEqual(Object.keys(m.members[0].values), ["up", "heapPct"]);
   assert.equal((await t.request("/api/services/flow/metrics?range=1y", { as: "viewer" })).status, 400);
   assert.equal((await t.request("/api/services/flow/metrics?fields=nope", { as: "viewer" })).status, 400);
   assert.equal((await t.request("/api/services/none/metrics", { as: "viewer" })).status, 404);
   const b = await (await t.request("/api/services/flow/bulletins?level=error", { as: "viewer" })).json();
-  assert.deepEqual(b.bulletins.map((x: { id: number; at: string; node: string }) => [x.id, x.at, x.node]), [[3, "2026-11-06T01:03:30Z", "node-8443"]]);
+  assert.deepEqual(b.bulletins.map((x: { id: number; at: string; node: string }) => [x.id, x.at, x.node]), [[3, `${DAY}T01:03:30Z`, "node-8443"]]);
   const listed = await (await t.request("/api/services", { as: "viewer" })).json();
   assert.equal(listed.clusters[0].trend.heapPct.length, 12, "the cards' trend: an hour in 5-minute steps");
 
   // Step 3: the rules run as samples come in. app2:/opt/a's newest sample is old and its executor online for long: no samples.
-  t.store.setServiceFact("flow", "app2:/opt/a", "onlineSince", "2026-11-06T00:00:00Z");
-  await send(service, [sample("app2:/opt/a", "2026-11-06T01:05:00Z")]);
+  t.store.setServiceFact("flow", "app2:/opt/a", "onlineSince", `${DAY}T00:00:00Z`);
+  await send(service, [sample("app2:/opt/a", `${DAY}T01:05:00Z`)]);
   const a = await (await t.request("/api/services/flow/alerts", { as: "viewer" })).json();
   assert.deepEqual([a.canEdit, a.thresholds.effective.certWarnDays, a.thresholds.info.certWarnDays.unit, a.rules["node-disconnected"].levels], [false, 30, "days", ["CRIT"]]);
   assert.deepEqual(a.alerts.map((x: { rule: string; member: string; state: string; level: string }) => [x.rule, x.member, x.state, x.level]), [["no-samples", "app2:/opt/a", "open", "WARN"]]);

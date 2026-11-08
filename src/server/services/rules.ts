@@ -38,7 +38,7 @@ export const RULES: Record<RuleId, { label: string; scope: "member" | "service";
 /** Each threshold: what it is, its unit and bounds (the page's form says the same). */
 export const THRESHOLDS: Record<keyof Thresholds, { label: string; unit: string; min: number; max: number; rule: RuleId; description: string }> = {
   executorLostMinutes: { label: "Executor lost after", unit: "min", min: 0, max: 60, rule: "executor-lost", description: "How long the service executor may be offline (beyond its 30 seconds without a heartbeat) before the alert opens. Short restarts of the executor stay quiet." },
-  backpressureMinutes: { label: "Back pressure for", unit: "min", min: 0, max: 1440, rule: "backpressure", description: "How long some connection must stay at back pressure. 0 opens the alert on the first sample that shows it." },
+  backpressureMinutes: { label: "Back pressure for", unit: "min", min: 0, max: 1440, rule: "backpressure", description: "How long some connection must stay at back pressure. Back pressure is read every 5 minutes by default (the service executor's EXECUTOR_BACKPRESSURE_SECONDS), so it takes that many readings in a row; 0 opens the alert on the first reading that shows it." },
   repoDiskWarnPct: { label: "Repository disk warning", unit: "%", min: 1, max: 100, rule: "repo-disk", description: "A repository's disk this full opens a warning." },
   repoDiskCritPct: { label: "Repository disk critical", unit: "%", min: 1, max: 100, rule: "repo-disk", description: "This full makes it critical; above the warning threshold." },
   heapPct: { label: "Heap above", unit: "%", min: 1, max: 100, rule: "heap", description: "The heap use (of its maximum) that counts as high." },
@@ -155,8 +155,13 @@ export function evaluate(store: Store, s: ServiceStatus, t: Thresholds, now: Dat
     const versions = [...new Set(s.members.filter((m) => m.source === "samples" && m.state === "running" && m.live?.version).map((m) => m.live!.version!))];
     if (versions.length > 1) add("version-mismatch", "*", "WARN", `The nodes run ${versions.join(" and ")}`, { versions });
   }
-  // Back pressure is flow-wide: every node reports the same, so one alert for the service from all its points.
-  const bp = store.servicePoints(s.id, iso(nowMs - t.backpressureMinutes * MIN - 3 * period * 1000), iso(nowMs + 1000)).filter((x) => typeof x.point.bpFull === "number");
+  // Back pressure is flow-wide: every node reports the same, so one alert for the service from all its points. It is
+  // read every few minutes (owner 2026-11-07, summary.backpressure.everySeconds): the window reaches 3 intervals back,
+  // and a summary older than that (stale) cannot tell.
+  const bpEvery = Math.max(period, s.summary.backpressure?.everySeconds ?? period);
+  const bp = s.summary.backpressure && !s.summary.backpressure.stale
+    ? store.servicePoints(s.id, iso(nowMs - t.backpressureMinutes * MIN - 3 * bpEvery * 1000), iso(nowMs + 1000)).filter((x) => typeof x.point.bpFull === "number")
+    : [];
   if (!bp.length) hold("backpressure", "*");
   else {
     const run = heldSince(bp, (x) => (x.point.bpFull as number) > 0);

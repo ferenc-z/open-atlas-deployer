@@ -121,6 +121,9 @@ except Exception as e: print("unavailable", e)')"
       # S28: the service executor queries provenance with the monitor certificate: "query provenance" and "view
       # provenance" of the whole flow (the root process group; components inherit it).
       "/provenance|read|$CLIENT_MONITOR" "/provenance-data/process-groups/@root|read|$CLIENT_MONITOR"
+      # Owner 2026-11-07: and "view the data" of the whole flow, so provenance events carry the FlowFile attributes
+      # (NiFi hides them without it; it would also allow reading content, which the executor never asks for).
+      "/data/process-groups/@root|read|$CLIENT_MONITOR"
       "/proxy|read|$CLIENT_NGINX" "/proxy|write|$CLIENT_NGINX"
       # P8: nginx calls NiFi as itself for Studio (S20): monitoring reads (provenance is the Deployer's own since S28).
       "/flow|read|$CLIENT_NGINX" "/system|read|$CLIENT_NGINX" "/controller|read|$CLIENT_NGINX"
@@ -129,9 +132,15 @@ except Exception as e: print("unavailable", e)')"
     done_cluster=""
     for n in "${names[@]}"; do
       if is_member "$n"; then [ -n "$done_cluster" ] && continue; done_cluster=1; fi
+      # A cluster replicates a request to the node that holds the data with the receiving node as proxy, and NiFi
+      # checks "view the data" for every identity in the chain: the nodes need it too, or attributes stay hidden.
+      extra=()
+      if is_member "$n"; then
+        for m in $(instances); do is_member "$m" && extra+=("/data/process-groups/@root|read|$(node_dn "$(inst_field "$m" 5)")"); done
+      fi
       echo "== grant on $n"
       python3 -I "$HERE/grant.py" "https://localhost:$(inst_field "$n" 4)/nifi-api" \
-        "$PEM/operator.crt" "$PEM/operator.key" "$PEM/ca.crt" "${gr[@]}"
+        "$PEM/operator.crt" "$PEM/operator.key" "$PEM/ca.crt" "${gr[@]}" "${extra[@]}"
     done ;;
   curl)
     api "${names[0]}" "${names[1]}" "${names[2]:-monitor}"; echo ;;

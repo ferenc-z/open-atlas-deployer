@@ -1109,6 +1109,14 @@ export class Store {
       .map((r) => ({ member: r.member, at: r.at, point: JSON.parse(r.point) }));
   }
 
+  /** Owner 2026-11-07: the newest back pressure summary of a service's samples at or after a time (the executor reads
+   *  it every few minutes, so most samples carry none). */
+  latestServiceBackpressure(service: string, since: string): { member: string; at: string; backpressure: Record<string, unknown> } | undefined {
+    const r = this.db.prepare(`SELECT member, at, json_extract(body, '$.nifi.backpressure') AS bp FROM service_samples
+      WHERE service = ? AND at >= ? AND json_extract(body, '$.nifi.backpressure') IS NOT NULL ORDER BY at DESC, rowid DESC LIMIT 1`).get(service, since) as Row | undefined;
+    return r ? { member: r.member, at: r.at, backpressure: JSON.parse(r.bp) } : undefined;
+  }
+
   /** The members with samples at or after a time, with their oldest such sample. */
   sampledMembers(since: string): { service: string; member: string; first: string }[] {
     return (this.db.prepare("SELECT service, member, MIN(at) AS first FROM service_samples WHERE at >= ? AND point IS NOT NULL GROUP BY service, member").all(since) as Row[])

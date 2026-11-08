@@ -670,6 +670,8 @@ class RestTrimTest(unittest.TestCase):
         bp = sx.trim_backpressure(tree)
         self.assertEqual((bp["connections"], bp["full"], bp["maxPercent"]), (4, 2, 100))
         self.assertEqual([(c["id"], c["group"]) for c in bp["top"]], [(2, "ingest"), (4, "deep"), (1, "root")], "fullest first, empty ones left out")
+        self.assertEqual([c["id"] for c in sx.trim_backpressure(tree, top=2)["top"]], [2, 4], "only the fullest N")
+        self.assertEqual(sx.trim_backpressure(tree, top=1)["full"], 2, "the count covers every connection, not only the N")
         self.assertNotIn("queued", bp["top"][0], "only numbers and names")
         self.assertEqual(sx.trim_backpressure({}), {"connections": 0, "full": 0, "maxPercent": 0, "top": []})
 
@@ -714,6 +716,11 @@ class RestTrimTest(unittest.TestCase):
         c = sx.config(environ={"EXECUTOR_COLLECT_SECONDS": "5", "EXECUTOR_NIFI_CA_RELAXED": "1"})
         self.assertEqual((c["collect_seconds"], c["nifi_ca_relaxed"]), (30, True))
         self.assertEqual((sx.config(environ={})["collect_seconds"], sx.config(environ={"EXECUTOR_COLLECT_SECONDS": "900"})["collect_seconds"]), (60, 300))
+        # Back pressure (owner 2026-11-07): every 5 minutes and the fullest 5 by default, within 30-3600 s and 1-50.
+        self.assertEqual((sx.config(environ={})["backpressure_seconds"], sx.config(environ={})["backpressure_top"]), (300, 5))
+        low = sx.config(environ={"EXECUTOR_BACKPRESSURE_SECONDS": "10", "EXECUTOR_BACKPRESSURE_TOP": "0"})
+        high = sx.config(environ={"EXECUTOR_BACKPRESSURE_SECONDS": "99999", "EXECUTOR_BACKPRESSURE_TOP": "500"})
+        self.assertEqual((low["backpressure_seconds"], low["backpressure_top"], high["backpressure_seconds"], high["backpressure_top"]), (30, 1, 3600, 50))
 
     @unittest.skipUnless(shutil.which("openssl"), "needs openssl")
     def test_reads_a_pem_certificate(self):
@@ -780,7 +787,7 @@ class CollectorTest(Base):
         self.api.watch = [self.watch[0]]
         ex.heartbeat()
         self.assertEqual([w["service"] for w in ex.watch], ["n112"], "a removal counts from the next beat")
-        self.assertEqual(ex.beat_body(None)["collector"], {"seconds": 60, "watching": 1, "backlog": 0, "certificate": False})
+        self.assertEqual(ex.beat_body(None)["collector"], {"seconds": 60, "backpressureSeconds": 300, "watching": 1, "backlog": 0, "certificate": False})
         self.api.watch = None
         ex.heartbeat()
         self.assertEqual(ex.watch, [], "a Deployer that sends no list: nothing is watched")
@@ -848,6 +855,47 @@ class CollectorTest(Base):
         node = self.by_service(c.round(sx.watch_entries(self.watch)))["c250-1"]["nifi"]
         self.assertEqual((node["state"], node["errors"]), ("partial", {"cluster": "HTTP 403: no read policy"}))
         self.assertIn("diagnostics", node)
+
+    def test_redaction_matches_the_deployer(self):
+        """The cases the Deployer's redact.ts passes (testdata/redact/cases.json): the two rule sets must agree."""
+        cases = json.loads((HERE.parent / "testdata" / "redact" / "cases.json").read_text())
+        self.assertTrue(cases["text"])
+        for text, want in cases["text"]:
+            self.assertEqual(sx.redact(text), want, text)
+            self.assertEqual(sx.redact(want), want, "redacting twice changes nothing")
+
+    def test_back_pressure_only_every_interval_and_as_a_summary(self):
+        c = self.collector()
+        c.cfg = dict(c.cfg, backpressure_seconds=300, backpressure_top=2)
+        clock = [5000.0]
+        real = sx.time.monotonic
+        sx.time.monotonic = lambda: clock[0]
+        status = "flow/process-groups/root/status?recursive=true"
+        try:
+            watch = sx.watch_entries(self.watch[2:3])
+            first = self.by_service(c.round(watch))["c250-1"]["nifi"]
+            clock[0] += 60
+            second = self.by_service(c.round(watch))["c250-1"]["nifi"]
+            clock[0] += 220
+            third = self.by_service(c.round(watch))["c250-1"]["nifi"]
+        finally:
+            sx.time.monotonic = real
+        self.assertEqual(first["backpressure"]["everySeconds"], 300)
+        self.assertIn("at", first["backpressure"])
+        self.assertEqual({k: first["backpressure"][k] for k in ("connections", "full", "maxPercent", "top")}, {"connections": 0, "full": 0, "maxPercent": 0, "top": []})
+        self.assertEqual(second["state"], "ok", "a round without back pressure is not partial")
+        self.assertNotIn("backpressure", second, "not again within the interval")
+        self.assertIn("backpressure", third, "again at the round due (half a period early counts: rounds drift)")
+        self.assertEqual([call[3] for call in c.calls if call[1] == 18445].count(status), 2)
+
+        # Asked and failed: not asked again before the interval is over either.
+        c2 = self.collector()
+        orig = c2.fetch
+        c2.fetch = lambda ctx, connect, port, sni, path, timeout: (500, b"too big") if path == status else orig(ctx, connect, port, sni, path, timeout)
+        failed = self.by_service(c2.round(watch))["c250-1"]["nifi"]
+        self.assertEqual((failed["state"], failed["errors"]), ("partial", {"backpressure": "HTTP 500: too big"}))
+        again = self.by_service(c2.round(watch))["c250-1"]["nifi"]
+        self.assertEqual((again["state"], "backpressure" in again), ("ok", False))
 
     def test_a_nifi_that_hangs_costs_at_most_its_budget(self):
         c = self.collector()

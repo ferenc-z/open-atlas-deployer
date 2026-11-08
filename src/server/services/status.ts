@@ -65,6 +65,37 @@ export interface MemberStatus {
 
 export interface CertSummary { member: string; store: string; subject: string | null; notAfter: string; days: number }
 
+/** One of the fullest queues in a back pressure summary (the service executor sends at most its EXECUTOR_BACKPRESSURE_TOP). */
+export interface CongestedQueue {
+  id?: string; name?: string | null; group?: string | null; sourceName?: string | null; destinationName?: string | null;
+  percentUseCount?: number; percentUseBytes?: number; flowFilesQueued?: number; bytesQueued?: number;
+}
+
+/** Owner 2026-11-07: back pressure is read every everySeconds (default 300) and kept only as a summary: how many
+ *  connections are at their threshold (full), the fullest percentage and the fullest queues. Flow-wide: the newest of
+ *  any member. stale: older than 3 intervals (the rules cannot tell then). */
+export interface BackpressureSummary {
+  at: string; member: string; everySeconds: number; connections: number | null; full: number | null; maxPercent: number | null;
+  top: CongestedQueue[]; stale: boolean;
+}
+
+/** How far back the newest back pressure summary is looked for: 3 of the longest interval (3600 s). */
+const BACKPRESSURE_LOOKBACK = 3 * 3600_000;
+
+export function backpressureSummary(store: Store, id: string, period: number, now: Date): BackpressureSummary | null {
+  const got = store.latestServiceBackpressure(id, new Date(now.getTime() - BACKPRESSURE_LOOKBACK).toISOString());
+  if (!got) return null;
+  const b = got.backpressure as Any;
+  const n = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+  // An executor from before sends it every round, without its own time or interval.
+  const everySeconds = n(b.everySeconds) ?? period;
+  const at = typeof b.at === "string" ? b.at : got.at;
+  return {
+    at, member: got.member, everySeconds, connections: n(b.connections), full: n(b.full), maxPercent: n(b.maxPercent),
+    top: Array.isArray(b.top) ? (b.top as CongestedQueue[]) : [], stale: now.getTime() - Date.parse(at) > STALE_PERIODS * Math.max(everySeconds, period) * 1000,
+  };
+}
+
 export interface ServiceStatus {
   id: string;
   kind: DraftItem["kind"];
@@ -93,6 +124,8 @@ export interface ServiceStatus {
     alerts: { open: number; CRIT: number; WARN: number };
     /** The certificate rule's thresholds in effect (days): the badges colour by them. */
     certDays: { warn: number; crit: number };
+    /** The newest back pressure summary (none: never read, or not for 3 hours). */
+    backpressure: BackpressureSummary | null;
   };
   findings: Finding[];
   /** S27: every certificate of every member, as of each member's newest reading. */
@@ -208,6 +241,7 @@ export function serviceStatus(store: Store, executor: (host: string) => Executor
       asOf: asOfs[0] ?? null, period, cert: soonestCert(certs, now), certErrors: certs.filter((x) => x.error).length,
       certDays: { warn: limits.certWarnDays, crit: limits.certCritDays },
       alerts: { open: open.length, CRIT: open.filter((a) => a.level === "CRIT").length, WARN: open.filter((a) => a.level === "WARN").length },
+      backpressure: backpressureSummary(store, item.id, period, now),
     },
     findings,
     certs,

@@ -152,3 +152,53 @@ test("thresholds: the profile's defaults, overrides from the column, bounds and 
   assert.equal(store.serviceEvents("c250", { kind: "thresholds" }).length, 2);
   store.close();
 });
+
+test("back pressure read every 5 minutes as a summary (owner 2026-11-07): the newest summary, the rule over the readings, stale ones cannot tell", () => {
+  const now = { t: new Date("2026-11-06T12:00:00Z") };
+  const store = lab(now);
+  const iso = (ms: number) => new Date(ms).toISOString().replace(".000Z", "Z");
+  const t0 = Date.parse("2026-11-06T12:00:00Z");
+  const top = [{ id: "q1", name: "to-db", group: "ingest", sourceName: "Fetch", destinationName: "PutDB", percentUseCount: 100, percentUseBytes: 40, flowFilesQueued: 10000, bytesQueued: 5 }];
+  // Samples every 30 s; only the one at each full 5 minutes carries back pressure (the executor's interval).
+  const at = (i: number, full: number | null) => {
+    const when = iso(t0 + i * 30_000);
+    const ss = both(when);
+    for (const x of ss) {
+      const n = x.nifi as Record<string, unknown>;
+      if (full === null) delete n.backpressure;
+      else n.backpressure = { at: when, everySeconds: 300, connections: 12, full, maxPercent: full ? 100 : 30, top: full ? top : [] };
+    }
+    now.t = new Date(Date.parse(when) + 5000);
+    ingest(store, ss);
+    check(store, () => online, "c250", now.t);
+  };
+  for (let i = 0; i <= 20; i++) at(i, i % 10 === 0 ? 1 : null);
+  // Readings at 12:00, 12:05 and 12:10 at back pressure: 10 minutes held.
+  assert.deepEqual(openRules(store), ["WARN backpressure *"]);
+  const st = serviceStatus(store, () => online, "c250", now.t)!;
+  assert.deepEqual({ ...st.summary.backpressure, member: "-" }, { at: "2026-11-06T12:10:00Z", member: "-", everySeconds: 300, connections: 12, full: 1, maxPercent: 100, top, stale: false });
+  assert.equal(st.members[0]!.live!.point!.bpFull, 1, "the newest sample is the one with the reading");
+  assert.equal(st.members[0]!.live!.point!._bpEvery, 300);
+  for (let i = 21; i <= 29; i++) at(i, null);
+  assert.equal(serviceStatus(store, () => online, "c250", now.t)!.members[0]!.live!.point!.bpFull, null, "samples between readings carry none");
+  assert.equal(serviceStatus(store, () => online, "c250", now.t)!.summary.backpressure!.full, 1, "the summary is still the newest reading");
+  // No reading for over 3 intervals: stale, the alert stays as it is (cannot tell).
+  for (let i = 30; i <= 52; i++) at(i, null);
+  assert.equal(serviceStatus(store, () => online, "c250", now.t)!.summary.backpressure!.stale, true);
+  assert.deepEqual(openRules(store), ["WARN backpressure *"]);
+  at(53, 0);
+  assert.deepEqual(openRules(store), [], "a reading without back pressure resolves it");
+  assert.deepEqual(serviceStatus(store, () => online, "c250", now.t)!.summary.backpressure!.top, []);
+  store.close();
+});
+
+test("back pressure from an executor that sent it every sample (before the summary): read as one reading per sample", () => {
+  const now = { t: new Date("2026-11-06T12:00:40Z") };
+  const store = lab(now);
+  ingest(store, both("2026-11-06T12:00:30Z", { bp: 2 }));
+  const bp = serviceStatus(store, () => online, "c250", now.t)!.summary.backpressure!;
+  assert.deepEqual([bp.at, bp.everySeconds, bp.full, bp.maxPercent, bp.top, bp.stale], ["2026-11-06T12:00:30Z", 30, 2, 100, [], false], "its own time and the sampling period");
+  now.t = new Date("2026-11-06T12:03:00Z");
+  assert.equal(serviceStatus(store, () => online, "c250", now.t)!.summary.backpressure!.stale, true, "3 sampling periods later");
+  store.close();
+});

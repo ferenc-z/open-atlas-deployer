@@ -1,0 +1,91 @@
+{
+  "_": "Redaction cases shared by the Deployer (src/server/services/redact.ts, test/redact.test.ts) and the service executor (REDACT in executor/service_executor.py, test_service_executor.py): both sides must give `want` for every `text` case. `attributes` are the FlowFile attribute names whose values the Deployer hides from the AI (redactProvenance; TS only, the executor sends attributes as NiFi gives them).",
+  "text": [
+    [
+      "2026-11-06 01:00:00,000 ERROR [Timer-Driven Process Thread-3] o.a.n.p.s.PutSQL login failed password=hunter2 user=etl",
+      "2026-11-06 01:00:00,000 ERROR [Timer-Driven Process Thread-3] o.a.n.p.s.PutSQL login failed password=[hidden] user=etl"
+    ],
+    [
+      "nifi.security.keystorePasswd: 'abc def'",
+      "nifi.security.keystorePasswd: [hidden]"
+    ],
+    [
+      "nifi.sensitive.props.key=0123456789ab",
+      "nifi.sensitive.props.key=[hidden]"
+    ],
+    [
+      "Authorization: Basic dXNlcjpwYXNzd29yZA==",
+      "Authorization: Basic [hidden]"
+    ],
+    [
+      "bearer eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJtZSJ9.c2lnbmF0dXJlLXZhbHVl",
+      "bearer [hidden]"
+    ],
+    [
+      "got eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJtZSJ9.c2lnbmF0dXJlLXZhbHVl back",
+      "got [token hidden] back"
+    ],
+    [
+      "api_key=AKIA1234;secret=\"x y\"&client_secret=z",
+      "api_key=[hidden];secret=[hidden]&client_secret=[hidden]"
+    ],
+    [
+      "{\"access_key\": \"AKIA99\", \"user\": \"etl\"}",
+      "{\"access_key\": [hidden], \"user\": \"etl\"}"
+    ],
+    [
+      "ldaps://cn=admin:pw@ldap:636 failed",
+      "ldaps://cn=admin:[hidden]@ldap:636 failed"
+    ],
+    [
+      "jdbc url https://u:p4ss@api/x",
+      "jdbc url https://u:[hidden]@api/x"
+    ],
+    [
+      "-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n-----END RSA PRIVATE KEY----- after",
+      "[private key hidden] after"
+    ],
+    [
+      "-----BEGIN PRIVATE KEY-----\nMIIabc cut off",
+      "[private key hidden]"
+    ],
+    [
+      "Connection to 10.0.0.5:2181 lost, retrying in 1000 ms",
+      "Connection to 10.0.0.5:2181 lost, retrying in 1000 ms"
+    ],
+    [
+      "Processor PutFile[id=1234-abcd] transferred 3 FlowFiles",
+      "Processor PutFile[id=1234-abcd] transferred 3 FlowFiles"
+    ],
+    [
+      "filename=report-2026-11-07.csv path=./in/",
+      "filename=report-2026-11-07.csv path=./in/"
+    ]
+  ],
+  "attributes": {
+    "hidden": [
+      "db.password",
+      "http.headers.Authorization",
+      "api_key",
+      "aws.access.key",
+      "client_secret",
+      "sftp.private.key.passphrase",
+      "session.id",
+      "Cookie",
+      "oauth.token",
+      "key",
+      "ssl.key"
+    ],
+    "shown": [
+      "filename",
+      "path",
+      "uuid",
+      "mime.type",
+      "file.size",
+      "kafka.topic",
+      "http.request.uri",
+      "keyword",
+      "monkey"
+    ]
+  }
+}

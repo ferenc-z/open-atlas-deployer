@@ -30,7 +30,7 @@ export function FlowFileTrace({ s }: { s: ServiceStatus }) {
     <div className="panel">
       <p className="muted small">
         Read from NiFi's provenance repository by {cluster ? "a node's" : "the host's"} service executor with the monitor certificate (NiFi grants its identity
-        "query provenance" and "view provenance" on the flow). Each search asks NiFi once{cluster ? " for the whole cluster (NiFi merges the nodes' events)" : ""}, at most
+        "query provenance", "view provenance" and "view the data" on the flow, so events show the FlowFile's attributes). Each search asks NiFi once{cluster ? " for the whole cluster (NiFi merges the nodes' events)" : ""}, at most
         100 events, 4 MiB and 30 seconds, and the query is deleted on NiFi afterwards. Only reads: nothing is replayed, no content is read.
       </p>
       {!info.supported && <p><span className="badge bad">Not supported</span> {info.note}</p>}
@@ -208,7 +208,7 @@ function Detail({ s, event, onClose }: { s: ServiceStatus; event: ProvEvent; onC
             <tr key={k}><th className="small">{k}</th><td className="small mono">{v}</td></tr>
           ))}
         </tbody></table>
-        {full.attributesHidden ? <p className="muted small">NiFi does not show this event's attributes to the monitoring identity (it may not view the data of this component). Content is never read here.</p>
+        {full.attributesHidden ? <p className="muted small">NiFi does not show this event's attributes to the monitoring identity: give it "view the data" on the flow (/data/process-groups/&lt;root group id&gt;, read; on a cluster every node's identity too). Content is never read here.</p>
           : full.attributes && <>
             <h4>Attributes</h4>
             <table><thead><tr><th>Name</th><th>Value</th><th>Before</th></tr></thead><tbody>{full.attributes.map((a) => (
