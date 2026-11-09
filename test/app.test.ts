@@ -2267,8 +2267,8 @@ test("§15.2 P5, §15.3: a service executor's heartbeat reply carries its watch 
   t.store.addStandalone({ kind: "standalone", id: "n200", service: "nifi", profile: "nifi-2.x", version: "2.0.0", webUrl: null, member: single }, "uat", actor);
   const watch = (await beat()).watch;
   assert.deepEqual(watch, [
-    { service: "flow", kind: "node", member: "app2:/opt/a", profile: "nifi-2.x", installDir: "/opt/a", confDir: "/opt/a/conf", https: { host: "nifi.app2", port: 8443 }, nodeAddress: "node-8443", logDir: "/opt/a/logs" },
-    { service: "flow", kind: "node", member: "app2:/opt/b (conf /etc/nifi-b)", profile: "nifi-2.x", installDir: "/opt/b", confDir: "/etc/nifi-b", https: { host: "nifi.app2", port: 9443 }, nodeAddress: "node-9443", logDir: "/opt/b/logs" },
+    { service: "flow", kind: "node", member: "app2:/opt/a", profile: "nifi-2.x", installDir: "/opt/a", confDir: "/opt/a/conf", https: { host: "nifi.app2", port: 8443 }, nodeAddress: "node-8443", logDir: "/opt/a/logs", files: [] },
+    { service: "flow", kind: "node", member: "app2:/opt/b (conf /etc/nifi-b)", profile: "nifi-2.x", installDir: "/opt/b", confDir: "/etc/nifi-b", https: { host: "nifi.app2", port: 9443 }, nodeAddress: "node-9443", logDir: "/opt/b/logs", files: [] },
   ], "only this host's, n200 is on app1");
 
   // Samples: only those of what the host watches are kept; at most 20 a request; only from the service executor.

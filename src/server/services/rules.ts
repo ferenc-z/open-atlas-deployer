@@ -12,10 +12,11 @@ import type { AlertLevel, ServiceAlert, Store } from "../store.ts";
 import type { Thresholds } from "./profiles.ts";
 import { serviceStatus, thresholdsOf, type MemberStatus, type ServiceStatus } from "./status.ts";
 import { bucketOf } from "./logs.ts";
+import { memberDrift } from "./configdrift.ts";
 
 export type RuleId =
   | "executor-lost" | "no-samples" | "process-down" | "node-disconnected" | "no-coordinator" | "backpressure" | "repo-disk" | "heap"
-  | "error-bulletins" | "zk-errors" | "version-mismatch" | "no-certificate" | "cert-expiry" | "cert-unreadable";
+  | "error-bulletins" | "zk-errors" | "version-mismatch" | "no-certificate" | "cert-expiry" | "cert-unreadable" | "config-drift";
 
 /** What each rule watches; scope: per member or for the whole service. */
 export const RULES: Record<RuleId, { label: string; scope: "member" | "service"; levels: AlertLevel[]; description: string }> = {
@@ -33,6 +34,7 @@ export const RULES: Record<RuleId, { label: string; scope: "member" | "service";
   "no-certificate": { label: "No monitor certificate", scope: "member", levels: ["WARN"], description: "The service executor has no monitor certificate (EXECUTOR_NIFI_CLIENT_CERT and _KEY): only the process and the host are sampled, not NiFi." },
   "cert-expiry": { label: "Certificate expiring", scope: "member", levels: ["WARN", "CRIT"], description: "A certificate of the keystore, the truststore or the monitor certificate expires within the warning or critical number of days, or has expired." },
   "cert-unreadable": { label: "Certificate unreadable", scope: "member", levels: ["WARN"], description: "A keystore or truststore could not be read (encrypted password, missing file, no keytool): its expiry is not watched." },
+  "config-drift": { label: "Configuration drift", scope: "member", levels: ["WARN"], description: "A configuration file on the host is not what the Deployer says it should be: someone or NiFi changed or removed it. See the differences on the Changes tab; adopt it there or, later, overwrite it." },
 };
 
 /** Each threshold: what it is, its unit and bounds (the page's form says the same). */
@@ -85,6 +87,7 @@ export function evaluate(store: Store, s: ServiceStatus, t: Thresholds, now: Dat
   const add = (rule: RuleId, member: string, level: AlertLevel, text: string, detail: Record<string, unknown> = {}) => active.push({ rule, member, level, text, detail });
   const hold = (rule: RuleId, member: string) => held.add(keyOf(rule, member));
   const cluster = s.kind === "cluster";
+  const memberFiles = store.serviceMemberFiles(s.id);
 
   for (const m of s.members) {
     const name = memberName(s, m);
@@ -145,6 +148,13 @@ export function evaluate(store: Store, s: ServiceStatus, t: Thresholds, now: Dat
     }
     const unreadable = certs.filter((c) => c.error);
     if (unreadable.length) add("cert-unreadable", k, "WARN", `${name}: ${unreadable.map((c) => `${c.store}: ${c.error}`).join("; ")}`, { ...base, stores: unreadable.map((c) => ({ store: c.store, error: c.error })) });
+    // §16.3: the fingerprints. Names only here: this goes on the timeline, and from there to the AI.
+    const drift = memberDrift(m, memberFiles);
+    if (drift.state === "unknown") hold("config-drift", k);
+    else if (drift.state === "drift") {
+      const off = drift.files.filter((f) => f.state === "changed" || f.state === "missing");
+      add("config-drift", k, "WARN", `${name}: ${off.map((f) => `${f.name}${f.state === "missing" ? " (gone)" : ""}`).join(", ")} on the host ${off.length > 1 ? "are" : "is"} not what is kept`, { ...base, files: off.map((f) => f.name) });
+    }
   }
 
   // The whole service.
@@ -208,12 +218,12 @@ export function check(store: Store, executor: (host: string) => ExecutorInfo, id
     seen.add(key);
     const detail = { ...c.detail, text: c.text };
     const was = open.get(key);
-    if (!was) { if (store.openServiceAlert({ service: id, member: c.member, rule: c.rule, level: c.level, detail }, at, { text: `${c.level} ${RULES[c.rule].label}: ${c.text}` }) !== undefined) out.opened++; }
+    if (!was) { if (store.openServiceAlert({ service: id, member: c.member, rule: c.rule, level: c.level, detail }, at, { text: `${c.level} ${RULES[c.rule].label}: ${c.text}` }, c.rule === "config-drift" ? "drift-detected" : undefined) !== undefined) out.opened++; }
     else if (was.level !== c.level || was.detail.text !== c.text) { store.updateServiceAlert(was.id, c.level, detail, at, { text: `${c.level} (was ${was.level}) ${RULES[c.rule].label}: ${c.text}` }); out.changed++; }
   }
   for (const [key, a] of open) {
     if (seen.has(key) || held.has(key)) continue;
-    store.resolveServiceAlert(a.id, at, { text: `Resolved: ${RULES[a.rule as RuleId]?.label ?? a.rule}${a.member === "*" ? "" : ` (${String(a.detail.label ?? a.member)})`}` });
+    store.resolveServiceAlert(a.id, at, { text: `Resolved: ${RULES[a.rule as RuleId]?.label ?? a.rule}${a.member === "*" ? "" : ` (${String(a.detail.label ?? a.member)})`}` }, a.rule === "config-drift" ? "drift-resolved" : undefined);
     out.resolved++;
   }
   out.events += changes(store, s);

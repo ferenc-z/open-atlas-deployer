@@ -41,6 +41,7 @@ const KIND: Record<string, { label: string; tone: string }> = {
   "alert-opened": { label: "Alert", tone: "bad" }, "alert-changed": { label: "Alert level", tone: "warn" }, "alert-resolved": { label: "Resolved", tone: "ok" },
   "node-disconnected": { label: "Disconnected", tone: "bad" }, "node-reconnected": { label: "Reconnected", tone: "ok" },
   "process-restarted": { label: "Restarted", tone: "info" }, "version-changed": { label: "Version", tone: "warn" },
+  "drift-detected": { label: "Drift", tone: "warn" }, "drift-resolved": { label: "Drift gone", tone: "ok" },
   "taken-over": { label: "Taken over", tone: "info" }, "config-imported": { label: "Configuration", tone: "info" }, thresholds: { label: "Thresholds", tone: "muted" },
 };
 

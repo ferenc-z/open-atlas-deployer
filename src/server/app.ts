@@ -35,6 +35,8 @@ import { acceptChanges, changeSummary, changeView, fileDiffs, outcomeOf, revealV
 import { configView } from "./services/configview.ts";
 import { catalogFor, profile as profileById, profileFor, PROFILES } from "./services/profiles.ts";
 import type { ConfigReviewer } from "./services/configreview.ts";
+import { checkConfig, openMembers } from "./services/configcheck.ts";
+import { adoptedBody, DriftError, hasDrifted, liveDifferences, readLive, serviceDrift, type LiveReadOptions } from "./services/configdrift.ts";
 import { installKey, type DraftItem } from "./services/draft.ts";
 import { serviceStatus, thresholdsOf, timeline } from "./services/status.ts";
 import { alertView, check, parseThresholds, RULES, THRESHOLDS } from "./services/rules.ts";
@@ -83,6 +85,8 @@ export interface Dependencies {
   omaFetcher?: typeof fetch;
   /** §16.3: the AI review of a saved configuration revision; none without OMA. */
   configReview?: Pick<ConfigReviewer, "start">;
+  /** §16.3: how long reading a file from a host for its drift waits (tests pass their own timings). */
+  liveRead?: LiveReadOptions;
   /** Service ops §6: taking over discovered services (drafts, confirmation). */
   takeover?: Takeover;
   /** Phase 2 step 4: reading and following services' logs through their service executors (tests pass their own timings). */
@@ -784,6 +788,11 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     if (!box) return reject(c, 503, "config/no-key", "DEPLOYER_CREDENTIAL_ENCRYPTION_KEY is not set: configuration files cannot be opened.");
     return { id, service, latest, box };
   };
+  const serviceMembers = (service: NonNullable<ReturnType<typeof registeredService>>) => (service.kind === "standalone" ? [service.member] : service.nodes);
+  const driftFailed = (c: Context, error: unknown) => {
+    if (error instanceof DriftError) return reject(c, error.status, error.code, error.message, error.details);
+    return configFailed(c, error);
+  };
   const configFailed = (c: Context, error: unknown) => {
     if (error instanceof ConfigDocError) return reject(c, error.code === "config/reimport" ? 409 : 400, error.code, error.message);
     if (error instanceof StoreError) return reject(c, error.code === "config-draft/unknown" ? 404 : 409, error.code, error.message, error.details);
@@ -962,7 +971,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
       return c.json({ revision, findings: out.findings, change: out.change, draft: draftView(store.serviceConfigDraft(cfg.id, d.id)!, revision) }, 201);
     } catch (error) { return configFailed(c, error); }
   });
-  // The AI's read tools for what comes later (§16.3): there are no changes until step 11 and no drift until step 7.
+  // The AI's read tools for what comes later (§16.3): there are no changes until step 11.
   const serviceKnown = (c: Context) => (registeredService(c.req.param("id")!) ? undefined : reject(c, 404, "service/unknown", `No standalone instance or cluster ${c.req.param("id")}.`));
   api.get("/api/services/:id/changes", async (c) => {
     const p = await authenticate(c, "view");
@@ -977,7 +986,60 @@ export function createApp({ config, store, sessions, observer, deployments, vers
   api.get("/api/services/:id/drift", async (c) => {
     const p = await authenticate(c, "view");
     if (p instanceof Response) return p;
-    return serviceKnown(c) ?? c.json({ known: false, members: [], note: "Comparing the files on the hosts with the kept configuration is not there yet: drift is unknown." });
+    const unknown = serviceKnown(c);
+    if (unknown) return unknown;
+    const id = c.req.param("id")!;
+    const status = serviceStatus(store, (h) => handoff.executor(h, "service"), id)!;
+    const rows = store.serviceMemberFiles(id);
+    const drift = serviceDrift(status, rows);
+    const asked = c.req.query("member");
+    if (!asked) return c.json(drift);
+    const cfg = configOf(c);
+    if (cfg instanceof Response) return cfg;
+    const m = serviceMembers(cfg.service).find((x) => installKey(x) === asked);
+    if (!m) return reject(c, 404, "config/unknown-member", `${asked} is not a member of ${id}.`);
+    const own = rows.filter((f) => f.member === asked);
+    const names = own.filter(hasDrifted).map((f) => f.file);
+    if (!names.length) return c.json({ ...drift, differences: { member: asked, files: [] } });
+    try {
+      const live = await readLive(handoff, m, own, names, p.id, deps.liveRead);
+      const expected = (name: string) => {
+        const row = own.find((f) => f.file === name)!;
+        return store.serviceConfig(id, row.revision)?.body.members.find((x) => installKey(x) === asked)?.files.find((f) => f.name === name);
+      };
+      return c.json({ ...drift, differences: liveDifferences(m, live, expected, cfg.box) });
+    } catch (error) { return driftFailed(c, error); }
+  });
+  // §16.3: the host's file becomes what is kept and what it should be. Nothing on the host changes. What the person saw
+  // must still be what the host has: sha256 is checked against a new read, and the content is sealed from that read.
+  api.post("/api/services/:id/drift/adopt", async (c) => {
+    const p = await configEditor(c);
+    if (p instanceof Response) return p;
+    const cfg = configOf(c);
+    if (cfg instanceof Response) return cfg;
+    const body = await c.req.json().catch(() => ({})) as { member?: unknown; file?: unknown; sha256?: unknown; replacePending?: unknown; note?: unknown };
+    if (typeof body.member !== "string" || typeof body.file !== "string" || typeof body.sha256 !== "string") return reject(c, 400, "drift/invalid", "Give member, file and the sha256 the differences showed.");
+    const m = serviceMembers(cfg.service).find((x) => installKey(x) === body.member);
+    const own = store.serviceMemberFiles(cfg.id).filter((f) => f.member === body.member);
+    const row = own.find((f) => f.file === body.file);
+    if (!m || !row) return reject(c, 404, "drift/unknown-file", `${cfg.id} has no ${body.file} on ${body.member}.`);
+    try {
+      const [live] = await readLive(handoff, m, own, [row.file], p.id, deps.liveRead);
+      if (!live?.bytes) throw new DriftError(409, "drift/missing", `${row.file} is gone from the host: there is nothing to adopt.`);
+      if (live.sha256 !== body.sha256) throw new DriftError(409, "drift/changed", `${row.file} has changed on the host since the differences were shown: look at them again.`);
+      if (live.sha256 === row.expectedSha256) throw new DriftError(409, "drift/none", `${row.file} is what it should be: there is nothing to adopt.`);
+      const latest = store.serviceConfig(cfg.id)!;
+      const kept = latest.body.members.find((x) => installKey(x) === body.member)?.files.find((f) => f.name === row.file);
+      const same = kept?.sha256 === live.sha256;
+      // A saved revision not applied yet changes this file: adopting would take its change out of the newest revision.
+      if (!same && kept?.sha256 !== row.expectedSha256 && body.replacePending !== true) throw new DriftError(409, "drift/pending", `Revision ${latest.revision} changes ${row.file} and has not been applied: adopting replaces that change. Send replacePending to go on.`);
+      const out = same ? { split: null, body: null } : adoptedBody(latest.body, cfg.service.kind, row.member, { ...live, bytes: live.bytes }, cfg.box);
+      const context = checkContext(cfg.service);
+      const findings = out.body && context.profile ? checkConfig({ ...context, profile: context.profile, members: openMembers(out.body.members, cfg.box), base: openMembers(latest.body.members, cfg.box) }).findings : [];
+      const revision = store.adoptServiceFile(cfg.id, { member: row.member, file: row.file, base: latest.revision, expected: row.expectedSha256, sha256: live.sha256!, split: out.split, body: out.body, findings, note: noteOf(body.note) }, actorOf(p));
+      check(store, (h) => handoff.executor(h, "service"), cfg.id);
+      return c.json({ revision, saved: Boolean(out.body), findings }, out.body ? 201 : 200);
+    } catch (error) { return driftFailed(c, error); }
   });
   api.get("/api/services/drafts", async (c) => {
     const p = await authenticate(c, "view");

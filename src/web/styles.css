@@ -179,7 +179,7 @@ pre.json { background: var(--surface); border: 1px solid var(--border); border-r
 .executor-host { display: inline-flex; align-items: center; gap: 6px; }
 .panel { margin-bottom: 16px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }
 .panel h2, .panel h3 { margin: 0; }
-.plan { display: grid; gap: 10px; }
+.plan { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
 .findings { margin: 0; padding-left: 4px; list-style: none; display: grid; gap: 4px; }
 .checks { list-style: none; padding-left: 0; margin: 4px 0; }
 .banner ul { margin: 6px 0 0; padding-left: 18px; }
@@ -447,8 +447,9 @@ textarea.xml-text { font-size: 12px; line-height: 1.5; }
 table.props.revisions td { vertical-align: top; }
 table.props tr.selected td { background: var(--info-bg); }
 .compare-form { margin-top: 0; max-width: 760px; }
-.diffs { display: grid; gap: 10px; }
+.diffs { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
 .diffs h4 { margin: 0 0 4px; }
 .diffs details { margin-top: 6px; }
 .diffs summary { color: var(--text); }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.drift-adopt { margin-left: 12px; }

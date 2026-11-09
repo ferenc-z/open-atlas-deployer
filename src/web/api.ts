@@ -258,6 +258,10 @@ export type DraftPreview = { findings: ConfigFinding[]; change: ChangeAssessment
 export type ConfigDraftDetail = ConfigDraft & { preview: DraftPreview };
 export type ConfigDiff = { service: string; from: number | null; to: number; members: MemberDiff[] };
 const configPath = (id: string, rest: string) => `services/${encodeURIComponent(id)}/config/${rest}`;
+export type { DriftFile, LiveDiff, LiveDifferences, MemberDrift, ServiceDrift } from "../server/services/configdrift.ts";
+export type DriftAnswer = import("../server/services/configdrift.ts").ServiceDrift & { differences?: import("../server/services/configdrift.ts").LiveDifferences };
+export const serviceDrift = (id: string, member?: string) => call<DriftAnswer>("GET", `services/${encodeURIComponent(id)}/drift${member ? `?member=${encodeURIComponent(member)}` : ""}`);
+export const adoptDrift = (id: string, body: { member: string; file: string; sha256: string; replacePending?: boolean }) => call<{ revision: number; saved: boolean; findings: ConfigFinding[] }>("POST", `services/${encodeURIComponent(id)}/drift/adopt`, body);
 export const serviceConfigDiff = (id: string, q: { from?: number; to?: number; member?: string }) => {
   const query = new URLSearchParams(Object.entries(q).flatMap(([k, v]) => (v === undefined || v === "" ? [] : [[k, String(v)]])));
   return call<ConfigDiff>("GET", configPath(id, `diff?${query}`));

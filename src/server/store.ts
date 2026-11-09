@@ -821,11 +821,16 @@ export class Store {
 
   /** An env-read copy is for the import within seconds: it is handed over once, and dropped after 10 minutes anyway. */
   takeExecutorEnvContent(id: string): string | undefined {
-    this.db.prepare("UPDATE executor_jobs SET env_content = NULL WHERE env_content_at < ?").run(new Date(this.now().getTime() - 600_000).toISOString());
+    this.dropOldExecutorContent();
     const r = this.db.prepare("SELECT env_content FROM executor_jobs WHERE id = ?").get(id) as Row | undefined;
     if (r?.env_content == null) return undefined;
     this.db.prepare("UPDATE executor_jobs SET env_content = NULL WHERE id = ?").run(id);
     return r.env_content;
+  }
+
+  /** Also once a minute: a read that came after its reader gave up is never taken. */
+  dropOldExecutorContent() {
+    this.db.prepare("UPDATE executor_jobs SET env_content = NULL WHERE env_content_at < ?").run(new Date(this.now().getTime() - 600_000).toISOString());
   }
 
   setHeartbeat(host: string, heartbeat: unknown, executor: ExecutorKind = "deploy") {
@@ -1034,6 +1039,43 @@ export class Store {
   serviceMemberFiles(service: string): ServiceMemberFile[] {
     return (this.db.prepare("SELECT * FROM service_member_files WHERE service = ? ORDER BY member, file").all(service) as Row[])
       .map((r) => ({ member: r.member, file: r.file, path: r.path, expectedSha256: r.expected_sha256, revision: r.revision, appliedAt: r.applied_at, change: r.change ?? null, actualSha256: r.actual_sha256 ?? null, actualAt: r.actual_at ?? null }));
+  }
+
+  /** What a sample saw of a member's files (§16.3): fingerprints by name; null, or a file left out, is not known. A sample older than what is recorded changes nothing. */
+  setServiceMemberActuals(service: string, member: string, seen: ReadonlyMap<string, string | null> | null, at: string) {
+    const rows = this.db.prepare("SELECT file FROM service_member_files WHERE service = ? AND member = ?").all(service, member) as Row[];
+    const update = this.db.prepare("UPDATE service_member_files SET actual_sha256 = ?, actual_at = ? WHERE service = ? AND member = ? AND file = ? AND (actual_at IS NULL OR actual_at <= ?)");
+    this.inTransaction(() => { for (const r of rows) update.run(seen?.get(r.file) ?? null, at, service, member, r.file, at); });
+  }
+
+  /**
+   * Keeps one member's file as the host has it (§16.3): what it should be from now on, in a new revision unless the newest
+   * already has it. Nothing on the host changes. It must still be the drift that was looked at: expected and the base.
+   */
+  adoptServiceFile(service: string, a: { member: string; file: string; base: number; expected: string; sha256: string; split: ServiceConfigBody | null; body: ServiceConfigBody | null; findings: ConfigFinding[]; note: string | null }, actor: Actor): number {
+    return this.inTransaction(() => {
+      const latest = (this.db.prepare("SELECT MAX(revision) AS n FROM service_configs WHERE service = ?").get(service) as Row).n as number | null;
+      if (latest !== a.base) throw new StoreError("drift/stale", `The configuration of ${service} is at revision ${latest} now: look at the differences again.`);
+      const row = this.db.prepare("SELECT expected_sha256 FROM service_member_files WHERE service = ? AND member = ? AND file = ?").get(service, a.member, a.file) as Row | undefined;
+      if (row?.expected_sha256 !== a.expected) throw new StoreError("drift/stale", `${a.file} of ${a.member} should be something else now: look at the differences again.`);
+      const at = this.stamp();
+      let revision = latest;
+      if (a.body) {
+        const insert = this.db.prepare("INSERT INTO service_configs (service, revision, body, source, saved_at, saved_by, via, note, base, findings) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        if (a.split) {
+          revision++;
+          insert.run(service, revision, JSON.stringify(a.split), "split", at, actor.id, actor.via, "Split into a common layer and node overrides for the first edit", revision - 1, null);
+          this.insertServiceEvent({ service, member: null, at, kind: "config-saved", detail: { text: `Configuration revision ${revision} saved: split into layers for the first edit`, by: actor.id, revision } });
+          this.insertAudit(actor, "service.config-split", `${service}#${revision}`, { base: revision - 1 });
+        }
+        revision++;
+        insert.run(service, revision, JSON.stringify(a.body), "adopt", at, actor.id, actor.via, a.note, revision - 1, JSON.stringify(a.findings));
+        this.insertServiceEvent({ service, member: a.member, at, kind: "config-saved", detail: { text: `Configuration revision ${revision} saved: ${a.file} adopted from the host${a.note ? `: ${a.note}` : ""}`, by: actor.id, revision } });
+      }
+      this.db.prepare("UPDATE service_member_files SET expected_sha256 = ?, revision = ?, applied_at = ?, change = NULL WHERE service = ? AND member = ? AND file = ?").run(a.sha256, revision, at, service, a.member, a.file);
+      this.insertAudit(actor, "service.config-adopted", `${service}#${revision}`, { member: a.member, file: a.file, base: a.base, newRevision: Boolean(a.body) });
+      return revision;
+    });
   }
 
   private toConfigDraft(r: Row): ServiceConfigDraft {
@@ -1386,13 +1428,13 @@ export class Store {
   }
 
   /** Opens an alert with its timeline event; none when one is open already for the same service, member and rule. */
-  openServiceAlert(a: { service: string; member: string; rule: string; level: AlertLevel; detail: Record<string, unknown> }, at: string, event: Record<string, unknown>): number | undefined {
+  openServiceAlert(a: { service: string; member: string; rule: string; level: AlertLevel; detail: Record<string, unknown> }, at: string, event: Record<string, unknown>, kind = "alert-opened"): number | undefined {
     return this.inTransaction(() => {
       const r = this.db.prepare("INSERT OR IGNORE INTO service_alerts (service, member, rule, level, state, opened_at, detail, updated_at) VALUES (?, ?, ?, ?, 'open', ?, ?, ?)")
         .run(a.service, a.member, a.rule, a.level, at, JSON.stringify(a.detail), at);
       if (!Number(r.changes)) return undefined;
       const id = Number(r.lastInsertRowid);
-      this.insertServiceEvent({ service: a.service, member: a.member === "*" ? null : a.member, at, kind: "alert-opened", detail: { ...event, alert: id, rule: a.rule, level: a.level } });
+      this.insertServiceEvent({ service: a.service, member: a.member === "*" ? null : a.member, at, kind, detail: { ...event, alert: id, rule: a.rule, level: a.level } });
       return id;
     });
   }
@@ -1407,12 +1449,12 @@ export class Store {
     });
   }
 
-  resolveServiceAlert(id: number, at: string, event: Record<string, unknown>) {
+  resolveServiceAlert(id: number, at: string, event: Record<string, unknown>, kind = "alert-resolved") {
     this.inTransaction(() => {
       const was = this.db.prepare("SELECT * FROM service_alerts WHERE id = ? AND state = 'open'").get(id) as Row | undefined;
       if (!was) return;
       this.db.prepare("UPDATE service_alerts SET state = 'resolved', resolved_at = ?, updated_at = ? WHERE id = ?").run(at, at, id);
-      this.insertServiceEvent({ service: was.service, member: was.member === "*" ? null : was.member, at, kind: "alert-resolved", detail: { ...event, alert: id, rule: was.rule, level: was.level } });
+      this.insertServiceEvent({ service: was.service, member: was.member === "*" ? null : was.member, at, kind, detail: { ...event, alert: id, rule: was.rule, level: was.level } });
     });
   }
 

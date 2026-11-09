@@ -701,8 +701,15 @@ def watch_entries(value):
             "https": {"host": https["host"] if isinstance(https.get("host"), str) else None, "port": as_port(https.get("port"))},
             "nodeAddress": w["nodeAddress"] if isinstance(w.get("nodeAddress"), str) else None,
             "logDir": os.path.normpath(logs) if ok_path(logs) else None,
+            "files": watch_files(w.get("files")),
         })
     return out
+
+
+def watch_files(value):
+    """The configuration files of a watch entry (§16.3), to fingerprint: known names at absolute paths."""
+    return [{"name": f["name"], "path": os.path.normpath(f["path"])} for f in (value if isinstance(value, list) else [])[:len(NIFI_CONF_FILES)]
+            if isinstance(f, dict) and f.get("name") in NIFI_CONF_FILES and ok_path(f.get("path"))]
 
 
 def java_date(text):
@@ -1155,6 +1162,30 @@ class Collector:
             out["logs"] = self.summary.read(w["member"], w.get("logDir") or os.path.join(w["installDir"], "logs"))
         except Exception as e:  # never the sample's end
             out["logs"] = {"error": f"the log summary failed: {e}"[:300]}
+        # §16.3: what the Deployer compares with what each file should be. Only hashes, the content stays here.
+        out["files"] = [self.fingerprint(f) for f in w.get("files") or []]
+        return out
+
+    def fingerprint(self, f):
+        """A file's name, path and sha256 (or missing, or error). Hashed again only when its stat changes: ctime as well,
+        since mtime can be set back."""
+        out = {"name": f["name"], "path": f["path"]}
+        try:
+            st = os.stat(f["path"])
+            stamp = (st.st_mtime_ns, st.st_ctime_ns, st.st_size)
+            cache = self.__dict__.setdefault("fingerprints", {})
+            known = cache.get(f["path"])
+            if not known or known[0] != stamp:
+                h = hashlib.sha256()
+                with open(f["path"], "rb") as fh:
+                    for chunk in iter(lambda: fh.read(1 << 20), b""):
+                        h.update(chunk)
+                known = cache[f["path"]] = (stamp, h.hexdigest())
+            out["sha256"] = known[1]
+        except FileNotFoundError:
+            out["missing"] = True
+        except OSError as e:
+            out["error"] = (e.strerror or str(e))[:200]
         return out
 
     @property

@@ -120,6 +120,7 @@ const serviceUpkeep = (cleanup: boolean) => {
     rollUp(store, new Date());
     // §15.3: the rules once a minute too, for what sends nothing (an executor gone, samples overdue).
     checkAll(store, (h) => deployments.handoff.executor(h, "service"));
+    store.dropOldExecutorContent();
     if (cleanup) prune(store, new Date());
   } catch (error) { console.error("service metrics:", error); }
 };

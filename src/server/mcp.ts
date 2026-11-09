@@ -154,6 +154,15 @@ function draftShape(body: Any) {
   });
 }
 
+/** get_service_drift: which files, and the redacted differences; no hashes (§16.3). */
+function driftShape(body: Any) {
+  return redactStrings({
+    service: body.service, known: body.known, drifted: body.drifted,
+    members: (body.members ?? []).map((m: Any) => ({ member: m.member, state: m.state, reason: m.reason, asOf: m.asOf, files: m.files.map((f: Any) => ({ name: f.name, path: f.path, state: f.state, revision: f.revision, seenAt: f.actualAt })) })),
+    ...(body.differences ? { differences: { member: body.differences.member, files: body.differences.files.map((f: Any) => ({ name: f.name, path: f.path, change: f.change, diff: f.diff, secretsChanged: f.secretsChanged, opened: f.opened })) }, legend: "diff: + is on the host, - is what it should be, ... is left out. secretsChanged: secrets whose value differs, by name only." } : {}),
+  });
+}
+
 /** diff_service_config: two revisions (from, to), the redacted differences with a changed secret only by name; or a revision's nodes. */
 function diffShape(body: Any, a: Record<string, unknown>) {
   if (a.from !== undefined || a.to !== undefined) return { service: body.service, from: body.from, to: body.to, members: aiDiffs(body.members ?? []), legend: "diff: + is in to, - is in from, ... is left out. secretsChanged: secrets whose value differs, by name only." };
@@ -218,8 +227,8 @@ const SERVICE_TOOLS: Tool[] = [
     properties: { id: SERVICE }, required: ["id"], request: (a) => ({ method: "GET", path: `/api/services/${enc(a.id)}/changes` }), shape: redacted },
   { name: "get_service_change", readOnly: true, description: "One change of a service with each node's steps. Not there yet: see list_service_changes.",
     properties: { id: SERVICE, change: s("The change's id, from list_service_changes.") }, required: ["id", "change"], request: (a) => ({ method: "GET", path: `/api/services/${enc(a.id)}/changes/${enc(a.change)}` }), shape: redacted },
-  { name: "get_service_drift", readOnly: true, description: "Whether the files on the hosts still match the kept configuration. Not there yet: it answers known: false, so never say there is no drift from it.",
-    properties: { id: SERVICE }, required: ["id"], request: (a) => ({ method: "GET", path: `/api/services/${enc(a.id)}/drift` }), shape: redacted },
+  { name: "get_service_drift", readOnly: true, description: "Whether the files on the hosts still are what the Deployer says they should be: per member and file same, changed, missing or unknown. known: false means some member cannot tell (reason says why), so never say there is no drift from it. With member (a member key) it also reads the differing files from that host: the changed lines, a changed secret only by name. Only a person adopts a drifted file, on the page.",
+    properties: { id: SERVICE, member: s("Optional: a member key, to see the differences of its files.") }, required: ["id"], request: (a) => ({ method: "GET", path: `/api/services/${enc(a.id)}/drift`, query: { member: a.member } }), shape: driftShape },
   { name: "lookup_property", readOnly: true, description: "The service profile's property catalog: for a key (exact) or words (q) in keys and descriptions, its file, type, default, whether the nodes of a cluster must agree (scope cluster) or each has its own (node), whether a change needs a restart, whether it is sensitive, the versions it exists in, what it does. By service (its profile and version), or profile (nifi-1.x, nifi-2.x) and version.",
     properties: { service: s("Optional: a registered service's id."), profile: s("Optional: nifi-1.x or nifi-2.x."), version: s("Optional NiFi version, e.g. 1.12.1."), key: s("Optional: the exact key, e.g. nifi.cluster.node.protocol.port."), q: s("Optional words to look for."), file: s("Optional: nifi.properties or bootstrap.conf."), limit: n("Optional, default 50.") },
     request: (a) => ({ method: "GET", path: "/api/service-properties", query: { service: a.service, profile: a.profile, version: a.version, key: a.key, q: a.q, file: a.file, limit: a.limit } }) },

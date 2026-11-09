@@ -48,6 +48,7 @@ export function ServiceDetail({ id, initialDraft, onBack }: { id: string; initia
   const cluster = s.kind === "cluster";
   const loaded = { s, cfg, reload: load, drafts, open: setTab, saved: () => { loadCfg(); load(); drafts.refresh(); } };
   const tabs = TABS.filter((t) => t.shown(loaded));
+  const driftCount = s.members.reduce((n, m) => n + m.configDrift.length, 0);
   const current = tabs.find((t) => t.id === tab) ?? tabs[0]!;
   const f = s.summary.findings;
   return (
@@ -79,7 +80,7 @@ export function ServiceDetail({ id, initialDraft, onBack }: { id: string; initia
         </div>
       </section>
       <div className="subtabs" role="tablist">
-        {tabs.map((t) => <button key={t.id} role="tab" aria-selected={t.id === current.id} className={t.id === current.id ? "active" : ""} onClick={() => setTab(t.id)}>{t.label}</button>)}
+        {tabs.map((t) => <button key={t.id} role="tab" aria-selected={t.id === current.id} className={t.id === current.id ? "active" : ""} onClick={() => setTab(t.id)}>{t.label}{t.id === "changes" && driftCount > 0 && <span className="badge warn" title="Files on the hosts are not what is kept">{driftCount}</span>}</button>)}
       </div>
       {current.render(loaded)}
     </>

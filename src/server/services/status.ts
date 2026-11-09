@@ -4,6 +4,7 @@
 // executor without the collector, or just registered) falls back to its host's newest discovery as in phase 1.
 // A cluster's node connections come from the coordinator's view (/controller/cluster is complete only there).
 
+import { hasDrifted } from "./configdrift.ts";
 import type { ExecutorInfo } from "../handoff.ts";
 import type { NginxCheck, Point, ServiceCert, Store } from "../store.ts";
 import { confDirOf, installKey, type DraftItem, type ServiceMember, type ServicePorts } from "./draft.ts";
@@ -56,6 +57,8 @@ export interface MemberStatus {
   executor: { online: boolean; reason?: string; version?: string; ageSeconds?: number };
   /** Files whose newest revision is not what this member should have now (§16.3 "pending"): saved, not applied yet. */
   configPending: string[];
+  /** Files that are not what this member should have, as last seen (§16.3 "drift"): changed or gone on the host. */
+  configDrift: string[];
   state: MemberState;
   /** Where the state comes from, and as of when. */
   source: "samples" | "discovery" | "executor" | "none";
@@ -180,7 +183,8 @@ export function serviceStatus(store: Store, executor: (host: string) => Executor
   };
   const samples = new Map(store.latestServiceSamples(id).map((x) => [x.member, x]));
   const latestConfig = store.serviceConfig(id)?.body;
-  const expected = new Map(store.serviceMemberFiles(id).map((f) => [`${f.member}\0${f.file}`, f.expectedSha256]));
+  const memberFiles = store.serviceMemberFiles(id);
+  const expected = new Map(memberFiles.map((f) => [`${f.member}\0${f.file}`, f.expectedSha256]));
   const pendingOf = (key: string) => latestConfig?.members.find((m) => installKey(m) === key)?.files.filter((f) => expected.get(`${key}\0${f.name}`) !== f.sha256).map((f) => f.name) ?? [];
   // The coordinator's view of the cluster: the newest sample whose own node is the coordinator, else the newest with a view.
   const views = [...samples.values()].filter((x) => Array.isArray((x.body.nifi as Any | undefined)?.cluster?.nodes)).sort((a, b) => (a.at < b.at ? 1 : -1));
@@ -220,6 +224,7 @@ export function serviceStatus(store: Store, executor: (host: string) => Executor
       key: installKey(m), host: m.host, installDir: m.installDir, confDir: confDirOf(m), ...(m.nodeAddress !== undefined ? { nodeAddress: m.nodeAddress } : {}), serviceUser: m.serviceUser, ports: m.ports,
       executor: { online: e.online, ...(e.reason ? { reason: e.reason } : {}), ...(e.heartbeat?.version ? { version: e.heartbeat.version } : {}), ...(e.ageSeconds !== undefined ? { ageSeconds: e.ageSeconds } : {}) },
       configPending: pendingOf(installKey(m)),
+      configDrift: memberFiles.filter((f) => f.member === installKey(m) && hasDrifted(f)).map((f) => f.file),
       state, source, asOf, live,
       seen: d ? { job: d.job, at: d.at, version: found?.version ?? null, pid: found?.process?.pid ?? null, webUrl: found?.webUrl ?? null } : null,
     };

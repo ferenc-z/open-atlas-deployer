@@ -24,6 +24,9 @@ import { sealFile, type ConfigFileRecord, type ConfigMember, type ServiceConfigB
 import { ConfigReviewer } from "../src/server/services/configreview.ts";
 import type { DraftCluster, DraftStandalone } from "../src/server/services/draft.ts";
 import { Takeover } from "../src/server/services/takeover.ts";
+import { watchList } from "../src/server/services/watch.ts";
+import { ingest } from "../src/server/services/metrics.ts";
+import { check } from "../src/server/services/rules.ts";
 import { Store } from "../src/server/store.ts";
 import { Versions } from "../src/server/versions.ts";
 
@@ -58,7 +61,21 @@ function setup(name = "uat", store = new Store(":memory:"), review?: (store: Sto
   const takeover = new Takeover({ store, handoff, box, environment: () => deployments.environment().env.name, hosts: () => hostIds(deployments.environment().env) });
   const keys = { resolve: async (bearer: string) => KEYS[bearer] } as unknown as Keys;
   const env = new EnvManager(store, deployments, new Schemas(undefined, join(dir, "templates"), fetcher), box, "compare");
-  const app = createApp({ config, store, takeover, keys, ...(review ? { configReview: review(store) } : {}), sessions: new WorkbenchSessions(config.workbenchUrl, fetcher), observer, deployments, versions: new Versions(undefined, fetcher), env, workbench: new WorkbenchAdmin(config.workbenchUrl, () => "", fetcher) });
+  // What the hosts have, by path: a stand-in for the service executor's svc-read.
+  const live = new Map<string, string>();
+  const reads: Record<string, unknown>[] = [];
+  const answerReads = async () => {
+    for (let job = store.claimExecutorJob("local", "service"); job; job = store.claimExecutorJob("local", "service")) {
+      reads.push(job);
+      const files = (job.files as string[]).flatMap((name) => {
+        const path = `${String(job.installDir)}/conf/${name}`, text = live.get(path);
+        return text === undefined ? [] : [{ name, path, sha256: sha(Buffer.from(text, "latin1")), size: text.length, modifiedAt: "2026-11-09T00:00:00Z", content: Buffer.from(text, "latin1").toString("base64") }];
+      });
+      handoff.putEnvContent(String(job.id), JSON.stringify({ files }));
+      handoff.putStatus(String(job.id), { state: "succeeded", steps: [], result: { files: files.map(({ content: _c, ...f }) => f) } as never });
+    }
+  };
+  const app = createApp({ config, store, takeover, keys, liveRead: { sleep: answerReads, timeoutMs: 2000, pollMs: 1 }, ...(review ? { configReview: review(store) } : {}), sessions: new WorkbenchSessions(config.workbenchUrl, fetcher), observer, deployments, versions: new Versions(undefined, fetcher), env, workbench: new WorkbenchAdmin(config.workbenchUrl, () => "", fetcher) });
   type As = { as?: string; key?: string };
   const call = (method: string, path: string, who: As, body?: unknown) => {
     const headers = new Headers({ "content-type": "application/json" });
@@ -66,7 +83,7 @@ function setup(name = "uat", store = new Store(":memory:"), review?: (store: Sto
     if (who.key) headers.set("authorization", `Bearer ${who.key}`);
     return app.request(`/deploy${path}`, { method, headers, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
   };
-  return { app, store, call };
+  return { app, store, call, handoff, live, reads };
 }
 
 const NIFI = (over: Record<string, string>) => {
@@ -635,7 +652,7 @@ test("the read tools for what comes later say they know nothing yet", async () =
   assert.deepEqual(list.value.changes, []);
   assert.match(list.value.note, /not there yet/);
   assert.equal((await tool(t, AI, "get_service_change", { id: "solo", change: "x" })).value.finding.code, "service-change/unknown");
-  assert.equal((await tool(t, AI, "get_service_drift", { id: "solo" })).value.known, false);
+  assert.equal((await tool(t, AI, "get_service_drift", { id: "solo" })).value.known, false, "no samples yet: not known");
   for (const name of ["list_service_changes", "get_service_drift"]) assert.equal((await tool(t, AI, name, { id: "nope" })).value.finding.code, "service/unknown");
   assert.equal((await t.call("GET", "/api/services/solo/drift", {})).status, 401);
 });
@@ -789,4 +806,256 @@ test("the open_service_change card: Workbench's entry, the example and the page 
   const page = /HOST_OPERATIONS = (\[[^\]]*\])/.exec(readFileSync("src/web/Assistant.tsx", "utf8"))![1]!;
   assert.deepEqual(JSON.parse(page), entry());
   assert.match(readFileSync("agents/deploy-assistant.md", "utf8"), /`open_service_change`/);
+});
+
+// --- Phase 3 step 7 (§7, §16.3): drift
+
+const SOLO = "local:/opt/solo";
+const SOLO_PROPS = "/opt/solo/conf/nifi.properties";
+const HEX = /[0-9a-f]{64}/;
+
+function drifting(name = "uat") {
+  const t = setup(name);
+  takenOver(t.store);
+  t.store.setHeartbeat("local", { executor: "service", version: "0.9.0", protocols: [2], kinds: ["svc-read", "svc-read@2"] }, "service");
+  return t;
+}
+/** What the Deployer should have there, as the host has it to begin with. */
+const keptText = (t: T, service: string, member: string, file: string) => opened(fileIn(t.store, service, undefined, member, file)).toString();
+const syncLive = (t: T) => {
+  for (const [service, member] of [["solo", SOLO], ["flow", A], ["flow", B]] as const) {
+    for (const f of t.store.serviceMemberFiles(service).filter((x) => x.member === member)) t.live.set(f.path, keptText(t, service, member, f.file));
+  }
+};
+/** A round of the collector for one member: fingerprints of what the host has, unless the sample is an older executor's. */
+function round(t: T, service: string, member: string, o: { files?: boolean; at?: string } = {}) {
+  const at = o.at ?? new Date().toISOString();
+  const files = t.store.serviceMemberFiles(service).filter((f) => f.member === member).map((f) => {
+    const text = t.live.get(f.path);
+    return text === undefined ? { name: f.file, path: f.path, missing: true } : { name: f.file, path: f.path, sha256: sha(Buffer.from(text, "latin1")) };
+  });
+  ingest(t.store, [{ service, member, at, process: { running: true, pid: 7, startedAt: "2026-11-01T00:00:00Z" }, nifi: { state: "ok" }, ...(o.files === false ? {} : { files }) }]);
+  check(t.store, (h) => t.handoff.executor(h, "service"), service);
+}
+const driftOf = async (t: T, service: string, member?: string) => (await t.call("GET", `/api/services/${service}/drift${member ? `?member=${encodeURIComponent(member)}` : ""}`, { as: "viewer" })).json() as Promise<any>;
+const openDrift = (t: T, service: string) => t.store.serviceAlerts({ service, state: "open", limit: 50 }).filter((a) => a.rule === "config-drift");
+const eventKinds = (t: T, service: string) => t.store.serviceEvents(service, { limit: 100 }).map((e) => e.kind);
+const adopt = (t: T, service: string, body: Record<string, unknown>, who: { as?: string; key?: string } = { as: "uat" }) => t.call("POST", `/api/services/${service}/drift/adopt`, who, body);
+
+test("the watch list names each member's files, and a sample's fingerprints are not kept in its body", () => {
+  const t = drifting();
+  syncLive(t);
+  const entry = watchList(t.store, "local").find((w) => w.member === SOLO)!;
+  assert.deepEqual(entry.files.map((f) => f.name).sort(), ["authorizers.xml", "nifi.properties"]);
+  assert.equal(entry.files.find((f) => f.name === "nifi.properties")!.path, SOLO_PROPS);
+  round(t, "solo", SOLO);
+  assert.equal(t.store.latestServiceSamples("solo")[0]!.body.files, undefined);
+  const row = t.store.serviceMemberFiles("solo").find((f) => f.file === "nifi.properties")!;
+  assert.equal(row.actualSha256, row.expectedSha256);
+  const was = row.actualAt!;
+  // A sample from before what is recorded (a backlog) changes nothing.
+  ingest(t.store, [{ service: "solo", member: SOLO, at: "2020-01-01T00:00:00Z", files: [{ name: "nifi.properties", sha256: "0".repeat(64) }] }]);
+  const after = t.store.serviceMemberFiles("solo").find((f) => f.file === "nifi.properties")!;
+  assert.deepEqual([after.actualSha256, after.actualAt], [row.expectedSha256, was]);
+});
+
+test("drift is unknown without fingerprints: an older executor's samples neither open nor close the alert", async () => {
+  const t = drifting();
+  syncLive(t);
+  assert.equal((await driftOf(t, "solo")).known, false, "no samples yet");
+  round(t, "solo", SOLO, { files: false });
+  const old = await driftOf(t, "solo");
+  assert.equal(old.known, false);
+  assert.equal(old.members[0].state, "unknown");
+  assert.match(old.members[0].reason, /too old/);
+  assert.equal(openDrift(t, "solo").length, 0);
+  t.live.set(SOLO_PROPS, `${t.live.get(SOLO_PROPS)}# a comment\n`);
+  round(t, "solo", SOLO);
+  assert.equal(openDrift(t, "solo").length, 1);
+  round(t, "solo", SOLO, { files: false });
+  assert.equal(openDrift(t, "solo").length, 1, "cannot tell: the alert stays");
+  assert.equal((await driftOf(t, "solo")).known, false);
+});
+
+test("a changed file: the alert and the timeline name it, the differences hide its secrets, and nothing of it stays", async () => {
+  const t = drifting();
+  syncLive(t);
+  round(t, "solo", SOLO);
+  const same = await driftOf(t, "solo");
+  assert.deepEqual([same.known, same.drifted, same.members[0].state], [true, false, "same"]);
+  assert.equal(openDrift(t, "solo").length, 0);
+
+  const text = t.live.get(SOLO_PROPS)!;
+  t.live.set(SOLO_PROPS, `${text.replace("keystore-s3cret", "other-s3cret").replace("nifi.ui.banner.text=", "nifi.ui.banner.text=by-hand")}# password=comment-s3cret\nnifi.extra.password=added-s3cret\n`);
+  round(t, "solo", SOLO);
+  const alert = openDrift(t, "solo")[0]!;
+  assert.equal(alert.level, "WARN");
+  assert.match(String(alert.detail.text), /nifi\.properties/);
+  assert.doesNotMatch(JSON.stringify(alert), HEX);
+  assert.ok(eventKinds(t, "solo").includes("drift-detected"));
+  assert.doesNotMatch(JSON.stringify(t.store.serviceEvents("solo", { limit: 100 })), HEX);
+  const status = await (await t.call("GET", "/api/services/solo/status", { as: "viewer" })).json() as any;
+  assert.deepEqual(status.members[0].configDrift, ["nifi.properties"]);
+
+  const summary = await driftOf(t, "solo");
+  assert.deepEqual([summary.known, summary.drifted, summary.members[0].state], [true, true, "drift"]);
+  assert.equal(summary.differences, undefined);
+  assert.equal(t.reads.length, 0, "the summary reads nothing from the host");
+
+  const read = await driftOf(t, "solo", SOLO);
+  assert.equal(t.reads.length, 1);
+  assert.deepEqual(t.reads[0]!.files, ["nifi.properties"], "only what differs is read");
+  const file = read.differences.files[0];
+  assert.equal(file.name, "nifi.properties");
+  assert.deepEqual(file.secretsChanged.sort(), ["nifi.extra.password", "nifi.security.keystorePasswd"]);
+  assert.match(file.diff, /\+ nifi\.ui\.banner\.text=by-hand/);
+  assert.equal(file.sha256, sha(Buffer.from(t.live.get(SOLO_PROPS)!, "latin1")));
+  assert.doesNotMatch(JSON.stringify(read), LEAK);
+  const left = (t.store as any).db.prepare("SELECT env_content, request FROM executor_jobs").all() as { env_content: unknown; request: string }[];
+  assert.ok(left.every((r) => r.env_content === null), "what was read is not kept");
+  assert.doesNotMatch(JSON.stringify(left), /s3cret/);
+
+  // The AI: the same, without a hash.
+  const ai = await tool(t, AI, "get_service_drift", { id: "solo", member: SOLO });
+  assert.equal(ai.value.drifted, true);
+  assert.deepEqual(ai.value.differences.files[0].secretsChanged.sort(), ["nifi.extra.password", "nifi.security.keystorePasswd"]);
+  assert.doesNotMatch(ai.text, HEX);
+  assert.doesNotMatch(ai.text, LEAK);
+  assert.doesNotMatch((await tool(t, AI, "get_service_drift", { id: "solo" })).text, HEX);
+  assert.equal((await tool(t, AI, "get_service_drift", { id: "solo", member: "local:/nope" })).value.finding.code, "config/unknown-member");
+});
+
+test("adopting: who may, the same content as was shown, a new revision, nothing written, and the alert closes", async () => {
+  const t = drifting();
+  syncLive(t);
+  t.live.set(SOLO_PROPS, `${t.live.get(SOLO_PROPS)}# by hand\n`);
+  round(t, "solo", SOLO);
+  const shown = (await driftOf(t, "solo", SOLO)).differences.files[0].sha256 as string;
+  const body = { member: SOLO, file: "nifi.properties", sha256: shown };
+
+  assert.equal((await adopt(t, "solo", body, {})).status, 401);
+  for (const who of [{ as: "viewer" }, { key: AI }]) assert.equal((await adopt(t, "solo", body, who)).status, 403, JSON.stringify(who));
+  assert.equal((await adopt(t, "solo", { member: SOLO }, { as: "uat" })).status, 400);
+  assert.equal((await adopt(t, "solo", { ...body, file: "nope.xml" })).status, 404);
+  const other = await adopt(t, "solo", { ...body, sha256: "0".repeat(64) });
+  assert.deepEqual([other.status, (await other.json() as any).error], [409, "drift/changed"]);
+  assert.equal(t.store.serviceConfig("solo")!.revision, 1);
+
+  const saved = await adopt(t, "solo", body);
+  assert.equal(saved.status, 201);
+  const out = await saved.json() as any;
+  assert.equal(out.revision, 2);
+  assert.doesNotMatch(JSON.stringify(out), LEAK);
+  const revision = t.store.serviceConfig("solo")!;
+  assert.deepEqual([revision.source, revision.base], ["adopt", 1]);
+  assert.equal(fileIn(t.store, "solo", 2, SOLO, "nifi.properties").sha256, shown);
+  const row = t.store.serviceMemberFiles("solo").find((f) => f.file === "nifi.properties")!;
+  assert.deepEqual([row.expectedSha256, row.revision], [shown, 2]);
+  assert.equal(openDrift(t, "solo").length, 0);
+  assert.ok(eventKinds(t, "solo").includes("drift-resolved"));
+  assert.ok(t.store.listAudit(50, { action: "service.config-adopted" }).length > 0);
+  assert.deepEqual((await (await t.call("GET", "/api/services/solo/status", { as: "viewer" })).json() as any).members[0].configPending, [], "the newest revision is what the host has");
+
+  // Put back by hand and adopted back: a third revision, with the original bytes.
+  syncLive(t);
+  const original = NIFI({ "nifi.web.https.port": "7443" });
+  t.live.set(SOLO_PROPS, original);
+  round(t, "solo", SOLO);
+  assert.equal(openDrift(t, "solo").length, 1);
+  assert.equal((await adopt(t, "solo", { member: SOLO, file: "nifi.properties", sha256: sha(original) })).status, 201);
+  assert.equal(fileIn(t.store, "solo", 3, SOLO, "nifi.properties").sha256, fileIn(t.store, "solo", 1, SOLO, "nifi.properties").sha256);
+  round(t, "solo", SOLO);
+  assert.equal(openDrift(t, "solo").length, 0);
+  assert.equal((await adopt(t, "solo", { member: SOLO, file: "nifi.properties", sha256: sha(original) })).status, 409, "no drift: nothing to adopt");
+});
+
+test("adopting refuses a file that is gone, says so before replacing a change not applied yet, and on PROD takes a browser", async () => {
+  const t = drifting();
+  syncLive(t);
+  t.live.delete(SOLO_PROPS);
+  round(t, "solo", SOLO);
+  const gone = await driftOf(t, "solo");
+  assert.equal(gone.members[0].files.find((f: any) => f.name === "nifi.properties").state, "missing");
+  assert.match(String(openDrift(t, "solo")[0]!.detail.text), /gone/);
+  const read = await driftOf(t, "solo", SOLO);
+  assert.deepEqual([read.differences.files[0].change, read.differences.files[0].sha256], ["removed", null]);
+  assert.doesNotMatch(JSON.stringify(read), LEAK);
+  const refused = await adopt(t, "solo", { member: SOLO, file: "nifi.properties", sha256: "0".repeat(64) });
+  assert.deepEqual([refused.status, (await refused.json() as any).error], [409, "drift/missing"]);
+
+  syncLive(t);
+  const made = await (await t.call("POST", "/api/services/solo/config/drafts", { as: "uat" }, { changes: [BANNER] })).json() as any;
+  assert.equal((await t.call("POST", `/api/services/solo/config/drafts/${made.id}/save`, { as: "uat" }, {})).status, 201);
+  t.live.set(SOLO_PROPS, `${t.live.get(SOLO_PROPS)}# by hand\n`);
+  round(t, "solo", SOLO);
+  const hash = sha(Buffer.from(t.live.get(SOLO_PROPS)!, "latin1"));
+  const pending = await adopt(t, "solo", { member: SOLO, file: "nifi.properties", sha256: hash });
+  assert.deepEqual([pending.status, (await pending.json() as any).error], [409, "drift/pending"]);
+  assert.equal(t.store.serviceConfig("solo")!.revision, 2);
+  assert.equal((await adopt(t, "solo", { member: SOLO, file: "nifi.properties", sha256: hash, replacePending: true })).status, 201);
+
+  const prod = drifting("prod");
+  syncLive(prod);
+  prod.live.set(SOLO_PROPS, `${prod.live.get(SOLO_PROPS)}# by hand\n`);
+  round(prod, "solo", SOLO);
+  const body = { member: SOLO, file: "nifi.properties", sha256: sha(Buffer.from(prod.live.get(SOLO_PROPS)!, "latin1")) };
+  assert.equal((await adopt(prod, "solo", body, { key: "dpk_prod" })).status, 403);
+  assert.equal((await adopt(prod, "solo", body, { as: "prod" })).status, 201);
+});
+
+test("adopting on a cluster goes into that node's layer: by key when that gives the same bytes, else the whole file; the other node stays", async () => {
+  const t = drifting();
+  syncLive(t);
+  const path = "/opt/a/conf/nifi.properties";
+  const before = t.store.serviceMemberFiles("flow");
+  const bBefore = fileIn(t.store, "flow", undefined, B, "nifi.properties").sha256;
+  // A value changed in place, a secret among them.
+  const valued = t.live.get(path)!.replace("nifi.ui.banner.text=", "nifi.ui.banner.text=on-a").replace("node-8443-s3cret", "changed-s3cret");
+  t.live.set(path, valued);
+  round(t, "flow", A);
+  round(t, "flow", B);
+  assert.deepEqual(openDrift(t, "flow").map((a) => a.member), [A]);
+  const first = await adopt(t, "flow", { member: A, file: "nifi.properties", sha256: sha(valued) });
+  assert.equal(first.status, 201);
+  assert.equal((await first.json() as any).revision, 3, "split first, as a first edit is");
+  const config = t.store.serviceConfig("flow")!;
+  assert.deepEqual([config.source, t.store.serviceConfig("flow", 2)!.source], ["adopt", "split"]);
+  const own = config.body.layers!.nodes[A]!["nifi.properties"]!;
+  assert.ok("set" in own, "by key");
+  assert.ok(own.set.some((v) => v.key === "nifi.ui.banner.text" && "value" in v && v.value === "on-a"));
+  assert.ok(own.set.some((v) => v.key === "nifi.security.keystorePasswd" && "sealed" in v), "a secret is sealed in the layer");
+  assert.doesNotMatch(JSON.stringify(config.body.layers), /changed-s3cret/);
+  assert.equal(fileIn(t.store, "flow", 3, A, "nifi.properties").sha256, sha(valued));
+  assert.equal(fileIn(t.store, "flow", 3, B, "nifi.properties").sha256, bBefore);
+  const expectedOf = (rows: typeof before) => rows.filter((f) => f.member === B).map((f) => [f.file, f.expectedSha256, f.revision]);
+  assert.deepEqual(expectedOf(t.store.serviceMemberFiles("flow")), expectedOf(before));
+  assert.equal(openDrift(t, "flow").length, 0);
+
+  // A comment cannot be said by key: the whole file, byte for byte.
+  const commented = `${valued}# on a only\n`;
+  t.live.set(path, commented);
+  round(t, "flow", A);
+  assert.equal((await adopt(t, "flow", { member: A, file: "nifi.properties", sha256: sha(commented) })).status, 201);
+  const next = t.store.serviceConfig("flow")!;
+  assert.ok("replace" in next.body.layers!.nodes[A]!["nifi.properties"]!);
+  assert.equal(fileIn(t.store, "flow", next.revision, A, "nifi.properties").sha256, sha(commented));
+  // An edit on this node afterwards still works, and the differences on the page hide what the layer holds.
+  assert.doesNotMatch(JSON.stringify(await (await t.call("GET", `/api/services/flow/config`, { as: "viewer" })).json()), LEAK);
+});
+
+test("with the service executor offline the differences say so at once; the summary cannot tell", async () => {
+  const t = setup();
+  takenOver(t.store);
+  syncLive(t);
+  const res = await t.call("GET", `/api/services/solo/drift?member=${encodeURIComponent(SOLO)}`, { as: "viewer" });
+  assert.equal((await res.json() as any).members[0].state, "unknown", "nothing has drifted as far as is known: nothing to read");
+  round(t, "solo", SOLO);
+  const summary = await driftOf(t, "solo");
+  assert.equal(summary.known, false);
+  assert.match(summary.members[0].reason, /offline/);
+  t.live.set(SOLO_PROPS, "changed=1\n");
+  round(t, "solo", SOLO);
+  const read = await t.call("GET", `/api/services/solo/drift?member=${encodeURIComponent(SOLO)}`, { as: "viewer" });
+  assert.deepEqual([read.status, (await read.json() as any).error], [409, "drift/executor"]);
+  assert.equal(openDrift(t, "solo").length, 0, "no executor: the rule cannot tell");
 });

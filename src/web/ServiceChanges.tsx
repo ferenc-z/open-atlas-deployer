@@ -2,9 +2,9 @@
 // compared two at a time. A draft is a list of changes on a revision (made on the Configuration tab); saving one makes
 // the next revision and changes nothing on the hosts. Secrets are never here: a changed secret is named, not shown.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import * as api from "./api.ts";
-import type { ChangeAssessment, ConfigDiff, ConfigDraft, ConfigDraftDetail, ConfigFinding, DraftChangeView, MemberDiff, ServiceConfigView, ServiceStatus } from "./api.ts";
+import type { ChangeAssessment, ConfigDiff, ConfigDraft, ConfigDraftDetail, ConfigFinding, DraftChangeView, DriftAnswer, LiveDifferences, MemberDiff, ServiceConfigView, ServiceStatus } from "./api.ts";
 import { ask } from "./Confirm.tsx";
 import { Markdown } from "./Markdown.tsx";
 import { SEVERITY, SOURCE, webPort, when } from "./svc.tsx";
@@ -76,7 +76,7 @@ function ordered(diff: string) {
   return out;
 }
 
-function FileDiffs({ members, s }: { members: MemberDiff[]; s: ServiceStatus }) {
+function FileDiffs({ members, s, action }: { members: MemberDiff[]; s: ServiceStatus; action?: (member: string, file: string) => ReactNode }) {
   if (!members.length) return <p className="muted">No file differs.</p>;
   return (
     <div className="diffs">{members.map((m) => (
@@ -87,7 +87,7 @@ function FileDiffs({ members, s }: { members: MemberDiff[]; s: ServiceStatus }) 
           const lines = shown.some((l) => l.startsWith("+ ") || l.startsWith("- "));
           return (
             <details key={f.name} open>
-              <summary><span className="mono">{f.name}</span>{f.change !== "content" && <span className="badge info">{f.change}</span>}</summary>
+              <summary><span className="mono">{f.name}</span>{f.change !== "content" && <span className="badge info">{f.change}</span>}{action?.(m.member, f.name)}</summary>
               {f.secretsChanged.length > 0 && <p className="small"><span className="hidden-value">Secret values changed:</span> <span className="mono">{f.secretsChanged.join(", ")}</span></p>}
               {!f.opened && <p className="small muted">A side was imported by an older version and cannot be opened: the kept copies are compared, secrets are not.</p>}
               {lines ? <pre className="diff">{shown.map((l, i) => <div key={i} className={l.startsWith("+ ") ? "add" : l.startsWith("- ") ? "del" : ""}>{l || " "}</div>)}</pre>
@@ -279,6 +279,74 @@ function Revisions({ s, cfg }: { s: ServiceStatus; cfg: ServiceConfigView }) {
   );
 }
 
+const DRIFT_STATE = { same: { label: "Same", tone: "ok" }, changed: { label: "Changed", tone: "warn" }, missing: { label: "Gone", tone: "bad" }, unknown: { label: "Unknown", tone: "muted" } } as const;
+
+/** Whether the files on the hosts still are what they should be, what differs, and keeping a host's file as a new revision. */
+function Drift({ s, cfg, onSaved }: { s: ServiceStatus; cfg: ServiceConfigView; onSaved: () => void }) {
+  const [drift, setDrift] = useState<DriftAnswer | undefined>();
+  const [open, setOpen] = useState<string | null>(null);
+  const [shown, setShown] = useState<LiveDifferences | undefined>();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [saved, setSaved] = useState("");
+  const load = useCallback(() => { api.serviceDrift(s.id).then(setDrift, (e: Error) => setError(e.message)); }, [s.id]);
+  useEffect(() => { load(); const t = setInterval(load, 15_000); return () => clearInterval(t); }, [load]);
+  const read = useCallback((member: string) => {
+    setOpen(member); setShown(undefined); setError("");
+    api.serviceDrift(s.id, member).then((x) => setShown(x.differences), (e: Error) => setError(e.message));
+  }, [s.id]);
+  const adopt = async (member: string, file: string) => {
+    const seen = shown?.files.find((f) => f.name === file);
+    if (!seen?.sha256) return;
+    const pending = s.members.find((m) => m.key === member)?.configPending.includes(file) ?? false;
+    const where = s.kind === "cluster" ? `${memberName(s, member)}'s ${file}` : file;
+    const message = `Keep ${where} as the host has it, as a new revision?${s.kind === "cluster" ? " It becomes this node's own, which the checks may report as differing from the other nodes." : ""} Nothing changes on the host.${pending ? `\n\nThe newest revision changes this file and has not been applied: adopting replaces that change.` : ""}`;
+    if (!(await ask(message, { confirm: "Adopt", danger: pending }))) return;
+    setBusy(true); setError(""); setSaved("");
+    try {
+      const out = await api.adoptDrift(s.id, { member, file, sha256: seen.sha256, ...(pending ? { replacePending: true } : {}) });
+      setSaved(`${file} is kept as r${out.revision}.`);
+      setOpen(null); setShown(undefined);
+      load(); onSaved();
+    } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
+  };
+  if (!drift) return <section className="panel"><h3>Files on the hosts</h3>{error ? <p className="error">{error}</p> : <p className="muted">Loading…</p>}</section>;
+  const off = drift.members.flatMap((m) => m.files.filter((f) => f.state !== "same").map((f) => ({ m, f })));
+  const reasons = [...new Set(drift.members.filter((m) => m.state === "unknown" && m.reason).map((m) => m.reason!))];
+  const asOf = drift.members.map((m) => m.asOf).filter(Boolean).sort().at(-1);
+  return (
+    <section className="panel">
+      <h3>Files on the hosts {drift.drifted && <span className="badge warn">Drift</span>}</h3>
+      {reasons.map((r) => <p key={r} className="muted"><span className="badge muted">Unknown</span> {r}</p>)}
+      {!off.length && !reasons.length && <p className="ok">Every file is what it should be{asOf ? ` (seen ${when(asOf)})` : ""}.</p>}
+      {off.length > 0 && <table className="props revisions">
+        <thead><tr>{s.kind === "cluster" && <th>Node</th>}<th>File</th><th>State</th><th>Should be</th><th>Seen</th><th></th></tr></thead>
+        <tbody>{off.map(({ m, f }) => (
+          <tr key={`${m.member}:${f.name}`}>
+            {s.kind === "cluster" && <td className="mono">{memberName(s, m.member)}</td>}
+            <td className="mono" title={f.path}>{f.name}</td>
+            <td><span className={`badge ${DRIFT_STATE[f.state].tone}`}>{DRIFT_STATE[f.state].label}</span></td>
+            <td className="mono">r{f.revision}</td>
+            <td className="nowrap">{f.actualAt ? when(f.actualAt) : "—"}</td>
+            <td>{f.state !== "unknown" && <button className="link" onClick={() => read(m.member)}>Show differences</button>}</td>
+          </tr>
+        ))}</tbody>
+      </table>}
+      {open && !shown && !error && <p className="muted">Reading the files from the host…</p>}
+      {open && shown && <div className="plan">
+        <p className="muted small">Read from the host just now and not kept. Red is what the file should be, green what the host has. Secret values stay hidden; a changed one is only named.</p>
+        <FileDiffs members={shown.files.length ? [shown] : []} s={s} action={(member, file) => {
+          const f = shown.files.find((x) => x.name === file);
+          return cfg.canDraft && f?.sha256 ? <button className="drift-adopt" onClick={(e) => { e.preventDefault(); void adopt(member, file); }} disabled={busy} title="Keep the host's file as a new revision">Adopt</button> : null;
+        }} />
+        <p className="muted small">Adopting keeps the host's file as a new revision and changes nothing on the host. A file that is gone cannot be adopted. Writing what is kept back over the host's file comes with applying a revision.</p>
+      </div>}
+      {saved && <p className="ok">{saved}</p>}
+      {error && <p className="error">{error}</p>}
+    </section>
+  );
+}
+
 export function ServiceChanges({ s, cfg, drafts, onSaved, onEdit }: { s: ServiceStatus; cfg: ServiceConfigView; drafts: Drafts; onSaved: () => void; onEdit: () => void }) {
   const { refresh } = drafts;
   useEffect(refresh, [refresh]);
@@ -286,6 +354,7 @@ export function ServiceChanges({ s, cfg, drafts, onSaved, onEdit }: { s: Service
   return (
     <>
       <p className="muted small page-note">Drafts become revisions here. Nothing on this tab changes a host: a revision is kept until it is applied.</p>
+      <Drift s={s} cfg={cfg} onSaved={onSaved} />
       <section className="panel">
         <h3>Drafts</h3>
         {!drafts.list.length ? <p className="muted">No open drafts. {cfg.canDraft ? <>Edit a key on the <button className="link" onClick={onEdit}>Configuration tab</button> to start one.</> : "You can see drafts here, but not make them."}</p> : <>

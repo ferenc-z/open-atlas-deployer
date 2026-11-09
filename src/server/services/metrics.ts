@@ -3,6 +3,7 @@
 // (30 days); its bulletins go to service_bulletins (each once, dated: NiFi gives only the time of day), its certificates
 // to service_certs (only the newest reading). Rates come from counters here (cpuSeconds, GC). Rules and alerts are step 3.
 
+import { fingerprintsOf } from "./configdrift.ts";
 import type { Point, ServiceBulletin, ServiceCert, Store } from "../store.ts";
 import type { ServiceSample } from "./watch.ts";
 import { installKey, type ServiceMember } from "./draft.ts";
@@ -204,7 +205,8 @@ export function ingest(store: Store, samples: ServiceSample[]): { bulletins: num
     // Step 4: the log summary's patterns to service_log_patterns.
     const logs = ingestLogs(store, s);
     // The raw body without what went to its own tables.
-    const { certs: _c, ...rest } = s;
+    store.setServiceMemberActuals(s.service, s.member, fingerprintsOf(s), s.at);
+    const { certs: _c, files: _f, ...rest } = s;
     const nifi = rest.nifi as Any | undefined;
     kept.push({ ...rest, ...(nifi ? { nifi: { ...nifi, bulletins: undefined } } : {}), ...(logs ? { logs } : {}), point } as ServiceSample & { point: Point });
   }

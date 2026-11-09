@@ -3,6 +3,7 @@
     python3 -m unittest test_service_executor        (from executor/)
 """
 import calendar
+import hashlib
 import json
 import os
 import pathlib
@@ -13,6 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -996,6 +998,55 @@ class CollectorTest(Base):
         ex.push_samples()
         self.assertEqual(self.api.posts[-1], 2)
         self.assertEqual(len(self.api.samples), 30)
+
+    def test_the_sample_carries_each_files_fingerprint_not_its_content(self):
+        conf = self.n200 / "conf"
+        props = conf / "nifi.properties"
+        entry = {**self.entry("n200", self.n200), "files": [
+            {"name": "nifi.properties", "path": str(props)}, {"name": "authorizers.xml", "path": str(conf / "authorizers.xml")},
+            {"name": "not-ours.txt", "path": str(props)}, {"name": "bootstrap.conf", "path": "relative"}]}
+        watch = sx.watch_entries([entry])
+        self.assertEqual([f["name"] for f in watch[0]["files"]], ["nifi.properties", "authorizers.xml"], "only known names at absolute paths")
+        c = self.collector()
+        (conf / "authorizers.xml").unlink(missing_ok=True)
+        files = c.round(watch)[0]["files"]
+        self.assertEqual(files[0], {"name": "nifi.properties", "path": str(props), "sha256": hashlib.sha256(props.read_bytes()).hexdigest()})
+        self.assertEqual(files[1], {"name": "authorizers.xml", "path": str(conf / "authorizers.xml"), "missing": True})
+        self.assertNotIn("wrong", json.dumps(files), "no content goes out")
+        # A comment at the end shows; putting the file back with its old mtime shows too.
+        original, st = props.read_bytes(), props.stat()
+        with open(props, "ab") as f:
+            f.write(b"# a comment\n")
+        changed = c.round(watch)[0]["files"][0]["sha256"]
+        self.assertEqual(changed, hashlib.sha256(props.read_bytes()).hexdigest())
+        self.assertNotEqual(changed, files[0]["sha256"])
+        props.write_bytes(original)
+        os.utime(props, ns=(st.st_atime_ns, st.st_mtime_ns))
+        self.assertEqual(c.round(watch)[0]["files"][0]["sha256"], files[0]["sha256"])
+
+    def test_a_file_is_hashed_again_only_when_it_changes(self):
+        props = self.n200 / "conf" / "nifi.properties"
+        c = self.collector()
+        f = {"name": "nifi.properties", "path": str(props)}
+        first = c.fingerprint(f)
+        real, opened = sx.hashlib.sha256, []
+        with mock.patch.object(sx.hashlib, "sha256", side_effect=lambda *a: opened.append(1) or real(*a)):
+            self.assertEqual(c.fingerprint(f), first)
+            self.assertEqual(opened, [], "the same stat: not read again")
+            # Same size and mtime, other bytes: ctime tells (it ticks every few milliseconds, so wait out this tick).
+            st = props.stat()
+            time.sleep(0.05)
+            data = props.read_bytes()
+            props.write_bytes(data[:-1] + (b"x" if data[-1:] != b"x" else b"y"))
+            os.utime(props, ns=(st.st_atime_ns, st.st_mtime_ns))
+            self.assertNotEqual(c.fingerprint(f)["sha256"], first["sha256"])
+
+    def test_an_unreadable_file_says_so_and_the_sample_goes_on(self):
+        props = self.n200 / "conf" / "nifi.properties"
+        c = self.collector()
+        with mock.patch("builtins.open", side_effect=PermissionError(13, "Permission denied")):
+            out = c.fingerprint({"name": "nifi.properties", "path": str(props)})
+        self.assertEqual(out, {"name": "nifi.properties", "path": str(props), "error": "Permission denied"})
 
     def test_a_collector_failure_is_in_the_sample(self):
         c = self.collector()

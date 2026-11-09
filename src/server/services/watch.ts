@@ -22,6 +22,8 @@ export interface WatchEntry {
   nodeAddress: string | null;
   /** NiFi's log directory as discovery saw it (NIFI_LOG_DIR, else <install>/logs); null: not known. */
   logDir: string | null;
+  /** The configuration files to fingerprint (§16.3): what this member should have, so it is what the fingerprints are compared with. */
+  files: { name: string; path: string }[];
 }
 
 /** A sample as the executor sends it (§15.3); the Deployer keeps the body as it is (step 2 takes it apart). */
@@ -53,6 +55,7 @@ export function watchList(store: Store, host: string): WatchEntry[] {
       service, kind, member: installKey(m), profile, installDir: m.installDir, confDir: confDirOf(m),
       https: { host: typeof httpsHost === "string" ? httpsHost : null, port: m.ports?.https ?? null },
       nodeAddress: m.nodeAddress ?? null, logDir: typeof logs === "string" ? logs : null,
+      files: store.serviceMemberFiles(service).filter((f) => f.member === installKey(m)).map((f) => ({ name: f.file, path: f.path })),
     };
   };
   return [
