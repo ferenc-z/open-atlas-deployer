@@ -18,6 +18,9 @@ export const STATE: Record<MemberStatus["state"], { label: string; tone: string;
   lost: { label: "Lost", tone: "bad", title: "The host's service executor is offline: nothing is known since its last sample" },
 };
 
+/** How a configuration revision came to be. */
+export const SOURCE: Record<string, string> = { import: "imported from the hosts at takeover", edit: "edited", split: "split into layers (the same files)", adopt: "adopted from a host", rollback: "back to an earlier revision" };
+
 export const SEVERITY: Record<Finding["severity"], { tone: string; mark: string }> = { error: { tone: "bad", mark: "✕" }, warning: { tone: "warn", mark: "!" }, info: { tone: "info", mark: "i" } };
 
 export const membersOf = (s: RegisteredService) => (s.kind === "cluster" ? s.nodes : [s.member]);

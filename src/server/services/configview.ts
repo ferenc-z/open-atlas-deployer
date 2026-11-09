@@ -5,7 +5,8 @@
 // are compared on the real values but only labelled "value A" / "value B", never shown (like the takeover findings).
 
 import { sealedText, type ConfigFileRecord, type ServiceConfigBody } from "./config.ts";
-import { parsePropertyEntries } from "./configdoc.ts";
+import { isSecretKey, parsePropertyEntries, xmlSecrets } from "./configdoc.ts";
+import { installKey } from "./draft.ts";
 import { catalogFor, profile as profileById, sectionOf, SECTIONS, type CatalogEntry, type Section } from "./profiles.ts";
 
 const HIDDEN = "(hidden)";
@@ -19,7 +20,8 @@ export function parseProperties(text: string): PropertyLine[] {
 
 /** default: the shipped value; changed: set to something else; hidden: a secret (not compared); unknown: not in the catalog. */
 export type RowStatus = "default" | "changed" | "hidden" | "unknown";
-export interface PropertyRow extends PropertyLine { section: Section; status: RowStatus }
+/** secret: its new value is write-only. Not the same as status hidden: a revision kept before a key was exempted still hides it. */
+export interface PropertyRow extends PropertyLine { section: Section; status: RowStatus; secret: boolean }
 
 export type CatalogView = Pick<CatalogEntry, "key" | "file" | "type" | "default" | "scope" | "restart" | "sensitive" | "section" | "description" | "note" | "grouping">;
 
@@ -29,7 +31,7 @@ export function rowsOf(file: Pick<ConfigFileRecord, "name" | "redacted">, catalo
   return parseProperties(file.redacted).map((l) => {
     const e = catalog.get(`${file.name}:${l.key}`);
     const status: RowStatus = l.value === HIDDEN ? "hidden" : !e ? "unknown" : e.default === null ? (l.value === "" ? "default" : "changed") : same(l.value, e.default) ? "default" : "changed";
-    return { ...l, section: e ? e.section : file.name === "bootstrap.conf" && /^java\.arg\./.test(l.key) ? sectionOf(l.key, file.name) : "Other", status };
+    return { ...l, secret: isSecretKey(l.key), section: e ? e.section : file.name === "bootstrap.conf" && /^java\.arg\./.test(l.key) ? sectionOf(l.key, file.name) : "Other", status };
   });
 }
 
@@ -80,7 +82,7 @@ export interface ConfigView {
   /** The profile's catalog for the service's version, keyed by file:key in the rows. */
   catalog: CatalogView[];
   /** Per member (the body's order), per properties file: the rows. */
-  rows: { host: string; installDir: string; files: Record<string, PropertyRow[]> }[];
+  rows: { host: string; installDir: string; key: string; files: Record<string, PropertyRow[]>; xmlSecrets: Record<string, { name: string; hidden: boolean }[]> }[];
   /** A cluster's files compared across its nodes (null for a standalone instance). */
   compare: FileCompare[] | null;
 }
@@ -92,8 +94,10 @@ export function configView(body: ServiceConfigBody, profileId: string, version: 
     ({ key, file, type, default: d, scope, restart, sensitive, section, description, ...(note ? { note } : {}), ...(grouping ? { grouping } : {}) }));
   const byKey = new Map(catalog.map((e) => [`${e.file}:${e.key}`, e]));
   const rows = body.members.map((m) => ({
-    host: m.host, installDir: m.installDir,
+    host: m.host, installDir: m.installDir, key: installKey(m),
     files: Object.fromEntries(m.files.filter((f) => f.format === "properties").map((f) => [f.name, rowsOf(f, byKey)])),
+    // Each XML file's secrets by name, in order, empty ones too: the position among the same-named is what a reveal asks for.
+    xmlSecrets: Object.fromEntries(m.files.filter((f) => f.format === "xml").map((f) => [f.name, xmlSecrets(f.redacted).map((x) => ({ name: x.name, hidden: x.value.trim() === HIDDEN }))])),
   }));
   let compare: FileCompare[] | null = null;
   if (kind === "cluster") {

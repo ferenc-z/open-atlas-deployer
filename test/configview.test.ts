@@ -70,6 +70,16 @@ test("a cluster's files are compared node by node: differences first by severity
   assert.equal(blind.rows.find((r) => r.key === "nifi.sensitive.props.key")!.severity, null);
 });
 
+test("the view says which keys are write-only, names each member by its install key, and lists an XML file's secrets", () => {
+  const xml = '<x><property name="Password">pw</property><property name="Password"></property><property name="Password">pw2</property></x>';
+  const body: ServiceConfigBody = { members: [{ ...member("h", "nifi.security.keystorePasswd=s3cret\nnifi.web.max.access.token.requests.per.second=25\nnifi.web.https.port=8443\n", [file("authorizers.xml", xml)]), confDir: "/etc/x" }] };
+  const row = configView(body, "nifi-2.x", "2.5.0", "standalone").rows[0]!;
+  assert.equal(row.key, "h:/opt/x (conf /etc/x)");
+  assert.deepEqual(row.files["nifi.properties"]!.map((r) => r.secret), [true, false, false]);
+  // Only the hidden ones can be shown; the empty one still counts for the position a reveal asks for.
+  assert.deepEqual(row.xmlSecrets["authorizers.xml"], [{ name: "Password", hidden: true }, { name: "Password", hidden: false }, { name: "Password", hidden: true }]);
+});
+
 test("a registered service's status carries its takeover findings and a timeline", () => {
   const store = new Store(":memory:");
   const actor = { id: "admin", via: "cli" } as const;

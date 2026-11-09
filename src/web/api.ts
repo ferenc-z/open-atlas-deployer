@@ -3,7 +3,7 @@
 
 import type { Principal } from "../server/auth.ts";
 import type { EnvironmentStatus } from "../server/observe.ts";
-import type { AuditEntry, RegisteredApp } from "../server/store.ts";
+import type { AuditEntry, RegisteredApp, ServiceConfigDraft } from "../server/store.ts";
 import type { Manifest } from "../compose/generate.ts";
 import type { SetupStatus, SetupStep } from "../server/setup.ts";
 import type { AiItem, AiStatus, AiUse } from "../server/setup-ai.ts";
@@ -226,6 +226,8 @@ import type { DraftItem, ServiceDraft } from "../server/services/draft.ts";
 import type { Finding, Skipped } from "../server/services/assess.ts";
 import type { MemberStatus, ServiceStatus } from "../server/services/status.ts";
 import type { ConfigFileRecord } from "../server/services/config.ts";
+import type { ChangeAssessment, ConfigFinding } from "../server/services/configcheck.ts";
+import type { DraftChangeView, MemberDiff } from "../server/services/configedit.ts";
 import type { CatalogView, CompareRow, ConfigView, FileCompare, PropertyRow } from "../server/services/configview.ts";
 export type { CatalogView, CompareRow, ConfigView, FileCompare, PropertyRow };
 export type { DraftItem, Finding, MemberStatus, ServiceDraft, ServiceStatus, Skipped };
@@ -237,11 +239,37 @@ export type RegisteredService = (Extract<DraftItem, { kind: "standalone" }> | Ex
 export const services = () => call<{ standalones: RegisteredService[]; clusters: RegisteredService[] }>("GET", "services");
 export const serviceStatus = (id: string) => call<ServiceStatus>("GET", `services/${encodeURIComponent(id)}/status`);
 export type ServiceConfigView = { service: string; revision: number; source: string; savedAt: string; savedBy: string; via: string; note: string | null;
-  body: { members: { host: string; installDir: string; confDir?: string; files: Omit<ConfigFileRecord, "sealed">[]; missing: string[] }[] };
-  revisions: { revision: number; source: string; savedAt: string; savedBy: string; note: string | null }[];
+  body: { members: { host: string; installDir: string; confDir?: string; files: Omit<ConfigFileRecord, "sealed">[]; missing: string[] }[]; layers?: unknown };
+  revisions: { revision: number; source: string; savedAt: string; savedBy: string; via: string; note: string | null; base: number | null }[];
+  /** The revision this one was edited from, its findings when saved, and its AI review (step 6 fills it). */
+  base: number | null; findings: ConfigFinding[] | null; review: ConfigReview | null;
+  canDraft: boolean; canReveal: boolean;
   /** S24: parsed rows, the catalog, and a cluster's node comparison (null when the service is not registered). */
   view: ConfigView | null };
 export const serviceConfig = (id: string, revision?: number) => call<ServiceConfigView>("GET", `services/${encodeURIComponent(id)}/config${revision ? `?revision=${revision}` : ""}`);
+// Phase 3: configuration drafts and revisions (§7, §16.3). A draft is changes on a revision; saving one makes the next
+// revision and changes nothing on the hosts.
+export type { ChangeAssessment, ConfigFinding, DraftChangeView, MemberDiff };
+export type ConfigReview = { state?: string; text?: string; error?: string };
+/** What is sent: as the page got it (a secret as hidden: true keeps the draft's own new value), or a new secret. */
+export type DraftChangeInput = DraftChangeView | { file: string; member: string | null; key: string; secret: string };
+export type ConfigDraft = Omit<ServiceConfigDraft, "changes"> & { changes: DraftChangeView[]; stale: boolean };
+export type DraftPreview = { findings: ConfigFinding[]; change: ChangeAssessment | null; members: MemberDiff[] } | { problem: { code: string; message: string } } | null;
+export type ConfigDraftDetail = ConfigDraft & { preview: DraftPreview };
+export type ConfigDiff = { service: string; from: number | null; to: number; members: MemberDiff[] };
+const configPath = (id: string, rest: string) => `services/${encodeURIComponent(id)}/config/${rest}`;
+export const serviceConfigDiff = (id: string, q: { from?: number; to?: number; member?: string }) => {
+  const query = new URLSearchParams(Object.entries(q).flatMap(([k, v]) => (v === undefined || v === "" ? [] : [[k, String(v)]])));
+  return call<ConfigDiff>("GET", configPath(id, `diff?${query}`));
+};
+export const configDrafts = (id: string, state?: "open" | "saved" | "discarded") => call<{ drafts: ConfigDraft[] }>("GET", configPath(id, `drafts${state ? `?state=${state}` : ""}`));
+export const configDraft = (id: string, draft: string) => call<ConfigDraftDetail>("GET", configPath(id, `drafts/${encodeURIComponent(draft)}`));
+export const createConfigDraft = (id: string, body: { base: number; changes: DraftChangeInput[]; note?: string }) => call<ConfigDraftDetail>("POST", configPath(id, "drafts"), body);
+export const putConfigDraft = (id: string, draft: string, body: { base?: number; changes?: DraftChangeInput[]; note?: string }) => call<ConfigDraftDetail>("PUT", configPath(id, `drafts/${encodeURIComponent(draft)}`), body);
+export const discardConfigDraft = (id: string, draft: string) => call<ConfigDraft>("DELETE", configPath(id, `drafts/${encodeURIComponent(draft)}`));
+export const saveConfigDraft = (id: string, draft: string, note?: string) => call<{ revision: number; findings: ConfigFinding[]; change: ChangeAssessment | null; draft: ConfigDraft }>("POST", configPath(id, `drafts/${encodeURIComponent(draft)}/save`), note === undefined ? {} : { note });
+/** A kept value (admin in a browser): one key at a time, and written to the audit trail. */
+export const revealConfigValue = (id: string, body: { member?: string; revision: number; file: string; key: string; index?: number }) => call<{ value: string; count: number }>("POST", configPath(id, "reveal"), body);
 /** svc-discover on a host's service executor; the newest one. */
 /** One asked installation: its path, or with its conf directory when that is elsewhere (and conf.dir does not say so). */
 export type DiscoverDir = string | { install: string; conf?: string };

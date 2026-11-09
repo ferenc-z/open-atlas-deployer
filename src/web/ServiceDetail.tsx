@@ -2,11 +2,13 @@
 // stays the same in every phase (name, up, findings, soonest certificate; version, environment, ZooKeeper,
 // configuration revision; the NiFi UI on the right), then tabs. Phase 2 step 2 adds Metrics and live states; later
 // steps add theirs to TABS (Logs, Events and alerts, FlowFile trace, Changes) and a tab without data yet is not shown.
+// The configuration and its open drafts are held here: the Configuration and Changes tabs share them.
 
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import * as api from "./api.ts";
 import type { Field, MemberStatus, MetricsView, Range, ServiceBulletin, ServiceConfigView, ServiceStatus } from "./api.ts";
 import { LineChart, type Series } from "./Charts.tsx";
+import { ServiceChanges, useDrafts, type Drafts } from "./ServiceChanges.tsx";
 import { ServiceConfig } from "./ServiceConfig.tsx";
 import { Logs } from "./Logs.tsx";
 import { FlowFileTrace } from "./Trace.tsx";
@@ -14,7 +16,7 @@ import { NginxAddress } from "./Nginx.tsx";
 import { AlertBadge, EventsAndAlerts, OpenAlerts, Timeline } from "./Alerts.tsx";
 import { ago, CertBadge, certTone, ConfCell, daysLeft, daysText, fmtBytes, fmtNumber, memberKey, serviceName, SEVERITY, STATE, StatusNotes, UpBadge, webPort, when } from "./svc.tsx";
 
-type Loaded = { s: ServiceStatus; cfg: ServiceConfigView | null | undefined; reload: () => void };
+type Loaded = { s: ServiceStatus; cfg: ServiceConfigView | null | undefined; reload: () => void; drafts: Drafts; saved: () => void; open: (tab: string) => void };
 type Tab = { id: string; label: string; shown: (l: Loaded) => boolean; render: (l: Loaded) => ReactNode };
 
 const TABS: Tab[] = [
@@ -24,7 +26,8 @@ const TABS: Tab[] = [
   { id: "trace", label: "FlowFile trace", shown: (l) => l.s.members.length > 0, render: (l) => <FlowFileTrace s={l.s} /> },
   { id: "events", label: "Events and alerts", shown: () => true, render: (l) => <EventsAndAlerts s={l.s} /> },
   { id: "nodes", label: "Nodes", shown: () => true, render: (l) => <Nodes s={l.s} /> },
-  { id: "configuration", label: "Configuration", shown: () => true, render: (l) => <ServiceConfig cfg={l.cfg} status={l.s} /> },
+  { id: "configuration", label: "Configuration", shown: () => true, render: (l) => <ServiceConfig cfg={l.cfg} status={l.s} drafts={l.drafts} onReview={() => l.open("changes")} /> },
+  { id: "changes", label: "Changes", shown: (l) => Boolean(l.cfg), render: (l) => <ServiceChanges s={l.s} cfg={l.cfg!} drafts={l.drafts} onSaved={l.saved} onEdit={() => l.open("configuration")} /> },
 ];
 
 /** How a member is named on the charts: a node by address and port, a standalone by host. */
@@ -37,11 +40,13 @@ export function ServiceDetail({ id, onBack }: { id: string; onBack: () => void }
   const [error, setError] = useState("");
   const load = useCallback(() => { api.serviceStatus(id).then(setS, (e: Error) => setError(e.message)); }, [id]);
   useEffect(() => { load(); const t = setInterval(load, 10_000); return () => clearInterval(t); }, [load]);
-  useEffect(() => { api.serviceConfig(id).then(setCfg, () => setCfg(null)); }, [id]);
+  const loadCfg = useCallback(() => { api.serviceConfig(id).then(setCfg, () => setCfg(null)); }, [id]);
+  useEffect(loadCfg, [loadCfg]);
+  const drafts = useDrafts(id);
   const back = <button className="link" onClick={onBack}>← Services</button>;
   if (!s) return <>{back}{error ? <p className="error">{error}</p> : <p className="muted">Loading…</p>}</>;
   const cluster = s.kind === "cluster";
-  const loaded = { s, cfg, reload: load };
+  const loaded = { s, cfg, reload: load, drafts, open: setTab, saved: () => { loadCfg(); load(); drafts.refresh(); } };
   const tabs = TABS.filter((t) => t.shown(loaded));
   const current = tabs.find((t) => t.id === tab) ?? tabs[0]!;
   const f = s.summary.findings;

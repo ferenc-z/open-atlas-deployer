@@ -425,3 +425,30 @@ pre.log.tail { max-height: 560px; min-height: 120px; white-space: pre-wrap; }
 /* FlowFile trace (phase 2 step 7): a lineage as a list of events in time order. */
 ol.lineage { margin: 0.5rem 0 0; padding-left: 1.5rem; }
 ol.lineage li { padding: 0.25rem 0; border-bottom: 1px solid var(--border, rgba(127,127,127,0.2)); line-height: 1.6; }
+/* Phase 3 step 5: editing a configuration, the Changes tab. */
+.draft-bar { display: grid; gap: 4px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+.draft-bar p { margin: 0; }
+.draft-bar-main { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.draft-bar-main .badge { margin-left: 0; }
+.draft-bar-main .spacer { flex: 1; }
+table.props.editable td.row-actions { width: 1%; white-space: nowrap; text-align: right; }
+table.props tr.edit-row td { background: var(--bg); padding: 12px; }
+.key-edit { display: grid; gap: 10px; max-width: 760px; }
+.key-edit.card { max-width: none; padding: 14px 16px; }
+.key-edit p { margin: 0; }
+.key-edit .field > input, .key-edit .field > textarea { width: 100%; box-sizing: border-box; }
+.key-edit .field > select { align-self: flex-start; max-width: 100%; }
+textarea.xml-text { font-size: 12px; line-height: 1.5; }
+.in-draft { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 4px; font-weight: 600; }
+.in-draft .badge { margin-left: 0; }
+.in-draft button.link { font-weight: 400; }
+.reveal code { overflow-wrap: anywhere; }
+.xml-secrets { margin: 4px 0 0; padding: 0; list-style: none; display: grid; gap: 4px; }
+table.props.revisions td { vertical-align: top; }
+table.props tr.selected td { background: var(--info-bg); }
+.compare-form { margin-top: 0; max-width: 760px; }
+.diffs { display: grid; gap: 10px; }
+.diffs h4 { margin: 0 0 4px; }
+.diffs details { margin-top: 6px; }
+.diffs summary { color: var(--text); }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
