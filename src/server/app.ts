@@ -10,7 +10,7 @@ import { HTTPException } from "hono/http-exception";
 import type { Environment, Manifest } from "../compose/generate.ts";
 import { compareVersions, covering } from "../manifest/version.ts";
 import { crossAppConflicts, validateManifest } from "../manifest/validate.ts";
-import { isProd } from "./plan.ts";
+import { deployPermission, isProd } from "./plan.ts";
 import {
   EMERGENCY_COOKIE, EMERGENCY_TTL_MS, LoginThrottle, emergencyPrincipal, newToken, parseCookies, sha256, verifyPassword,
   type Permission, type Principal, type WorkbenchSessions,
@@ -27,11 +27,14 @@ import { PeerError, type Peer, type PeerStatus } from "./peer.ts";
 import { EXECUTOR_KINDS, EXECUTOR_VERSION, ExecutorUnsupported, hostIds, hostOf, newJobId, tokenSha256, type ExecutorKind, type Heartbeat } from "./handoff.ts";
 import { lineDiff } from "./ingress.ts";
 import { environmentStatus, hostStateOf, parseDockerPs, type Observer } from "./observe.ts";
-import { StoreError, type Actor, type Store } from "./store.ts";
+import { StoreError, type Actor, type ServiceConfigDraft, type Store } from "./store.ts";
 import { withoutSealed } from "./services/config.ts";
+import { ConfigDocError } from "./services/configdoc.ts";
+import { redactText } from "./services/redact.ts";
+import { acceptChanges, changeSummary, changeView, fileDiffs, outcomeOf, revealValue, sameFiles, type DraftChange } from "./services/configedit.ts";
 import { configView } from "./services/configview.ts";
 import { catalogFor, profile as profileById, profileFor, PROFILES } from "./services/profiles.ts";
-import type { DraftItem } from "./services/draft.ts";
+import { installKey, type DraftItem } from "./services/draft.ts";
 import { serviceStatus, thresholdsOf, timeline } from "./services/status.ts";
 import { alertView, check, parseThresholds, RULES, THRESHOLDS } from "./services/rules.ts";
 import { TakeoverError, type Takeover } from "./services/takeover.ts";
@@ -749,7 +752,196 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     // (secrets compared on the sealed values, shown only as labels).
     const registered = store.standalones().find((s) => s.id === cfg.service) ?? store.clusters().find((s) => s.id === cfg.service);
     const view = registered ? configView(cfg.body, registered.profile, registered.version, registered.kind, takeover?.unsealer()) : null;
-    return c.json({ ...cfg, body: withoutSealed(cfg.body), revisions: store.serviceConfigRevisions(cfg.service), view });
+    return c.json({ ...cfg, body: withoutSealed(cfg.body), revisions: store.serviceConfigRevisions(cfg.service), view, canDraft: mayEditConfig(p), canReveal: p.permissions.includes("admin") && !isKey(p) });
+  });
+  // Phase 3 (§7, §16.3): configuration drafts and revisions. A draft is changes on a revision; saving makes the next
+  // revision and changes nothing on the hosts. Seeing them takes deploy-viewer, with secrets hidden; changing them takes the
+  // environment's deploy group, on PROD only from a browser session (D7); a secret's value only an admin in a browser.
+  const mayEditConfig = (p: Principal) => {
+    const env = deployments.environment().env;
+    return p.permissions.includes(deployPermission(env)) && !(isProd(env) && isKey(p));
+  };
+  const configEditor = async (c: Context): Promise<Principal | Response> => {
+    let env: Environment;
+    try { env = deployments.environment().env; } catch (error) { return deployError(c, error); }
+    const p = await authenticate(c, deployPermission(env));
+    if (p instanceof Response) return p;
+    if (isProd(env) && isKey(p)) return reject(c, 403, "auth/browser-only", "On PROD the configuration is changed only from a browser session, not API keys.");
+    return p;
+  };
+  /** The service, its newest revision and the key its files are sealed with, or the answer why there are none. */
+  const configOf = (c: Context) => {
+    const id = c.req.param("id")!;
+    const service = registeredService(id);
+    if (!service) return reject(c, 404, "service/unknown", `No standalone instance or cluster ${id}.`);
+    const latest = store.serviceConfig(id);
+    if (!latest) return reject(c, 404, "service-config/none", `No configuration for ${id}.`);
+    const box = takeover?.box;
+    if (!box) return reject(c, 503, "config/no-key", "DEPLOYER_CREDENTIAL_ENCRYPTION_KEY is not set: configuration files cannot be opened.");
+    return { id, service, latest, box };
+  };
+  const configFailed = (c: Context, error: unknown) => {
+    if (error instanceof ConfigDocError) return reject(c, error.code === "config/reimport" ? 409 : 400, error.code, error.message);
+    if (error instanceof StoreError) return reject(c, error.code === "config-draft/unknown" ? 404 : 409, error.code, error.message, error.details);
+    throw error;
+  };
+  /** What the checks look at besides the files: the other services' ports, and each host's memory from its newest sample. */
+  const checkContext = (service: NonNullable<ReturnType<typeof registeredService>>) => {
+    const others = [
+      ...store.standalones().filter((s) => s.id !== service.id).map((s) => ({ service: s.service, profile: s.profile, member: s.member })),
+      ...store.clusters().filter((s) => s.id !== service.id).flatMap((s) => s.nodes.map((member) => ({ service: s.service, profile: s.profile, member }))),
+    ];
+    const members = service.kind === "standalone" ? [service.member] : service.nodes;
+    const memory: Record<string, number> = {};
+    for (const s of store.latestServiceSamples(service.id)) {
+      const total = (s.body as { host?: { memory?: { totalBytes?: unknown } } }).host?.memory?.totalBytes;
+      const m = members.find((x) => installKey(x) === s.member);
+      if (m && typeof total === "number") memory[m.host] = total;
+    }
+    return { profile: profileById(service.profile), version: service.version, kind: service.kind, others, memory };
+  };
+  const draftView = (d: ServiceConfigDraft, latest: number) => {
+    const { changes, ...rest } = d;
+    return { ...rest, changes: changes.map((x) => changeView(x, takeover?.box)), stale: d.state === "open" && d.base !== latest };
+  };
+  /** What an open draft would make of its base: the files that differ (redacted) and what the change means. */
+  const draftPreview = (d: ServiceConfigDraft, service: NonNullable<ReturnType<typeof registeredService>>) => {
+    const box = takeover?.box, base = store.serviceConfig(d.service, d.base);
+    if (d.state !== "open" || !box || !base) return null;
+    try {
+      const out = outcomeOf(base.body, d.changes, box, checkContext(service));
+      return { findings: out.findings, change: out.change, members: fileDiffs(base.body.members, out.body.members, box) };
+    } catch (error) {
+      if (error instanceof ConfigDocError) return { problem: { code: error.code, message: error.message } };
+      throw error;
+    }
+  };
+  // Free text that reaches the timeline, and through it the AI: what looks like a password goes no further.
+  const noteOf = (v: unknown): string | null => (typeof v === "string" && v.trim() ? redactText(v.trim().slice(0, 2000)) : null);
+  const tooLarge = (c: Context) => (Number(c.req.header("content-length") ?? 0) > 8 << 20 ? reject(c, 400, "config-draft/too-large", "At most 8 MiB in a request.") : undefined);
+  api.get("/api/services/:id/config/diff", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    const cfg = configOf(c);
+    if (cfg instanceof Response) return cfg;
+    const number = (name: string) => {
+      const raw = c.req.query(name);
+      return raw === undefined ? undefined : Number.isInteger(Number(raw)) ? Number(raw) : NaN;
+    };
+    const toAsked = number("to"), fromAsked = number("from");
+    if (Number.isNaN(toAsked) || Number.isNaN(fromAsked)) return reject(c, 400, "config-diff/revision", "from and to are revision numbers.");
+    const to = toAsked === undefined ? cfg.latest : store.serviceConfig(cfg.id, toAsked);
+    if (!to) return reject(c, 404, "service-config/none", `No configuration revision ${toAsked} for ${cfg.id}.`);
+    const fromRevision = fromAsked ?? to.base ?? to.revision - 1;
+    const from = store.serviceConfig(cfg.id, fromRevision);
+    if (!from && fromAsked !== undefined) return reject(c, 404, "service-config/none", `No configuration revision ${fromAsked} for ${cfg.id}.`);
+    const member = c.req.query("member") || undefined;
+    if (member && ![...to.body.members, ...(from?.body.members ?? [])].some((m) => installKey(m) === member)) return reject(c, 404, "config/unknown-member", `${member} is not a member of ${cfg.id}.`);
+    return c.json({ service: cfg.id, from: from?.revision ?? null, to: to.revision, members: fileDiffs(from?.body.members ?? [], to.body.members, cfg.box, member) });
+  });
+  api.post("/api/services/:id/config/reveal", async (c) => {
+    const p = await authenticate(c, "admin");
+    if (p instanceof Response) return p;
+    if (isKey(p)) return reject(c, 403, "auth/browser-only", "A secret's value is shown only in a browser session, not to API keys.");
+    const cfg = configOf(c);
+    if (cfg instanceof Response) return cfg;
+    const body = await c.req.json().catch(() => ({})) as { revision?: unknown; member?: unknown; file?: unknown; key?: unknown; index?: unknown };
+    if (typeof body.file !== "string" || typeof body.key !== "string") return reject(c, 400, "config-reveal/invalid", "Give file and key, and member and revision if needed.");
+    if (body.index !== undefined && (!Number.isInteger(body.index) || (body.index as number) < 0)) return reject(c, 400, "config-reveal/invalid", "index is which of the same-named XML secrets, from 0.");
+    const revision = body.revision === undefined ? cfg.latest : typeof body.revision === "number" ? store.serviceConfig(cfg.id, body.revision) : undefined;
+    if (!revision) return reject(c, 404, "service-config/none", `No configuration revision ${String(body.revision)} for ${cfg.id}.`);
+    if (body.member === undefined && revision.body.members.length > 1) return reject(c, 400, "config-reveal/invalid", "Give member: this service has several.");
+    const member = body.member === undefined ? revision.body.members[0] : revision.body.members.find((m) => installKey(m) === body.member);
+    const file = member?.files.find((f) => f.name === body.file);
+    if (!member || !file) return reject(c, 404, "config-reveal/none", "That revision has no such member or file.");
+    try {
+      const got = revealValue(file, body.key, cfg.box, body.index as number | undefined);
+      if (!got) return reject(c, 404, "config-reveal/none", `${body.file} has no ${body.key} to show.`);
+      store.audit(actorOf(p), "service.config-revealed", `${cfg.id}#${revision.revision}`, { member: installKey(member), file: body.file, key: body.key });
+      c.header("cache-control", "no-store");
+      return c.json({ revision: revision.revision, member: installKey(member), file: body.file, key: body.key, ...got });
+    } catch (error) { return configFailed(c, error); }
+  });
+  api.get("/api/services/:id/config/drafts", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    const id = c.req.param("id");
+    if (!registeredService(id)) return reject(c, 404, "service/unknown", `No standalone instance or cluster ${id}.`);
+    const state = c.req.query("state");
+    if (state !== undefined && !["open", "saved", "discarded"].includes(state)) return reject(c, 400, "config-draft/state", "state is open, saved or discarded.");
+    const latest = store.serviceConfig(id)?.revision ?? 0;
+    return c.json({ drafts: store.serviceConfigDrafts(id, state as "open" | undefined).map((d) => draftView(d, latest)) });
+  });
+  api.get("/api/services/:id/config/drafts/:draft", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    const id = c.req.param("id");
+    const service = registeredService(id);
+    const d = store.serviceConfigDraft(id, c.req.param("draft"));
+    if (!service || !d) return reject(c, 404, "config-draft/unknown", `No configuration draft ${c.req.param("draft")} of ${id}.`);
+    return c.json({ ...draftView(d, store.serviceConfig(id)?.revision ?? 0), preview: draftPreview(d, service) });
+  });
+  api.post("/api/services/:id/config/drafts", async (c) => {
+    const p = await configEditor(c);
+    if (p instanceof Response) return p;
+    const cfg = configOf(c);
+    if (cfg instanceof Response) return cfg;
+    const big = tooLarge(c);
+    if (big) return big;
+    const body = await c.req.json().catch(() => ({})) as { base?: unknown; changes?: unknown; note?: unknown };
+    if (body.base !== undefined && body.base !== cfg.latest.revision) return reject(c, 409, "config-draft/stale", `The configuration of ${cfg.id} is at revision ${cfg.latest.revision}, not ${String(body.base)}: read it again and make the change on that.`);
+    try {
+      const changes = acceptChanges(body.changes ?? [], cfg.latest.body, cfg.service.kind, cfg.box);
+      const { findings } = outcomeOf(cfg.latest.body, changes, cfg.box, checkContext(cfg.service));
+      const d = store.createServiceConfigDraft({ service: cfg.id, base: cfg.latest.revision, changes, note: noteOf(body.note), findings, audit: changes.map(changeSummary) }, actorOf(p));
+      return c.json({ ...draftView(d, cfg.latest.revision), preview: draftPreview(d, cfg.service) }, 201);
+    } catch (error) { return configFailed(c, error); }
+  });
+  // The whole draft again: what the page shows goes back as it is (a secret as hidden: true, XML with its "(hidden)").
+  // base: moves the draft to the newest revision, after someone else saved one.
+  api.put("/api/services/:id/config/drafts/:draft", async (c) => {
+    const p = await configEditor(c);
+    if (p instanceof Response) return p;
+    const cfg = configOf(c);
+    if (cfg instanceof Response) return cfg;
+    const big = tooLarge(c);
+    if (big) return big;
+    const was = store.serviceConfigDraft(cfg.id, c.req.param("draft")!);
+    if (!was) return reject(c, 404, "config-draft/unknown", `No configuration draft ${c.req.param("draft")} of ${cfg.id}.`);
+    if (was.state !== "open") return reject(c, 409, "config-draft/closed", `Configuration draft ${was.id} is ${was.state}.`);
+    const body = await c.req.json().catch(() => ({})) as { base?: unknown; changes?: unknown; note?: unknown };
+    if (body.base !== undefined && body.base !== cfg.latest.revision) return reject(c, 409, "config-draft/stale", `The configuration of ${cfg.id} is at revision ${cfg.latest.revision}, not ${String(body.base)}.`);
+    const base = body.base !== undefined ? cfg.latest : store.serviceConfig(cfg.id, was.base);
+    if (!base) return reject(c, 404, "service-config/none", `No configuration revision ${was.base} for ${cfg.id}.`);
+    try {
+      const changes: DraftChange[] = body.changes === undefined ? was.changes : acceptChanges(body.changes, base.body, cfg.service.kind, cfg.box, was.changes);
+      const { findings } = outcomeOf(base.body, changes, cfg.box, checkContext(cfg.service));
+      const d = store.updateServiceConfigDraft(cfg.id, was.id, { base: base.revision, changes, note: body.note === undefined ? was.note : noteOf(body.note), findings, audit: changes.map(changeSummary) }, actorOf(p));
+      return c.json({ ...draftView(d, cfg.latest.revision), preview: draftPreview(d, cfg.service) });
+    } catch (error) { return configFailed(c, error); }
+  });
+  api.delete("/api/services/:id/config/drafts/:draft", async (c) => {
+    const p = await configEditor(c);
+    if (p instanceof Response) return p;
+    const id = c.req.param("id")!;
+    try { return c.json(draftView(store.discardServiceConfigDraft(id, c.req.param("draft")!, actorOf(p)), store.serviceConfig(id)?.revision ?? 0)); } catch (error) { return configFailed(c, error); }
+  });
+  api.post("/api/services/:id/config/drafts/:draft/save", async (c) => {
+    const p = await configEditor(c);
+    if (p instanceof Response) return p;
+    const cfg = configOf(c);
+    if (cfg instanceof Response) return cfg;
+    const d = store.serviceConfigDraft(cfg.id, c.req.param("draft")!);
+    if (!d) return reject(c, 404, "config-draft/unknown", `No configuration draft ${c.req.param("draft")} of ${cfg.id}.`);
+    if (d.state !== "open") return reject(c, 409, "config-draft/closed", `Configuration draft ${d.id} is ${d.state}.`);
+    if (d.base !== cfg.latest.revision) return reject(c, 409, "config-draft/stale", `The configuration of ${cfg.id} is at revision ${cfg.latest.revision}, this draft was made on ${d.base}: move it to the newest revision first.`);
+    const body = await c.req.json().catch(() => ({})) as { note?: unknown };
+    try {
+      const out = outcomeOf(cfg.latest.body, d.changes, cfg.box, checkContext(cfg.service));
+      if (sameFiles(out.split?.members ?? cfg.latest.body.members, out.body.members)) return reject(c, 409, "config-draft/no-change", "This draft changes nothing in any file.");
+      const revision = store.saveServiceConfigDraft(cfg.id, d.id, { split: out.split, body: out.body, findings: out.findings, note: noteOf(body.note) ?? d.note, audit: d.changes.map(changeSummary) }, actorOf(p));
+      return c.json({ revision, findings: out.findings, change: out.change, draft: draftView(store.serviceConfigDraft(cfg.id, d.id)!, revision) }, 201);
+    } catch (error) { return configFailed(c, error); }
   });
   api.get("/api/services/drafts", async (c) => {
     const p = await authenticate(c, "view");

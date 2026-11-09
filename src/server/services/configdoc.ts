@@ -226,6 +226,9 @@ function xmlSlots(text: string): XmlSlot[] {
   return slots.sort((a, b) => a.start - b.start);
 }
 
+/** The secret places of an XML file with their values, in file order: only for comparing on the server and for an admin. */
+export const xmlSecrets = (text: string): { name: string; value: string }[] => xmlSlots(text).map((s) => ({ name: s.name, value: text.slice(s.start, s.end) }));
+
 /** An XML file with secret values hidden; an empty one stays empty. */
 export function redactXml(text: string): { text: string; secrets: string[] } {
   const secrets: string[] = [];

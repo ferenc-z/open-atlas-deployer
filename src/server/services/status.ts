@@ -54,6 +54,8 @@ export interface MemberStatus {
   serviceUser: string | null;
   ports: ServicePorts;
   executor: { online: boolean; reason?: string; version?: string; ageSeconds?: number };
+  /** Files whose newest revision is not what this member should have now (§16.3 "pending"): saved, not applied yet. */
+  configPending: string[];
   state: MemberState;
   /** Where the state comes from, and as of when. */
   source: "samples" | "discovery" | "executor" | "none";
@@ -177,6 +179,9 @@ export function serviceStatus(store: Store, executor: (host: string) => Executor
     return discoveries.get(host)!;
   };
   const samples = new Map(store.latestServiceSamples(id).map((x) => [x.member, x]));
+  const latestConfig = store.serviceConfig(id)?.body;
+  const expected = new Map(store.serviceMemberFiles(id).map((f) => [`${f.member}\0${f.file}`, f.expectedSha256]));
+  const pendingOf = (key: string) => latestConfig?.members.find((m) => installKey(m) === key)?.files.filter((f) => expected.get(`${key}\0${f.name}`) !== f.sha256).map((f) => f.name) ?? [];
   // The coordinator's view of the cluster: the newest sample whose own node is the coordinator, else the newest with a view.
   const views = [...samples.values()].filter((x) => Array.isArray((x.body.nifi as Any | undefined)?.cluster?.nodes)).sort((a, b) => (a.at < b.at ? 1 : -1));
   const coordinator = views.find((x) => {
@@ -214,6 +219,7 @@ export function serviceStatus(store: Store, executor: (host: string) => Executor
     return {
       key: installKey(m), host: m.host, installDir: m.installDir, confDir: confDirOf(m), ...(m.nodeAddress !== undefined ? { nodeAddress: m.nodeAddress } : {}), serviceUser: m.serviceUser, ports: m.ports,
       executor: { online: e.online, ...(e.reason ? { reason: e.reason } : {}), ...(e.heartbeat?.version ? { version: e.heartbeat.version } : {}), ...(e.ageSeconds !== undefined ? { ageSeconds: e.ageSeconds } : {}) },
+      configPending: pendingOf(installKey(m)),
       state, source, asOf, live,
       seen: d ? { job: d.job, at: d.at, version: found?.version ?? null, pid: found?.process?.pid ?? null, webUrl: found?.webUrl ?? null } : null,
     };

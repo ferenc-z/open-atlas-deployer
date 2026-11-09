@@ -16,13 +16,13 @@ function bytesOf(f: Omit<LayerFile, "redacted" | "secrets" | "format" | "size">,
   return opened.bytes;
 }
 
-function layerFile(name: string, bytes: Buffer, box: SecretBox): LayerFile {
+export function layerFile(name: string, bytes: Buffer, box: SecretBox): LayerFile {
   const { path: _p, modifiedAt: _m, ...f } = sealFile({ name, path: "", modifiedAt: "" }, bytes, box);
   return f;
 }
 
 /** A node's value as a layer keeps it: a secret sealed, unless empty (redacted copies show those too). */
-function layerValue({ key, value }: WrittenProperty, box: SecretBox): LayerValue {
+export function layerValue({ key, value }: WrittenProperty, box: SecretBox): LayerValue {
   const name = parsePropertyEntries(`${key}=`)[0]?.name ?? key;
   return value !== "" && isSecretKey(name) ? { key, sealed: box.seal(value) } : { key, value };
 }

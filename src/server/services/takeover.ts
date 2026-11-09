@@ -59,6 +59,9 @@ export class Takeover {
     return box ? (sealed) => box.open(sealed) : undefined;
   }
 
+  /** What configuration files are sealed with (configuration drafts, §16.3); undefined without the key. */
+  get box(): SecretBox | undefined { return this.o.box; }
+
   fingerprintKey(): string {
     const kept = this.o.store.setting(FINGERPRINT_KEY);
     if (kept) return kept;

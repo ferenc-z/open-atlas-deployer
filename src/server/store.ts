@@ -13,6 +13,8 @@ import { crossAppConflicts, validateManifest } from "../manifest/validate.ts";
 import { compareVersions } from "../manifest/version.ts";
 import { checkDraftItem, confDirOf, installKey, type DraftCluster, type DraftItem, type DraftReview, type DraftStandalone, type DraftState, type ServiceDraft, type ServiceMember } from "./services/draft.ts";
 import type { ServiceConfigBody } from "./services/config.ts";
+import type { ConfigFinding } from "./services/configcheck.ts";
+import type { DraftChange } from "./services/configedit.ts";
 import { randomBytes } from "node:crypto";
 
 export interface Actor { id: string; via: "workbench" | "emergency" | "cli" | "key" | "service" }
@@ -21,6 +23,16 @@ export interface ManifestRevision { appliesFrom: string; revision: number; saved
 /** trial: in UAT for a trial deploy from an assessment (§10.5.1 ⑤), not yet registered by an administrator (⑥). */
 export interface RegisteredApp { id: string; name: string; repo: string; addedAt: string; addedBy: string; manifests: ManifestRevision[]; trial: string | null }
 export interface AuditEntry { id: number; at: string; actor: string; via: string; action: string; target: string; detail: unknown }
+
+/** A configuration draft (§16.3): changes on a revision; saving makes it the next revision. */
+export interface ServiceConfigDraft {
+  id: string; service: string; base: number; state: "open" | "saved" | "discarded"; changes: DraftChange[]; note: string | null; findings: ConfigFinding[];
+  createdAt: string; createdBy: string; via: string; updatedAt: string; updatedBy: string; savedRevision: number | null;
+}
+/** What one member's file should be: written by a change (or the import), so it can lag the newest revision. */
+export interface ServiceMemberFile {
+  member: string; file: string; path: string; expectedSha256: string; revision: number; appliedAt: string; change: string | null; actualSha256: string | null; actualAt: string | null;
+}
 
 export class StoreError extends Error {
   readonly code: string;
@@ -110,6 +122,13 @@ CREATE TABLE IF NOT EXISTS service_draft_items (
 CREATE TABLE IF NOT EXISTS service_configs (
   service TEXT NOT NULL, revision INTEGER NOT NULL, body TEXT NOT NULL, source TEXT NOT NULL, saved_at TEXT NOT NULL,
   saved_by TEXT NOT NULL, via TEXT NOT NULL, note TEXT, base INTEGER, findings TEXT, review TEXT, PRIMARY KEY (service, revision));
+CREATE TABLE IF NOT EXISTS service_config_drafts (
+  id TEXT PRIMARY KEY, service TEXT NOT NULL, base_revision INTEGER NOT NULL, state TEXT NOT NULL, changes TEXT NOT NULL, note TEXT, findings TEXT,
+  created_at TEXT NOT NULL, created_by TEXT NOT NULL, via TEXT NOT NULL, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL, saved_revision INTEGER);
+CREATE INDEX IF NOT EXISTS service_config_drafts_service ON service_config_drafts (service, state);
+CREATE TABLE IF NOT EXISTS service_member_files (
+  service TEXT NOT NULL, member TEXT NOT NULL, file TEXT NOT NULL, path TEXT NOT NULL, expected_sha256 TEXT NOT NULL, revision INTEGER NOT NULL,
+  applied_at TEXT NOT NULL, change TEXT, actual_sha256 TEXT, actual_at TEXT, PRIMARY KEY (service, member, file));
 CREATE TABLE IF NOT EXISTS service_samples (
   service TEXT NOT NULL, member TEXT NOT NULL, at TEXT NOT NULL, body TEXT NOT NULL, received_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS service_samples_at ON service_samples (service, member, at);
@@ -301,6 +320,10 @@ export class Store {
     {
       const have = (this.db.prepare("PRAGMA table_info(service_configs)").all() as Row[]).map((c) => c.name);
       for (const [column, type] of [["base", "INTEGER"], ["findings", "TEXT"], ["review", "TEXT"]]) if (!have.includes(column)) this.db.exec(`ALTER TABLE service_configs ADD COLUMN ${column} ${type}`);
+    }
+    // Phase 3 step 4: what each member's files should be, for services taken over before it was kept: their revision 1.
+    for (const r of this.db.prepare("SELECT * FROM service_configs c WHERE revision = 1 AND NOT EXISTS (SELECT 1 FROM service_member_files f WHERE f.service = c.service)").all() as Row[]) {
+      this.insertMemberFiles(r.service, JSON.parse(r.body), 1, r.saved_at);
     }
     // Phase 2 step 3: services registered before the timeline get their takeover and imported configurations on it.
     this.db.exec(`INSERT INTO service_events (service, member, at, kind, detail)
@@ -978,6 +1001,7 @@ export class Store {
         else this.insertCluster(item, d.environment, actor, draft);
         this.db.prepare("INSERT INTO service_configs (service, revision, body, source, saved_at, saved_by, via, note) VALUES (?, 1, ?, 'import', ?, ?, ?, ?)")
           .run(item.id, JSON.stringify(configs[item.id]), at, actor.id, actor.via, `Imported when takeover draft ${draft} was confirmed`);
+        this.insertMemberFiles(item.id, configs[item.id]!, 1, at);
         this.insertServiceEvent({ service: item.id, member: null, at, kind: "config-imported", detail: { text: "Configuration revision 1 imported from the hosts", by: actor.id, revision: 1 } });
         this.insertAudit(actor, "service.config-imported", `${item.id}#1`, { files: configs[item.id]!.members.map((m) => ({ installation: `${m.host}:${m.installDir}`, files: m.files.map((f) => `${f.name} ${f.sha256.slice(0, 12)}`) })) });
       }
@@ -988,16 +1012,111 @@ export class Store {
   }
 
   /** A service's configuration at a revision (the newest when none is given), sealed copies included. */
-  serviceConfig(service: string, revision?: number): { service: string; revision: number; body: ServiceConfigBody; source: string; savedAt: string; savedBy: string; via: string; note: string | null } | undefined {
+  serviceConfig(service: string, revision?: number): { service: string; revision: number; body: ServiceConfigBody; source: string; savedAt: string; savedBy: string; via: string; note: string | null; base: number | null; findings: ConfigFinding[] | null; review: unknown } | undefined {
     const r = (revision === undefined
       ? this.db.prepare("SELECT * FROM service_configs WHERE service = ? ORDER BY revision DESC LIMIT 1").get(service)
       : this.db.prepare("SELECT * FROM service_configs WHERE service = ? AND revision = ?").get(service, revision)) as Row | undefined;
-    return r && { service: r.service, revision: r.revision, body: JSON.parse(r.body), source: r.source, savedAt: r.saved_at, savedBy: r.saved_by, via: r.via, note: r.note ?? null };
+    return r && { service: r.service, revision: r.revision, body: JSON.parse(r.body), source: r.source, savedAt: r.saved_at, savedBy: r.saved_by, via: r.via, note: r.note ?? null, base: r.base ?? null, findings: r.findings ? JSON.parse(r.findings) : null, review: r.review ? JSON.parse(r.review) : null };
   }
 
-  serviceConfigRevisions(service: string): { revision: number; source: string; savedAt: string; savedBy: string; note: string | null }[] {
-    return (this.db.prepare("SELECT revision, source, saved_at, saved_by, note FROM service_configs WHERE service = ? ORDER BY revision DESC").all(service) as Row[])
-      .map((r) => ({ revision: r.revision, source: r.source, savedAt: r.saved_at, savedBy: r.saved_by, note: r.note ?? null }));
+  serviceConfigRevisions(service: string): { revision: number; source: string; savedAt: string; savedBy: string; via: string; note: string | null; base: number | null }[] {
+    return (this.db.prepare("SELECT revision, source, saved_at, saved_by, via, note, base FROM service_configs WHERE service = ? ORDER BY revision DESC").all(service) as Row[])
+      .map((r) => ({ revision: r.revision, source: r.source, savedAt: r.saved_at, savedBy: r.saved_by, via: r.via, note: r.note ?? null, base: r.base ?? null }));
+  }
+
+  private insertMemberFiles(service: string, body: ServiceConfigBody, revision: number, at: string) {
+    const insert = this.db.prepare("INSERT OR IGNORE INTO service_member_files (service, member, file, path, expected_sha256, revision, applied_at) VALUES (?, ?, ?, ?, ?, ?, ?)");
+    for (const m of body.members) for (const f of m.files) insert.run(service, installKey(m), f.name, f.path, f.sha256, revision, at);
+  }
+
+  /** What each member's files should be now (§16.3): by member, since during a rolling change they are on different revisions. */
+  serviceMemberFiles(service: string): ServiceMemberFile[] {
+    return (this.db.prepare("SELECT * FROM service_member_files WHERE service = ? ORDER BY member, file").all(service) as Row[])
+      .map((r) => ({ member: r.member, file: r.file, path: r.path, expectedSha256: r.expected_sha256, revision: r.revision, appliedAt: r.applied_at, change: r.change ?? null, actualSha256: r.actual_sha256 ?? null, actualAt: r.actual_at ?? null }));
+  }
+
+  private toConfigDraft(r: Row): ServiceConfigDraft {
+    return {
+      id: r.id, service: r.service, base: r.base_revision, state: r.state, changes: JSON.parse(r.changes), note: r.note ?? null, findings: r.findings ? JSON.parse(r.findings) : [],
+      createdAt: r.created_at, createdBy: r.created_by, via: r.via, updatedAt: r.updated_at, updatedBy: r.updated_by, savedRevision: r.saved_revision ?? null,
+    };
+  }
+
+  /** A configuration draft, its sealed values included (services/configedit.ts makes what the pages get). */
+  serviceConfigDraft(service: string, id: string): ServiceConfigDraft | undefined {
+    const r = this.db.prepare("SELECT * FROM service_config_drafts WHERE service = ? AND id = ?").get(service, id) as Row | undefined;
+    return r && this.toConfigDraft(r);
+  }
+
+  serviceConfigDrafts(service: string, state?: ServiceConfigDraft["state"]): ServiceConfigDraft[] {
+    const rows = state
+      ? this.db.prepare("SELECT * FROM service_config_drafts WHERE service = ? AND state = ? ORDER BY created_at DESC, id").all(service, state)
+      : this.db.prepare("SELECT * FROM service_config_drafts WHERE service = ? ORDER BY created_at DESC, id").all(service);
+    return (rows as Row[]).map((r) => this.toConfigDraft(r));
+  }
+
+  createServiceConfigDraft(d: { service: string; base: number; changes: DraftChange[]; note: string | null; findings: ConfigFinding[]; audit: unknown }, actor: Actor): ServiceConfigDraft {
+    const id = `cfg-${randomBytes(6).toString("hex")}`;
+    const at = this.stamp();
+    this.inTransaction(() => {
+      this.db.prepare("INSERT INTO service_config_drafts (id, service, base_revision, state, changes, note, findings, created_at, created_by, via, updated_at, updated_by) VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?)")
+        .run(id, d.service, d.base, JSON.stringify(d.changes), d.note, JSON.stringify(d.findings), at, actor.id, actor.via, at, actor.id);
+      this.insertAudit(actor, "service.config-draft-created", `${d.service}/${id}`, { base: d.base, changes: d.audit });
+    });
+    return this.serviceConfigDraft(d.service, id)!;
+  }
+
+  private openConfigDraft(service: string, id: string): ServiceConfigDraft {
+    const d = this.serviceConfigDraft(service, id);
+    if (!d) throw new StoreError("config-draft/unknown", `No configuration draft ${id} of ${service}.`);
+    if (d.state !== "open") throw new StoreError("config-draft/closed", `Configuration draft ${id} is ${d.state}.`);
+    return d;
+  }
+
+  updateServiceConfigDraft(service: string, id: string, d: { base: number; changes: DraftChange[]; note: string | null; findings: ConfigFinding[]; audit: unknown }, actor: Actor): ServiceConfigDraft {
+    this.inTransaction(() => {
+      this.openConfigDraft(service, id);
+      this.db.prepare("UPDATE service_config_drafts SET base_revision = ?, changes = ?, note = ?, findings = ?, updated_at = ?, updated_by = ? WHERE id = ?")
+        .run(d.base, JSON.stringify(d.changes), d.note, JSON.stringify(d.findings), this.stamp(), actor.id, id);
+      this.insertAudit(actor, "service.config-draft-updated", `${service}/${id}`, { base: d.base, changes: d.audit });
+    });
+    return this.serviceConfigDraft(service, id)!;
+  }
+
+  discardServiceConfigDraft(service: string, id: string, actor: Actor): ServiceConfigDraft {
+    this.inTransaction(() => {
+      this.openConfigDraft(service, id);
+      this.db.prepare("UPDATE service_config_drafts SET state = 'discarded', updated_at = ?, updated_by = ? WHERE id = ?").run(this.stamp(), actor.id, id);
+      this.insertAudit(actor, "service.config-draft-discarded", `${service}/${id}`, null);
+    });
+    return this.serviceConfigDraft(service, id)!;
+  }
+
+  /**
+   * A draft becomes a revision (nothing on the hosts changes). It must have been made on the newest revision. split: a
+   * cluster's first edit keeps its files in layers as a revision of its own first. Answers the draft's revision.
+   */
+  saveServiceConfigDraft(service: string, id: string, out: { split: ServiceConfigBody | null; body: ServiceConfigBody; findings: ConfigFinding[]; note: string | null; audit: unknown }, actor: Actor): number {
+    return this.inTransaction(() => {
+      const d = this.openConfigDraft(service, id);
+      const latest = (this.db.prepare("SELECT MAX(revision) AS n FROM service_configs WHERE service = ?").get(service) as Row).n as number | null;
+      if (latest !== d.base) throw new StoreError("config-draft/stale", `The configuration of ${service} is at revision ${latest}, this draft was made on ${d.base}: move it to the newest revision first.`);
+      const at = this.stamp();
+      const insert = this.db.prepare("INSERT INTO service_configs (service, revision, body, source, saved_at, saved_by, via, note, base, findings) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+      let revision = latest;
+      if (out.split) {
+        revision++;
+        insert.run(service, revision, JSON.stringify(out.split), "split", at, actor.id, actor.via, "Split into a common layer and node overrides for the first edit", revision - 1, null);
+        this.insertServiceEvent({ service, member: null, at, kind: "config-saved", detail: { text: `Configuration revision ${revision} saved: split into layers for the first edit`, by: actor.id, revision } });
+        this.insertAudit(actor, "service.config-split", `${service}#${revision}`, { base: revision - 1, draft: id });
+      }
+      revision++;
+      insert.run(service, revision, JSON.stringify(out.body), "edit", at, actor.id, actor.via, out.note, revision - 1, JSON.stringify(out.findings));
+      this.insertServiceEvent({ service, member: null, at, kind: "config-saved", detail: { text: `Configuration revision ${revision} saved${out.note ? `: ${out.note}` : ""}`, by: actor.id, revision, draft: id } });
+      this.insertAudit(actor, "service.config-saved", `${service}#${revision}`, { base: revision - 1, draft: id, draftedVia: d.via, changes: out.audit });
+      this.db.prepare("UPDATE service_config_drafts SET state = 'saved', saved_revision = ?, findings = ?, note = ?, updated_at = ?, updated_by = ? WHERE id = ?").run(revision, JSON.stringify(out.findings), out.note, at, actor.id, id);
+      return revision;
+    });
   }
 
   /** Closes an open draft without registering anything; its items stay for the record. */

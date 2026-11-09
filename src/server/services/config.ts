@@ -54,6 +54,12 @@ export function sealFile(f: Pick<ConfigFileRecord, "name" | "path" | "modifiedAt
   return { name: f.name, path: f.path, sha256: createHash("sha256").update(raw).digest("hex"), size: raw.length, modifiedAt: f.modifiedAt, format, sealed: box.seal(raw.toString("base64")), sealedAs: "base64", redacted, secrets };
 }
 
+/** A file's text with its secrets hidden, the way a new kept copy would have it. */
+export function redactedText(name: string, raw: Buffer): string {
+  const text = decodeText(raw), format = formatOf(name);
+  return format === "properties" ? redactProperties(text).text : format === "xml" ? redactXml(text).text : text;
+}
+
 /** One read file as it is kept, checked against its hash. */
 export function importFile(f: ReadFile, box: SecretBox): ConfigFileRecord {
   const raw = Buffer.from(f.content, "base64");
