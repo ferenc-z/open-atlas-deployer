@@ -109,7 +109,7 @@ CREATE TABLE IF NOT EXISTS service_draft_items (
   updated_at TEXT NOT NULL, updated_by TEXT NOT NULL, PRIMARY KEY (draft, id));
 CREATE TABLE IF NOT EXISTS service_configs (
   service TEXT NOT NULL, revision INTEGER NOT NULL, body TEXT NOT NULL, source TEXT NOT NULL, saved_at TEXT NOT NULL,
-  saved_by TEXT NOT NULL, via TEXT NOT NULL, note TEXT, PRIMARY KEY (service, revision));
+  saved_by TEXT NOT NULL, via TEXT NOT NULL, note TEXT, base INTEGER, findings TEXT, review TEXT, PRIMARY KEY (service, revision));
 CREATE TABLE IF NOT EXISTS service_samples (
   service TEXT NOT NULL, member TEXT NOT NULL, at TEXT NOT NULL, body TEXT NOT NULL, received_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS service_samples_at ON service_samples (service, member, at);
@@ -296,6 +296,11 @@ export class Store {
     for (const table of ["service_standalones", "service_clusters"]) {
       const have = (this.db.prepare(`PRAGMA table_info(${table})`).all() as Row[]).map((c) => c.name);
       for (const column of ["nginx_url", "nginx_check"]) if (!have.includes(column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} TEXT`);
+    }
+    // Phase 3 step 2: the revision an edit started from, its findings and its AI review (revisions before them: NULL).
+    {
+      const have = (this.db.prepare("PRAGMA table_info(service_configs)").all() as Row[]).map((c) => c.name);
+      for (const [column, type] of [["base", "INTEGER"], ["findings", "TEXT"], ["review", "TEXT"]]) if (!have.includes(column)) this.db.exec(`ALTER TABLE service_configs ADD COLUMN ${column} ${type}`);
     }
     // Phase 2 step 3: services registered before the timeline get their takeover and imported configurations on it.
     this.db.exec(`INSERT INTO service_events (service, member, at, kind, detail)

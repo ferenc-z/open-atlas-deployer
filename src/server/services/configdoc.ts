@@ -120,7 +120,7 @@ export type PropertyChange = { key: string; value: string } | { key: string; uns
 
 /** A new value as a properties file holds it: anything beyond ASCII as \uXXXX, which reads the same whatever the file's
  *  encoding is (NiFi loads these files as ISO-8859-1). Values are otherwise as written, like the ones parsed. */
-function encodeValue(key: string, value: string): string {
+export function encodeValue(key: string, value: string): string {
   if (value.includes(HIDDEN)) throw new ConfigDocError("config/hidden-value", `${key}: "${HIDDEN}" is a placeholder, not a value`);
   if (/[\x00-\x08\n-\x1f\x7f]/.test(value)) throw new ConfigDocError("config/bad-value", `${key}: the value has a line break or a control character`);
   if (/^[ \t\f]/.test(value)) throw new ConfigDocError("config/bad-value", `${key}: the value starts with whitespace, which Java drops`);
@@ -134,18 +134,19 @@ function mainEol(lines: { eol: string }[]): string {
   return ["\r\n", "\r"].find((eol) => count(eol) > count("\n")) ?? "\n";
 }
 
-function applyChange(text: string, change: PropertyChange): string {
-  const { key } = change;
-  if (!/^[\x21-\x7e]+$/.test(key) || /[=:\\]/.test(key) || /^[#!]/.test(key)) throw new ConfigDocError("config/bad-key", "A key is plain ASCII without =, :, \\ or a leading # or !");
+function dropEntry(text: string, name: string): string {
   const lines = physicalLines(text);
-  const same = parseEntries(lines).filter((e) => e.name === key);
-  if ("unset" in change) {
-    if (!same.length) return text;
-    const gone = new Set(same.flatMap((e) => Array.from({ length: e.lines }, (_, i) => e.line - 1 + i)));
-    return lines.filter((_, i) => !gone.has(i)).map((l) => l.body + l.eol).join("");
-  }
-  const value = encodeValue(key, change.value);
-  const last = same.at(-1);
+  const same = parseEntries(lines).filter((e) => e.name === name);
+  if (!same.length) return text;
+  const gone = new Set(same.flatMap((e) => Array.from({ length: e.lines }, (_, i) => e.line - 1 + i)));
+  return lines.filter((_, i) => !gone.has(i)).map((l) => l.body + l.eol).join("");
+}
+
+/** The key (as written) set to the value (as written). */
+function writeEntry(text: string, key: string, value: string): string {
+  const lines = physicalLines(text);
+  const name = unescapeKey(key);
+  const last = parseEntries(lines).filter((e) => e.name === name).at(-1);
   if (!last) {
     const eol = mainEol(lines);
     return !text ? `${key}=${value}${eol}` : lines.at(-1)!.eol ? `${text}${key}=${value}${eol}` : `${text}${eol}${key}=${value}`;
@@ -158,10 +159,38 @@ function applyChange(text: string, change: PropertyChange): string {
   return [...lines.slice(0, from), replaced, ...lines.slice(from + last.lines)].map((l) => l.body + l.eol).join("");
 }
 
+function applyChange(text: string, change: PropertyChange): string {
+  const { key } = change;
+  if (!/^[\x21-\x7e]+$/.test(key) || /[=:\\]/.test(key) || /^[#!]/.test(key)) throw new ConfigDocError("config/bad-key", "A key is plain ASCII without =, :, \\ or a leading # or !");
+  return "unset" in change ? dropEntry(text, key) : writeEntry(text, key, encodeValue(key, change.value));
+}
+
 /** A properties file with the changes made: only the lines of the changed keys differ, a new key goes at the end, and a
  *  key removed goes with all its lines. No change (or setting what is already there) gives the same bytes. */
 export function editProperties(bytes: Buffer, changes: readonly PropertyChange[]): Buffer {
   return Buffer.from(changes.reduce(applyChange, bytes.toString("latin1")), "latin1");
+}
+
+/** A key and value exactly as a file has them: the bytes read as latin1, escapes kept. */
+export interface WrittenProperty { key: string; value: string }
+
+/** What Java would load from a properties file: by key, the last of a repeated one. */
+export function effectiveProperties(bytes: Buffer): Map<string, WrittenProperty> {
+  return new Map(parsePropertyEntries(bytes.toString("latin1")).map((e) => [e.name, { key: e.key, value: e.value }]));
+}
+
+/** A template with keys removed and set, as written: unlike editProperties nothing is re-encoded, so a value taken from
+ *  a file goes back as the same bytes. Keys and values must still fit on the one line they get. */
+export function writeProperties(template: Buffer, set: readonly WrittenProperty[], unset: readonly string[] = []): Buffer {
+  let text = template.toString("latin1");
+  for (const key of unset) text = dropEntry(text, unescapeKey(key));
+  for (const { key, value } of set) {
+    const parsed = parsePropertyEntries(`${key}=`);
+    if (parsed.length !== 1 || parsed[0]!.key !== key) throw new ConfigDocError("config/bad-key", "A key does not read back as one key");
+    if (/[\r\n]/.test(value) || continues(value)) throw new ConfigDocError("config/bad-value", `${key}: the value would not stay on one line`);
+    text = writeEntry(text, key, value);
+  }
+  return Buffer.from(text, "latin1");
 }
 
 // --- XML

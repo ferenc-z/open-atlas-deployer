@@ -2,7 +2,7 @@
 // installation's configuration files (svc-read) as revision 1, the way D38 imports environment.json; from then on the
 // database is what counts. Files hold passwords and keys, so each is kept sealed whole (SecretBox, like env secrets) and
 // beside it a redacted copy for the pages: secret values read "(hidden)". Layering a cluster into a common layer and
-// node overrides (§7) is for configuration management; revision 1 keeps every installation's files as they were.
+// node overrides (§7) is services/layers.ts; revision 1 keeps every installation's files as they were.
 
 import { createHash } from "node:crypto";
 import type { SecretBox } from "../secretbox.ts";
@@ -32,8 +32,17 @@ export interface ConfigFileRecord {
 
 /** confDir: where the files were read (each file also carries its own path); absent in revisions imported before it was kept. */
 export interface ConfigMember { host: string; installDir: string; confDir?: string; files: ConfigFileRecord[]; missing: string[] }
-/** A configuration revision's body: one entry per installation (a standalone's one, each node of a cluster). */
-export interface ServiceConfigBody { members: ConfigMember[] }
+/** A file of a cluster's layers: kept like a member's file, but belonging to no path. */
+export type LayerFile = Omit<ConfigFileRecord, "path" | "modifiedAt">;
+/** A node's value for a key, both as written in the file (bytes read as latin1); a secret's is sealed on its own. */
+export type LayerValue = { key: string; value: string } | { key: string; sealed: string };
+/** What a node has of a file on top of the common layer, or instead of it (replace: no common copy of this file). */
+export type NodeFileLayer = { set: LayerValue[]; unset: string[] } | { replace: LayerFile };
+/** How a cluster's files are made (§16.3): common holds each file's template, nodes (by installKey) what differs. */
+export interface ConfigLayers { common: Record<string, LayerFile>; nodes: Record<string, Record<string, NodeFileLayer>> }
+/** A configuration revision's body: one entry per installation (a standalone's one, each node of a cluster), each with
+ *  its files as rendered, complete; layers (a cluster, once edited) is what they were rendered from. */
+export interface ServiceConfigBody { members: ConfigMember[]; layers?: ConfigLayers }
 
 const formatOf = (name: string): ConfigFileRecord["format"] => (/\.(properties|conf)$/.test(name) ? "properties" : /\.xml$/.test(name) ? "xml" : "other");
 
@@ -74,7 +83,23 @@ export function sealedText(f: Pick<ConfigFileRecord, "sealed" | "sealedAs">, uns
   return f.sealedAs === "base64" ? decodeText(Buffer.from(opened, "base64")) : opened;
 }
 
-/** A revision as the pages get it: without the sealed copies. */
-export function withoutSealed(body: ServiceConfigBody): { members: (Omit<ConfigMember, "files"> & { files: Omit<ConfigFileRecord, "sealed" | "sealedAs">[] })[] } {
-  return { members: body.members.map((m) => ({ ...m, files: m.files.map(({ sealed: _s, sealedAs: _a, ...f }) => f) })) };
+type Unsealed<T> = Omit<T, "sealed" | "sealedAs">;
+const unsealed = <T extends { sealed: string; sealedAs?: "base64" }>({ sealed: _s, sealedAs: _a, ...f }: T): Unsealed<T> => f;
+
+export type LayerValueView = { key: string; value: string } | { key: string; hidden: true };
+export type NodeFileLayerView = { set: LayerValueView[]; unset: string[] } | { replace: Unsealed<LayerFile> };
+export interface ConfigLayersView { common: Record<string, Unsealed<LayerFile>>; nodes: Record<string, Record<string, NodeFileLayerView>> }
+
+const layerView = (l: NodeFileLayer): NodeFileLayerView => "replace" in l
+  ? { replace: unsealed(l.replace) }
+  : { set: l.set.map((v) => ("sealed" in v ? { key: v.key, hidden: true as const } : { key: v.key, value: decodeText(Buffer.from(v.value, "latin1")) })), unset: l.unset };
+
+/** A revision as the pages get it: without the sealed copies, in the members and in the layers. */
+export function withoutSealed(body: ServiceConfigBody): { members: (Omit<ConfigMember, "files"> & { files: Unsealed<ConfigFileRecord>[] })[]; layers?: ConfigLayersView } {
+  const members = body.members.map((m) => ({ ...m, files: m.files.map(unsealed) }));
+  if (!body.layers) return { members };
+  return { members, layers: {
+    common: Object.fromEntries(Object.entries(body.layers.common).map(([name, f]) => [name, unsealed(f)])),
+    nodes: Object.fromEntries(Object.entries(body.layers.nodes).map(([node, files]) => [node, Object.fromEntries(Object.entries(files).map(([name, l]) => [name, layerView(l)]))])),
+  } };
 }

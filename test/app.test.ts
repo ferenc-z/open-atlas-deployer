@@ -42,7 +42,8 @@ import { Drift } from "../src/server/drift.ts";
 import { Briefs, collectFacts, type BriefFacts } from "../src/server/brief.ts";
 import { fakeServices, fakeState, sha256, tarGz, type FakeState } from "./fakes.ts";
 import { NifiOpsGraph } from "../src/server/services/graph-publish.ts";
-import { sealedText } from "../src/server/services/config.ts";
+import { sealedText, sealFile } from "../src/server/services/config.ts";
+import { splitBody } from "../src/server/services/layers.ts";
 
 const SESSION = "open_atlas_workbench_session";
 
@@ -2636,4 +2637,34 @@ test("phase 2 step 7: provenance through the service executor (deploy-viewer): t
   const lineageJob = await answer(() => ({ op: "lineage", nodes: [{ id: UUID, type: "FLOWFILE" }], links: [] }));
   assert.deepEqual([lineageJob.op, lineageJob.direction, lineageJob.uuid], ["lineage", "FLOWFILE", UUID]);
   assert.equal((await aiLineage).value.nodes.length, 1);
+});
+
+test("phase 3 step 2: no service endpoint or tool answers with a sealed copy or a secret of a layered revision", async () => {
+  const t = setup({ services: fakeState() });
+  setEnvironment(t, ({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", hosts, registries: { ghcr: "ghcr.io/acme" }, apps: { shop: { version: "1.2.0", host: "app2" } } }));
+  const member = (installDir: string, https: number) => ({ host: "app2", installDir, serviceUser: "nifi", startEnvironment: null, ports: { https }, nodeAddress: `node-${https}`, discovery: null });
+  t.store.addCluster({ kind: "cluster", id: "flow", service: "nifi", profile: "nifi-2.x", version: "2.5.0", webUrl: null, zookeeper: "zk:2181", zookeeperRoot: "/flow", nodes: [member("/opt/a", 8443), member("/opt/b", 9443)] }, "uat", { id: "admin", via: "cli" });
+  const files = (dir: string, n: string) => [
+    sealFile({ name: "nifi.properties", path: `${dir}/conf/nifi.properties`, modifiedAt: "t" }, Buffer.from(`nifi.web.https.port=${n}\nnifi.security.keystorePasswd=node${n}-s3cret\nnifi.sensitive.props.key=common-s3cret\n`), t.box),
+    sealFile({ name: "authorizers.xml", path: `${dir}/conf/authorizers.xml`, modifiedAt: "t" }, Buffer.from(`<a><property name="Password">xml${n}-s3cret</property></a>`), t.box),
+  ];
+  const body = splitBody({ members: [{ host: "app2", installDir: "/opt/a", missing: [], files: files("/opt/a", "8443") }, { host: "app2", installDir: "/opt/b", missing: [], files: files("/opt/b", "9443") }] }, t.box);
+  assert.ok(body.layers && JSON.stringify(body).includes("sealed"));
+  (t.store as any).db.prepare("INSERT INTO service_configs (service, revision, body, source, saved_at, saved_by, via, note) VALUES ('flow', 1, ?, 'split', 't', 'admin', 'cli', NULL)").run(JSON.stringify(body));
+
+  const clean = (where: string, text: string) => assert.ok(!/s3cret|v1:|"sealed/.test(text), `${where}: ${text.slice(0, 300)}`);
+  const paths = [...new Set(t.app.routes.filter((r) => r.method === "GET" && r.path.includes("/api/services")).map((r) => r.path.replace(/^\/deploy/, "")))];
+  assert.ok(paths.length >= 15 && paths.includes("/api/services/:id/config"), "every GET under /api/services, as the app has them");
+  for (const path of paths) {
+    const url = path.replace(":id", "flow").replace(/:\w+/g, "x");
+    const r = await t.request(url, { as: "admin" });
+    clean(url, await r.text());
+  }
+  const cfg = await (await t.request("/api/services/flow/config", { as: "viewer" })).json();
+  assert.equal(cfg.source, "split");
+  assert.deepEqual(cfg.body.layers.nodes["app2:/opt/a"]["nifi.properties"].set, [{ key: "nifi.web.https.port", value: "8443" }, { key: "nifi.security.keystorePasswd", hidden: true }]);
+  assert.ok(cfg.body.layers.nodes["app2:/opt/a"]["authorizers.xml"].replace.redacted.includes("(hidden)"));
+
+  const key = (await makeKey(t, "admin", { kind: "service", name: "deploy-assistant", days: 30 })).body.key as string;
+  for (const name of ["get_service_config", "diff_service_config"]) clean(name, JSON.stringify((await tool(t, key, name, { id: "flow", all: true })).value));
 });
