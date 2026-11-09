@@ -4,7 +4,7 @@
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -17,8 +17,11 @@ import { EnvManager, Schemas } from "../src/server/env.ts";
 import { Handoff, hostIds } from "../src/server/handoff.ts";
 import type { Keys } from "../src/server/keys.ts";
 import { Observer } from "../src/server/observe.ts";
+import { OmaSessions, type OmaEvent } from "../src/server/oma.ts";
+import { deployerEntry } from "../src/server/setup-ai.ts";
 import { SecretBox } from "../src/server/secretbox.ts";
 import { sealFile, type ConfigFileRecord, type ConfigMember, type ServiceConfigBody } from "../src/server/services/config.ts";
+import { ConfigReviewer } from "../src/server/services/configreview.ts";
 import type { DraftCluster, DraftStandalone } from "../src/server/services/draft.ts";
 import { Takeover } from "../src/server/services/takeover.ts";
 import { Store } from "../src/server/store.ts";
@@ -37,7 +40,7 @@ const KEYS: Record<string, Principal> = {
   dpk_uat: keyPrincipal("u@x", "key", ["deploy-uat"]), dpk_prod: keyPrincipal("p@x", "key", ["deploy-prod"]), dpk_admin: keyPrincipal("a@x", "key", [], true), dps_assistant: keyPrincipal("assistant", "service", []),
 };
 
-function setup(name = "uat", store = new Store(":memory:")) {
+function setup(name = "uat", store = new Store(":memory:"), review?: (store: Store) => ConfigReviewer) {
   const dir = mkdtempSync(join(tmpdir(), "configdraft-"));
   const environmentFile = join(dir, "environment.json");
   writeFileSync(environmentFile, JSON.stringify({ name, project: "open-atlas", bindIp: "127.0.0.1", registries: {}, apps: {} }));
@@ -55,7 +58,7 @@ function setup(name = "uat", store = new Store(":memory:")) {
   const takeover = new Takeover({ store, handoff, box, environment: () => deployments.environment().env.name, hosts: () => hostIds(deployments.environment().env) });
   const keys = { resolve: async (bearer: string) => KEYS[bearer] } as unknown as Keys;
   const env = new EnvManager(store, deployments, new Schemas(undefined, join(dir, "templates"), fetcher), box, "compare");
-  const app = createApp({ config, store, takeover, keys, sessions: new WorkbenchSessions(config.workbenchUrl, fetcher), observer, deployments, versions: new Versions(undefined, fetcher), env, workbench: new WorkbenchAdmin(config.workbenchUrl, () => "", fetcher) });
+  const app = createApp({ config, store, takeover, keys, ...(review ? { configReview: review(store) } : {}), sessions: new WorkbenchSessions(config.workbenchUrl, fetcher), observer, deployments, versions: new Versions(undefined, fetcher), env, workbench: new WorkbenchAdmin(config.workbenchUrl, () => "", fetcher) });
   type As = { as?: string; key?: string };
   const call = (method: string, path: string, who: As, body?: unknown) => {
     const headers = new Headers({ "content-type": "application/json" });
@@ -102,14 +105,14 @@ const fileIn = (store: Store, service: string, revision: number | undefined, mem
   store.serviceConfig(service, revision)!.body.members.find((m) => `${m.host}:${m.installDir}` === member)!.files.find((f) => f.name === name)!;
 const BANNER = { file: "nifi.properties", key: "nifi.ui.banner.text", value: "hello" };
 
-test("permissions in UAT (§13): viewers read, deploy-uat and its personal keys draft and save, the Assistant's key does not, only a browser admin reveals", async () => {
+test("permissions in UAT (§13): viewers read, deploy-uat and its personal keys draft and save, the Assistant's key only creates drafts, only a browser admin reveals", async () => {
   const t = setup();
   takenOver(t.store);
   const drafts = "/api/services/solo/config/drafts";
   const create = (who: { as?: string; key?: string }) => t.call("POST", drafts, who, { changes: [BANNER] });
 
   assert.equal((await create({})).status, 401);
-  for (const who of [{ as: "viewer" }, { as: "prod" }, { as: "nobody" }, { key: "dps_assistant" }]) assert.equal((await create(who)).status, 403, JSON.stringify(who));
+  for (const who of [{ as: "viewer" }, { as: "prod" }, { as: "nobody" }]) assert.equal((await create(who)).status, 403, JSON.stringify(who));
   assert.equal((await t.app.request(`/deploy${drafts}`, { method: "POST", headers: { cookie: "open_atlas_workbench_session=uat" }, body: "{}" })).status, 403, "no CSRF token");
 
   const made = await (await create({ as: "uat" })).json();
@@ -470,4 +473,320 @@ test("a file kept by an older version that cannot be opened cannot be edited, on
   assert.equal((await t.call("POST", `/api/services/solo/config/drafts/${made.id}/save`, { as: "uat" }, {})).status, 201);
   const reveal = await t.call("POST", "/api/services/solo/config/reveal", { as: "admin" }, { file: "nifi.properties", key: "nifi.ui.banner.text" });
   assert.equal(reveal.status, 409);
+});
+
+// --- Phase 3 step 6 (§10, §16.3): the AI writes drafts and nothing else, never sees or touches a secret; the review is advice.
+
+type T = ReturnType<typeof setup>;
+async function tool(t: T, key: string, name: string, args: Record<string, unknown>) {
+  const res = await t.call("POST", "/mcp", { key }, { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } });
+  const body = await res.json() as any;
+  const text = body.result.content[0].text as string;
+  return { text, value: JSON.parse(text), isError: Boolean(body.result.isError) };
+}
+const AI = "dps_assistant";
+let requestId = 0;
+const draftTool = (t: T, id: string, changes: unknown[], key = AI, extra: Record<string, unknown> = {}) =>
+  tool(t, key, "draft_service_config", { id, changes, note: "As asked", request_id: `r${++requestId}`, ...extra });
+const openDrafts = (t: T, service: string) => t.store.serviceConfigDrafts(service, "open");
+
+for (const name of ["uat", "prod"]) {
+  test(`draft_service_config in ${name.toUpperCase()}: the service key makes a draft, a person saves it`, async () => {
+    const t = setup(name);
+    takenOver(t.store);
+    const listed = await (await t.call("POST", "/mcp", { key: AI }, { jsonrpc: "2.0", id: 1, method: "tools/list" })).json() as any;
+    const entry = listed.result.tools.find((x: { name: string }) => x.name === "draft_service_config");
+    assert.equal(entry.annotations.readOnlyHint, false);
+    assert.equal(entry.annotations.destructiveHint, false);
+    for (const n of ["list_service_changes", "get_service_change", "get_service_drift"]) assert.equal(listed.result.tools.find((x: { name: string }) => x.name === n)?.annotations.readOnlyHint, true, n);
+    assert.ok(!listed.result.tools.some((x: { name: string }) => /save|apply|restart/.test(x.name) && /service/.test(x.name)), "no tool saves or applies a service's configuration");
+
+    const made = await draftTool(t, "solo", [BANNER]);
+    assert.equal(made.isError, false, made.text);
+    assert.equal(made.value.saved, false);
+    assert.equal(made.value.base, 1);
+    assert.equal(made.value.restart, "restart", "a key the catalog does not know counts as needing a restart");
+    assert.ok(made.value.findings.some((f: { code: string }) => f.code === "config/unknown-key"));
+    assert.match(made.value.differences[0].files[0].diff, /\+ nifi\.ui\.banner\.text=hello/);
+    assert.doesNotMatch(made.text, LEAK);
+    assert.doesNotMatch(made.text, /sha256/);
+    assert.match(made.value.next, /open_service_change/);
+    const kept = t.store.serviceConfigDraft("solo", made.value.draft)!;
+    assert.equal(kept.via, "service", "the page marks it as the AI's");
+    assert.equal(kept.createdBy, "assistant");
+    assert.equal(t.store.serviceConfig("solo")!.revision, 1, "no revision");
+
+    const path = `/api/services/solo/config/drafts/${made.value.draft}`;
+    assert.equal((await t.call("POST", `${path}/save`, { key: AI }, {})).status, 403, "the service key does not save");
+    assert.equal((await t.call("PUT", path, { key: AI }, { changes: [] })).status, 403);
+    assert.equal((await t.call("DELETE", path, { key: AI })).status, 403);
+    const saved = await t.call("POST", `${path}/save`, { as: name }, {});
+    assert.equal(saved.status, 201, "a person does");
+    assert.equal((await saved.json()).revision, 2);
+
+    const again = await tool(t, AI, "draft_service_config", { id: "solo", changes: [BANNER], note: "x", request_id: "same" });
+    const retry = await tool(t, AI, "draft_service_config", { id: "solo", changes: [BANNER], note: "x", request_id: "same" });
+    assert.equal(retry.value.draft, again.value.draft, "a retry does not make a second draft");
+    assert.equal(openDrafts(t, "solo").length, 1);
+
+    const personal = await draftTool(t, "solo", [BANNER], name === "prod" ? "dpk_prod" : "dpk_uat");
+    if (name === "prod") assert.equal(personal.value.finding.code, "auth/browser-only", "PROD takes no personal key");
+    else assert.equal(personal.isError, false);
+  });
+
+  test(`draft_service_config in ${name.toUpperCase()}: it cannot touch a secret, in any form, and nothing is drafted`, async () => {
+    const t = setup(name);
+    takenOver(t.store);
+    const P = "nifi.properties", X = "authorizers.xml";
+    const refused: unknown[][] = [
+      [{ file: P, key: "nifi.security.keystorePasswd", value: "new-pass" }],
+      [{ file: P, key: "nifi.sensitive.props.key", value: "new-pass" }],
+      [{ file: P, key: "nifi.security.keystorePasswd", unset: true }],
+      [{ file: P, key: "nifi.security.keystorePasswd", hidden: true }],
+      [{ file: P, key: "my.api.token", value: "new-pass" }],
+      [{ file: P, key: "nifi.security.keystore\\Passwd", value: "new-pass" }],
+      [{ file: P, key: "nifi.ui.banner.text", secret: "new-pass" }],
+      [BANNER, { file: P, key: "nifi.security.keyPasswd", value: "new-pass" }],
+      [{ file: X, text: AUTH("new-pass") }],
+      [{ file: X, text: "<authorizers>\n  <property name=\"Url\">ldap://x</property>\n</authorizers>\n" }],
+      [{ file: X, text: `${AUTH("(hidden)")}<!-- --><property name="Secret">new-pass</property>\n` }],
+    ];
+    for (const changes of refused) {
+      const out = await draftTool(t, "solo", changes);
+      assert.equal(out.value.finding?.code, "config/secret-by-person", JSON.stringify(changes));
+      assert.equal(out.isError, true);
+      assert.doesNotMatch(out.text, /new-pass/);
+    }
+    assert.equal(openDrafts(t, "solo").length, 0, "nothing drafted");
+    assert.equal((await t.call("POST", "/api/services/solo/config/drafts", { key: AI }, { changes: [{ file: P, key: "nifi.security.keystorePasswd", value: "new-pass" }] })).status, 400, "the route itself, not only the tool");
+
+    // A key the name rule catches but the catalog lists as not sensitive is an ordinary key; XML with its (hidden) kept is fine.
+    assert.equal((await draftTool(t, "solo", [{ file: P, key: "nifi.web.max.access.token.requests.per.second", value: "30" }])).isError, false);
+    const xml = await draftTool(t, "solo", [{ file: X, text: AUTH("(hidden)").replace("ldap://x", "ldap://y") }]);
+    assert.equal(xml.isError, false, xml.text);
+    assert.match(xml.value.differences[0].files[0].diff, /ldap:\/\/y/);
+    assert.doesNotMatch(xml.text, LEAK);
+    const d = t.store.serviceConfigDraft("solo", xml.value.draft)!;
+    assert.equal((await t.call("POST", `/api/services/solo/config/drafts/${d.id}/save`, { as: name }, {})).status, 201);
+    assert.equal(opened(fileIn(t.store, "solo", undefined, "local:/opt/solo", X)).includes("solo-xml-s3cret"), true, "the secret stays as it was");
+
+    assert.equal((await draftTool(t, "solo", [])).value.finding.code, "config-draft/empty");
+    assert.equal((await draftTool(t, "solo", [{ file: P, key: "nifi.ui.banner.text", value: "(hidden)" }])).isError, true);
+    assert.equal((await draftTool(t, "solo", [BANNER], AI, { base: 1 })).value.finding.code, "config-draft/stale");
+  });
+}
+
+test("draft_service_config on a cluster: common layer and one node, restart or whole cluster, no revision and no secret labels", async () => {
+  const t = setup();
+  takenOver(t.store);
+  // A person made the nodes' sensitive key differ: the page's finding has labels for it, the AI's has none.
+  const person = await (await t.call("POST", "/api/services/flow/config/drafts", { as: "uat" }, { changes: [{ file: "nifi.properties", member: A, key: "nifi.sensitive.props.key", secret: "new-pass" }] })).json();
+  await t.call("POST", `/api/services/flow/config/drafts/${person.id}/save`, { as: "uat" }, {});
+  const revision = t.store.serviceConfig("flow")!.revision;
+
+  const one = await draftTool(t, "flow", [{ ...BANNER, member: B }]);
+  assert.equal(one.isError, false, one.text);
+  assert.deepEqual(one.value.differences.map((m: { member: string }) => m.member), [B]);
+  const pageView = await (await t.call("GET", `/api/services/flow/config/drafts/${one.value.draft}`, { as: "uat" })).json();
+  assert.match(JSON.stringify(pageView.preview.findings), /value A/, "the page does have the labels");
+  assert.doesNotMatch(one.text, /value [AB]\b/);
+  assert.doesNotMatch(one.text, LEAK);
+
+  const all = await draftTool(t, "flow", [BANNER]);
+  assert.equal(all.value.restart, "rolling");
+  assert.deepEqual(all.value.differences.map((m: { member: string }) => m.member).sort(), [A, B]);
+
+  const full = await draftTool(t, "flow", [{ file: "nifi.properties", key: "nifi.zookeeper.root.node", value: "/other" }, BANNER]);
+  assert.equal(full.value.restart, "whole-cluster");
+  assert.deepEqual(full.value.fullBecause.map((x: { key: string }) => x.key), ["nifi.zookeeper.root.node"]);
+  assert.ok(full.value.findings.some((f: { code: string }) => f.code === "config/not-rolling-safe"));
+
+  assert.equal((await draftTool(t, "flow", [{ ...BANNER, member: "local:/nope" }])).value.finding.code, "config/unknown-member");
+  assert.equal(t.store.serviceConfig("flow")!.revision, revision, "drafts make no revision, not even the first split");
+});
+
+test("diff_service_config compares two revisions for the AI: a changed secret by name, a password in a comment hidden; the node comparison stays", async () => {
+  const t = setup();
+  takenOver(t.store);
+  const made = await (await t.call("POST", "/api/services/solo/config/drafts", { as: "uat" }, { changes: [BANNER, { file: "nifi.properties", key: "nifi.security.keystorePasswd", secret: "new-pass" }, { file: "authorizers.xml", text: `<!-- password=comment-s3cret -->\n${AUTH("(hidden)")}` }] })).json();
+  assert.equal((await t.call("POST", `/api/services/solo/config/drafts/${made.id}/save`, { as: "uat" }, {})).status, 201);
+
+  const diff = await tool(t, AI, "diff_service_config", { id: "solo", to: 2 });
+  assert.equal(diff.isError, false, diff.text);
+  assert.equal(diff.value.from, 1);
+  assert.equal(diff.value.to, 2);
+  const files = diff.value.members[0].files as { name: string; diff: string; secretsChanged: string[] }[];
+  assert.deepEqual(files.find((f) => f.name === "nifi.properties")!.secretsChanged, ["nifi.security.keystorePasswd"]);
+  assert.match(files.find((f) => f.name === "nifi.properties")!.diff, /banner\.text=hello/);
+  assert.match(files.find((f) => f.name === "authorizers.xml")!.diff, /password=\[hidden\]/);
+  assert.doesNotMatch(diff.text, LEAK);
+  assert.doesNotMatch(diff.text, /[0-9a-f]{64}/, "no hashes");
+  assert.equal((await tool(t, AI, "diff_service_config", { id: "solo", from: 1, to: 2, member: "local:/nope" })).value.finding.code, "config/unknown-member");
+  assert.equal((await tool(t, AI, "diff_service_config", { id: "solo", from: 9 })).value.finding.code, "service-config/none");
+  const nodes = await tool(t, AI, "diff_service_config", { id: "flow" });
+  assert.equal(nodes.value.kind, "cluster");
+  assert.match((await tool(t, AI, "diff_service_config", { id: "solo" })).value.note, /from or to/);
+});
+
+test("the read tools for what comes later say they know nothing yet", async () => {
+  const t = setup();
+  takenOver(t.store);
+  const list = await tool(t, AI, "list_service_changes", { id: "solo" });
+  assert.deepEqual(list.value.changes, []);
+  assert.match(list.value.note, /not there yet/);
+  assert.equal((await tool(t, AI, "get_service_change", { id: "solo", change: "x" })).value.finding.code, "service-change/unknown");
+  assert.equal((await tool(t, AI, "get_service_drift", { id: "solo" })).value.known, false);
+  for (const name of ["list_service_changes", "get_service_drift"]) assert.equal((await tool(t, AI, name, { id: "nope" })).value.finding.code, "service/unknown");
+  assert.equal((await t.call("GET", "/api/services/solo/drift", {})).status, 401);
+});
+
+/** A stand-in for OMA's sessions. */
+function fakeOma() {
+  const fake = {
+    prompts: [] as { title: string; correlation: string; text: string }[],
+    events: [] as OmaEvent[],
+    openFails: null as Error | null,
+    eventsFail: null as Error | null,
+    hold: null as Promise<void> | null,
+    async open(title: string, correlation: string, text: string) {
+      fake.prompts.push({ title, correlation, text });
+      if (fake.hold) await fake.hold;
+      if (fake.openFails) throw fake.openFails;
+      return "sess-1";
+    },
+    async events_() { if (fake.eventsFail) throw fake.eventsFail; return fake.events; },
+  };
+  return fake;
+}
+function withReview(name = "uat") {
+  const oma = fakeOma();
+  const clock = { now: Date.parse("2026-11-09T00:00:00Z") };
+  let reviewer!: ConfigReviewer;
+  const t = setup(name, new Store(":memory:"), (store) => (reviewer = new ConfigReviewer(store, { open: oma.open, events: oma.events_ }, box, () => name, () => clock.now)));
+  takenOver(t.store);
+  const save = async (changes: unknown[], note = "Why") => {
+    const made = await (await t.call("POST", "/api/services/solo/config/drafts", { as: name }, { changes })).json();
+    return t.call("POST", `/api/services/solo/config/drafts/${made.id}/save`, { as: name }, { note });
+  };
+  const review = () => t.store.serviceConfig("solo")!.review as { state: string; session: string | null; text?: string; error?: string } | null;
+  return { t, oma, clock, save, review, poll: () => reviewer.poll() };
+}
+
+for (const name of ["uat", "prod"]) {
+  test(`configuration review in ${name.toUpperCase()}: opened on save with nothing secret, answer kept on the revision`, async () => {
+    const r = withReview(name);
+    const res = await r.save([
+      { file: "nifi.properties", key: "nifi.web.https.port", value: "7444" }, BANNER,
+      { file: "nifi.properties", key: "nifi.security.keystorePasswd", secret: "new-pass" },
+      { file: "authorizers.xml", text: `<!-- password=comment-s3cret -->\n${AUTH("(hidden)")}` },
+    ], "password=note-s3cret for the migration");
+    assert.equal(res.status, 201);
+    await new Promise((done) => setImmediate(done));
+    assert.equal(r.oma.prompts.length, 1);
+    const { title, correlation, text } = r.oma.prompts[0]!;
+    assert.match(title, /solo r2/);
+    assert.equal(correlation, "solo#2");
+    assert.match(text, /Configuration review/);
+    assert.match(text, /nifi\.web\.https\.port/, "the differences");
+    assert.match(text, /config\/unknown-key/, "the check's findings");
+    assert.match(text, /"key": "nifi\.web\.https\.port",\s+"file": "nifi\.properties"/, "the catalog's entry for a changed key");
+    assert.match(text, /"secretsChanged": \[\s+"nifi\.security\.keystorePasswd"/, "a changed secret by name");
+    assert.doesNotMatch(text, LEAK, "no secret, not even in a comment or the note");
+    assert.doesNotMatch(text, /[0-9a-f]{64}/, "no hashes");
+    assert.doesNotMatch(text, /value [AB]\b/);
+
+    assert.deepEqual([r.review()?.state, r.review()?.session], ["running", "sess-1"]);
+    await r.poll();
+    assert.equal(r.review()?.state, "running", "no answer yet");
+    r.oma.events = [{ type: "agent.message", content: [{ type: "text", text: "**结论** 没问题" }] }, { type: "session.status_idle" }];
+    await r.poll();
+    assert.deepEqual([r.review()?.state, r.review()?.text], ["done", "**结论** 没问题"]);
+    const seen = await (await r.t.call("GET", "/api/services/solo/config", { as: "viewer" })).json();
+    assert.equal(seen.review.text, "**结论** 没问题", "the page shows it");
+    await r.poll();
+    assert.equal(r.oma.prompts.length, 1);
+  });
+}
+
+test("the review stops nothing: OMA failing, slow or unreachable, or an error in the checks, and the revision is saved all the same", async () => {
+  // Opening fails.
+  const failing = withReview();
+  failing.oma.openFails = new Error("OMA POST /v1/sessions returned HTTP 503");
+  assert.equal((await failing.save([BANNER])).status, 201);
+  await new Promise((done) => setImmediate(done));
+  assert.equal(failing.t.store.serviceConfig("solo")!.revision, 2);
+  assert.equal(failing.review()?.state, "failed");
+  assert.match(failing.review()!.error!, /HTTP 503/);
+  assert.equal((await failing.t.call("GET", "/api/services/solo/config", { as: "viewer" })).status, 200);
+
+  // OMA does not answer: the save does not wait, and the review shows as running from the start.
+  const slow = withReview();
+  let release!: () => void;
+  slow.oma.hold = new Promise((done) => { release = done; });
+  assert.equal((await slow.save([BANNER])).status, 201);
+  assert.deepEqual([slow.review()?.state, slow.review()?.session], ["running", null]);
+  release();
+  await new Promise((done) => setImmediate(done));
+  assert.equal(slow.review()?.session, "sess-1");
+
+  // OMA goes away: still running until the time limit.
+  const gone = withReview();
+  assert.equal((await gone.save([BANNER])).status, 201);
+  await new Promise((done) => setImmediate(done));
+  gone.oma.eventsFail = new Error("connection refused");
+  await gone.poll();
+  assert.equal(gone.review()?.state, "running");
+  gone.clock.now += 11 * 60_000;
+  await gone.poll();
+  assert.deepEqual([gone.review()?.state, gone.review()?.error], ["failed", "connection refused"]);
+
+  // A session that errors, and one that never ends.
+  const erring = withReview();
+  await erring.save([BANNER]);
+  await new Promise((done) => setImmediate(done));
+  erring.oma.events = [{ type: "session.error", error: "model unavailable" }];
+  await erring.poll();
+  assert.equal(erring.review()?.state, "failed");
+  assert.match(erring.review()!.error!, /model unavailable/);
+  const silent = withReview();
+  await silent.save([BANNER]);
+  await new Promise((done) => setImmediate(done));
+  silent.clock.now += 11 * 60_000;
+  await silent.poll();
+  assert.match(silent.review()!.error!, /no result after 10 minutes/);
+
+  // A check's error is no reason either.
+  const wrong = withReview();
+  assert.equal((await wrong.save([{ file: "nifi.properties", key: "nifi.web.https.port", value: "not-a-port" }])).status, 201);
+  await new Promise((done) => setImmediate(done));
+  assert.match(wrong.oma.prompts[0]!.text, /config\/bad-value/);
+
+  // Without OMA there is no review at all; the saves above in other tests go the same way.
+  const plain = setup();
+  takenOver(plain.store);
+  const made = await (await plain.call("POST", "/api/services/solo/config/drafts", { as: "uat" }, { changes: [BANNER] })).json();
+  assert.equal((await plain.call("POST", `/api/services/solo/config/drafts/${made.id}/save`, { as: "uat" }, {})).status, 201);
+  assert.equal(plain.store.serviceConfig("solo")!.review, null);
+});
+
+test("the review's session has no Vault, so no tools: a session opened without vaults sends none", async () => {
+  const bodies: Record<string, unknown>[] = [];
+  const fetcher = (async (_url: string, init: RequestInit) => {
+    if (init.body) bodies.push(JSON.parse(String(init.body)));
+    return Response.json({ id: "s" });
+  }) as unknown as typeof fetch;
+  await new OmaSessions({ url: "http://oma", keyFile: () => "k", agent: "a", vaults: [] }, fetcher).open("t", "c", "x");
+  assert.equal("vault_ids" in bodies[0]!, false);
+  assert.match(readFileSync("src/server/index.ts", "utf8"), /new ConfigReviewer\(store, new OmaSessions\(\{[^\n]*vaults: \[\]/, "index.ts opens it that way");
+});
+
+test("the open_service_change card: Workbench's entry, the example and the page list the same operations, and saving the entry again brings new ones", () => {
+  const entry = (existing?: Record<string, unknown>) => (deployerEntry("https://x/deploy/", existing).chat as { hostOperations: string[]; starters: unknown }).hostOperations;
+  assert.ok(entry().includes("open_service_change"));
+  assert.deepEqual(entry({ chat: { hostOperations: ["plan_deploy"], starters: [] } }), entry(), "an entry saved earlier gets the new list");
+  const example = JSON.parse(readFileSync("examples/workbench-application.deployer.json", "utf8")).chat.hostOperations;
+  assert.deepEqual(example, entry());
+  const page = /HOST_OPERATIONS = (\[[^\]]*\])/.exec(readFileSync("src/web/Assistant.tsx", "utf8"))![1]!;
+  assert.deepEqual(JSON.parse(page), entry());
+  assert.match(readFileSync("agents/deploy-assistant.md", "utf8"), /`open_service_change`/);
 });

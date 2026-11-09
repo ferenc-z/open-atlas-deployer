@@ -6,7 +6,7 @@
   "chat": {
     "agent": { "name": "Deploy Assistant" },
     "embed": true,
-    "hostOperations": ["plan_deploy", "plan_rollback", "build_artifact", "set_env_value"],
+    "hostOperations": ["plan_deploy", "plan_rollback", "build_artifact", "set_env_value", "open_service_change"],
     "starters": [
       { "title": "What to upgrade", "q": "Which apps in this environment have new versions? Which have already run in UAT?" },
       { "title": "Why it failed", "q": "Why did the latest failed deploy fail?" },

@@ -8,11 +8,13 @@ import * as api from "./api.ts";
 import { AiMissing } from "./Setup.tsx";
 import { ask } from "./Confirm.tsx";
 
-export const HOST_OPERATIONS = ["plan_deploy", "plan_rollback", "build_artifact", "set_env_value"] as const;
+export const HOST_OPERATIONS = ["plan_deploy", "plan_rollback", "build_artifact", "set_env_value", "open_service_change"] as const;
 
 export interface HostActions {
   /** Opens the deploy panel with a plan for this version (and the deploy to go back to). */
   openPlan: (app: string, version: string, pinFrom?: string) => void;
+  /** Opens a service's Changes tab on this configuration draft. */
+  openServiceChange: (service: string, draft: string) => void;
 }
 
 type Payload = Record<string, unknown>;
@@ -22,6 +24,18 @@ const str = (v: unknown) => (typeof v === "string" ? v.trim() : "");
 export async function runHostOperation(operation: string, payload: Payload, actions: HostActions): Promise<{ ok: boolean; outcome: string }> {
   const app = str(payload.app);
   if (!(HOST_OPERATIONS as readonly string[]).includes(operation)) return { ok: false, outcome: `The Deployer does not accept operation ${operation}` };
+  if (operation === "open_service_change") {
+    const service = str(payload.service), draft = str(payload.draft);
+    if (!service || !draft) return { ok: false, outcome: "The card has no service or draft" };
+    try {
+      const d = await api.configDraft(service, draft);
+      if (d.state !== "open") return { ok: false, outcome: `Draft ${draft} is already ${d.state}` };
+    } catch (error) {
+      return { ok: false, outcome: (error as Error).message };
+    }
+    actions.openServiceChange(service, draft);
+    return { ok: true, outcome: `Opened draft ${draft} of ${service} on its Changes tab: nothing is saved or applied until it is reviewed and saved there` };
+  }
   if (!app) return { ok: false, outcome: "The card has no app" };
   try {
     switch (operation) {
@@ -116,7 +130,7 @@ export function AssistantPanel({ workbenchUrl, environment, page, app, actions, 
             {mode === "normal" && <div className="assistant-resizer" onPointerDown={drag} title="Drag to resize" aria-hidden="true" />}
             <div className="toolbar">
               <strong>Deploy Assistant</strong>
-              <span className="muted">Read-only; changes run through cards after you confirm them</span>
+              <span className="muted">Reads and proposes; changes run through cards</span>
               <button className="link" onClick={() => setMode("collapsed")} title="Fold into a strip; the conversation stays">Collapse</button>
               <button className="link wide-only" onClick={() => setMode(mode === "expanded" ? "normal" : "expanded")}>{mode === "expanded" ? "Restore" : "Expand"}</button>
               <button className="link" onClick={onClose}>Close</button>

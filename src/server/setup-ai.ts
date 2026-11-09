@@ -44,13 +44,14 @@ export function deployerEntry(url: string, existing?: Record<string, unknown>): 
     id: "deployer", kind: "application", url,
     chat: {
       agent: { name: ASSISTANT_NAME },
-      hostOperations: ["plan_deploy", "plan_rollback", "build_artifact", "set_env_value"],
       starters: [
         { title: "What to upgrade", q: "Which apps in this environment have new versions? Which have already run in UAT?" },
         { title: "Why it failed", q: "Why did the latest failed deploy fail?" },
         { title: "Env differences", q: "How do this app's environment variables differ from UAT?" },
       ],
       ...chat,
+      // Not left to what was saved before: saving the entry again is how a new operation reaches Workbench.
+      hostOperations: ["plan_deploy", "plan_rollback", "build_artifact", "set_env_value", "open_service_change"],
       embed: true,
     },
   };

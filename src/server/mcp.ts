@@ -13,6 +13,7 @@
 import type { Principal } from "./auth.ts";
 import type { Store } from "./store.ts";
 import { installKey } from "./services/draft.ts";
+import { aiDiffs, aiFindings } from "./services/configreview.ts";
 import { redactProvenance, redactStrings, redactText } from "./services/redact.ts";
 
 interface Property { type: "string" | "integer" | "boolean" | "array" | "object"; description: string; items?: { type: "object" | "string" } }
@@ -22,7 +23,7 @@ export interface Tool {
   description: string;
   /** Read-only tools are the only ones a service key sees, besides draft tools; the others change something (destructiveHint). */
   readOnly: boolean;
-  /** Writes only an assessment's draft (§10.5.6): the service key sees it, and the route checks the task token. */
+  /** Writes only a draft, which a person turns into something: the service key sees it, and the route decides (an assessment's draft takes the task token, §10.5.6; a service's configuration draft touches no secret, §16.3). */
   draft?: boolean;
   /** D38: a Workbench admin's personal key only. */
   admin?: boolean;
@@ -135,11 +136,30 @@ function configShape(body: Any, a: Record<string, unknown>) {
   return { service: body.service, revision: body.revision, savedAt: body.savedAt, savedBy: body.savedBy, source: body.source, note: body.note, revisions: body.revisions ?? [], members };
 }
 
-/** diff_service_config: phase 2 compares a revision's nodes (two revisions come with configuration management, phase 3). */
+/** draft_service_config: what the draft means, for the Assistant to explain; nothing about any secret. */
+function draftShape(body: Any) {
+  const preview = (body.preview ?? {}) as Any;
+  const change = preview.change as Any | null | undefined;
+  return redactStrings({
+    draft: body.id, service: body.service, base: body.base, state: body.state, saved: false, note: body.note, changes: body.changes,
+    ...(preview.problem ? { problem: preview.problem } : {
+      changesAnyFile: (preview.members ?? []).length > 0,
+      findings: aiFindings(preview.findings ?? []),
+      // whole-cluster is config/not-rolling-safe: all the nodes stop and start together; rolling: one at a time.
+      restart: !change?.restart && change?.mode !== "full" ? "none" : body.kind !== "cluster" ? "restart" : change.mode === "full" ? "whole-cluster" : "rolling",
+      fullBecause: change?.fullBecause ?? [],
+      differences: aiDiffs(preview.members ?? []),
+    }),
+    next: "Nothing is saved or applied: a person reviews this draft on the page. End your reply with an open_service_change card for it.",
+  });
+}
+
+/** diff_service_config: two revisions (from, to), the redacted differences with a changed secret only by name; or a revision's nodes. */
 function diffShape(body: Any, a: Record<string, unknown>) {
+  if (a.from !== undefined || a.to !== undefined) return { service: body.service, from: body.from, to: body.to, members: aiDiffs(body.members ?? []), legend: "diff: + is in to, - is in from, ... is left out. secretsChanged: secrets whose value differs, by name only." };
   const nodes = (body.body?.members ?? []).map((m: any) => installKey(m));
   const compare = body.view?.compare as Any[] | null | undefined;
-  if (!compare) return { service: body.service, revision: body.revision, kind: "standalone", nodes, files: [], note: "A standalone instance has no nodes to compare. Comparing two revisions comes with configuration management (phase 3)." };
+  if (!compare) return { service: body.service, revision: body.revision, kind: "standalone", nodes, files: [], note: "A standalone instance has no nodes to compare. Give from or to to compare two revisions." };
   const files = compare.map((f) => ({
     name: f.name, identical: f.identical, differing: f.differing,
     rows: (f.rows as Any[]).filter((r) => a.all || r.severity).map((r) => ({ key: r.key, section: r.section, severity: r.severity, values: r.values.map((v: Any, i: number) => ({ node: nodes[i] ?? i, value: v.value, from: v.from })) })),
@@ -186,9 +206,20 @@ const SERVICE_TOOLS: Tool[] = [
   { name: "get_service_config", readOnly: true, description: "A service's configuration as the Deployer keeps it (the newest revision, or the one given): per member its files (nifi.properties, bootstrap.conf, …) as text, secret values reading (hidden) and named in hidden. member and file narrow it.",
     properties: { id: SERVICE, revision: n("Optional revision; the newest by default."), member: s("Optional: a member key or host."), file: s("Optional: one file name, e.g. nifi.properties.") }, required: ["id"],
     request: (a) => ({ method: "GET", path: `/api/services/${enc(a.id)}/config`, query: { revision: a.revision } }), shape: configShape },
-  { name: "diff_service_config", readOnly: true, description: "A cluster's configuration compared node by node (one revision, the newest by default): per file the keys that differ, worst first, each node's value and whether it comes from the file or the catalog default; all: true lists every key. Secrets are only compared (value A / value B). Comparing two revisions is not there yet (phase 3).",
-    properties: { id: SERVICE, revision: n("Optional revision."), all: { type: "boolean", description: "Optional: also the keys that agree." } }, required: ["id"],
-    request: (a) => ({ method: "GET", path: `/api/services/${enc(a.id)}/config`, query: { revision: a.revision } }), shape: diffShape },
+  { name: "diff_service_config", readOnly: true, description: "A service's configuration compared. Without from and to, a cluster node by node (one revision, the newest by default): per file the keys that differ, worst first, each node's value and whether it comes from the file or the catalog default; all: true lists every key; secrets are only compared (value A / value B). With from or to, two revisions (to defaults to the newest, from to the revision to came from): per member and file the changed lines, a changed secret only by name; member narrows it.",
+    properties: { id: SERVICE, revision: n("Optional revision for the node comparison."), all: { type: "boolean", description: "Optional: also the keys that agree (node comparison)." }, from: n("Optional: compare revisions, from this one."), to: n("Optional: compare revisions, up to this one."), member: s("Optional with from or to: a member key.") }, required: ["id"],
+    request: (a) => (a.from !== undefined || a.to !== undefined
+      ? { method: "GET", path: `/api/services/${enc(a.id)}/config/diff`, query: { from: a.from, to: a.to, member: a.member } }
+      : { method: "GET", path: `/api/services/${enc(a.id)}/config`, query: { revision: a.revision } }), shape: diffShape },
+  { name: "draft_service_config", readOnly: false, draft: true, destructive: false, description: "Writes a change of a service's configuration into a new draft, the only change the AI can make: nothing is saved as a revision or applied to a host until a person does it on the page. Answers the draft's id, the check's findings, whether it needs a restart (none, restart on a standalone instance, rolling or whole-cluster on a cluster, and why) and the differences. Secrets are refused (config/secret-by-person, and nothing is drafted): keys the catalog marks sensitive or with a secret-looking name, set or removed, and secret values in XML; a person enters those on the page. In XML text keep each (hidden) as it is. Each call makes a new draft. Then end your reply with an open_service_change card.",
+    properties: { id: SERVICE, changes: { type: "array", items: { type: "object" }, description: "The changes: {file, key, value} sets a key (added if new), {file, key, unset: true} removes it, {file, text} replaces an XML file's whole text (start from get_service_config's). On a cluster add member (a member key) for one node; without it the change is for all nodes (the common layer), which a node with its own value does not take (config/node-override), so give member for a key whose value differs between the nodes." }, note: s("Why this change, in the person's words (kept with the draft and on the timeline)."), base: n("Optional: the revision this was read from; refused if it is no longer the newest."), request_id: REQUEST_ID }, required: ["id", "changes", "note", "request_id"],
+    request: (a) => ({ method: "POST", path: `/api/services/${enc(a.id)}/config/drafts`, body: { ai: true, changes: a.changes, note: a.note, ...(a.base !== undefined ? { base: a.base } : {}) } }), shape: draftShape },
+  { name: "list_service_changes", readOnly: true, description: "Changes made to a service through the Deployer (applying configuration, restarts), newest first. Not there yet: the list is empty for now, and its note says so.",
+    properties: { id: SERVICE }, required: ["id"], request: (a) => ({ method: "GET", path: `/api/services/${enc(a.id)}/changes` }), shape: redacted },
+  { name: "get_service_change", readOnly: true, description: "One change of a service with each node's steps. Not there yet: see list_service_changes.",
+    properties: { id: SERVICE, change: s("The change's id, from list_service_changes.") }, required: ["id", "change"], request: (a) => ({ method: "GET", path: `/api/services/${enc(a.id)}/changes/${enc(a.change)}` }), shape: redacted },
+  { name: "get_service_drift", readOnly: true, description: "Whether the files on the hosts still match the kept configuration. Not there yet: it answers known: false, so never say there is no drift from it.",
+    properties: { id: SERVICE }, required: ["id"], request: (a) => ({ method: "GET", path: `/api/services/${enc(a.id)}/drift` }), shape: redacted },
   { name: "lookup_property", readOnly: true, description: "The service profile's property catalog: for a key (exact) or words (q) in keys and descriptions, its file, type, default, whether the nodes of a cluster must agree (scope cluster) or each has its own (node), whether a change needs a restart, whether it is sensitive, the versions it exists in, what it does. By service (its profile and version), or profile (nifi-1.x, nifi-2.x) and version.",
     properties: { service: s("Optional: a registered service's id."), profile: s("Optional: nifi-1.x or nifi-2.x."), version: s("Optional NiFi version, e.g. 1.12.1."), key: s("Optional: the exact key, e.g. nifi.cluster.node.protocol.port."), q: s("Optional words to look for."), file: s("Optional: nifi.properties or bootstrap.conf."), limit: n("Optional, default 50.") },
     request: (a) => ({ method: "GET", path: "/api/service-properties", query: { service: a.service, profile: a.profile, version: a.version, key: a.key, q: a.q, file: a.file, limit: a.limit } }) },

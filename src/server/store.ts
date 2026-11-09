@@ -15,6 +15,7 @@ import { checkDraftItem, confDirOf, installKey, type DraftCluster, type DraftIte
 import type { ServiceConfigBody } from "./services/config.ts";
 import type { ConfigFinding } from "./services/configcheck.ts";
 import type { DraftChange } from "./services/configedit.ts";
+import type { ConfigReview } from "./services/configreview.ts";
 import { randomBytes } from "node:crypto";
 
 export interface Actor { id: string; via: "workbench" | "emergency" | "cli" | "key" | "service" }
@@ -1117,6 +1118,15 @@ export class Store {
       this.db.prepare("UPDATE service_config_drafts SET state = 'saved', saved_revision = ?, findings = ?, note = ?, updated_at = ?, updated_by = ? WHERE id = ?").run(revision, JSON.stringify(out.findings), out.note, at, actor.id, id);
       return revision;
     });
+  }
+
+  /** The AI review of a revision (§16.3): written when it starts and when its session ends, not an edit of the revision. */
+  setServiceConfigReview(service: string, revision: number, review: ConfigReview) {
+    this.db.prepare("UPDATE service_configs SET review = ? WHERE service = ? AND revision = ?").run(JSON.stringify(review), service, revision);
+  }
+
+  runningConfigReviews(): { service: string; revision: number; review: ConfigReview }[] {
+    return (this.db.prepare("SELECT service, revision, review FROM service_configs WHERE review LIKE '%\"state\":\"running\"%'").all() as Row[]).map((r) => ({ service: r.service, revision: r.revision, review: JSON.parse(r.review) }));
   }
 
   /** Closes an open draft without registering anything; its items stay for the record. */

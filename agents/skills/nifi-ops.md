@@ -1,6 +1,6 @@
 ---
 name: nifi-ops
-description: Looking into the NiFi clusters and standalone instances the Deployer manages - status, alerts, events, metrics, bulletins, logs, configuration, node differences, FlowFile provenance and property meanings - with the Deployer's read-only service tools.
+description: Looking into the NiFi clusters and standalone instances the Deployer manages - status, alerts, events, metrics, bulletins, logs, configuration, node differences, FlowFile provenance and property meanings - with the Deployer's read-only service tools, and drafting a configuration change for a person to review.
 ---
 
 # Skill: NiFi operations
@@ -21,6 +21,8 @@ How to look into the NiFi clusters and standalone instances the Deployer manages
 | The newest lines of one file | `tail_logs {id, member?, lines?}` | a snapshot, not a stream; member can be left out for a standalone |
 | Configuration | `get_service_config {id, member?, file?}` | the files as kept; secrets read `(hidden)` |
 | Nodes disagree? | `diff_service_config {id}` | only differences; error = must agree, warning = should, info = per node by design |
+| What changed between two revisions | `diff_service_config {id, from?, to?, member?}` | either one is enough: `to` alone compares it with the revision it came from; a changed secret is only named |
+| Does the server still have what is kept? Was it applied or restarted from here? | `get_service_drift {id}`, `list_service_changes {id}`, `get_service_change {id, change}` | not there yet: drift answers `known: false` and the list is empty. Say you do not know; never read that as "no drift" |
 | Where did a FlowFile go, where did it stop? | `search_provenance {id, uuid or field+value, from, to}` → `get_lineage {id, uuid, node?}` → `get_provenance_event {id, eventId, node?}` | NiFi provenance (the FlowFile trace); a time range is required, keep it tight; on a cluster pass the event's `clusterNodeId` as `node` for lineage and event |
 | What a property means, its default, restart needed? | `lookup_property {service, key}` or `{version, q}` | answer by the service's version; `otherVersions` = the key exists in another version only |
 
@@ -44,9 +46,26 @@ How to look into the NiFi clusters and standalone instances the Deployer manages
 - **Certificates**: `get_cluster_status` lists every certificate with its expiry; renewals are done by operations.
 - **"Why is this setting different on node2"**: `diff_service_config` → `lookup_property` for the key (scope cluster means the nodes must agree).
 
+## Changing a configuration
+
+"把 prod-a 的堆调到 8g", "raise the banner text": you write a **draft**, a person does the rest.
+
+1. `get_service_config {id, file}` for the current value and revision, `lookup_property {service, key}` for what the key means and the valid values for this version. `bootstrap.conf` heap is `java.arg.N` lines (`-Xmx`, `-Xms`).
+2. `draft_service_config {id, changes, note, base, request_id}`. On a cluster without `member` the change is for all nodes; if `diff_service_config` shows the key differs between nodes, give each node's `member`.
+3. Say what the answer means, in the person's words: the findings as they are (an error holds up applying, nothing holds up saving), and `restart`: `none`, `restart` (a standalone instance stops and starts), `rolling` (one node at a time; the cluster stays up), or `whole-cluster` (`fullBecause`: **the whole cluster stops**; say so plainly).
+4. End with the card, with the change and its consequence and no secret value:
+
+````
+```app-actions
+{"actions":[{"operation":"open_service_change","label":"Review the draft · prod-a","payload":{"service":"prod-a","draft":"cfg-..."},"display":[{"label":"-Xmx (bootstrap.conf)","before":"4g","after":"8g"},{"label":"When applied","after":"Rolling restart"}]}]}
+```
+````
+
+`draft_service_config` refuses secrets (`config/secret-by-person`) and drafts nothing, so leave them out and draft the rest. Tell the person which key to enter themselves on the Configuration tab. Saving and applying are only on the page; applying a revision is not there yet, so do not promise it.
+
 ## Rules
 
 - Say "as of" with every state: the samples have a time (`asOf`); an executor offline means you do not know the current state.
 - Quote log lines and bulletins with node and time, a few at most; summarize the rest by count.
 - `[hidden]` and `(hidden)` are redacted secrets. Never ask for them, guess them or tell people how to read them.
-- Nothing can be changed from here: configuration changes, restarts and threshold changes are done on the page by people with the right role. Do not offer cards for services.
+- Besides a draft, nothing can be changed from here: saving and applying configuration, restarts and threshold changes are done on the page by people with the right role. `open_service_change` is the only card for services, and only with a draft you just made.

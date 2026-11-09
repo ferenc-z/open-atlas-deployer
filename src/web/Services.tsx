@@ -32,7 +32,7 @@ const savedLayout = (): Layout => { try { return localStorage.getItem(LAYOUT_KEY
 const kindLabel = (s: RegisteredService) => (s.kind === "cluster" ? `Cluster · ${s.nodes.length} nodes` : "Standalone");
 const where = (m: { host: string; ports: { https?: number | null; http?: number | null } }) => `${m.host}${webPort(m.ports) ? `:${webPort(m.ports)}` : ""}`;
 
-export function ServicesPage({ onTakeover, initialOpen }: { onTakeover: () => void; initialOpen?: string }) {
+export function ServicesPage({ onTakeover, initialOpen, initialDraft }: { onTakeover: () => void; initialOpen?: string; initialDraft?: string }) {
   const [list, setList] = useState<{ standalones: RegisteredService[]; clusters: RegisteredService[] } | undefined>();
   const [open, setOpen] = useState<string | undefined>(initialOpen);
   const [layout, setLayoutState] = useState<Layout>(savedLayout);
@@ -40,7 +40,7 @@ export function ServicesPage({ onTakeover, initialOpen }: { onTakeover: () => vo
   const refresh = useCallback(() => { api.services().then(setList, (e: Error) => setError(e.message)); }, []);
   useEffect(() => { refresh(); const t = setInterval(refresh, 15_000); return () => clearInterval(t); }, [refresh]);
   const setLayout = (l: Layout) => { setLayoutState(l); try { localStorage.setItem(LAYOUT_KEY, l); } catch { /* per-viewer convenience only */ } };
-  if (open) return <ServiceDetail key={open} id={open} onBack={() => { setOpen(undefined); refresh(); }} />;
+  if (open) return <ServiceDetail key={open} id={open} {...(initialDraft && open === initialOpen ? { initialDraft } : {})} onBack={() => { setOpen(undefined); refresh(); }} />;
   if (!list) return error ? <p className="error">{error}</p> : <p className="muted">Loading…</p>;
   const all = [...list.clusters, ...list.standalones];
   const envs = [...ENVIRONMENTS, ...new Set(all.map((s) => s.environment.toUpperCase()).filter((e) => !ENVIRONMENTS.includes(e)))];

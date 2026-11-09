@@ -26,6 +26,7 @@ import { Handoff, hostIds } from "./handoff.ts";
 import { Observer } from "./observe.ts";
 import { Peer } from "./peer.ts";
 import { SecretBox } from "./secretbox.ts";
+import { ConfigReviewer } from "./services/configreview.ts";
 import { Takeover } from "./services/takeover.ts";
 import { Store } from "./store.ts";
 import { WorkbenchKey } from "./workbench-key.ts";
@@ -97,7 +98,11 @@ const briefs = new Briefs(store, () => collectFacts({ store, deployments, status
 const takeover = new Takeover({ store, handoff: deployments.handoff, box, oma: assessor, environment: () => deployments.environment().env.name, hosts: () => hostIds(deployments.environment().env) });
 // Phase 2 step 6: the nifi-ops Studio graph, published through the same Builder MCP as studio-graph.
 const nifiOpsGraph = new NifiOpsGraph(store, { studio, graph: config.nifiOpsGraph });
-const app = createApp({ config, store, takeover, graph: nifiOpsGraph, sessions: new WorkbenchSessions(config.workbenchUrl), observer, deployments, versions, env, peer, onboarding, drift, briefs, keys, workbench, workbenchKey, deployerSettings,
+// §16.3: the AI review of a saved configuration revision, through the Deploy Assistant. No Vault: no tools (configreview.ts).
+const configReview = box && config.omaUrl && config.omaApiKeyFile && config.omaAgent
+  ? new ConfigReviewer(store, new OmaSessions({ url: config.omaUrl, keyFile: config.omaApiKeyFile, agent: config.omaAgent, ...(config.omaEnvironment ? { environment: config.omaEnvironment } : {}), vaults: [], ...(config.omaApplicationId ? { application: config.omaApplicationId } : {}) }), box, () => deployments.environment().env.name)
+  : undefined;
+const app = createApp({ config, store, takeover, ...(configReview ? { configReview } : {}), graph: nifiOpsGraph, sessions: new WorkbenchSessions(config.workbenchUrl), observer, deployments, versions, env, peer, onboarding, drift, briefs, keys, workbench, workbenchKey, deployerSettings,
   // D45: the image sets DEPLOYER_RESTART_BY_EXIT; the container's restart policy starts it again with the new settings.
   ...(process.env.DEPLOYER_RESTART_BY_EXIT === "true" ? { restart: () => setTimeout(() => { store.close(); process.exit(75); }, 300) } : {}) });
 // Job records follow the executor's status files even while nobody has the page open.
@@ -105,6 +110,7 @@ setInterval(() => {
   deployments.sync().catch((error) => console.error("sync:", error));
   diagnoser?.poll().catch((error) => console.error("diagnose:", error));
   onboarding.poll().catch((error) => console.error("assessments:", error));
+  configReview?.poll().catch((error) => console.error("config review:", error));
 }, 2_000).unref();
 setInterval(() => { briefs.tick().catch((error) => console.error("brief:", error)); }, 60_000).unref();
 setInterval(() => { drift.check().catch((error) => console.error("drift:", error)); }, 10 * 60_000).unref();

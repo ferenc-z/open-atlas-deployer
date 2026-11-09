@@ -33,16 +33,16 @@ const TABS: Tab[] = [
 /** How a member is named on the charts: a node by address and port, a standalone by host. */
 export const memberLabel = (s: ServiceStatus, m: MemberStatus) => (s.kind === "cluster" ? `${m.nodeAddress ?? m.host}:${webPort(m.ports) ?? "?"}` : m.host);
 
-export function ServiceDetail({ id, onBack }: { id: string; onBack: () => void }) {
+export function ServiceDetail({ id, initialDraft, onBack }: { id: string; initialDraft?: string; onBack: () => void }) {
   const [s, setS] = useState<ServiceStatus | undefined>();
   const [cfg, setCfg] = useState<ServiceConfigView | null | undefined>();
-  const [tab, setTab] = useState("overview");
+  const [tab, setTab] = useState(initialDraft ? "changes" : "overview");
   const [error, setError] = useState("");
   const load = useCallback(() => { api.serviceStatus(id).then(setS, (e: Error) => setError(e.message)); }, [id]);
   useEffect(() => { load(); const t = setInterval(load, 10_000); return () => clearInterval(t); }, [load]);
   const loadCfg = useCallback(() => { api.serviceConfig(id).then(setCfg, () => setCfg(null)); }, [id]);
   useEffect(loadCfg, [loadCfg]);
-  const drafts = useDrafts(id);
+  const drafts = useDrafts(id, initialDraft);
   const back = <button className="link" onClick={onBack}>← Services</button>;
   if (!s) return <>{back}{error ? <p className="error">{error}</p> : <p className="muted">Loading…</p>}</>;
   const cluster = s.kind === "cluster";

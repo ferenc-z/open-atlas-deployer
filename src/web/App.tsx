@@ -49,7 +49,12 @@ export function App() {
   const [assessment, setAssessment] = useState<string | undefined>();
   // A service to open on the Services page (from the Alerts page or the health card).
   const [service, setService] = useState<string | undefined>();
-  const actions =useMemo(() => ({ openPlan: (app: string, version: string, pinFrom?: string) => { setPanel({ kind: "deploy", app, initial: { version, ...(pinFrom ? { pinFrom } : {}) } }); setTab("status"); } }), []);
+  // A configuration draft to open with it (the Assistant's card); at: each card opens afresh, even on the same service.
+  const [serviceDraft, setServiceDraft] = useState<{ draft: string; at: number } | undefined>();
+  const actions =useMemo(() => ({
+    openPlan: (app: string, version: string, pinFrom?: string) => { setPanel({ kind: "deploy", app, initial: { version, ...(pinFrom ? { pinFrom } : {}) } }); setTab("status"); },
+    openServiceChange: (id: string, draft: string) => { setService(id); setServiceDraft({ draft, at: Date.now() }); setTab("services"); },
+  }), []);
   // §15 (D41): until setup is complete, Setup is the only page.
   const [setup, setSetup] = useState<SetupStatus | undefined>();
   const load = useCallback(() => {
@@ -72,7 +77,7 @@ export function App() {
   const setupOnly = !setup.complete;
   const shown: Tab = setupOnly ? "setup" : tab;
   const go = (t: Tab) => { setTab(t); if (t !== "onboarding") setAssessment(undefined); setService(undefined); };
-  const openService = (id: string) => { setTab("services"); setService(id); };
+  const openService = (id: string) => { setTab("services"); setService(id); setServiceDraft(undefined); };
   return (
     <div className="shell">
       <Sidebar principal={p} environment={me.environment} tab={shown} setTab={go} setupOnly={setupOnly} onSignedOut={load} assistant={assistant} toggleAssistant={() => setAssistant(!assistant)} />
@@ -88,7 +93,7 @@ export function App() {
           {shown === "status" && <><SetupLine status={setup} onOpen={() => go("setup")} /><DriftBanner /><Status services={<ServiceHealthCard onServices={() => go("services")} onAlerts={() => go("alerts")} />} panel={panel} setPanel={setPanel} isAdmin={p.permissions.includes("admin")} canRegenerate={p.permissions.includes("deploy-uat") || p.permissions.includes("deploy-prod")} onAssessment={(id) => { setPanel(undefined); setAssessment(id); setTab("onboarding"); }} /></>}
           {shown === "history" && <HistoryPage onBack={(j) => { setPanel({ kind: "deploy", app: j.app, initial: { version: j.version, pinFrom: j.id } }); setTab("status"); }} />}
           {shown === "hosts" && <HostsPage isAdmin={p.permissions.includes("admin")} />}
-          {shown === "services" && <ServicesPage key={service ?? ""} onTakeover={() => go("takeover")} {...(service ? { initialOpen: service } : {})} />}
+          {shown === "services" && <ServicesPage key={`${service ?? ""}:${serviceDraft?.at ?? ""}`} onTakeover={() => go("takeover")} {...(service ? { initialOpen: service } : {})} {...(serviceDraft ? { initialDraft: serviceDraft.draft } : {})} />}
           {shown === "alerts" && <AlertsPage onOpen={openService} />}
           {shown === "takeover" && <TakeoverPage isAdmin={p.permissions.includes("admin")} onRegistered={() => go("services")} />}
           {shown === "settings" && <SettingsPage />}

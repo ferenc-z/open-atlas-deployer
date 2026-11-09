@@ -31,9 +31,10 @@ import { StoreError, type Actor, type ServiceConfigDraft, type Store } from "./s
 import { withoutSealed } from "./services/config.ts";
 import { ConfigDocError } from "./services/configdoc.ts";
 import { redactText } from "./services/redact.ts";
-import { acceptChanges, changeSummary, changeView, fileDiffs, outcomeOf, revealValue, sameFiles, type DraftChange } from "./services/configedit.ts";
+import { acceptChanges, changeSummary, changeView, fileDiffs, outcomeOf, revealValue, sameFiles, secretSubmitted, xmlSecretChanged, type DraftChange } from "./services/configedit.ts";
 import { configView } from "./services/configview.ts";
 import { catalogFor, profile as profileById, profileFor, PROFILES } from "./services/profiles.ts";
+import type { ConfigReviewer } from "./services/configreview.ts";
 import { installKey, type DraftItem } from "./services/draft.ts";
 import { serviceStatus, thresholdsOf, timeline } from "./services/status.ts";
 import { alertView, check, parseThresholds, RULES, THRESHOLDS } from "./services/rules.ts";
@@ -80,6 +81,8 @@ export interface Dependencies {
   restart?: () => void;
   /** §15.4 step 6: how the AI checks reach OMA (tests pass a fake). */
   omaFetcher?: typeof fetch;
+  /** §16.3: the AI review of a saved configuration revision; none without OMA. */
+  configReview?: Pick<ConfigReviewer, "start">;
   /** Service ops §6: taking over discovered services (drafts, confirmation). */
   takeover?: Takeover;
   /** Phase 2 step 4: reading and following services' logs through their service executors (tests pass their own timings). */
@@ -119,7 +122,8 @@ export function createApp({ config, store, sessions, observer, deployments, vers
   }
 
   /** The principal, or the response that refuses the request. */
-  async function authenticate(c: Context, need: Permission): Promise<Principal | Response> {
+  /** serviceMay: a service key passes though it holds only view (one route: the AI creating a configuration draft, §16.3). */
+  async function authenticate(c: Context, need: Permission, serviceMay = false): Promise<Principal | Response> {
     let principal: Principal | undefined;
     const marker = c.req.header("x-deployer-internal");
     if (marker) {
@@ -143,7 +147,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
       if (result.kind === "anonymous") return reject(c, 401, "auth/unauthenticated", "Sign in to Workbench first.");
       principal = result.principal;
     }
-    if (!principal.permissions.includes(need)) return reject(c, 403, "auth/forbidden", need === "admin" ? "Only Workbench admins can do this." : "You are not in any of the deploy-viewer, deploy-uat or deploy-prod groups.");
+    if (!principal.permissions.includes(need) && !(serviceMay && principal.via === "service")) return reject(c, 403, "auth/forbidden", need === "admin" ? "Only Workbench admins can do this." : "You are not in any of the deploy-viewer, deploy-uat or deploy-prod groups.");
     if (!isKey(principal) && c.req.method !== "GET" && c.req.header("x-csrf-token") !== principal.csrfToken) return reject(c, 403, "auth/csrf", "The request has no valid CSRF token; reload the page.");
     return principal;
   }
@@ -761,12 +765,12 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     const env = deployments.environment().env;
     return p.permissions.includes(deployPermission(env)) && !(isProd(env) && isKey(p));
   };
-  const configEditor = async (c: Context): Promise<Principal | Response> => {
+  const configEditor = async (c: Context, serviceMay = false): Promise<Principal | Response> => {
     let env: Environment;
     try { env = deployments.environment().env; } catch (error) { return deployError(c, error); }
-    const p = await authenticate(c, deployPermission(env));
+    const p = await authenticate(c, deployPermission(env), serviceMay);
     if (p instanceof Response) return p;
-    if (isProd(env) && isKey(p)) return reject(c, 403, "auth/browser-only", "On PROD the configuration is changed only from a browser session, not API keys.");
+    if (isProd(env) && isKey(p) && p.via !== "service") return reject(c, 403, "auth/browser-only", "On PROD the configuration is changed only from a browser session, not API keys.");
     return p;
   };
   /** The service, its newest revision and the key its files are sealed with, or the answer why there are none. */
@@ -881,20 +885,33 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     if (!service || !d) return reject(c, 404, "config-draft/unknown", `No configuration draft ${c.req.param("draft")} of ${id}.`);
     return c.json({ ...draftView(d, store.serviceConfig(id)?.revision ?? 0), preview: draftPreview(d, service) });
   });
+  // §16.3: the Assistant's service key may create a draft, on PROD too; a person still saves it (every other draft route
+  // keeps it out). What the AI submits (the service key, or ai: true from draft_service_config) touches no secret.
   api.post("/api/services/:id/config/drafts", async (c) => {
-    const p = await configEditor(c);
+    const p = await configEditor(c, true);
     if (p instanceof Response) return p;
     const cfg = configOf(c);
     if (cfg instanceof Response) return cfg;
     const big = tooLarge(c);
     if (big) return big;
-    const body = await c.req.json().catch(() => ({})) as { base?: unknown; changes?: unknown; note?: unknown };
+    const body = await c.req.json().catch(() => ({})) as { base?: unknown; changes?: unknown; note?: unknown; ai?: unknown };
     if (body.base !== undefined && body.base !== cfg.latest.revision) return reject(c, 409, "config-draft/stale", `The configuration of ${cfg.id} is at revision ${cfg.latest.revision}, not ${String(body.base)}: read it again and make the change on that.`);
+    const byAi = p.via === "service" || body.ai === true;
+    const personOnly = (what: string) => reject(c, 400, "config/secret-by-person", `${what} holds a secret: the AI does not touch those. Nothing was drafted. Ask the person to enter it on the Configuration tab, and draft the other changes without it.`);
+    if (byAi) {
+      const secret = secretSubmitted(body.changes);
+      if (secret) return personOnly(secret);
+      if (!Array.isArray(body.changes) || !body.changes.length) return reject(c, 400, "config-draft/empty", "Give at least one change.");
+    }
     try {
       const changes = acceptChanges(body.changes ?? [], cfg.latest.body, cfg.service.kind, cfg.box);
+      if (byAi) {
+        const secret = xmlSecretChanged(changes, cfg.latest.body, cfg.service.kind, cfg.box);
+        if (secret) return personOnly(secret);
+      }
       const { findings } = outcomeOf(cfg.latest.body, changes, cfg.box, checkContext(cfg.service));
       const d = store.createServiceConfigDraft({ service: cfg.id, base: cfg.latest.revision, changes, note: noteOf(body.note), findings, audit: changes.map(changeSummary) }, actorOf(p));
-      return c.json({ ...draftView(d, cfg.latest.revision), preview: draftPreview(d, cfg.service) }, 201);
+      return c.json({ ...draftView(d, cfg.latest.revision), kind: cfg.service.kind, preview: draftPreview(d, cfg.service) }, 201);
     } catch (error) { return configFailed(c, error); }
   });
   // The whole draft again: what the page shows goes back as it is (a secret as hidden: true, XML with its "(hidden)").
@@ -940,8 +957,27 @@ export function createApp({ config, store, sessions, observer, deployments, vers
       const out = outcomeOf(cfg.latest.body, d.changes, cfg.box, checkContext(cfg.service));
       if (sameFiles(out.split?.members ?? cfg.latest.body.members, out.body.members)) return reject(c, 409, "config-draft/no-change", "This draft changes nothing in any file.");
       const revision = store.saveServiceConfigDraft(cfg.id, d.id, { split: out.split, body: out.body, findings: out.findings, note: noteOf(body.note) ?? d.note, audit: d.changes.map(changeSummary) }, actorOf(p));
+      // §16.3: advice, after the fact: the save does not wait for it and cannot fail because of it.
+      deps.configReview?.start(cfg.id, revision, { findings: out.findings, change: out.change }).catch((error) => console.error("config review:", error));
       return c.json({ revision, findings: out.findings, change: out.change, draft: draftView(store.serviceConfigDraft(cfg.id, d.id)!, revision) }, 201);
     } catch (error) { return configFailed(c, error); }
+  });
+  // The AI's read tools for what comes later (§16.3): there are no changes until step 11 and no drift until step 7.
+  const serviceKnown = (c: Context) => (registeredService(c.req.param("id")!) ? undefined : reject(c, 404, "service/unknown", `No standalone instance or cluster ${c.req.param("id")}.`));
+  api.get("/api/services/:id/changes", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    return serviceKnown(c) ?? c.json({ changes: [], note: "Applying configuration and restarting from the Deployer are not there yet: no change was made through it." });
+  });
+  api.get("/api/services/:id/changes/:change", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    return serviceKnown(c) ?? reject(c, 404, "service-change/unknown", `No change ${c.req.param("change")} of ${c.req.param("id")}.`);
+  });
+  api.get("/api/services/:id/drift", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    return serviceKnown(c) ?? c.json({ known: false, members: [], note: "Comparing the files on the hosts with the kept configuration is not there yet: drift is unknown." });
   });
   api.get("/api/services/drafts", async (c) => {
     const p = await authenticate(c, "view");

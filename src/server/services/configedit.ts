@@ -12,6 +12,7 @@ import { checkConfig, openMembers, type ChangeAssessment, type CheckInput, type 
 import { ConfigDocError, decodeText, editProperties, editXml, effectiveProperties, encodeValue, HIDDEN, isSecretKey, parsePropertyEntries, redactXml, xmlSecrets } from "./configdoc.ts";
 import { installKey } from "./draft.ts";
 import { layerFile, layerValue, renderBody, splitBody } from "./layers.ts";
+import { PROFILES } from "./profiles.ts";
 
 interface Where { file: string; member: string | null }
 /** One change as a draft keeps it. member null: a standalone's one member, or a cluster's common layer. secret: the new
@@ -98,6 +99,32 @@ export function acceptChanges(raw: unknown, base: ServiceConfigBody, kind: "stan
     encodeValue(key, value);
     return c.secret !== undefined || isSecretKey(parsed[0]!.name) ? { ...where, key, secret: box.seal(value) } : { ...where, key, value };
   });
+}
+
+const CATALOG_SECRETS: ReadonlySet<string> = new Set(PROFILES.flatMap((p) => p.catalog).filter((e) => e.sensitive).map((e) => e.key));
+const secretName = (key: string) => {
+  const name = parsePropertyEntries(`${key}=`)[0]?.name ?? key;
+  return isSecretKey(name) || CATALOG_SECRETS.has(name);
+};
+
+/** What the AI submitted that names a secret (§16.3): a person enters those on the page. Looked at before acceptChanges, which would seal it. */
+export function secretSubmitted(raw: unknown): string | null {
+  for (const entry of Array.isArray(raw) ? raw : []) {
+    const c = (entry && typeof entry === "object" ? entry : {}) as Record<string, unknown>;
+    if (c.secret !== undefined || c.hidden === true) return typeof c.key === "string" ? c.key : String(c.file);
+    if (typeof c.key === "string" && secretName(c.key)) return c.key;
+  }
+  return null;
+}
+
+/** An XML change that alters a secret's value, adds one or takes one away; text that keeps each "(hidden)" does none of these. */
+export function xmlSecretChanged(changes: readonly DraftChange[], base: ServiceConfigBody, kind: "standalone" | "cluster", box: SecretBox): string | null {
+  const edited = kind === "cluster" ? splitBody(base, box) : base;
+  const secrets = (bytes: Buffer) => JSON.stringify(xmlSecrets(decodeText(bytes)).map((s) => [s.name, s.value]));
+  for (const c of changes) {
+    if ("sealed" in c && secrets(bytesOf(recordAt(edited, kind, c.file, c.member), box)) !== secrets(textBytes(c, box))) return c.file;
+  }
+  return null;
 }
 
 /** A kept change as the pages get it: no secret, and XML text with its secrets hidden. */

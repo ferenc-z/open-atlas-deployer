@@ -20,9 +20,9 @@ export type Drafts = {
   took: (d: ConfigDraft) => void;
 };
 
-export function useDrafts(id: string): Drafts {
+export function useDrafts(id: string, initial?: string): Drafts {
   const [list, setList] = useState<ConfigDraft[]>([]);
-  const [chosen, setChosen] = useState<string | null>(null);
+  const [chosen, setChosen] = useState<string | null>(initial ?? null);
   const refresh = useCallback(() => { api.configDrafts(id, "open").then((r) => setList(r.drafts), () => setList([])); }, [id]);
   useEffect(refresh, [refresh]);
   const took = useCallback((d: ConfigDraft) => {
@@ -230,6 +230,12 @@ function Revisions({ s, cfg }: { s: ServiceStatus; cfg: ServiceConfigView }) {
     api.serviceConfig(s.id, to).then((x) => { if (on) setDetail(x); }, () => undefined);
     return () => { on = false; };
   }, [s.id, to]);
+  // The AI review ends a while after the save.
+  useEffect(() => {
+    if (detail?.review?.state !== "running") return;
+    const t = setTimeout(() => { api.serviceConfig(s.id, to).then((x) => setDetail((was) => (was?.revision === x.revision ? x : was)), () => undefined); }, 5_000);
+    return () => clearTimeout(t);
+  }, [detail, s.id, to]);
   const pick = (r: number) => { setTo(r); setFrom(fromOf(r)); };
   const options = cfg.revisions.map((r) => <option key={r.revision} value={r.revision}>r{r.revision} · {when(r.savedAt)}</option>);
   const shown = useMemo(() => cfg.revisions.find((r) => r.revision === to), [cfg.revisions, to]);
@@ -264,6 +270,7 @@ function Revisions({ s, cfg }: { s: ServiceStatus; cfg: ServiceConfigView }) {
         {detail.findings && detail.findings.length > 0 && <div><h4>Checks when r{to} was saved</h4><Findings findings={detail.findings} /></div>}
         {detail.review && <div>
           <h4>AI review of r{to} {detail.review.state && <span className={`badge ${detail.review.state === "done" ? "ok" : detail.review.state === "failed" ? "bad" : "info"}`}>{detail.review.state}</span>}</h4>
+          {detail.review.state === "running" && <p className="muted small">The AI is reading this revision. It does not hold anything up.</p>}
           {detail.review.text && <Markdown text={detail.review.text} />}
           {detail.review.error && <p className="error">{detail.review.error}</p>}
         </div>}
