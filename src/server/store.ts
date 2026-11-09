@@ -781,13 +781,25 @@ export class Store {
     this.db.prepare("INSERT INTO executor_jobs (id, host, request, content, queued_at, executor) VALUES (?, ?, ?, ?, ?, ?)").run(id, host, JSON.stringify(request), content ?? null, this.stamp(), executor === "deploy" ? null : executor);
   }
 
-  /** Claims the oldest job queued for one executor of a host; an env job's content leaves the queue with it. */
-  claimExecutorJob(host: string, executor: ExecutorKind = "deploy"): Record<string, unknown> | undefined {
-    const r = this.db.prepare("SELECT id, request, content FROM executor_jobs WHERE host = ? AND COALESCE(executor, 'deploy') = ? AND picked_at IS NULL ORDER BY queued_at, rowid LIMIT 1").get(host, executor) as Row | undefined;
+  /** Claims the oldest job queued for one executor of a host (only: of these job kinds); an env job's content leaves the queue with it. */
+  claimExecutorJob(host: string, executor: ExecutorKind = "deploy", only?: string[]): Record<string, unknown> | undefined {
+    const r = this.db.prepare(`SELECT id, request, content FROM executor_jobs WHERE host = ? AND COALESCE(executor, 'deploy') = ? AND picked_at IS NULL${only ? " AND json_extract(request, '$.kind') IN (SELECT value FROM json_each(?))" : ""} ORDER BY queued_at, rowid LIMIT 1`)
+      .get(host, executor, ...(only ? [JSON.stringify(only)] : [])) as Row | undefined;
     if (!r) return undefined;
-    this.db.prepare("UPDATE executor_jobs SET picked_at = ?, content = NULL WHERE id = ?").run(this.stamp(), r.id);
+    this.takeQueuedExecutorJob(r.id);
     const request = JSON.parse(r.request) as Record<string, unknown>;
     return r.content === null ? request : { ...request, content: r.content };
+  }
+
+  /** A job leaves the queue, and its content with it. */
+  takeQueuedExecutorJob(id: string) {
+    this.db.prepare("UPDATE executor_jobs SET picked_at = ?, content = NULL WHERE id = ?").run(this.stamp(), id);
+  }
+
+  /** The jobs still queued whose request says when they expire. */
+  queuedExecutorJobsWithExpiry(): { id: string; expiresAt: unknown }[] {
+    return (this.db.prepare("SELECT id, json_extract(request, '$.expiresAt') AS expires_at FROM executor_jobs WHERE picked_at IS NULL AND json_extract(request, '$.expiresAt') IS NOT NULL").all() as Row[])
+      .map((r) => ({ id: r.id, expiresAt: r.expires_at }));
   }
 
   executorJob(id: string): { host: string; executor: ExecutorKind; request: Record<string, unknown>; pickedAt: string | null; status: ExecutorStatus | null; log: string } | undefined {

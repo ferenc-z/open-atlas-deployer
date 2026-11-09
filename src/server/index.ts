@@ -57,7 +57,7 @@ const drivers = [
   new StudioGraphDriver(studio, config.templatesDir),
   new OmaAgentDriver(omaBuilder, workbench, config.templatesDir, config.omaUrl ? { url: config.omaUrl, keyFile: config.omaApiKeyFile } : undefined),
 ];
-const deployments = new Deployments(store, new Handoff(store), observer, config.environmentFile, {
+const deployments = new Deployments(store, new Handoff(store, Date.now, box), observer, config.environmentFile, {
   peer, releases: versions, drivers,
   bundles: new Bundles(join(config.dataDir, "bundles"), config.githubTokenFile, fetch, config.githubApi),
   contracts: new ContractDocs(config.githubTokenFile, fetch, config.githubApi),
@@ -121,6 +121,7 @@ const serviceUpkeep = (cleanup: boolean) => {
     // §15.3: the rules once a minute too, for what sends nothing (an executor gone, samples overdue).
     checkAll(store, (h) => deployments.handoff.executor(h, "service"));
     store.dropOldExecutorContent();
+    deployments.handoff.expireQueued();
     if (cleanup) prune(store, new Date());
   } catch (error) { console.error("service metrics:", error); }
 };

@@ -126,8 +126,9 @@ class DeployerApi:
     def heartbeat(self, beat):
         return self.call("POST", "/executor/v1/heartbeat", body=beat)
 
-    def next_job(self, wait):
-        r = self.call("GET", f"/executor/v1/jobs/next?wait={int(wait)}", timeout=wait + 30)
+    def next_job(self, wait, only=None):
+        """only="read": only the read kinds, whatever else is queued stays queued (§16.3: a change is running here)."""
+        r = self.call("GET", f"/executor/v1/jobs/next?wait={int(wait)}" + (f"&only={only}" if only else ""), timeout=wait + 30)
         return r["job"] if r else None
 
     def put_status(self, job_id, status):
@@ -296,7 +297,11 @@ class ProtocolExecutor:
         status = json.loads(marker.read_text())
         if status.get("state") not in FINAL:
             status.update(state="failed", finishedAt=now_iso(), message=self.INTERRUPTED)
-            self.api.put_status(status["id"], status)
+            try:
+                self.api.put_status(status["id"], status)
+            except Exception as e:  # the Deployer may be restarting too: an interrupted job is still said once it answers
+                self.say(f"cannot send the status of {status['id']}, kept for later: {e}")
+                self.keep_pending(status)
         marker.unlink()
 
     def pending_dir(self):
@@ -313,6 +318,8 @@ class ProtocolExecutor:
         if not d.is_dir():
             return
         for path in sorted(d.glob("*.json")):
+            if path.stem == self.job_id:
+                continue  # a job running beside this loop sends its own status; an old one must not overtake a newer one
             kept = json.loads(path.read_text())
             try:
                 if kept.get("log"):

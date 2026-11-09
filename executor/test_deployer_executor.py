@@ -21,6 +21,7 @@ class FakeApi:
         self.queue, self.status, self.logs, self.env, self.beats, self.states = [], {}, {}, {}, [], []
         # D16: the Deployer's version as its heartbeat answer says, and whether it is down (restarting).
         self.deployer, self.down = None, False
+        self.polls, self.read_kinds = [], ()
 
     def token(self):
         return "dpe_test"
@@ -31,8 +32,13 @@ class FakeApi:
         self.beats.append(beat)
         return {"ok": True, "deployer": self.deployer}
 
-    def next_job(self, wait):
-        return self.queue.pop(0) if self.queue else None
+    def next_job(self, wait, only=None):
+        """only: as the Deployer's jobs/next?only=read, READ_KINDS when a test sets them; what else is queued stays."""
+        self.polls.append((wait, only))
+        for i, job in enumerate(self.queue):
+            if not only or job.get("kind") in self.read_kinds:
+                return self.queue.pop(i)
+        return None
 
     def put_status(self, job_id, status):
         if self.down:

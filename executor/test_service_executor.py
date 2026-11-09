@@ -95,7 +95,7 @@ class RegistrationTest(Base):
         beat = self.api.beats[-1]
         self.assertEqual(beat["executor"], "service")
         self.assertEqual(beat["protocols"], [2])
-        self.assertEqual(beat["kinds"], ["svc-discover", "svc-read", "log-read", "log-tail", "nifi-provenance", "executor-upgrade", "svc-discover@2", "svc-read@2", "nifi-provenance@1"],
+        self.assertEqual(beat["kinds"], ["svc-discover", "svc-read", "svc-state", "log-read", "log-tail", "nifi-provenance", "executor-upgrade", "svc-discover@2", "svc-read@2", "nifi-provenance@1", "svc-state@1"],
                          "the service jobs and what they can do (§15.2); never the deploy ones")
         name, root = sx.ServiceExecutor.user()
         self.assertEqual((beat["user"], beat["isRoot"]), (name, root))
@@ -172,19 +172,28 @@ class ReadChannelTest(Base):
         self.assertEqual((self.api.status["read-job-fail"]["state"], self.api.status["read-job-fail"]["message"]), ("failed", "cannot read it"))
         self.assertEqual(self.api.status["read-job-refuse"]["state"], "refused")
 
-    def test_a_change_waits_for_the_reads_in_flight(self):
+    def test_an_executor_upgrade_waits_for_the_reads_in_flight(self):
         self.read("read-job-0001")
         self.ex.run_once()
         self.assertTrue(wait_until(lambda: self.ex.started))
-        self.api.queue.append({"protocol": 2, "id": "change-job-0001", "kind": "svc-write"})
+        self.api.queue.append({"protocol": 2, "id": "upgrade-job-0001", "kind": "executor-upgrade", "version": "nonsense"})
         done = threading.Thread(target=self.ex.run_once)
         done.start()
         time.sleep(0.1)
-        self.assertNotIn("change-job-0001", self.api.status, "not started while the read runs")
+        self.assertNotIn("upgrade-job-0001", self.api.status, "not started while the read runs")
         self.ex.gates["read-job-0001"].set()
         done.join(5)
         self.assertEqual(self.api.status["read-job-0001"]["state"], "succeeded")
-        self.assertEqual(self.api.status["change-job-0001"]["state"], "refused", "svc-write is not on this executor yet")
+        self.assertEqual(self.api.status["upgrade-job-0001"]["state"], "refused", "its version is malformed")
+
+    def test_a_kind_this_executor_does_not_know_is_refused_without_waiting_for_the_reads(self):
+        self.read("read-job-0001")
+        self.ex.run_once()
+        self.assertTrue(wait_until(lambda: self.ex.started))
+        self.api.queue.append({"protocol": 2, "id": "write-job-0001", "kind": "svc-write"})
+        self.ex.run_once()
+        self.assertEqual(self.api.status["write-job-0001"]["state"], "refused")
+        self.assertEqual(self.api.status["read-job-0001"]["state"], "running")
 
     def test_a_read_left_running_by_a_previous_process_is_marked_interrupted(self):
         sx.write_json(self.ex.read_marker("read-job-gone"), {"protocol": 2, "id": "read-job-gone", "state": "running", "steps": [], "result": {}})
@@ -205,6 +214,164 @@ class ReadChannelTest(Base):
         self.ex.deliver_pending()
         self.assertEqual(self.api.status["read-job-down"]["state"], "succeeded")
         self.assertIn("reading for read-job-down", self.api.logs["read-job-down"])
+
+
+class Changer(Reader):
+    """A service executor with a change job for the tests (svc-write and svc-control come with later steps)."""
+
+    CHANGE_JOBS = {"test-change": "test_change"}
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.changed = []
+
+    def test_change(self, req, status):
+        self.changed.append(req["id"])
+        self.step(status, "change")
+        self.log(f"changing for {req['id']}")
+        self.gates.setdefault(req["id"], threading.Event()).wait(5)
+        if req.get("fail"):
+            raise sx.Failed("cannot change it")
+        status["result"] = {"answer": req["id"]}
+        self.finish(status, "succeeded", "changed")
+
+
+class ChangeChannelTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.api.read_kinds = ("test-read",)
+        self.ex = self.executor(Changer)
+        self.addCleanup(self.release_all)
+
+    def release_all(self):
+        for job_id in [*self.ex.reads, *self.ex.changed]:
+            self.ex.gates.setdefault(job_id, threading.Event()).set()
+        self.ex.wait_reads()
+        self.ex.wait_change()
+
+    def change(self, job_id, **extra):
+        self.api.queue.append({"protocol": 2, "id": job_id, "kind": "test-change", **extra})
+
+    def read(self, job_id):
+        self.api.queue.append({"protocol": 2, "id": job_id, "kind": "test-read"})
+
+    def running_change(self, job_id="change-job-0001"):
+        self.change(job_id)
+        self.assertTrue(self.ex.run_once())
+        self.assertTrue(wait_until(lambda: job_id in self.ex.changed))
+
+    def test_the_heartbeat_names_the_change_job(self):
+        self.assertIn("test-change", self.ex.KINDS)
+
+    def test_reads_run_beside_a_change_and_a_second_change_stays_queued(self):
+        self.running_change()
+        self.read("read-job-0001")
+        self.change("change-job-0002")
+        self.assertTrue(self.ex.run_once(wait=25), "the read behind the second change is taken")
+        self.assertEqual(self.api.polls[-1], (sx.CHANGE_POLL_SECONDS, "read"), "a short poll, for the next change to be taken soon after")
+        self.assertTrue(wait_until(lambda: self.ex.started == ["read-job-0001"]))
+        self.ex.gates["read-job-0001"].set()
+        self.assertTrue(wait_until(lambda: self.api.status.get("read-job-0001", {}).get("state") == "succeeded"), "the read ends while the change runs")
+        self.assertEqual(self.api.status["change-job-0001"]["state"], "running")
+        self.assertFalse(self.ex.run_once(), "nothing but the second change is queued")
+        self.assertEqual([j["id"] for j in self.api.queue], ["change-job-0002"], "not taken: lost in a restart here if it were")
+        self.assertEqual(self.ex.changed, ["change-job-0001"])
+
+        self.ex.gates["change-job-0001"].set()
+        self.ex.wait_change()
+        self.assertEqual((self.api.status["change-job-0001"]["state"], self.api.status["change-job-0001"]["result"]), ("succeeded", {"answer": "change-job-0001"}))
+        self.assertIn("changing for change-job-0001", self.api.logs["change-job-0001"])
+        self.assertTrue(self.ex.run_once())
+        self.assertEqual(self.api.polls[-1][1], None, "no change runs: anything may come")
+        self.assertTrue(wait_until(lambda: "change-job-0002" in self.ex.changed))
+
+    def test_the_log_of_a_read_stays_out_of_the_changes(self):
+        self.running_change()
+        self.read("read-job-0001")
+        self.ex.run_once()
+        self.assertTrue(wait_until(lambda: self.ex.started))
+        self.release_all()
+        self.assertNotIn("reading for", self.api.logs["change-job-0001"])
+        self.assertNotIn("changing for", self.api.logs["read-job-0001"])
+
+    def test_every_heartbeat_says_the_change_while_it_runs(self):
+        self.running_change()
+        self.ex.heartbeat()
+        self.assertEqual(self.api.beats[-1]["busy"], "change-job-0001")
+        self.release_all()
+        self.ex.heartbeat()
+        self.assertIsNone(self.api.beats[-1]["busy"])
+
+    def test_a_failed_change_says_so_and_the_loop_goes_on(self):
+        self.change("change-job-0001", fail=True)
+        self.ex.run_once()
+        self.assertTrue(wait_until(lambda: self.ex.changed))
+        self.release_all()
+        self.assertEqual((self.api.status["change-job-0001"]["state"], self.api.status["change-job-0001"]["message"]), ("failed", "cannot change it"))
+        self.assertFalse(self.ex.changing())
+        self.assertFalse(self.ex.current_marker().exists())
+
+    def test_an_executor_upgrade_is_not_taken_beside_a_change(self):
+        self.running_change()
+        self.api.queue.append({"protocol": 2, "id": "upgrade-job-0001", "kind": "executor-upgrade", "version": "9.9.9"})
+        self.assertFalse(self.ex.run_once())
+        self.assertEqual([j["id"] for j in self.api.queue], ["upgrade-job-0001"])
+        self.assertNotIn("upgrade-job-0001", self.api.status)
+
+    def test_a_deployer_that_ignores_only_read_cannot_start_another_job_beside_a_change(self):
+        self.running_change()
+        self.api.read_kinds = ("test-read", "test-change", "executor-upgrade")
+        self.change("change-job-0002")
+        self.api.queue.append({"protocol": 2, "id": "upgrade-job-0001", "kind": "executor-upgrade", "version": "9.9.9"})
+        self.ex.run_once()
+        self.ex.run_once()
+        self.assertEqual(self.ex.changed, ["change-job-0001"])
+        self.assertEqual([self.api.status["change-job-0002"]["state"], self.api.status["upgrade-job-0001"]["state"]], ["refused", "refused"])
+        self.assertIn("change-job-0001", self.api.status["upgrade-job-0001"]["message"])
+        self.assertEqual(json.loads(self.ex.current_marker().read_text())["id"], "change-job-0001", "the running change's marker is its own")
+        self.assertEqual(self.api.status["change-job-0001"]["state"], "running")
+
+    def test_a_restart_during_a_change_says_it_was_interrupted_on_the_next_start(self):
+        self.running_change()
+        again = self.executor(Changer)  # the process is gone; its marker is what is left of the change
+        again.recover()
+        status = self.api.status["change-job-0001"]
+        self.assertEqual((status["state"], status["message"]), ("failed", again.INTERRUPTED))
+        self.assertFalse(again.current_marker().exists())
+        self.assertFalse(again.changing(), "not run again")
+
+    def test_a_restart_during_a_change_with_the_deployer_down_says_it_once_the_deployer_answers(self):
+        self.running_change()
+        again = self.executor(Changer)
+        self.api.down = True
+        again.recover()
+        self.assertEqual(self.api.status["change-job-0001"]["state"], "running")
+        self.assertFalse(again.current_marker().exists())
+        self.api.down = False
+        again.deliver_pending()
+        self.assertEqual(self.api.status["change-job-0001"]["state"], "failed")
+
+    def test_a_kept_status_of_the_running_change_cannot_overtake_a_newer_one(self):
+        self.running_change()
+        self.ex.keep_pending({"id": "change-job-0001", "state": "running", "steps": ["old"]})
+        self.ex.deliver_pending()
+        self.assertNotIn("old", self.api.status["change-job-0001"]["steps"], "left to the change")
+        self.ex.gates["change-job-0001"].set()
+        self.ex.wait_change()
+        self.assertEqual(self.api.status["change-job-0001"]["state"], "succeeded")
+        self.assertEqual(list((self.root / "work" / "pending").glob("*.json")), [], "taken with the newer status")
+
+    def test_a_final_status_kept_while_the_deployer_is_down_is_sent_once_the_change_has_ended(self):
+        self.running_change()
+        self.ex.status_tries = 1
+        self.api.down = True
+        self.ex.gates["change-job-0001"].set()
+        self.ex.wait_change()
+        self.assertEqual(self.api.status["change-job-0001"]["state"], "running")
+        self.api.down = False
+        self.ex.deliver_pending()
+        self.assertEqual(self.api.status["change-job-0001"]["state"], "succeeded")
+        self.assertIn("changing for change-job-0001", self.api.logs["change-job-0001"])
 
 
 def nifi_home(root, name, version, props, boot=None, two=True):
@@ -857,6 +1024,129 @@ class CollectorTest(Base):
         node = self.by_service(c.round(sx.watch_entries(self.watch)))["c250-1"]["nifi"]
         self.assertEqual((node["state"], node["errors"]), ("partial", {"cluster": "HTTP 403: no read policy"}))
         self.assertIn("diagnostics", node)
+
+    # --- svc-state (§16.3) ---
+
+    def state_entry(self, w):
+        conf = pathlib.Path(w["confDir"])
+        return sx.watch_entries([{**w, "files": [{"name": "nifi.properties", "path": str(conf / "nifi.properties")}, {"name": "bootstrap.conf", "path": str(conf / "bootstrap.conf")}]}])[0]
+
+    @staticmethod
+    def limits(soft=1024, hard=4096, processes="unlimited"):
+        return ("Limit                     Soft Limit           Hard Limit           Units     \n"
+                f"Max cpu time              unlimited            unlimited            seconds   \n"
+                f"Max processes             {processes}            {processes}            processes \n"
+                f"Max open files            {soft}                 {hard}                 files     \n")
+
+    def test_svc_state_of_a_cluster_node_has_its_processes_limits_files_and_the_nodes(self):
+        (self.proc.root / "4000" / "limits").write_text(self.limits())
+        (self.proc.root / "4001" / "limits").write_text(self.limits(4096, 4096))
+        (self.proc.root / "4000" / "stat").write_text("4000 (java) S 1 " + " ".join(["0"] * 17) + " 400 0 0\n")
+        (self.proc.root / "4001" / "stat").write_text("4001 (java) S 4000 " + " ".join(["0"] * 17) + " 800 0 0\n")
+        os.chmod(self.c250 / "conf" / "nifi.properties", 0o640)
+        out = self.collector().state(self.state_entry(self.entry("c250", self.c250, https=18445, node="localhost")))
+        tick = os.sysconf("SC_CLK_TCK")
+        self.assertEqual(out["process"], {"running": True, "pid": 4001, "startedAt": sx.iso_at(1700000000 + 800 / tick), "bootstrapPid": 4000,
+                                          "bootstrapStartedAt": sx.iso_at(1700000000 + 400 / tick), "user": sx.user_name(os.geteuid())})
+        self.assertEqual(out["limits"], {"nofile": {"soft": 1024, "hard": 4096}, "nproc": {"soft": "unlimited", "hard": "unlimited"}}, "the bootstrap's")
+        rest = out["rest"]
+        self.assertEqual((rest["state"], rest["invalidCount"], rest["url"]), ("ok", 0, "https://localhost:18445"))
+        self.assertEqual([(n["apiPort"], n["address"], n["status"], n["roles"]) for n in rest["cluster"]["nodes"]],
+                         [(18445, "localhost", "CONNECTED", ["Primary Node", "Cluster Coordinator"]), (18446, "localhost", "CONNECTED", [])])
+        self.assertEqual(sorted(rest["cluster"]["nodes"][0]), ["address", "apiPort", "nodeId", "roles", "status"])
+        self.assertEqual(rest["cluster"]["self"], rest["cluster"]["nodes"][0]["nodeId"], "by address and HTTPS port")
+        props = next(f for f in out["files"] if f["name"] == "nifi.properties")
+        self.assertEqual(props["sha256"], hashlib.sha256((self.c250 / "conf" / "nifi.properties").read_bytes()).hexdigest())
+        self.assertEqual((props["owner"], props["mode"]), (sx.user_name(os.geteuid()), "0640"))
+        self.assertIn("group", props)
+        self.assertIn("label", props)
+
+    def test_svc_state_of_the_standalones_has_no_nodes(self):
+        for name, home, port in (("n112", self.n112, 18443), ("n200", self.n200, 18444)):
+            c = self.collector()
+            out = c.state(self.state_entry(self.entry(name, home, https=port)))
+            self.assertEqual((out["process"]["running"], out["rest"]["state"], out["rest"]["invalidCount"]), (True, "ok", 0), name)
+            self.assertNotIn("cluster", out["rest"], name)
+            self.assertEqual([call[3] for call in c.calls], ["flow/status"], "only what it needs")
+
+    def test_svc_state_of_a_stopped_nifi_calls_nothing(self):
+        c = self.collector()
+        out = c.state(self.state_entry(self.entry("c250", self.stopped, https=18446)))
+        self.assertEqual(out["process"], {"running": False, "pid": None, "startedAt": None, "bootstrapPid": None, "bootstrapStartedAt": None, "user": None})
+        self.assertEqual((out["environment"], out["environmentDropped"], out["limits"], out["rest"]), (None, [], None, {"state": "not-running"}))
+        self.assertEqual(c.calls, [])
+        self.assertEqual([("sha256" in f, "owner" in f) for f in out["files"]], [(True, True), (True, True)], "the files are still there to compare")
+        (self.stopped / "conf" / "bootstrap.conf").unlink()
+        self.assertEqual(c.state(self.state_entry(self.entry("c250", self.stopped, https=18446)))["files"][1].get("missing"), True)
+
+    def test_svc_state_when_the_rest_api_does_not_answer_or_answers_with_an_error(self):
+        entry = self.state_entry(self.entry("c250", self.c250, https=18445, node="localhost"))
+        c = self.collector()
+        c.down.add(18445)
+        rest = c.state(entry)["rest"]
+        self.assertEqual((rest["state"], rest["url"]), ("unreachable", "https://localhost:18445"))
+        self.assertTrue(rest["error"])
+
+        c = self.collector()
+        c.fetch = lambda ctx, connect, port, sni, path, timeout: (409, b"Cluster is still in the process of voting on the appropriate Data Flow.")
+        rest = c.state(entry)["rest"]
+        self.assertEqual((rest["state"], rest["invalidCount"]), ("partial", None))
+        self.assertTrue(rest["errors"]["cluster"].startswith("HTTP 409: Cluster is still"), "an answer to wait on, not a failure")
+        self.assertNotIn("cluster", rest)
+
+        c = self.collector()
+        c.context = lambda: (None, "no monitor certificate")
+        self.assertEqual(c.state(entry)["rest"], {"state": "no-certificate", "error": "no monitor certificate"})
+
+    def test_svc_state_filters_the_start_environment_as_the_deployer_does(self):
+        # The same variables as test/services.test.ts "the start environment keeps what starting NiFi needs".
+        env = {"PATH": "/usr/bin", "HOME": "/home/nifi", "JAVA_HOME": "/opt/jdk", "LC_ALL": "C.UTF-8", "NIFI_HOME": "/opt/nifi", "TZ": "Asia/Shanghai",
+               "WSL_INTEROP": "/run/WSL/1_interop", "DISPLAY": ":0", "XDG_RUNTIME_DIR": "/run/user/1000", "SSH_AUTH_SOCK": "/tmp/x", "SHLVL": "1",
+               "NIFI_SENSITIVE_PROPS_KEY": "abc", "NIFI_TOKEN": "(hidden)", "JAVA_OPTS": "-Djavax.net.ssl.keyStorePassword=s3cret", "NIFI_PID_DIR": "(hidden)"}
+        kept, dropped = sx.filter_start_environment(env)
+        self.assertEqual(kept, {"PATH": "/usr/bin", "HOME": "/home/nifi", "JAVA_HOME": "/opt/jdk", "LC_ALL": "C.UTF-8", "NIFI_HOME": "/opt/nifi", "TZ": "Asia/Shanghai"})
+        self.assertEqual(dropped, ["DISPLAY", "JAVA_OPTS", "NIFI_PID_DIR", "NIFI_SENSITIVE_PROPS_KEY", "NIFI_TOKEN", "SHLVL", "SSH_AUTH_SOCK", "WSL_INTEROP", "XDG_RUNTIME_DIR"])
+        self.assertEqual(sx.filter_start_environment(None), (None, []))
+
+        (self.proc.root / "4000" / "environ").write_bytes(b"\0".join(f"{k}={v}".encode() for k, v in env.items()) + b"\0")
+        out = self.collector().state(self.state_entry(self.entry("c250", self.c250, https=18445, node="localhost")))
+        self.assertEqual((out["environment"], out["environmentDropped"]), (kept, dropped))
+        self.assertNotIn("s3cret", json.dumps(out), "its status is kept as it is")
+
+    def test_svc_state_says_the_label_where_there_is_one_and_never_fails_without_one(self):
+        path = str(self.c250 / "conf" / "nifi.properties")
+        with mock.patch.object(sx.os, "getxattr", return_value=b"system_u:object_r:usr_t:s0\0", create=True) as getxattr:
+            self.assertEqual(sx.file_attributes(path)["label"], "system_u:object_r:usr_t:s0")
+        getxattr.assert_called_once_with(path, "security.selinux")
+        with mock.patch.object(sx.os, "getxattr", side_effect=OSError(61, "No data available"), create=True):
+            self.assertIsNone(sx.file_attributes(path)["label"])
+
+    def test_svc_state_as_a_job_on_the_read_channel(self):
+        test = self
+
+        class Lab(sx.ServiceExecutor):
+            def make_collector(self):
+                return test.collector()
+
+        ex = self.executor(Lab)
+        self.assertTrue({"svc-state", "svc-state@1"} <= set(ex.KINDS))
+        self.api.watch = [self.entry("c250", self.c250, https=18445, node="localhost")]
+        ex.heartbeat()
+        member = ex.watch[0]["member"]
+        self.api.queue += [{"protocol": 2, "id": "svc-state-0001", "kind": "svc-state", "member": member, "change": "change-1", "expiresAt": "2026-11-09T00:00:00Z"},
+                           {"protocol": 2, "id": "svc-state-0002", "kind": "svc-state", "member": "local:/somewhere/else"}]
+        ex.run_once()
+        ex.run_once()
+        ex.wait_reads()
+        done = self.api.status["svc-state-0001"]
+        self.assertEqual((done["state"], done["result"]["member"], done["result"]["process"]["pid"]), ("succeeded", member, 4001))
+        self.assertEqual(self.api.status["svc-state-0002"]["state"], "refused")
+        self.assertIn("REST: ok", self.api.logs["svc-state-0001"])
+
+    def test_svc_state_when_the_processes_cannot_be_read_fails_rather_than_says_not_running(self):
+        c = sx.Collector(cfg(self.root), proc=self.root / "no-proc", uid=os.geteuid())
+        with self.assertRaises(OSError):
+            c.state(self.state_entry(self.entry("c250", self.c250, https=18445)))
 
     def test_redaction_matches_the_deployer(self):
         """The cases the Deployer's redact.ts passes (testdata/redact/cases.json): the two rule sets must agree."""

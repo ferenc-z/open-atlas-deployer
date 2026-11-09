@@ -24,7 +24,7 @@ import { OnboardingError, type Onboarding } from "./onboarding.ts";
 import type { Briefs } from "./brief.ts";
 import type { Drift } from "./drift.ts";
 import { PeerError, type Peer, type PeerStatus } from "./peer.ts";
-import { EXECUTOR_KINDS, EXECUTOR_VERSION, ExecutorUnsupported, hostIds, hostOf, newJobId, tokenSha256, type ExecutorKind, type Heartbeat } from "./handoff.ts";
+import { EXECUTOR_KINDS, EXECUTOR_VERSION, ExecutorUnsupported, hostIds, hostOf, newJobId, SERVICE_READ_KINDS, tokenSha256, type ExecutorKind, type Heartbeat } from "./handoff.ts";
 import { lineDiff } from "./ingress.ts";
 import { environmentStatus, hostStateOf, parseDockerPs, type Observer } from "./observe.ts";
 import { StoreError, type Actor, type ServiceConfigDraft, type Store } from "./store.ts";
@@ -195,7 +195,11 @@ export function createApp({ config, store, sessions, observer, deployments, vers
   }));
   api.get("/executor/v1/jobs/next", executorRoute(async (c, host, kind) => {
     const wait = Math.min(30, Math.max(0, Number(c.req.query("wait") ?? 0))) * 1000;
-    const job = await handoff.next(host, wait, c.req.raw.signal, kind);
+    // §16.3: a change runs on the service executor, which takes only reads meanwhile. A value not known here must not
+    // hand it a change.
+    const only = c.req.query("only");
+    if (only !== undefined && only !== "read") return reject(c, 400, "executor/bad-only", `only=${only.slice(0, 40)} is not known here.`);
+    const job = await handoff.next(host, wait, c.req.raw.signal, kind, only ? SERVICE_READ_KINDS : undefined);
     return job ? c.json({ job }) : c.body(null, 204);
   }));
   const ownJob = (handler: (c: Context, id: string) => Promise<Response>) => executorRoute(async (c, host, kind) => {

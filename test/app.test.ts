@@ -818,6 +818,13 @@ test("S18: a host's service executor has its own token and heartbeat, shows on t
   const build = await (await post(t, "/api/apps/shop/build", "uat", { version: "1.2.0" })).json();
   const id = build.jobs[0].id;
   assert.equal((await call("/executor/v1/jobs/next", service)).status, 204);
+  // §16.3: while a change runs there, the service executor asks only for reads; a value not known here hands it nothing.
+  t.store.queueExecutorJob("executor-upgrade-0", "app2", { protocol: 2, id: "executor-upgrade-0", kind: "executor-upgrade" }, undefined, "service");
+  t.store.queueExecutorJob("svc-read-0", "app2", { protocol: 2, id: "svc-read-0", kind: "svc-read" }, undefined, "service");
+  assert.equal((await call("/executor/v1/jobs/next?only=everything", service)).status, 400);
+  assert.equal((await (await call("/executor/v1/jobs/next?only=read", service)).json()).job.id, "svc-read-0", "the read behind the change");
+  assert.equal((await call("/executor/v1/jobs/next?only=read", service)).status, 204, "the change stays queued");
+  assert.equal((await (await call("/executor/v1/jobs/next", service)).json()).job.id, "executor-upgrade-0", "taken when no change runs");
   assert.equal((await call(`/executor/v1/jobs/${id}/status`, service, { method: "PUT", body: JSON.stringify({ state: "running", steps: [], result: {} }) })).status, 404);
   assert.equal((await call("/executor/v1/state", service, { method: "POST", body: JSON.stringify({ containers: "", files: {} }) })).status, 409);
   assert.equal((await (await call("/executor/v1/jobs/next", deploy)).json()).job.id, id);

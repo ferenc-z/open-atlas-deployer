@@ -10,8 +10,12 @@ as: not root, it sees and manages only that user's services.
 Jobs come on two channels (§12). The read channel runs jobs that only look (discover, read a file, read a log) side
 by side, at most EXECUTOR_READ_SLOTS at a time, each within its timeout (the request's timeoutSeconds, at most
 EXECUTOR_READ_TIMEOUT); a job that runs over is reported failed and its late result dropped. The change channel runs one
-job at a time, after the reads in flight have ended; for now it only has executor-upgrade (the executor's own release,
-§8.6). The read jobs so far: svc-discover (§6 step 2), which finds the NiFi on the machine from their processes and
+job at a time (§16.3): CHANGE_JOBS in a thread of their own, beside the reads, while the loop asks the Deployer only for
+reads (jobs/next?only=read), so that a second change stays queued there and never gets lost in a restart here;
+executor-upgrade (the executor's own release, §8.6) on the loop itself, after the reads in flight have ended. The read
+jobs so far: svc-state (§16.3), what one watched NiFi looks like now, for the Deployer to decide on: its processes, start
+environment (filtered), limits, the configuration files' hashes and owners, the REST API, the cluster's nodes, invalid
+components; svc-discover (§6 step 2), which finds the NiFi on the machine from their processes and
 from the directories it is given, and svc-read (§6 step 5), which reads an installation's configuration files for the
 Deployer to import; their content goes once over the job's content channel, never into the job's status. log-read
 (§9.3, §15.3) lists, tails, searches (by time, level, text or regular expression, .gz included; 5000 lines, 4 MiB, 30
@@ -44,6 +48,7 @@ import base64
 import calendar
 import collections
 import glob
+import grp
 import gzip
 import hashlib
 import hmac
@@ -57,6 +62,7 @@ import re
 import shutil
 import socket
 import ssl
+import stat
 import subprocess
 import sys
 import tarfile
@@ -228,6 +234,13 @@ def sha256_file(path):
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def group_name(gid):
+    try:
+        return grp.getgrgid(gid).gr_name
+    except KeyError:
+        return str(gid)
 
 
 def iso_at(seconds):
@@ -898,6 +911,60 @@ def trim_backpressure(d, top=BACKPRESSURE_TOP):
 TRIM = {"about": trim_about, "diagnostics": trim_diagnostics, "status": trim_status, "cluster": trim_cluster, "bulletins": trim_bulletins}
 
 
+# What svc-state says of the start environment (S10, as filterStartEnvironment in the Deployer's draft.ts): only what
+# starting NiFi depends on, nothing that looks secret. Its status is stored as it is, so it is filtered here.
+START_ENV_KEEP = frozenset({"PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "TZ", "UMASK", "JAVA_HOME", "JAVA_OPTS", "JAVA_TOOL_OPTIONS",
+                            "JRE_HOME", "RUN_AS_USER", "TMPDIR"})
+START_ENV_KEEP_NAME = re.compile(r"^(LC_[A-Z]+|NIFI_[A-Z0-9_]+)$")
+START_ENV_SECRET = re.compile(r"PASS|SECRET|TOKEN|CREDENTIAL|PRIVATE|(^|_)KEY($|_)|AUTH", re.I)
+START_ENV_SECRET_VALUE = re.compile(r"pass(word|wd)?=|secret=|token=", re.I)
+START_ENV_VALUE_MAX = 8192
+# The limits a start has to carry over (§16.3): /proc/<pid>/limits' line -> prlimit's name.
+LIMIT_LINES = {"Max open files": "nofile", "Max processes": "nproc"}
+
+
+def filter_start_environment(env):
+    """(what is kept, the names dropped); (None, []) without an environment."""
+    if env is None:
+        return None, []
+    kept, dropped = {}, []
+    for name, value in env.items():
+        wanted = name in START_ENV_KEEP or START_ENV_KEEP_NAME.match(name)
+        if not wanted or START_ENV_SECRET.search(name) or value == HIDDEN or START_ENV_SECRET_VALUE.search(value) or len(value) > START_ENV_VALUE_MAX:
+            dropped.append(name)
+        else:
+            kept[name] = value
+    return kept, sorted(dropped)
+
+
+def read_limits(proc, pid):
+    """{nofile: {soft, hard}, nproc: {soft, hard}} of a process, each a number or "unlimited"; None when unreadable."""
+    try:
+        lines = (pathlib.Path(proc) / str(pid) / "limits").read_text().splitlines()
+    except OSError:
+        return None
+    out = {}
+    for line in lines:
+        for title, name in LIMIT_LINES.items():
+            if line.startswith(title):
+                soft, hard = (int(v) if v.isdigit() else v for v in line[len(title):].split()[:2])
+                out[name] = {"soft": soft, "hard": hard}
+    return out
+
+
+def file_label(path):
+    """The file's SELinux label; None where there is none (no SELinux, or a file system without it)."""
+    try:
+        return os.getxattr(path, "security.selinux").rstrip(b"\0").decode(errors="replace")
+    except (OSError, AttributeError):
+        return None
+
+
+def file_attributes(path):
+    st = os.stat(path)
+    return {"owner": user_name(st.st_uid), "group": group_name(st.st_gid), "mode": f"{stat.S_IMODE(st.st_mode):04o}", "label": file_label(path)}
+
+
 class Collector:
     """Samples the watched NiFi (§15.3): process and host from /proc, disks, the REST API with the monitor certificate,
     the certificates' expiry (S27). Only reads; passwords and keys never leave the host. Tests replace fetch and keytool."""
@@ -1188,6 +1255,83 @@ class Collector:
             out["error"] = (e.strerror or str(e))[:200]
         return out
 
+    def cluster_table(self, nodes, address, port):
+        """The nodes as svc-state says them, and which is this member (by nifi.cluster.node.address and HTTPS port)."""
+        table = [{"nodeId": n.get("nodeId"), "address": n.get("address"), "apiPort": n.get("apiPort"), "status": n.get("status"), "roles": n.get("roles") or []} for n in nodes]
+        me = next((n["nodeId"] for n in table if n["address"] == address and n["apiPort"] == port), None) if address else None
+        return {"nodes": table, "self": me}
+
+    def state_rest(self, w, props):
+        """svc-state's REST part, with the monitor certificate, within NIFI_BUDGET. state: ok, partial (it answered, but
+        not everything: a 409 in an election), unreachable, no-certificate, no-https. A node that has not connected
+        answers some of this with an error, which is an answer to wait on, not a failure of the job."""
+        ctx, why_not = self.context()
+        if ctx is None:
+            return {"state": "no-certificate", "error": why_not}
+        target = nifi_target(w, props)
+        if not target:
+            return {"state": "no-https", "error": "nifi.web.https.port is not set: the collector only calls NiFi over HTTPS"}
+        connect, sni, port = target
+        node = props.get("nifi.cluster.is.node", "false").strip().lower() == "true"
+        out, errors = {"state": "ok", "url": f"https://{sni}:{port}", "invalidCount": None}, {}
+        deadline = time.monotonic() + NIFI_BUDGET
+        for name, path in [("status", "flow/status"), *([("cluster", "controller/cluster")] if node else [])]:
+            left = deadline - time.monotonic()
+            if left < 0.5:
+                errors[name] = f"skipped: {NIFI_BUDGET:g} seconds were used up"
+                continue
+            try:
+                status, body = self.fetch(ctx, connect, port, sni, path, min(REQUEST_TIMEOUT, left))
+            except (OSError, ssl.SSLError, http.client.HTTPException) as e:
+                return {"state": "unreachable", "url": out["url"], "error": (str(e) or type(e).__name__)[:300]}
+            if status != 200:
+                errors[name] = f"HTTP {status}: {body[:200].decode('utf-8', 'replace').strip()}"
+                continue
+            try:
+                d = json.loads(body)
+                if name == "status":
+                    out["invalidCount"] = trim_status(d).get("invalidCount")
+                else:
+                    out["cluster"] = self.cluster_table(trim_cluster(d)["nodes"], w.get("nodeAddress") or props.get("nifi.cluster.node.address", "").strip(), port)
+            except (ValueError, AttributeError, TypeError) as e:
+                errors[name] = f"unexpected answer: {e}"[:300]
+        if errors:
+            out.update(state="partial", errors=errors)
+        return out
+
+    def state(self, w):
+        """svc-state (§16.3): what one watched NiFi looks like now. Holds nothing between calls and changes nothing, so
+        the Deployer may ask as often as it needs; not seeing the processes is a failure, not "not running"."""
+        where = Discovery.layout(w["installDir"], conf=w["confDir"])
+        out = {"member": w["member"], "at": now_iso(), "problems": []}
+        props = {}
+        try:
+            props = read_properties(where["propertiesFile"])
+        except OSError as e:
+            out["problems"].append(f"cannot read {where['propertiesFile']}: {e.strerror or e}")
+        d = Discovery(self.proc, uid=self.uid)
+        proc = d.running().get((where["installDir"], where["confDir"]))
+        main, boot = (proc or {}).get("pid"), (proc or {}).get("bootstrapPid")
+        out["process"] = {"running": bool(main), "pid": main, "startedAt": d.started_at(main) if main else None,
+                          "bootstrapPid": boot, "bootstrapStartedAt": d.started_at(boot) if boot else None,
+                          "user": user_name(proc["uid"]) if proc else None}
+        # The bootstrap's, as discovery reads the start environment (S10): the JVM it starts raises its own limit.
+        environment, dropped = filter_start_environment(proc.get("environment") if proc else None)
+        out.update(environment=environment, environmentDropped=dropped, limits=read_limits(self.proc, boot or main) if proc else None)
+        if proc:
+            out["problems"].extend(proc.get("problems") or [])
+        out["files"] = []
+        for f in w.get("files") or []:
+            found = self.fingerprint(f)
+            try:
+                if "sha256" in found:
+                    found.update(file_attributes(f["path"]))
+            except OSError as e:
+                found["error"] = (e.strerror or str(e))[:200]
+            out["files"].append(found)
+        out["rest"] = self.state_rest(w, props) if main else {"state": "not-running"}
+        return out
+
     @property
     def summary(self):
         if getattr(self, "_summary", None) is None:
@@ -1232,6 +1376,8 @@ REDACT = (
     (re.compile(r"(?i)((?:pass(?:word|wd|phrase)?|pwd|secret|token|credentials?|api[_-]?key|access[_-]?key|private[_-]?key|sensitive\.props\.key)[\w.-]*[\"']?\s*[=:]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;&]+)"), r"\1[hidden]"),
     (re.compile(r"(?i)(\w+://[^/\s:@]+:)[^@\s/]+@"), r"\1[hidden]@"),
 )
+# How long a poll waits while a change runs (§16.3).
+CHANGE_POLL_SECONDS = 2
 SUMMARY_SAMPLE_MAX = 2048
 SUMMARY_READ_MAX = 4 << 20      # per member and round
 SUMMARY_BEHIND_MAX = 32 << 20   # further behind than this: skip to the newest SUMMARY_READ_MAX
@@ -1771,20 +1917,24 @@ class ProvenanceQuery:
 
 
 class ServiceExecutor(ProtocolExecutor):
-    """The service executor: the read channel, and executor-upgrade on the change channel."""
+    """The service executor: the read channel, and the change channel (executor-upgrade and CHANGE_JOBS)."""
 
     PACKAGE = PACKAGE
     PACKAGE_FILES = PACKAGE_FILES
     MAIN = "service_executor.py"
     EXECUTOR = "service"
     # Read jobs: kind -> method(job) returning the job's result (a dict).
-    READ_JOBS = {"svc-discover": "discover", "svc-read": "read_files", "log-read": "log_read", "log-tail": "log_tail",
+    READ_JOBS = {"svc-discover": "discover", "svc-read": "read_files", "svc-state": "state", "log-read": "log_read", "log-tail": "log_tail",
                  "nifi-provenance": "nifi_provenance"}
+    # Change jobs that run beside the reads: kind -> method(request, status), one at a time. None yet (svc-write and
+    # svc-control come with their own steps, §16.4).
+    CHANGE_JOBS = {}
     # What the read jobs can do beyond their first form, named "<kind>@<n>" in the heartbeat's kinds (§15.2): the
     # Deployer looks for one before it sends a request that needs it. svc-discover@2: dirs entries {install, conf};
     # svc-read@2: confDir (and bootstrapFile), an installation's conf directory kept apart from it (S25).
     # nifi-provenance@1: provenance, lineage, event and search-options as ProvenanceQuery reads them (S28).
-    CAPABILITIES = ["svc-discover@2", "svc-read@2", "nifi-provenance@1"]
+    # svc-state@1: the job's first form (§16.3), so the plain kind alone never counts.
+    CAPABILITIES = ["svc-discover@2", "svc-read@2", "nifi-provenance@1", "svc-state@1"]
     # Where discovery looks (tests point these elsewhere; the directories scanned are the configuration's scan_dirs).
     PROC = "/proc"
     AUTOSTART_DIRS = AUTOSTART_DIRS
@@ -1794,6 +1944,7 @@ class ServiceExecutor(ProtocolExecutor):
         super().__init__(cfg, out=out, api=api)
         self.reads = {}  # job id -> thread, for the reads in flight
         self.reads_lock = threading.Lock()
+        self.change_thread = None  # the change running beside the reads (run_once starts it, nothing else touches it)
         # The collector (§15.3): what the Deployer watches here (None until a heartbeat reply said), and the samples
         # not yet taken by the Deployer, as (monotonic time, sample).
         self.watch = None
@@ -1877,7 +2028,11 @@ class ServiceExecutor(ProtocolExecutor):
 
     @property
     def KINDS(self):
-        return [*self.READ_JOBS, *ProtocolExecutor.KINDS, *self.CAPABILITIES]
+        return [*self.READ_JOBS, *self.CHANGE_JOBS, *ProtocolExecutor.KINDS, *self.CAPABILITIES]
+
+    @property
+    def JOBS(self):
+        return {**ProtocolExecutor.JOBS, **self.CHANGE_JOBS}
 
     @staticmethod
     def user():
@@ -2207,6 +2362,20 @@ class ServiceExecutor(ProtocolExecutor):
 
     # --- provenance (S28, §9.5) ---
 
+    def watched(self, member):
+        with self.watch_lock:
+            w = next((x for x in self.watch or [] if x["member"] == member), None)
+        if w is None:
+            raise Refused("member is not an installation this executor watches")
+        return w
+
+    def state(self, job):
+        """svc-state (§16.3): request.member, a watched installation (Collector.state). A collector of its own: the
+        running one's hashes may be a round old, and this one decides what may be written."""
+        out = self.make_collector().state(self.watched(job.request.get("member")))
+        job.log(f"running: {out['process']['running']}, REST: {out['rest']['state']}, {len(out['files'])} file(s)")
+        return out
+
     def nifi_call(self, w, props):
         """(call(method, path, body, timeout) -> (status, bytes), whether it is a cluster node) for a watched NiFi's
         REST API with the monitor certificate, the TLS name and Host header as the collector uses them."""
@@ -2236,10 +2405,7 @@ class ServiceExecutor(ProtocolExecutor):
         Deployer knows it from an earlier search. At most 100 events, 4 MiB per answer, 30 seconds; NiFi's queries are
         deleted when done. The answer goes over the content channel (attributes may hold anything); the status has counts."""
         r = job.request
-        with self.watch_lock:
-            w = next((x for x in self.watch or [] if x["member"] == r.get("member")), None)
-        if w is None:
-            raise Refused("member is not an installation this executor watches")
+        w = self.watched(r.get("member"))
         where = Discovery.layout(w["installDir"], conf=w["confDir"])
         try:
             props = read_properties(where["propertiesFile"])
@@ -2260,6 +2426,8 @@ class ServiceExecutor(ProtocolExecutor):
         name, root = self.user()
         with self.reads_lock:
             reading = sorted(self.reads)
+        # The loop's own beats too: a change runs beside it.
+        body["busy"] = busy or self.job_id
         body.update({"user": name, "isRoot": root, "reading": reading, "readSlots": self.cfg["read_slots"]})
         with self.watch_lock:
             watching = None if self.watch is None else len(self.watch)
@@ -2279,16 +2447,56 @@ class ServiceExecutor(ProtocolExecutor):
         self.heartbeat()
         if not self.wait_for_slot(wait):
             return False
-        request = self.api.next_job(wait)
+        # While a change runs, only reads are taken: one taken and kept here would be lost in a restart, marked as taken.
+        # The poll stays short, for the next change to be taken soon after this one ends (a step of a rolling restart
+        # is one job after another).
+        changing = self.changing()
+        request = self.api.next_job(min(wait, CHANGE_POLL_SECONDS), only="read") if changing else self.api.next_job(wait)
         if not request:
             return False
-        if request.get("kind") in self.READ_JOBS and request.get("protocol") in PROTOCOLS and ID_RE.match(str(request.get("id", ""))):
+        kind, sound = request.get("kind"), request.get("protocol") in PROTOCOLS and ID_RE.match(str(request.get("id", "")))
+        if kind in self.READ_JOBS and sound:
             self.start_read(request)
-            return True
-        # The change channel: one job, after the reads in flight (an executor-upgrade restarts the process).
-        self.wait_reads()
-        self.handle(request)
+        elif changing:
+            self.refuse_beside_change(request)
+        elif kind in self.CHANGE_JOBS and sound:
+            self.change_thread = threading.Thread(target=self.run_change, args=(request,), daemon=True, name=f"change-{request['id']}")
+            self.change_thread.start()
+        else:
+            # executor-upgrade restarts the process, so the reads in flight end first and it stays on this loop.
+            if kind in ProtocolExecutor.JOBS:
+                self.wait_reads()
+            self.handle(request)
         return True
+
+    def changing(self):
+        return self.change_thread is not None and self.change_thread.is_alive()
+
+    def run_change(self, request):
+        try:
+            self.handle(request)
+        except Exception as e:  # handle already recorded the job's end
+            self.say(f"error: {e}")
+
+    def wait_change(self):
+        if self.change_thread is not None:
+            self.change_thread.join()
+
+    def refuse_beside_change(self, request):
+        """A job other than a read while a change runs: a Deployer that ignored only=read. handle would take over the
+        running change's marker and log, so it never gets there."""
+        job_id = str(request.get("id", ""))
+        if not ID_RE.match(job_id):
+            self.say(f"refused a job with the id {job_id[:80]!r}")
+            return
+        status = {"protocol": 2, "id": job_id, "kind": request.get("kind"), "state": "refused", "startedAt": now_iso(), "finishedAt": now_iso(), "steps": [], "result": {},
+                  "message": f"A change ({self.job_id}) is running on this service executor"}
+        self.say(f"{job_id} refused: {status['message']}")
+        try:
+            self.api.put_status(job_id, status)
+        except Exception as e:
+            self.say(f"cannot send the status of {job_id}, kept for later: {e}")
+            self.keep_pending(status)
 
     def wait_for_slot(self, wait):
         """True once fewer reads than EXECUTOR_READ_SLOTS run; False when none ended within `wait` seconds."""
@@ -2413,6 +2621,7 @@ def main(argv=None):
         ex.recover()
         ex.run_once()
         ex.wait_reads()
+        ex.wait_change()
         return 0
     ex.serve()
     return 0

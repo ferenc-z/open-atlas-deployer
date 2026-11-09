@@ -10,12 +10,24 @@
 
 import { createHash, randomBytes } from "node:crypto";
 import type { Environment } from "../compose/generate.ts";
+import type { SecretBox } from "./secretbox.ts";
 import type { ExecutorKind, ExecutorStatus, Store } from "./store.ts";
 export { EXECUTOR_KINDS, type ExecutorKind } from "./store.ts";
 
 export const PROTOCOL = 2;
 /** §8.6: the executor release this Deployer ships with (executor/deployer_executor.py VERSION); hosts on an older one are offered the upgrade. */
 export const EXECUTOR_VERSION = "0.9.0";
+
+/** §16.3: the service executor's read channel (service_executor.py READ_JOBS): what it may be handed while a change runs there. */
+export const SERVICE_READ_KINDS = ["svc-discover", "svc-read", "svc-state", "log-read", "log-tail", "nifi-provenance"];
+/** §16.3: jobs that must not run long after they were asked for (a stop when the executor comes back hours later). */
+const EXPIRING_KINDS = new Set(["svc-state", "svc-write", "svc-control"]);
+/** §16.3: how long such a job may wait in the queue when its request does not say (expiresAt). */
+export const QUEUE_LIMIT_MS = 5 * 60_000;
+/** §16.3: jobs whose content (every secret of a configuration) is sealed while it waits in the queue. */
+const SEALED_KINDS = new Set(["svc-write"]);
+/** §15.2: jobs whose first form is "<kind>@1", so the plain kind alone in a heartbeat never counts. */
+const FIRST_FORM_KINDS = new Set(["nifi-provenance", "svc-state", "svc-write", "svc-control"]);
 
 export interface Heartbeat {
   /** S18: which executor sent it; absent from deploy executors before S18. */
@@ -73,8 +85,8 @@ export function kindsNeeded(request: Record<string, unknown>): string[] {
   const kind = String(request.kind ?? "");
   const out = [kind];
   if (kind === "svc-discover" && Array.isArray(request.dirs) && request.dirs.some((d) => d !== null && typeof d === "object")) out.push("svc-discover@2");
-  // S28: provenance reads as ProvenanceQuery does them (the job's first form is @1, so the plain kind alone never counts).
-  if (kind === "nifi-provenance") out.push("nifi-provenance@1");
+  // S28: provenance reads as ProvenanceQuery does them; §16.3: svc-state, svc-write, svc-control.
+  if (FIRST_FORM_KINDS.has(kind)) out.push(`${kind}@1`);
   if (kind === "svc-read") {
     const home = String(request.installDir ?? "").replace(/\/+$/, "");
     if (request.confDir || (typeof request.bootstrapFile === "string" && request.bootstrapFile !== `${home}/conf/bootstrap.conf`)) out.push("svc-read@2");
@@ -90,17 +102,26 @@ export class ExecutorUnsupported extends Error {
   constructor(message: string, missing: string[]) { super(message); this.missing = missing; }
 }
 
+/** A job whose content would have to wait in the queue in the clear. */
+export class ContentNotSealed extends Error {
+  readonly status = 409;
+  readonly code = "executor/no-encryption-key";
+  constructor(kind: string) { super(`A ${kind} job holds secrets and cannot be queued without DEPLOYER_CREDENTIAL_ENCRYPTION_KEY.`); }
+}
+
 export const tokenSha256 = (token: string) => createHash("sha256").update(token).digest("hex");
 
 export class Handoff {
   private store: Store;
   private now: () => number;
+  private box: Pick<SecretBox, "seal" | "open"> | undefined;
   /** Long polls waiting for a job, by host. */
   private waiting = new Map<string, Set<() => void>>();
 
-  constructor(store: Store, now: () => number = Date.now) {
+  constructor(store: Store, now: () => number = Date.now, box?: Pick<SecretBox, "seal" | "open">) {
     this.store = store;
     this.now = now;
+    this.box = box;
   }
 
   // --- the Deployer's side ---------------------------------------------------------------------------
@@ -136,12 +157,20 @@ export class Handoff {
   }
 
   /** Queues a job for one executor of a host (by default its deploy executor); an env job's content is kept apart and
-   *  leaves the queue on pickup. */
+   *  leaves the queue on pickup, a svc-write's sealed until then. An expiring kind gets its expiresAt here when the
+   *  request has none, so that none waits for ever. */
   submit(id: string, request: Record<string, unknown>, host: string, kind: ExecutorKind = "deploy") {
     const missing = this.missing(host, request, kind);
     if (missing.length) throw this.unsupported(host, request, kind, missing);
     const { content, ...rest } = request;
-    this.store.queueExecutorJob(id, host, { protocol: PROTOCOL, id, ...rest }, typeof content === "string" ? content : undefined, kind);
+    const jobKind = String(request.kind ?? "");
+    let queued = typeof content === "string" ? content : undefined;
+    if (queued !== undefined && SEALED_KINDS.has(jobKind)) {
+      if (!this.box) throw new ContentNotSealed(jobKind);
+      queued = this.box.seal(queued);
+    }
+    if (EXPIRING_KINDS.has(jobKind) && rest.expiresAt === undefined) rest.expiresAt = new Date(this.now() + QUEUE_LIMIT_MS).toISOString();
+    this.store.queueExecutorJob(id, host, { protocol: PROTOCOL, id, ...rest }, queued, kind);
     for (const wake of this.waiting.get(`${kind}:${host}`) ?? []) wake();
   }
 
@@ -179,10 +208,11 @@ export class Handoff {
   }
 
   /** The next job for the host, waiting up to `waitMs` for one to be queued. `signal`: the executor's request; a poll
-   *  whose executor went away (restarted, network) takes no job, or it would be claimed with nobody to run it. */
-  async next(host: string, waitMs = 0, signal?: AbortSignal, kind: ExecutorKind = "deploy"): Promise<Record<string, unknown> | undefined> {
+   *  whose executor went away (restarted, network) takes no job, or it would be claimed with nobody to run it.
+   *  `only`: just these job kinds (§16.3: reads, while a change runs there); the rest stays queued. */
+  async next(host: string, waitMs = 0, signal?: AbortSignal, kind: ExecutorKind = "deploy", only?: string[]): Promise<Record<string, unknown> | undefined> {
     if (signal?.aborted) return undefined;
-    const now = this.claim(host, kind);
+    const now = this.claim(host, kind, only);
     if (now || waitMs <= 0) return now;
     await new Promise<void>((resolve) => {
       const key = `${kind}:${host}`;
@@ -193,19 +223,41 @@ export class Handoff {
       set.add(done);
       signal?.addEventListener("abort", done, { once: true });
     });
-    return signal?.aborted ? undefined : this.claim(host, kind);
+    return signal?.aborted ? undefined : this.claim(host, kind, only);
+  }
+
+  private closeQueued(id: string, message: string) {
+    this.store.setExecutorStatus(id, { state: "refused", steps: [], result: {}, message, finishedAt: new Date(this.now()).toISOString() });
+  }
+
+  /** §16.3: jobs still queued past their expiresAt (by this Deployer's clock, never the executor's) are refused and
+   *  their content dropped, with or without an executor there to ask. An expiresAt that cannot be read counts as past. */
+  expireQueued() {
+    for (const { id, expiresAt } of this.store.queuedExecutorJobsWithExpiry()) {
+      if (Date.parse(String(expiresAt)) > this.now()) continue;
+      this.store.takeQueuedExecutorJob(id);
+      this.closeQueued(id, `It waited in the queue past ${String(expiresAt)}, so it was not run.`);
+    }
   }
 
   /** The next queued job the executor can run; one it cannot (queued before it said so, or it was replaced by an
    *  older one since) fails here and never reaches it, so an old executor does not refuse a whole request it misreads. */
-  private claim(host: string, kind: ExecutorKind): Record<string, unknown> | undefined {
+  private claim(host: string, kind: ExecutorKind, only?: string[]): Record<string, unknown> | undefined {
+    this.expireQueued();
     for (;;) {
-      const job = this.store.claimExecutorJob(host, kind);
+      const job = this.store.claimExecutorJob(host, kind, only);
       if (!job) return undefined;
       const missing = this.missing(host, job, kind);
-      if (!missing.length) return job;
-      const at = new Date(this.now()).toISOString();
-      this.store.setExecutorStatus(String(job.id), { state: "refused", steps: [], result: {}, message: this.unsupported(host, job, kind, missing).message, finishedAt: at });
+      if (missing.length) {
+        this.closeQueued(String(job.id), this.unsupported(host, job, kind, missing).message);
+        continue;
+      }
+      if (typeof job.content !== "string" || !SEALED_KINDS.has(String(job.kind))) return job;
+      try {
+        return { ...job, content: this.box!.open(job.content) };
+      } catch { // the key changed while it waited: what it would write is not there any more
+        this.closeQueued(String(job.id), "Its content cannot be opened with this Deployer's key, so it was not run.");
+      }
     }
   }
 
