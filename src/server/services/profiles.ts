@@ -20,6 +20,8 @@ export interface CatalogEntry {
   sensitive: boolean;
   /** Used to tell which installations form one cluster (§6 step 3, P1). */
   grouping?: boolean;
+  /** false: nodes with the old and the new value cannot share a cluster, so changing it stops the whole cluster (S31). The list is not proven on a real cluster yet (§16.4 step 14b). */
+  rolling?: false;
   /** First version that has the key, and first that no longer has it (exclusive). */
   since?: string;
   until?: string;
@@ -58,6 +60,8 @@ export interface ServiceProfile {
   probes: string[];
   logs: string[];
   catalog: CatalogEntry[];
+  /** rolling: false for XML files: by file, the <property> names that cannot change node by node. */
+  notRollingXml: Record<string, string[]>;
   /** §9.2: the health rules' default thresholds (rules.ts); a service's thresholds column overrides them. */
   thresholds: Thresholds;
 }
@@ -99,6 +103,8 @@ const DESCRIPTIONS: Record<string, string> = {
   "nifi.cluster.load.balance.comms.timeout": "How long load balancing waits on a silent connection.",
   "nifi.zookeeper.connect.string": "The ZooKeeper servers the cluster elects its coordinator and primary node with.",
   "nifi.zookeeper.root.node": "The ZooKeeper path the cluster keeps its state under; one per cluster.",
+  "nifi.zookeeper.client.secure": "Whether NiFi talks TLS to ZooKeeper.",
+  "nifi.zookeeper.auth.type": "How NiFi authenticates to ZooKeeper, which decides who may read the znodes it creates.",
   "nifi.zookeeper.connect.timeout": "How long NiFi waits to connect to ZooKeeper.",
   "nifi.zookeeper.session.timeout": "How long a ZooKeeper session lives without heartbeats.",
   "nifi.state.management.provider.cluster": "The state-management.xml provider for cluster-wide state.",
@@ -111,6 +117,7 @@ const DESCRIPTIONS: Record<string, string> = {
   "nifi.remote.input.secure": "Whether site-to-site uses TLS.",
   "nifi.sensitive.props.key": "The key the flow's sensitive properties are encrypted with.",
   "nifi.sensitive.props.algorithm": "The algorithm the flow's sensitive properties are encrypted with.",
+  "nifi.sensitive.props.provider": "The security provider 1.x encrypts the flow's sensitive properties with.",
   "nifi.security.keystore": "The keystore with this NiFi's server certificate.",
   "nifi.security.keystoreType": "The keystore's type (JKS, PKCS12).",
   "nifi.security.keystorePasswd": "The keystore's password.",
@@ -149,7 +156,7 @@ const b = (key: string, type: CatalogEntry["type"], def: string | null, scope: C
  *  2026-11-05); a key the shipped file leaves out has its built-in value or null. A line's own defaults: defaults(). */
 const COMMON: CatalogEntry[] = [
   p("nifi.cluster.is.node", "boolean", "false", "cluster", { grouping: true }),
-  p("nifi.cluster.protocol.is.secure", "boolean", "false", "cluster", { note: "Shipped false in both lines; with HTTPS NiFi secures the cluster protocol anyway." }),
+  p("nifi.cluster.protocol.is.secure", "boolean", "false", "cluster", { rolling: false, note: "Shipped false in both lines; with HTTPS NiFi secures the cluster protocol anyway." }),
   p("nifi.cluster.node.address", "host", "", "node"),
   p("nifi.cluster.node.protocol.port", "port", "", "node"),
   p("nifi.cluster.load.balance.host", "host", "", "node"),
@@ -159,8 +166,10 @@ const COMMON: CatalogEntry[] = [
   p("nifi.cluster.node.connection.timeout", "duration", "5 sec", "cluster"),
   p("nifi.cluster.node.read.timeout", "duration", "5 sec", "cluster"),
   p("nifi.cluster.load.balance.comms.timeout", "duration", "30 sec", "cluster"),
-  p("nifi.zookeeper.connect.string", "string", "", "cluster", { grouping: true, note: "An external dependency, not managed (S22)." }),
-  p("nifi.zookeeper.root.node", "string", "/nifi", "cluster", { grouping: true }),
+  p("nifi.zookeeper.connect.string", "string", "", "cluster", { grouping: true, rolling: false, note: "An external dependency, not managed (S22)." }),
+  p("nifi.zookeeper.root.node", "string", "/nifi", "cluster", { grouping: true, rolling: false }),
+  p("nifi.zookeeper.client.secure", "boolean", "false", "cluster", { rolling: false }),
+  p("nifi.zookeeper.auth.type", "string", "", "cluster", { rolling: false }),
   p("nifi.zookeeper.connect.timeout", "duration", "10 secs", "cluster"),
   p("nifi.zookeeper.session.timeout", "duration", "10 secs", "cluster"),
   p("nifi.state.management.provider.cluster", "string", "zk-provider", "cluster"),
@@ -171,8 +180,8 @@ const COMMON: CatalogEntry[] = [
   p("nifi.remote.input.host", "host", "", "node"),
   p("nifi.remote.input.socket.port", "port", "", "node"),
   p("nifi.remote.input.secure", "boolean", "true", "cluster"),
-  p("nifi.sensitive.props.key", "string", "", "cluster", { sensitive: true, note: "Nodes with different keys cannot read each other's flow." }),
-  p("nifi.sensitive.props.algorithm", "string", null, "cluster"),
+  p("nifi.sensitive.props.key", "string", "", "cluster", { sensitive: true, rolling: false, note: "Nodes with different keys cannot read each other's flow." }),
+  p("nifi.sensitive.props.algorithm", "string", null, "cluster", { rolling: false }),
   p("nifi.security.keystore", "path", "", "node"),
   p("nifi.security.keystoreType", "string", "", "node"),
   p("nifi.security.keystorePasswd", "string", "", "node", { sensitive: true }),
@@ -193,6 +202,8 @@ const COMMON: CatalogEntry[] = [
 const defaults = (values: Record<string, string | null>, file: ConfigFile = "nifi.properties") =>
   COMMON.map((e) => (e.file === file && e.key in values ? { ...e, default: values[e.key]! } : e));
 
+const NOT_ROLLING_XML = { "state-management.xml": ["Connect String", "Root Node"] };
+
 const NIFI_1: ServiceProfile = {
   id: "nifi-1.x", service: "nifi", major: 1, tested: ["1.12.1"], java: ["8", "11"],
   files: [
@@ -207,8 +218,10 @@ const NIFI_1: ServiceProfile = {
   probes: ["/nifi-api/system-diagnostics", "/nifi-api/flow/status", "/nifi-api/controller/cluster", "/nifi-api/flow/bulletin-board"],
   logs: ["logs/nifi-app.log", "logs/nifi-user.log", "logs/nifi-bootstrap.log"],
   thresholds: NIFI_THRESHOLDS,
+  notRollingXml: NOT_ROLLING_XML,
   catalog: [
     ...defaults({ "nifi.web.http.port": "8080", "nifi.remote.input.secure": "false", "nifi.sensitive.props.algorithm": "PBEWITHMD5AND256BITAES-CBC-OPENSSL" }),
+    p("nifi.sensitive.props.provider", "string", "BC", "cluster", { rolling: false }),
     b("java", "path", "java", "node", { note: "The java command; nodes may differ in path, not in major version. 2.x has no such key (JAVA_HOME)." }),
     p("nifi.flow.configuration.file", "path", "./conf/flow.xml.gz", "node"),
     p("nifi.flow.configuration.json.file", "path", "./conf/flow.json.gz", "node", { since: "1.16.0" }),
@@ -224,6 +237,7 @@ const NIFI_2: ServiceProfile = {
   probes: NIFI_1.probes,
   logs: NIFI_1.logs,
   thresholds: NIFI_THRESHOLDS,
+  notRollingXml: NOT_ROLLING_XML,
   catalog: [
     ...defaults({
       "nifi.web.https.host": "localhost", "nifi.web.https.port": "8443", "nifi.sensitive.props.algorithm": "NIFI_PBKDF2_AES_GCM_256",
