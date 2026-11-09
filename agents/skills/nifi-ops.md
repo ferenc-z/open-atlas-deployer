@@ -23,7 +23,7 @@ How to look into the NiFi clusters and standalone instances the Deployer manages
 | Nodes disagree? | `diff_service_config {id}` | only differences; error = must agree, warning = should, info = per node by design |
 | What changed between two revisions | `diff_service_config {id, from?, to?, member?}` | either one is enough: `to` alone compares it with the revision it came from; a changed secret is only named |
 | Does the server still have what is kept? | `get_service_drift {id}`, then `{id, member}` for the changed lines | `known: false`: some member cannot tell (its `reason` says why); never read that as "no drift". A person adopts a drifted file on the Changes tab; overwriting the host is not there yet |
-| Was it applied or restarted from here? | `list_service_changes {id}`, `get_service_change {id, change}` | not there yet: the list is empty. Say you do not know |
+| Was it applied or restarted from here? | `list_service_changes {id}`, `get_service_change {id, change}` | `active` holds the service while it runs or waits for a person (`stopped`: read `message`). Changes made by hand on the host are not listed: say you do not know about those |
 | Where did a FlowFile go, where did it stop? | `search_provenance {id, uuid or field+value, from, to}` → `get_lineage {id, uuid, node?}` → `get_provenance_event {id, eventId, node?}` | NiFi provenance (the FlowFile trace); a time range is required, keep it tight; on a cluster pass the event's `clusterNodeId` as `node` for lineage and event |
 | What a property means, its default, restart needed? | `lookup_property {service, key}` or `{version, q}` | answer by the service's version; `otherVersions` = the key exists in another version only |
 

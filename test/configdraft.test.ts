@@ -645,12 +645,12 @@ test("diff_service_config compares two revisions for the AI: a changed secret by
   assert.match((await tool(t, AI, "diff_service_config", { id: "solo" })).value.note, /from or to/);
 });
 
-test("the read tools for what comes later say they know nothing yet", async () => {
+test("the read tools for what comes later: no change made yet, drift not known yet", async () => {
   const t = setup();
   takenOver(t.store);
   const list = await tool(t, AI, "list_service_changes", { id: "solo" });
   assert.deepEqual(list.value.changes, []);
-  assert.match(list.value.note, /not there yet/);
+  assert.equal(list.value.active, null);
   assert.equal((await tool(t, AI, "get_service_change", { id: "solo", change: "x" })).value.finding.code, "service-change/unknown");
   assert.equal((await tool(t, AI, "get_service_drift", { id: "solo" })).value.known, false, "no samples yet: not known");
   for (const name of ["list_service_changes", "get_service_drift"]) assert.equal((await tool(t, AI, name, { id: "nope" })).value.finding.code, "service/unknown");

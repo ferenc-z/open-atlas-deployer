@@ -26,6 +26,7 @@ import { Handoff, hostIds } from "./handoff.ts";
 import { Observer } from "./observe.ts";
 import { Peer } from "./peer.ts";
 import { SecretBox } from "./secretbox.ts";
+import { ServiceChanges } from "./services/changes.ts";
 import { ConfigReviewer } from "./services/configreview.ts";
 import { Takeover } from "./services/takeover.ts";
 import { Store } from "./store.ts";
@@ -102,12 +103,16 @@ const nifiOpsGraph = new NifiOpsGraph(store, { studio, graph: config.nifiOpsGrap
 const configReview = box && config.omaUrl && config.omaApiKeyFile && config.omaAgent
   ? new ConfigReviewer(store, new OmaSessions({ url: config.omaUrl, keyFile: config.omaApiKeyFile, agent: config.omaAgent, ...(config.omaEnvironment ? { environment: config.omaEnvironment } : {}), vaults: [], ...(config.omaApplicationId ? { application: config.omaApplicationId } : {}) }), box, () => deployments.environment().env.name)
   : undefined;
-const app = createApp({ config, store, takeover, ...(configReview ? { configReview } : {}), graph: nifiOpsGraph, sessions: new WorkbenchSessions(config.workbenchUrl), observer, deployments, versions, env, peer, onboarding, drift, briefs, keys, workbench, workbenchKey, deployerSettings,
+// §16.3: the changes of services, driven from the database: what was running when this process started finishes its member and waits for a person.
+const serviceChanges = new ServiceChanges({ store, handoff: deployments.handoff, box });
+serviceChanges.recover();
+const app = createApp({ config, store, takeover, changes: serviceChanges, ...(configReview ? { configReview } : {}), graph: nifiOpsGraph, sessions: new WorkbenchSessions(config.workbenchUrl), observer, deployments, versions, env, peer, onboarding, drift, briefs, keys, workbench, workbenchKey, deployerSettings,
   // D45: the image sets DEPLOYER_RESTART_BY_EXIT; the container's restart policy starts it again with the new settings.
   ...(process.env.DEPLOYER_RESTART_BY_EXIT === "true" ? { restart: () => setTimeout(() => { store.close(); process.exit(75); }, 300) } : {}) });
 // Job records follow the executor's status files even while nobody has the page open.
 setInterval(() => {
   deployments.sync().catch((error) => console.error("sync:", error));
+  try { serviceChanges.tick(); } catch (error) { console.error("service changes:", error); }
   diagnoser?.poll().catch((error) => console.error("diagnose:", error));
   onboarding.poll().catch((error) => console.error("assessments:", error));
   configReview?.poll().catch((error) => console.error("config review:", error));

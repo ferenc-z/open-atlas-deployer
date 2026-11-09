@@ -228,9 +228,24 @@ export class Handoff {
     return signal?.aborted ? undefined : this.claim(host, kind, only);
   }
 
+  /** result.notRun: the Deployer refused it, so no executor ever saw it. */
   private closeQueued(id: string, message: string) {
-    this.store.setExecutorStatus(id, { state: "refused", steps: [], result: {}, message, finishedAt: new Date(this.now()).toISOString() });
+    this.store.setExecutorStatus(id, { state: "refused", steps: [], result: { notRun: true } as ExecutorStatus["result"], message, finishedAt: new Date(this.now()).toISOString() });
   }
+
+  /** Takes a job back while it waits in the queue, its content with it; one an executor already has goes on regardless. */
+  cancelQueued(id: string, message: string) {
+    const job = this.store.executorJob(id);
+    if (!job || job.pickedAt) return;
+    this.store.takeQueuedExecutorJob(id);
+    this.closeQueued(id, message);
+  }
+
+  /** Forgets a job that has ended. */
+  drop(id: string) { this.store.dropExecutorJob(id); }
+
+  /** Whether a svc-write's content can wait in the queue sealed. */
+  get canSeal() { return Boolean(this.box); }
 
   /** §16.3: jobs still queued past their expiresAt (by this Deployer's clock, never the executor's) are refused and
    *  their content dropped, with or without an executor there to ask. An expiresAt that cannot be read counts as past. */

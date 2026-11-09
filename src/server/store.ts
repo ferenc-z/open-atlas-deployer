@@ -31,6 +31,13 @@ export interface ServiceConfigDraft {
   createdAt: string; createdBy: string; via: string; updatedAt: string; updatedBy: string; savedRevision: number | null;
 }
 /** What one member's file should be: written by a change (or the import), so it can lag the newest revision. */
+/** §16.3: a change of a service. plan, options and progress belong to services/changes.ts. */
+export interface ServiceChange {
+  id: string; service: string; kind: string; revision: number | null; mode: "rolling" | "full"; phase: string; state: "running" | "paused" | "stopped" | "succeeded" | "rolled-back" | "closed";
+  plan: unknown; options: unknown; currentMember: string | null; reason: string | null; message: string | null; progress: unknown; createdAt: string; createdBy: string; via: string; finishedAt: string | null;
+}
+export interface ServiceChangeStep { change: string; seq: number; member: string | null; step: string; state: "running" | "succeeded" | "failed" | "timed-out"; job: string | null; deadline: string; startedAt: string; finishedAt: string | null; detail: Record<string, unknown> }
+
 export interface ServiceMemberFile {
   member: string; file: string; path: string; expectedSha256: string; revision: number; appliedAt: string; change: string | null; actualSha256: string | null; actualAt: string | null;
 }
@@ -130,6 +137,14 @@ CREATE INDEX IF NOT EXISTS service_config_drafts_service ON service_config_draft
 CREATE TABLE IF NOT EXISTS service_member_files (
   service TEXT NOT NULL, member TEXT NOT NULL, file TEXT NOT NULL, path TEXT NOT NULL, expected_sha256 TEXT NOT NULL, revision INTEGER NOT NULL,
   applied_at TEXT NOT NULL, change TEXT, actual_sha256 TEXT, actual_at TEXT, PRIMARY KEY (service, member, file));
+CREATE TABLE IF NOT EXISTS service_changes (
+  id TEXT PRIMARY KEY, service TEXT NOT NULL, kind TEXT NOT NULL, revision INTEGER, mode TEXT NOT NULL, phase TEXT NOT NULL, state TEXT NOT NULL, plan TEXT NOT NULL,
+  options TEXT NOT NULL, current_member TEXT, reason TEXT, message TEXT, progress TEXT NOT NULL, created_at TEXT NOT NULL, created_by TEXT NOT NULL, via TEXT NOT NULL, finished_at TEXT);
+CREATE UNIQUE INDEX IF NOT EXISTS service_changes_active ON service_changes (service) WHERE state IN ('running', 'paused', 'stopped');
+CREATE INDEX IF NOT EXISTS service_changes_service ON service_changes (service, created_at);
+CREATE TABLE IF NOT EXISTS service_change_steps (
+  change TEXT NOT NULL REFERENCES service_changes(id), seq INTEGER NOT NULL, member TEXT, step TEXT NOT NULL, state TEXT NOT NULL, job TEXT, deadline TEXT NOT NULL,
+  started_at TEXT NOT NULL, finished_at TEXT, detail TEXT, PRIMARY KEY (change, seq));
 CREATE TABLE IF NOT EXISTS service_samples (
   service TEXT NOT NULL, member TEXT NOT NULL, at TEXT NOT NULL, body TEXT NOT NULL, received_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS service_samples_at ON service_samples (service, member, at);
@@ -309,6 +324,10 @@ export class Store {
     // An installation's conf directory when bootstrap.conf's conf.dir moves it (NULL, as before: <install_dir>/conf).
     for (const table of ["service_standalones", "service_nodes"]) {
       if (!(this.db.prepare(`PRAGMA table_info(${table})`).all() as Row[]).some((c) => c.name === "conf_dir")) this.db.exec(`ALTER TABLE ${table} ADD COLUMN conf_dir TEXT`);
+    }
+    // Phase 3 step 11: the limits a running NiFi has, to start it with again (§16.3).
+    for (const table of ["service_standalones", "service_nodes"]) {
+      if (!(this.db.prepare(`PRAGMA table_info(${table})`).all() as Row[]).some((c) => c.name === "start_limits")) this.db.exec(`ALTER TABLE ${table} ADD COLUMN start_limits TEXT`);
     }
     // Phase 2 step 2: each sample's flat numbers (the Metrics tab, the rollups), next to step 1's raw body.
     if (!(this.db.prepare("PRAGMA table_info(service_samples)").all() as Row[]).some((c) => c.name === "point")) this.db.exec("ALTER TABLE service_samples ADD COLUMN point TEXT");
@@ -1090,6 +1109,97 @@ export class Store {
     });
   }
 
+  /** A member's files as a change has just left them (§16.3): what they should be from now on, and what they are, so that no older sample calls it drift. */
+  setMemberFilesApplied(service: string, member: string, files: { file: string; path: string; sha256: string; revision: number }[], change: string) {
+    const at = this.stamp();
+    const upsert = this.db.prepare(`INSERT INTO service_member_files (service, member, file, path, expected_sha256, revision, applied_at, change, actual_sha256, actual_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT (service, member, file) DO UPDATE SET path = excluded.path, expected_sha256 = excluded.expected_sha256, revision = excluded.revision, applied_at = excluded.applied_at, change = excluded.change, actual_sha256 = excluded.actual_sha256, actual_at = excluded.actual_at`);
+    this.inTransaction(() => { for (const f of files) upsert.run(service, member, f.file, f.path, f.sha256, f.revision, at, change, f.sha256, at); });
+  }
+
+  /** How a member is started from now on (§16.3): what the running process had. */
+  setServiceMemberStart(service: string, member: string, environment: Record<string, string> | null, limits: unknown) {
+    for (const [table, owner] of [["service_standalones", "id"], ["service_nodes", "cluster"]] as const) {
+      for (const r of this.db.prepare(`SELECT rowid AS row_id, * FROM ${table} WHERE ${owner} = ?`).all(service) as Row[]) {
+        if (installKey(this.toMember(r)) === member) this.db.prepare(`UPDATE ${table} SET start_env = ?, start_limits = ? WHERE rowid = ?`).run(environment && JSON.stringify(environment), limits === null ? null : JSON.stringify(limits), r.row_id);
+      }
+    }
+  }
+
+  // §16.3: changes of a service and their steps. services/changes.ts decides; here is only what they are.
+  private toChange(r: Row): ServiceChange {
+    return { id: r.id, service: r.service, kind: r.kind, revision: r.revision ?? null, mode: r.mode, phase: r.phase, state: r.state, plan: JSON.parse(r.plan), options: JSON.parse(r.options), currentMember: r.current_member ?? null, reason: r.reason ?? null, message: r.message ?? null, progress: JSON.parse(r.progress), createdAt: r.created_at, createdBy: r.created_by, via: r.via, finishedAt: r.finished_at ?? null };
+  }
+
+  /** One change at a time per service, also while it is stopped (the unique index); the timeline and the audit in the same step. */
+  createServiceChange(c: { id: string; service: string; kind: string; revision: number | null; mode: string; phase: string; plan: unknown; options: unknown; reason: string | null; progress: unknown; text: string }, actor: Actor): ServiceChange {
+    return this.inTransaction(() => {
+      const active = this.db.prepare("SELECT id, state FROM service_changes WHERE service = ? AND state IN ('running', 'paused', 'stopped')").get(c.service) as Row | undefined;
+      if (active) throw new StoreError("service-change/active", `Change ${active.id} of ${c.service} is ${active.state}: finish or close it first.`);
+      const at = this.stamp();
+      this.db.prepare("INSERT INTO service_changes (id, service, kind, revision, mode, phase, state, plan, options, reason, progress, created_at, created_by, via) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)")
+        .run(c.id, c.service, c.kind, c.revision, c.mode, c.phase, JSON.stringify(c.plan), JSON.stringify(c.options), c.reason, JSON.stringify(c.progress), at, actor.id, actor.via);
+      this.insertServiceEvent({ service: c.service, member: null, at, kind: "change-started", detail: { text: c.text, by: actor.id, change: c.id } });
+      this.insertAudit(actor, "service.change-started", `${c.service}/${c.id}`, { kind: c.kind, revision: c.revision, mode: c.mode, reason: c.reason });
+      return this.serviceChange(c.service, c.id)!;
+    });
+  }
+
+  serviceChange(service: string, id: string): ServiceChange | undefined {
+    const r = this.db.prepare("SELECT * FROM service_changes WHERE service = ? AND id = ?").get(service, id) as Row | undefined;
+    return r && this.toChange(r);
+  }
+
+  serviceChanges(service: string, limit = 50): ServiceChange[] {
+    return (this.db.prepare("SELECT * FROM service_changes WHERE service = ? ORDER BY created_at DESC, rowid DESC LIMIT ?").all(service, limit) as Row[]).map((r) => this.toChange(r));
+  }
+
+  /** The change holding a service: running, paused or stopped. */
+  activeServiceChange(service: string): ServiceChange | undefined {
+    const r = this.db.prepare("SELECT * FROM service_changes WHERE service = ? AND state IN ('running', 'paused', 'stopped')").get(service) as Row | undefined;
+    return r && this.toChange(r);
+  }
+
+  activeServiceChanges(): ServiceChange[] {
+    return (this.db.prepare("SELECT * FROM service_changes WHERE state IN ('running', 'paused', 'stopped') ORDER BY created_at").all() as Row[]).map((r) => this.toChange(r));
+  }
+
+  runningServiceChanges(): ServiceChange[] {
+    return (this.db.prepare("SELECT * FROM service_changes WHERE state = 'running' ORDER BY created_at").all() as Row[]).map((r) => this.toChange(r));
+  }
+
+  updateServiceChange(id: string, c: Pick<ServiceChange, "state" | "phase" | "currentMember" | "message" | "finishedAt" | "progress">) {
+    this.db.prepare("UPDATE service_changes SET state = ?, phase = ?, current_member = ?, message = ?, finished_at = ?, progress = ? WHERE id = ?").run(c.state, c.phase, c.currentMember, c.message, c.finishedAt, JSON.stringify(c.progress), id);
+  }
+
+  private toChangeStep(r: Row): ServiceChangeStep {
+    return { change: r.change, seq: r.seq, member: r.member ?? null, step: r.step, state: r.state, job: r.job ?? null, deadline: r.deadline, startedAt: r.started_at, finishedAt: r.finished_at ?? null, detail: r.detail ? JSON.parse(r.detail) : {} };
+  }
+
+  addServiceChangeStep(s: { change: string; member: string | null; step: string; job: string | null; deadline: string; startedAt: string }): ServiceChangeStep {
+    const seq = ((this.db.prepare("SELECT MAX(seq) AS n FROM service_change_steps WHERE change = ?").get(s.change) as Row).n as number | null ?? 0) + 1;
+    this.db.prepare("INSERT INTO service_change_steps (change, seq, member, step, state, job, deadline, started_at) VALUES (?, ?, ?, ?, 'running', ?, ?, ?)").run(s.change, seq, s.member, s.step, s.job, s.deadline, s.startedAt);
+    return { ...s, seq, state: "running", finishedAt: null, detail: {} };
+  }
+
+  updateServiceChangeStep(change: string, seq: number, s: { state?: ServiceChangeStep["state"]; finishedAt?: string; detail?: Record<string, unknown> }) {
+    this.db.prepare("UPDATE service_change_steps SET state = COALESCE(?, state), finished_at = COALESCE(?, finished_at), detail = COALESCE(?, detail) WHERE change = ? AND seq = ?").run(s.state ?? null, s.finishedAt ?? null, s.detail ? JSON.stringify(s.detail) : null, change, seq);
+  }
+
+  serviceChangeSteps(change: string): ServiceChangeStep[] {
+    return (this.db.prepare("SELECT * FROM service_change_steps WHERE change = ? ORDER BY seq").all(change) as Row[]).map((r) => this.toChangeStep(r));
+  }
+
+  runningServiceChangeStep(change: string): ServiceChangeStep | undefined {
+    const r = this.db.prepare("SELECT * FROM service_change_steps WHERE change = ? AND state = 'running' ORDER BY seq DESC LIMIT 1").get(change) as Row | undefined;
+    return r && this.toChangeStep(r);
+  }
+
+  /** A job nobody will look at again (a change's round of svc-state). */
+  dropExecutorJob(id: string) {
+    this.db.prepare("DELETE FROM executor_jobs WHERE id = ?").run(id);
+  }
+
   private toConfigDraft(r: Row): ServiceConfigDraft {
     return {
       id: r.id, service: r.service, base: r.base_revision, state: r.state, changes: JSON.parse(r.changes), note: r.note ?? null, findings: r.findings ? JSON.parse(r.findings) : [],
@@ -1249,7 +1359,7 @@ export class Store {
   }
 
   private toMember(r: Row): ServiceMember & { control?: string } {
-    return { host: r.host, installDir: r.install_dir, confDir: r.conf_dir ?? confDirOf({ installDir: r.install_dir }), serviceUser: r.service_user ?? null, startEnvironment: parse(r.start_env), ports: JSON.parse(r.ports), ...(r.node_address !== undefined ? { nodeAddress: r.node_address ?? null } : {}), discovery: parse(r.discovery), ...(r.control ? { control: r.control } : {}) };
+    return { host: r.host, installDir: r.install_dir, confDir: r.conf_dir ?? confDirOf({ installDir: r.install_dir }), serviceUser: r.service_user ?? null, startEnvironment: parse(r.start_env), ...(r.start_limits ? { startLimits: parse(r.start_limits) } : {}), ports: JSON.parse(r.ports), ...(r.node_address !== undefined ? { nodeAddress: r.node_address ?? null } : {}), discovery: parse(r.discovery), ...(r.control ? { control: r.control } : {}) };
   }
 
   standalones(): (DraftStandalone & Registered)[] {

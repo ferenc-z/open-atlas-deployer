@@ -36,6 +36,7 @@ import { configView } from "./services/configview.ts";
 import { catalogFor, profile as profileById, profileFor, PROFILES } from "./services/profiles.ts";
 import type { ConfigReviewer } from "./services/configreview.ts";
 import { checkConfig, openMembers } from "./services/configcheck.ts";
+import { ChangeError, changeView as serviceChangeView, checkContextOf, planView, ServiceChanges } from "./services/changes.ts";
 import { adoptedBody, DriftError, hasDrifted, liveDifferences, readLive, serviceDrift, type LiveReadOptions } from "./services/configdrift.ts";
 import { installKey, type DraftItem } from "./services/draft.ts";
 import { serviceStatus, thresholdsOf, timeline } from "./services/status.ts";
@@ -87,6 +88,8 @@ export interface Dependencies {
   configReview?: Pick<ConfigReviewer, "start">;
   /** §16.3: how long reading a file from a host for its drift waits (tests pass their own timings). */
   liveRead?: LiveReadOptions;
+  /** §16.3: the change engine; made here when not given. */
+  changes?: ServiceChanges;
   /** Service ops §6: taking over discovered services (drafts, confirmation). */
   takeover?: Takeover;
   /** Phase 2 step 4: reading and following services' logs through their service executors (tests pass their own timings). */
@@ -159,6 +162,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
   // D35: the executors. Each host's executor calls in with its own token (dpe_); the Deployer never calls a host.
   // S18: the token also says which of the host's executors calls (deploy or service); each gets only its own jobs.
   const handoff = deployments.handoff;
+  const changes = deps.changes ?? new ServiceChanges({ store, handoff, box: takeover?.box, liveRead: deps.liveRead });
   const serviceLogs = deps.logs ?? new ServiceLogs(store, handoff);
   const provenance = deps.provenance ?? new ServiceProvenance(store, handoff, serviceLogs);
   const graph = deps.graph ?? new NifiOpsGraph(store, { studio: undefined, graph: config.nifiOpsGraph });
@@ -242,6 +246,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
       : !info.heartbeat?.kinds?.includes("executor-upgrade") ? `Executor ${version} on ${host} cannot upgrade itself: install ${EXECUTOR_VERSION} there by hand once (install.sh)`
       : !info.heartbeat.upgradeFrom ? `EXECUTOR_UPGRADE_FROM is not set on ${host}: set it in executor.env and restart the executor`
       : busy ? `${host} is running ${busy.id}; upgrade when it ends`
+      : changes.working(host).length ? `${host} is in the middle of change ${changes.working(host)[0]!.id}; upgrade when it ends`
       : undefined;
     return { available, ...(blocked ? { blocked } : {}), job, from: info.heartbeat?.upgradeFrom ?? null };
   };
@@ -259,6 +264,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
       : !at!.online ? at!.reason
       : !at!.heartbeat?.kinds?.includes("deployer-upgrade") ? `Executor ${at!.heartbeat?.version} on ${at!.host} cannot upgrade the Deployer: upgrade it to ${EXECUTOR_VERSION} first`
       : active.length ? `${active.map((j) => j.id).join(", ")} ${active.length > 1 ? "are" : "is"} running; upgrade when nothing runs`
+      : changes.working().length ? `Change ${changes.working()[0]!.id} of ${changes.working()[0]!.service} is in progress; upgrade when it ends`
       : undefined;
     return {
       version: DEPLOYER_VERSION, host: at?.host ?? null, image: at?.heartbeat?.deployer?.image ?? null, ...(blocked ? { blocked } : {}),
@@ -803,20 +809,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     throw error;
   };
   /** What the checks look at besides the files: the other services' ports, and each host's memory from its newest sample. */
-  const checkContext = (service: NonNullable<ReturnType<typeof registeredService>>) => {
-    const others = [
-      ...store.standalones().filter((s) => s.id !== service.id).map((s) => ({ service: s.service, profile: s.profile, member: s.member })),
-      ...store.clusters().filter((s) => s.id !== service.id).flatMap((s) => s.nodes.map((member) => ({ service: s.service, profile: s.profile, member }))),
-    ];
-    const members = service.kind === "standalone" ? [service.member] : service.nodes;
-    const memory: Record<string, number> = {};
-    for (const s of store.latestServiceSamples(service.id)) {
-      const total = (s.body as { host?: { memory?: { totalBytes?: unknown } } }).host?.memory?.totalBytes;
-      const m = members.find((x) => installKey(x) === s.member);
-      if (m && typeof total === "number") memory[m.host] = total;
-    }
-    return { profile: profileById(service.profile), version: service.version, kind: service.kind, others, memory };
-  };
+  const checkContext = (service: NonNullable<ReturnType<typeof registeredService>>) => checkContextOf(store, service);
   const draftView = (d: ServiceConfigDraft, latest: number) => {
     const { changes, ...rest } = d;
     return { ...rest, changes: changes.map((x) => changeView(x, takeover?.box)), stale: d.state === "open" && d.base !== latest };
@@ -975,18 +968,60 @@ export function createApp({ config, store, sessions, observer, deployments, vers
       return c.json({ revision, findings: out.findings, change: out.change, draft: draftView(store.serviceConfigDraft(cfg.id, d.id)!, revision) }, 201);
     } catch (error) { return configFailed(c, error); }
   });
-  // The AI's read tools for what comes later (§16.3): there are no changes until step 11.
   const serviceKnown = (c: Context) => (registeredService(c.req.param("id")!) ? undefined : reject(c, 404, "service/unknown", `No standalone instance or cluster ${c.req.param("id")}.`));
+  // §13, §16.3: changes. Anyone who sees a service sees its plans and changes; carrying one out takes the environment's
+  // deploy group, on PROD only from a browser session (D7). Service keys (the AI) never: it only reads.
+  const changeOperator = async (c: Context): Promise<Principal | Response> => {
+    let env: Environment;
+    try { env = deployments.environment().env; } catch (error) { return deployError(c, error); }
+    const p = await authenticate(c, deployPermission(env));
+    if (p instanceof Response) return p;
+    if (isProd(env) && isKey(p)) return reject(c, 403, "auth/browser-only", "On PROD changes are made only from a browser session, not API keys.");
+    return p;
+  };
+  const changeFailed = (c: Context, error: unknown) => {
+    if (error instanceof ChangeError) return reject(c, error.status, error.code, error.message, error.details);
+    if (error instanceof StoreError && error.code === "service-change/active") return reject(c, 409, error.code, error.message);
+    return driftFailed(c, error);
+  };
   api.get("/api/services/:id/changes", async (c) => {
     const p = await authenticate(c, "view");
     if (p instanceof Response) return p;
-    return serviceKnown(c) ?? c.json({ changes: [], note: "Applying configuration and restarting from the Deployer are not there yet: no change was made through it." });
+    const unknown = serviceKnown(c);
+    if (unknown) return unknown;
+    const id = c.req.param("id")!;
+    return c.json({ changes: store.serviceChanges(id).map((x) => serviceChangeView(x)), active: store.activeServiceChange(id)?.id ?? null });
   });
   api.get("/api/services/:id/changes/:change", async (c) => {
     const p = await authenticate(c, "view");
     if (p instanceof Response) return p;
-    return serviceKnown(c) ?? reject(c, 404, "service-change/unknown", `No change ${c.req.param("change")} of ${c.req.param("id")}.`);
+    const unknown = serviceKnown(c);
+    if (unknown) return unknown;
+    const found = store.serviceChange(c.req.param("id")!, c.req.param("change")!);
+    if (!found) return reject(c, 404, "service-change/unknown", `No change ${c.req.param("change")} of ${c.req.param("id")}.`);
+    return c.json(serviceChangeView(found, store.serviceChangeSteps(found.id)));
   });
+  api.post("/api/services/:id/changes/plan", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    try { return c.json(planView(await changes.plan(c.req.param("id")!, await c.req.json().catch(() => ({}))))); } catch (error) { return changeFailed(c, error); }
+  });
+  api.post("/api/services/:id/changes", async (c) => {
+    const p = await changeOperator(c);
+    if (p instanceof Response) return p;
+    const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+    try { return c.json(serviceChangeView(await changes.start(c.req.param("id")!, body, noteOf(body.reason), actorOf(p))), 201); } catch (error) { return changeFailed(c, error); }
+  });
+  for (const [name, act] of [["continue", "resume"], ["stop", "halt"], ["rollback", "rollback"], ["force-kill", "forceKill"], ["close", "close"]] as const) {
+    api.post(`/api/services/:id/changes/:change/${name}`, async (c) => {
+      const p = await changeOperator(c);
+      if (p instanceof Response) return p;
+      try {
+        const out = changes[act](c.req.param("id")!, c.req.param("change")!, actorOf(p));
+        return c.json(serviceChangeView(out, store.serviceChangeSteps(out.id)));
+      } catch (error) { return changeFailed(c, error); }
+    });
+  }
   api.get("/api/services/:id/drift", async (c) => {
     const p = await authenticate(c, "view");
     if (p instanceof Response) return p;
@@ -1023,6 +1058,8 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     if (cfg instanceof Response) return cfg;
     const body = await c.req.json().catch(() => ({})) as { member?: unknown; file?: unknown; sha256?: unknown; replacePending?: unknown; note?: unknown };
     if (typeof body.member !== "string" || typeof body.file !== "string" || typeof body.sha256 !== "string") return reject(c, 400, "drift/invalid", "Give member, file and the sha256 the differences showed.");
+    const holding = store.activeServiceChange(cfg.id);
+    if (holding) return reject(c, 409, "drift/change-active", `Change ${holding.id} is ${holding.state}: files may be in the middle of it. Finish or close it first.`);
     const m = serviceMembers(cfg.service).find((x) => installKey(x) === body.member);
     const own = store.serviceMemberFiles(cfg.id).filter((f) => f.member === body.member);
     const row = own.find((f) => f.file === body.file);

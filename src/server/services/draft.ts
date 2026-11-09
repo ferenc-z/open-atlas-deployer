@@ -22,6 +22,8 @@ export interface ServiceMember {
   serviceUser: string | null;
   /** The filtered start environment (filterStartEnvironment): what bin/nifi.sh is run with (S10). */
   startEnvironment: Record<string, string> | null;
+  /** What the running process had (svc-state), to start it with again (§16.3); absent until a change has looked. */
+  startLimits?: unknown;
   ports: ServicePorts;
   /** NiFi's nifi.cluster.node.address (nodes only). */
   nodeAddress?: string | null;
