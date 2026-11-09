@@ -95,7 +95,7 @@ class RegistrationTest(Base):
         beat = self.api.beats[-1]
         self.assertEqual(beat["executor"], "service")
         self.assertEqual(beat["protocols"], [2])
-        self.assertEqual(beat["kinds"], ["svc-discover", "svc-read", "svc-state", "log-read", "log-tail", "nifi-provenance", "executor-upgrade", "svc-discover@2", "svc-read@2", "nifi-provenance@1", "svc-state@1"],
+        self.assertEqual(beat["kinds"], ["svc-discover", "svc-read", "svc-state", "log-read", "log-tail", "nifi-provenance", "svc-write", "executor-upgrade", "svc-discover@2", "svc-read@2", "nifi-provenance@1", "svc-state@1", "svc-write@1"],
                          "the service jobs and what they can do (§15.2); never the deploy ones")
         name, root = sx.ServiceExecutor.user()
         self.assertEqual((beat["user"], beat["isRoot"]), (name, root))
@@ -190,9 +190,9 @@ class ReadChannelTest(Base):
         self.read("read-job-0001")
         self.ex.run_once()
         self.assertTrue(wait_until(lambda: self.ex.started))
-        self.api.queue.append({"protocol": 2, "id": "write-job-0001", "kind": "svc-write"})
+        self.api.queue.append({"protocol": 2, "id": "other-job-0001", "kind": "no-such-kind"})
         self.ex.run_once()
-        self.assertEqual(self.api.status["write-job-0001"]["state"], "refused")
+        self.assertEqual(self.api.status["other-job-0001"]["state"], "refused")
         self.assertEqual(self.api.status["read-job-0001"]["state"], "running")
 
     def test_a_read_left_running_by_a_previous_process_is_marked_interrupted(self):
@@ -217,7 +217,7 @@ class ReadChannelTest(Base):
 
 
 class Changer(Reader):
-    """A service executor with a change job for the tests (svc-write and svc-control come with later steps)."""
+    """A service executor with a change job for the tests, which it can hold open."""
 
     CHANGE_JOBS = {"test-change": "test_change"}
 
@@ -1560,6 +1560,781 @@ class LogsTest(Base):
         w = sx.watch_entries(self.watch)[0]
         s = c.sample(w, {}, {}, None, "no certificate")
         self.assertEqual((s["logs"]["file"], s["logs"]["patterns"]), (str(self.app), []))
+
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+class FakeXattrs:
+    """What the kernel keeps on a file for names a test user cannot set, by inode, as on a machine with SELinux: the
+    temporary file's label stays with it when it takes the file's place. The rest goes to the real calls."""
+
+    NAMES = (sx.XATTR_LABEL, sx.XATTR_ACL)
+
+    def __init__(self, test, selinux=True):
+        self.values, self.refuse, self.real = {}, set(), (os.getxattr, os.setxattr, os.listxattr)
+        marker = test.root / "enforce"
+        marker.write_text("1")
+        for patch in (mock.patch.object(os, "getxattr", self.getxattr), mock.patch.object(os, "setxattr", self.setxattr),
+                      mock.patch.object(os, "listxattr", self.listxattr),
+                      mock.patch.object(sx, "SELINUX_ENFORCE", str(marker) if selinux else str(test.root / "no-selinux"))):
+            patch.start()
+            test.addCleanup(patch.stop)
+
+    @staticmethod
+    def inode(target):
+        return os.stat(target).st_ino
+
+    def set(self, path, name, value):
+        self.values[(self.inode(path), name)] = value
+
+    def get(self, path, name):
+        return self.values.get((self.inode(path), name))
+
+    def getxattr(self, target, name, **kw):
+        if name not in self.NAMES:
+            return self.real[0](target, name, **kw)
+        value = self.values.get((self.inode(target), name))
+        if value is None:
+            raise OSError(61, "No data available")
+        return value
+
+    def setxattr(self, target, name, value, *a, **kw):
+        if name not in self.NAMES:
+            return self.real[1](target, name, value, *a, **kw)
+        if name in self.refuse:
+            raise PermissionError(13, "Permission denied")
+        self.values[(self.inode(target), name)] = value
+
+    def listxattr(self, target=None, **kw):
+        return [*self.real[2](target, **kw), *(n for (i, n) in self.values if i == self.inode(target))]
+
+
+class SvcWriteTest(Base):
+    OLD = b"# a comment\nnifi.web.https.port=9443\nnifi.flow.configuration.file=./conf/flow.xml.gz\nnifi.sensitive.props.key=OLD-SECRET-VALUE\n"
+    NEW = b"# a comment\nnifi.web.https.port=9443\nnifi.flow.configuration.file=./conf/flow.xml.gz\nnifi.sensitive.props.key=NEW-SECRET-VALUE\n"
+    LOGBACK = b"<configuration/>\n"
+    LOGBACK_NEW = b"<configuration scan='true'/>\n"
+    FLOW = b"\x1f\x8bthe flow\n"
+
+    def setUp(self):
+        super().setUp()
+        self.out = self.root / "out.txt"
+        self.outside = self.root / "outside"
+        self.outside.mkdir()
+        self.install = self.root / "nifi"
+        self.conf = self.install / "conf"
+        self.conf.mkdir(parents=True)
+        self.props = self.conf / "nifi.properties"
+        self.logback = self.conf / "logback.xml"
+        self.bootstrap = self.conf / "bootstrap.conf"
+        self.flow = self.conf / "flow.xml.gz"
+        self.props.write_bytes(self.OLD)
+        self.props.chmod(0o604)
+        self.logback.write_bytes(self.LOGBACK)
+        self.bootstrap.write_bytes(b"java=java\n")
+        self.flow.write_bytes(self.FLOW)
+        self.watch_entry = {"service": "s1", "member": "local:nifi", "installDir": str(self.install), "confDir": str(self.conf), "files": [
+            {"name": "nifi.properties", "path": str(self.props)}, {"name": "logback.xml", "path": str(self.logback)},
+            {"name": "bootstrap.conf", "path": str(self.bootstrap)}]}
+        self.stream = open(self.out, "w")
+        self.addCleanup(self.stream.close)
+        self.api = WatchApi()
+        self.api.watch = [self.watch_entry]
+        self.ex = sx.ServiceExecutor(cfg(self.root), out=self.stream, api=self.api)
+        self.ex.sleep = lambda s: None
+        self.ex.watch = sx.watch_entries(self.api.watch)
+        self.jobs = 0
+
+    def job(self, action, files=None, content=None, change="change-1", member="local:nifi", raw_content=None, **extra):
+        self.jobs += 1
+        job_id = f"write-job-{self.jobs:04}"
+        request = {"protocol": 2, "id": job_id, "kind": "svc-write", "action": action, "change": change, "member": member, **extra}
+        if files is not None:
+            request["files"] = files
+        if content is not None:
+            request["content"] = json.dumps({"files": [{"name": k, "base64": sx.base64.b64encode(v).decode()} for k, v in content.items()]})
+        if raw_content is not None:
+            request["content"] = raw_content
+        self.ex.handle(request)
+        return self.api.status[job_id]
+
+    def entry(self, path, data, base=None, name=None):
+        return {"name": name or path.name, "path": str(path), "baseSha256": sha(base) if base is not None else None, "sha256": sha(data)}
+
+    def apply(self, **extra):
+        return self.job("apply", [self.entry(self.props, self.NEW, self.OLD)], {"nifi.properties": self.NEW}, **extra)
+
+    def apply_two(self, **extra):
+        files = [self.entry(self.props, self.NEW, self.OLD), self.entry(self.logback, self.LOGBACK_NEW, self.LOGBACK)]
+        return self.job("apply", files, {"nifi.properties": self.NEW, "logback.xml": self.LOGBACK_NEW}, **extra)
+
+    def backup_dir(self, change="change-1"):
+        return self.root / "work" / "backups" / sha(b"local:nifi")[:16] / change
+
+    def snapshot(self, *dirs):
+        """Names, content, inode and mtime of what is in the directories."""
+        out = {}
+        for d in dirs or (self.conf,):
+            for p in sorted(pathlib.Path(d).rglob("*")):
+                st = p.lstat()
+                out[str(p)] = (p.read_bytes() if p.is_file() and not p.is_symlink() else None, st.st_ino, st.st_mtime_ns, st.st_mode)
+        return out
+
+    def assert_no_temp(self, *dirs):
+        for d in dirs or (self.conf,):
+            self.assertEqual([p.name for p in pathlib.Path(d).iterdir() if p.name.endswith(sx.WRITE_TEMP)], [])
+
+    # --- apply ---
+
+    def test_the_kind_and_its_first_form_are_in_the_heartbeat(self):
+        self.assertIn("svc-write", self.ex.KINDS)
+        self.assertIn("svc-write@1", self.ex.KINDS)
+
+    def test_apply_replaces_the_file_atomically_and_keeps_its_mode(self):
+        inode = self.props.stat().st_ino
+        done = self.apply()
+        self.assertEqual(done["state"], "succeeded", done.get("message"))
+        self.assertEqual(self.props.read_bytes(), self.NEW)
+        self.assertNotEqual(self.props.stat().st_ino, inode, "a new file took its place, nothing was written in place")
+        self.assertEqual(oct(self.props.stat().st_mode & 0o7777), "0o604")
+        file = done["result"]["files"][0]
+        self.assertEqual((file["name"], file["before"], file["after"], file["mode"], file["label"]), ("nifi.properties", sha(self.OLD), sha(self.NEW), "0604", None))
+        self.assert_no_temp()
+
+    def test_apply_backs_up_first_in_a_private_directory(self):
+        self.apply()
+        d = self.backup_dir()
+        self.assertEqual(oct(d.stat().st_mode & 0o777), "0o700")
+        self.assertEqual((d / "nifi.properties").read_bytes(), self.OLD)
+        self.assertEqual(oct((d / "nifi.properties").stat().st_mode & 0o777), "0o600")
+        self.assertEqual(oct((d / "manifest.json").stat().st_mode & 0o777), "0o600")
+        entry = json.loads((d / "manifest.json").read_text())["entries"][0]
+        st = self.props.stat()
+        self.assertEqual((entry["path"], entry["sha256"], entry["uid"], entry["gid"], entry["mode"], entry["existed"]),
+                         (str(self.props), sha(self.OLD), st.st_uid, st.st_gid, 0o604, True))
+
+    def test_apply_keeps_user_attributes(self):
+        try:
+            os.setxattr(self.props, "user.owner-note", b"kept")
+        except OSError:
+            self.skipTest("this file system has no user attributes")
+        self.apply()
+        self.assertEqual(os.getxattr(self.props, "user.owner-note"), b"kept")
+
+    def test_apply_gives_the_owner_of_the_file(self):
+        others = [g for g in os.getgroups() if g != self.props.stat().st_gid]
+        if not others:
+            self.skipTest("this user has no second group")
+        os.chown(self.props, -1, others[0])
+        done = self.apply()
+        self.assertEqual(done["state"], "succeeded", done.get("message"))
+        self.assertEqual(self.props.stat().st_gid, others[0])
+        self.assertEqual(self.props.stat().st_uid, os.getuid())
+
+    def test_an_owner_that_cannot_be_kept_fails_and_leaves_the_file(self):
+        with mock.patch.object(os, "fchown", side_effect=PermissionError(1, "Operation not permitted")):
+            done = self.apply()
+        self.assertEqual(done["state"], "failed")
+        self.assertIn("owner", done["message"])
+        self.assertEqual(self.props.read_bytes(), self.OLD)
+        self.assert_no_temp()
+
+    def test_a_new_file_gets_the_owner_of_nifi_properties_and_0640(self):
+        target = self.conf / "state-management.xml"
+        done = self.job("apply", [self.entry(target, b"<x/>\n")], {"state-management.xml": b"<x/>\n"})
+        self.assertEqual(done["state"], "succeeded", done.get("message"))
+        self.assertEqual(oct(target.stat().st_mode & 0o777), "0o640")
+        self.assertEqual(target.stat().st_uid, self.props.stat().st_uid)
+        self.assertIsNone(done["result"]["files"][0]["before"])
+
+    def test_several_files_and_a_symbolic_link_replaces_what_it_points_to(self):
+        real = self.conf / "kept" / "logback-real.xml"
+        real.parent.mkdir()
+        self.logback.rename(real)
+        self.logback.symlink_to(real)
+        self.assertEqual(self.apply_two()["state"], "succeeded")
+        self.assertTrue(self.logback.is_symlink(), "the link stays")
+        self.assertEqual(real.read_bytes(), self.LOGBACK_NEW)
+        self.assertEqual(self.props.read_bytes(), self.NEW)
+        self.assert_no_temp(real.parent)
+
+    # --- SELinux (a fake of the kernel's side: no machine here has it, §16.2 P14) ---
+
+    def test_the_label_and_the_acl_stay_with_the_file(self):
+        fake = FakeXattrs(self)
+        fake.set(self.props, sx.XATTR_LABEL, b"system_u:object_r:nifi_conf_t:s0\0")
+        fake.set(self.props, sx.XATTR_ACL, b"an acl")
+        done = self.apply()
+        self.assertEqual(done["state"], "succeeded", done.get("message"))
+        self.assertEqual(fake.get(self.props, sx.XATTR_LABEL), b"system_u:object_r:nifi_conf_t:s0\0")
+        self.assertEqual(fake.get(self.props, sx.XATTR_ACL), b"an acl")
+        self.assertEqual(done["result"]["files"][0]["label"], "system_u:object_r:nifi_conf_t:s0")
+        entry = json.loads((self.backup_dir() / "manifest.json").read_text())["entries"][0]
+        self.assertEqual(sx.base64.b64decode(entry["xattrs"][sx.XATTR_LABEL]), b"system_u:object_r:nifi_conf_t:s0\0")
+
+    def test_a_new_file_takes_the_label_of_nifi_properties(self):
+        fake = FakeXattrs(self)
+        fake.set(self.props, sx.XATTR_LABEL, b"system_u:object_r:nifi_conf_t:s0")
+        fake.set(self.props, sx.XATTR_ACL, b"not for a new file")
+        target = self.conf / "state-management.xml"
+        self.assertEqual(self.job("apply", [self.entry(target, b"<x/>\n")], {"state-management.xml": b"<x/>\n"})["state"], "succeeded")
+        self.assertEqual(fake.get(target, sx.XATTR_LABEL), b"system_u:object_r:nifi_conf_t:s0")
+        self.assertIsNone(fake.get(target, sx.XATTR_ACL))
+
+    def test_with_selinux_on_a_label_that_cannot_be_set_stops_the_replacement(self):
+        fake = FakeXattrs(self)
+        fake.set(self.props, sx.XATTR_LABEL, b"system_u:object_r:nifi_conf_t:s0")
+        fake.refuse.add(sx.XATTR_LABEL)
+        inode = self.props.stat().st_ino
+        done = self.apply()
+        self.assertEqual(done["state"], "failed")
+        self.assertIn(sx.XATTR_LABEL, done["message"])
+        self.assertEqual((self.props.read_bytes(), self.props.stat().st_ino), (self.OLD, inode))
+        self.assert_no_temp()
+
+    def test_with_selinux_on_a_file_without_a_label_is_not_replaced(self):
+        FakeXattrs(self)
+        done = self.apply()
+        self.assertEqual(done["state"], "failed")
+        self.assertIn("no label", done["message"])
+        self.assertEqual(self.props.read_bytes(), self.OLD)
+
+    def test_with_selinux_off_a_leftover_label_does_not_matter(self):
+        fake = FakeXattrs(self, selinux=False)
+        fake.set(self.props, sx.XATTR_LABEL, b"left:over:t:s0")
+        fake.refuse.add(sx.XATTR_LABEL)
+        self.assertEqual(self.apply()["state"], "succeeded")
+        self.assertEqual(self.props.read_bytes(), self.NEW)
+
+    def test_the_label_read_back_differs_and_the_file_goes_back(self):
+        fake = FakeXattrs(self)
+        fake.set(self.props, sx.XATTR_LABEL, b"system_u:object_r:nifi_conf_t:s0")
+        real_replace = os.replace
+        calls = []
+
+        def relabelled(src, dst, **kw):
+            real_replace(src, dst, **kw)
+            calls.extend(["replaced"] if "src_dir_fd" in kw else [])
+            if len(calls) == 1 and "src_dir_fd" in kw:  # the policy gives the new file another type once it is in place
+                fake.set(self.props, sx.XATTR_LABEL, b"system_u:object_r:etc_t:s0")
+
+        with mock.patch.object(os, "replace", relabelled):
+            done = self.apply()
+        self.assertEqual(done["state"], "failed")
+        self.assertIn("every file is back", done["message"])
+        self.assertEqual(self.props.read_bytes(), self.OLD)
+        self.assertEqual(fake.get(self.props, sx.XATTR_LABEL), b"system_u:object_r:nifi_conf_t:s0")
+
+    # --- where it may write ---
+
+    def assert_refused(self, done, text=None):
+        self.assertEqual(done["state"], "refused", done.get("message"))
+        if text:
+            self.assertIn(text, done["message"])
+
+    def test_a_path_with_dots_is_refused(self):
+        before = self.snapshot(self.conf, self.outside)
+        for path in (f"{self.conf}/../../outside/nifi.properties", f"{self.conf}/../conf/nifi.properties", "conf/nifi.properties", f"{self.props}\0"):
+            self.assert_refused(self.job("apply", [{**self.entry(self.props, self.NEW, self.OLD), "path": path}], {"nifi.properties": self.NEW}), "plain absolute path")
+        self.assertEqual(self.snapshot(self.conf, self.outside), before)
+
+    def test_a_path_that_is_not_where_the_file_is_registered_is_refused(self):
+        other = self.outside / "nifi.properties"
+        other.write_bytes(self.OLD)
+        for path in (other, self.conf / "elsewhere.properties", self.logback):
+            self.assert_refused(self.job("apply", [{**self.entry(self.props, self.NEW, self.OLD), "path": str(path)}], {"nifi.properties": self.NEW}), "not where")
+        self.assertEqual(other.read_bytes(), self.OLD)
+
+    def test_a_name_outside_the_list_is_refused(self):
+        for name in ("flow.xml.gz", "keystore.pkcs12", "../nifi.properties", None, ["nifi.properties"]):
+            self.assert_refused(self.job("apply", [{**self.entry(self.props, self.NEW, self.OLD), "name": name}], {"x": self.NEW}), "names among")
+
+    def test_a_symbolic_link_leading_out_is_refused_and_what_it_points_to_stays(self):
+        secret = self.outside / "elsewhere"
+        secret.write_bytes(self.OLD)
+        self.props.unlink()
+        self.props.symlink_to(secret)
+        self.assert_refused(self.apply(), "leads outside")
+        self.assertEqual(secret.read_bytes(), self.OLD)
+        self.assertTrue(self.props.is_symlink())
+
+    def test_a_registered_path_through_a_directory_link_leading_out_is_refused(self):
+        linked = self.conf / "linked"
+        linked.symlink_to(self.outside)
+        (self.outside / "logback.xml").write_bytes(self.LOGBACK)
+        self.watch_entry["files"][1]["path"] = str(linked / "logback.xml")
+        self.assert_refused(self.job("apply", [self.entry(linked / "logback.xml", self.LOGBACK_NEW, self.LOGBACK)], {"logback.xml": self.LOGBACK_NEW}), "leads outside")
+        self.assertEqual((self.outside / "logback.xml").read_bytes(), self.LOGBACK)
+
+    def test_a_bootstrap_conf_beside_the_conf_directory_may_be_written_but_not_a_link_out_of_it(self):
+        moved = self.root / "deploy" / "conf"
+        moved.mkdir(parents=True)
+        self.props.rename(moved / "nifi.properties")
+        self.watch_entry.update(confDir=str(moved), files=[{"name": "nifi.properties", "path": str(moved / "nifi.properties")}, {"name": "bootstrap.conf", "path": str(self.bootstrap)}])
+        new = b"java=java\nrun.as=\n"
+        boot = self.entry(self.bootstrap, new, b"java=java\n")
+        self.assertEqual(self.job("apply", [boot], {"bootstrap.conf": new})["state"], "succeeded")
+        self.assertEqual(self.bootstrap.read_bytes(), new)
+
+        secret = self.outside / "elsewhere.conf"
+        secret.write_bytes(new)
+        self.bootstrap.unlink()
+        self.bootstrap.symlink_to(secret)
+        self.assert_refused(self.job("apply", [self.entry(self.bootstrap, b"x\n", new)], {"bootstrap.conf": b"x\n"}, change="change-2"), "leads outside")
+        self.assertEqual(secret.read_bytes(), new)
+
+    def test_a_link_put_in_place_after_the_path_was_checked_is_not_followed(self):
+        """Another user of the conf directory swaps the file for a link between the check and the job's work."""
+        secret = self.outside / "shadow"
+        secret.write_bytes(self.OLD)
+        writer = sx.ConfigWriter(self.root / "work", self.watch_entry, "change-1")
+        t = writer.target("nifi.properties", str(self.props))
+        self.props.unlink()
+        self.props.symlink_to(secret)
+        with self.assertRaises(sx.Refused):
+            writer.current(t)
+
+    def test_a_directory_swapped_for_a_link_after_the_path_was_checked_is_not_followed(self):
+        writer = sx.ConfigWriter(self.root / "work", self.watch_entry, "change-1")
+        t = writer.target("nifi.properties", str(self.props))
+        self.conf.rename(self.root / "conf-away")
+        self.conf.symlink_to(self.outside)
+        with self.assertRaises(OSError):
+            writer.current(t)
+
+    def test_what_is_not_a_regular_file_is_refused(self):
+        self.props.unlink()
+        self.props.mkdir()
+        self.assert_refused(self.apply(), "not a regular file")
+
+    def test_a_member_this_executor_does_not_watch_is_refused(self):
+        self.assert_refused(self.apply(member="local:other"), "not an installation")
+        self.api.watch = None
+        self.assert_refused(self.apply(), "not an installation")
+
+    def test_a_change_id_that_is_not_a_plain_name_is_refused(self):
+        for change in ("../../etc", "a/b", "", None, "."):
+            self.assert_refused(self.apply(change=change), "change")
+        self.assertFalse((self.root / "work" / "backups").exists())
+
+    def test_an_unknown_action_is_refused(self):
+        self.assert_refused(self.job("replace-everything"), "action")
+
+    def test_two_entries_for_one_file_are_refused(self):
+        self.logback.unlink()
+        self.logback.symlink_to(self.props)
+        files = [self.entry(self.props, self.NEW, self.OLD), self.entry(self.logback, self.NEW, self.OLD)]
+        self.assert_refused(self.job("apply", files, {"nifi.properties": self.NEW, "logback.xml": self.NEW}), "twice")
+
+    # --- hashes ---
+
+    def test_a_file_changed_since_the_plan_is_refused_and_not_backed_up(self):
+        self.props.write_bytes(b"changed by hand\n")
+        done = self.apply()
+        self.assert_refused(done, "changed since the plan")
+        self.assertIn(sha(b"changed by hand\n"), done["message"])
+        self.assertEqual(self.props.read_bytes(), b"changed by hand\n")
+        self.assertFalse(self.backup_dir().exists())
+
+    def test_null_base_means_there_was_no_such_file(self):
+        self.assert_refused(self.job("apply", [self.entry(self.props, self.NEW)], {"nifi.properties": self.NEW}), "changed since the plan")
+        self.assertEqual(self.props.read_bytes(), self.OLD)
+
+    def test_a_file_gone_since_the_plan_is_refused(self):
+        self.props.unlink()
+        self.assert_refused(self.apply(), "changed since the plan")
+
+    def test_a_base_left_out_is_refused(self):
+        entry = self.entry(self.props, self.NEW, self.OLD)
+        del entry["baseSha256"]
+        self.assert_refused(self.job("apply", [entry], {"nifi.properties": self.NEW}), "baseSha256")
+
+    def test_content_that_does_not_have_its_hash_is_refused(self):
+        self.assert_refused(self.job("apply", [self.entry(self.props, self.NEW, self.OLD)], {"nifi.properties": b"something else"}), "does not have its sha256")
+        self.assertEqual(self.props.read_bytes(), self.OLD)
+        self.assertFalse(self.backup_dir().exists())
+
+    def test_content_that_is_missing_or_malformed_is_refused(self):
+        entry = self.entry(self.props, self.NEW, self.OLD)
+        self.assert_refused(self.job("apply", [entry]), "content")
+        self.assert_refused(self.job("apply", [entry], {}), "exactly")
+        self.assert_refused(self.job("apply", [entry], {"nifi.properties": self.NEW, "logback.xml": self.NEW}), "exactly")
+        self.assert_refused(self.job("apply", [entry], raw_content="not json"), "content")
+        self.assert_refused(self.job("apply", [entry], raw_content=json.dumps({"files": [{"name": "nifi.properties", "base64": "@@"}]})), "content")
+
+    def test_what_reaches_the_disk_is_checked_against_the_hash(self):
+        real_write = os.write
+
+        def flipped(fd, data):
+            real_write(fd, bytes(data).replace(b"NEW", b"BAD"))
+            return len(data)
+
+        with mock.patch.object(os, "write", flipped):
+            # The backup's copy goes through the same call, so it fails first unless it holds no NEW.
+            done = self.apply()
+        self.assertEqual(done["state"], "failed")
+        self.assertIn("sha256", done["message"])
+        self.assertEqual(self.props.read_bytes(), self.OLD)
+        self.assert_no_temp()
+
+    # --- failing halfway ---
+
+    def test_a_failure_while_writing_leaves_no_half_a_file(self):
+        real_write = os.write
+
+        def full(fd, data):
+            if bytes(data) == self.NEW:
+                real_write(fd, bytes(data)[:10])
+                raise OSError(28, "No space left on device")
+            return real_write(fd, data)
+
+        inode = self.props.stat().st_ino
+        with mock.patch.object(os, "write", full):
+            done = self.apply()
+        self.assertEqual(done["state"], "failed")
+        self.assertIn("No space left", done["message"])
+        self.assertEqual((self.props.read_bytes(), self.props.stat().st_ino), (self.OLD, inode))
+        self.assert_no_temp()
+        self.assertTrue(done["result"]["rolledBack"])
+
+    def test_the_second_replacement_failing_puts_the_first_back(self):
+        real_replace = os.replace
+        replaced = []
+
+        def second_fails(src, dst, **kw):
+            if dst == "logback.xml" and not replaced:
+                replaced.append(dst)
+                raise OSError(5, "Input/output error")
+            return real_replace(src, dst, **kw)
+
+        with mock.patch.object(os, "replace", second_fails):
+            done = self.apply_two()
+        self.assertEqual(done["state"], "failed")
+        self.assertIn("Input/output error", done["message"])
+        self.assertIn("every file is back", done["message"])
+        self.assertEqual(self.props.read_bytes(), self.OLD)
+        self.assertEqual(oct(self.props.stat().st_mode & 0o7777), "0o604")
+        self.assertEqual(self.logback.read_bytes(), self.LOGBACK)
+        self.assert_no_temp()
+        self.assertTrue(done["result"]["rolledBack"])
+        self.assertEqual({f["name"]: f["after"] for f in done["result"]["files"]}, {"nifi.properties": sha(self.OLD), "logback.xml": sha(self.LOGBACK)})
+
+    def test_putting_back_failing_says_which_file_stays_new(self):
+        real_replace = os.replace
+        seen = []
+
+        def fails_from_the_second(src, dst, **kw):
+            if "src_dir_fd" in kw:  # in the conf directory, not the backup's
+                seen.append(dst)
+                if len(seen) >= 2:
+                    raise OSError(5, "Input/output error")
+            return real_replace(src, dst, **kw)
+
+        with mock.patch.object(os, "replace", fails_from_the_second):
+            done = self.apply_two()
+        self.assertEqual(done["state"], "failed")
+        self.assertIn("could not put back", done["message"])
+        self.assertIn("nifi.properties", done["message"])
+        self.assertEqual(done["result"]["notRestored"], ["nifi.properties"])
+        self.assertFalse(done["result"]["rolledBack"])
+        self.assertEqual(self.props.read_bytes(), self.NEW, "the state the report gives")
+        self.assert_no_temp()
+
+    def test_a_backup_that_fails_writes_nothing(self):
+        (self.root / "work").mkdir(exist_ok=True)
+        (self.root / "work" / "backups").write_text("not a directory")
+        done = self.apply()
+        self.assertEqual(done["state"], "failed")
+        self.assertEqual(self.props.read_bytes(), self.OLD)
+
+    def test_a_temporary_file_a_killed_process_left_is_swept(self):
+        left = self.conf / f".nifi.properties{sx.WRITE_TEMP}"
+        left.write_bytes(b"half of it")
+        also = self.conf / f".authorizers.xml{sx.WRITE_TEMP}"
+        also.write_bytes(b"half of it")
+        self.assertEqual(self.apply()["state"], "succeeded")
+        self.assert_no_temp()
+
+    # --- retries ---
+
+    def test_a_retry_after_a_killed_job_keeps_the_first_backup_and_finishes(self):
+        files = [self.entry(self.props, self.NEW, self.OLD), self.entry(self.logback, self.LOGBACK_NEW, self.LOGBACK)]
+        self.assertEqual(self.job("backup", files)["state"], "succeeded")
+        self.props.write_bytes(self.NEW)  # killed after the first replacement
+        done = self.job("apply", files, {"nifi.properties": self.NEW, "logback.xml": self.LOGBACK_NEW})
+        self.assertEqual(done["state"], "succeeded", done.get("message"))
+        self.assertEqual((self.backup_dir() / "nifi.properties").read_bytes(), self.OLD, "the new file is not taken for the original")
+        self.assertEqual(self.logback.read_bytes(), self.LOGBACK_NEW)
+
+    def test_applying_again_changes_nothing_and_keeps_the_backup(self):
+        self.assertEqual(self.apply()["state"], "succeeded")
+        inode = self.props.stat().st_ino
+        done = self.apply()
+        self.assertEqual(done["state"], "succeeded")
+        self.assertIn("0 file(s) written", done["message"])
+        self.assertEqual(self.props.stat().st_ino, inode)
+        self.assertEqual((self.backup_dir() / "nifi.properties").read_bytes(), self.OLD)
+
+    def test_a_backup_cut_short_is_written_again(self):
+        d = self.backup_dir()
+        d.mkdir(parents=True)
+        (d / "nifi.properties.part").write_bytes(b"cut")
+        (d / "nifi.properties").write_bytes(b"cut")  # the manifest does not name it
+        self.assertEqual(self.apply()["state"], "succeeded")
+        self.assertEqual((d / "nifi.properties").read_bytes(), self.OLD)
+
+    # --- restore ---
+
+    def test_restore_puts_back_content_mode_and_label_and_removes_a_new_file(self):
+        fake = FakeXattrs(self)
+        fake.set(self.props, sx.XATTR_LABEL, b"system_u:object_r:nifi_conf_t:s0")
+        fake.set(self.logback, sx.XATTR_LABEL, b"system_u:object_r:nifi_conf_t:s0")
+        new_file = self.conf / "state-management.xml"
+        files = [self.entry(self.props, self.NEW, self.OLD), self.entry(new_file, b"<x/>\n")]
+        self.assertEqual(self.job("apply", files, {"nifi.properties": self.NEW, "state-management.xml": b"<x/>\n"})["state"], "succeeded")
+        self.props.chmod(0o600)
+        fake.set(self.props, sx.XATTR_LABEL, b"system_u:object_r:etc_t:s0")
+        done = self.job("restore")
+        self.assertEqual(done["state"], "succeeded", done.get("message"))
+        self.assertEqual(self.props.read_bytes(), self.OLD)
+        self.assertEqual(oct(self.props.stat().st_mode & 0o7777), "0o604")
+        self.assertEqual(fake.get(self.props, sx.XATTR_LABEL), b"system_u:object_r:nifi_conf_t:s0")
+        self.assertFalse(new_file.exists())
+        self.assert_no_temp()
+        self.assertEqual({f["name"]: (f["before"], f["after"]) for f in done["result"]["files"]},
+                         {"nifi.properties": (sha(self.NEW), sha(self.OLD)), "state-management.xml": (sha(b"<x/>\n"), None)})
+
+    def test_restore_twice_changes_nothing_the_second_time(self):
+        self.apply()
+        self.assertEqual(self.job("restore")["state"], "succeeded")
+        inode = self.props.stat().st_ino
+        self.assertEqual(self.job("restore")["state"], "succeeded")
+        self.assertEqual(self.props.stat().st_ino, inode)
+
+    def test_restore_without_a_backup_is_refused(self):
+        self.assert_refused(self.job("restore"), "no backup")
+
+    def test_a_damaged_backup_is_not_restored_and_nothing_is_replaced(self):
+        self.apply_two()
+        (self.backup_dir() / "logback.xml").write_bytes(b"damaged")
+        done = self.job("restore")
+        self.assertEqual(done["state"], "failed")
+        self.assertIn("logback.xml", done["message"])
+        self.assertEqual(done["result"]["notRestored"], ["logback.xml"])
+        self.assertEqual(self.props.read_bytes(), self.NEW, "all prepared, or none replaced")
+        self.assertEqual(self.logback.read_bytes(), self.LOGBACK_NEW)
+        self.assert_no_temp()
+
+    def test_a_manifest_naming_a_path_out_of_the_registered_ones_is_refused(self):
+        self.apply()
+        target = self.outside / "nifi.properties"
+        target.write_bytes(b"not touched")
+        manifest = self.backup_dir() / "manifest.json"
+        m = json.loads(manifest.read_text())
+        m["entries"][0]["path"] = str(target)
+        manifest.write_text(json.dumps(m))
+        self.assert_refused(self.job("restore"), "not where")
+        self.assertEqual(target.read_bytes(), b"not touched")
+
+    def test_restore_follows_a_link_inside_the_conf_directory(self):
+        real = self.conf / "kept.xml"
+        self.logback.rename(real)
+        self.logback.symlink_to(real)
+        self.assertEqual(self.job("apply", [self.entry(self.logback, self.LOGBACK_NEW, self.LOGBACK)], {"logback.xml": self.LOGBACK_NEW})["state"], "succeeded")
+        self.assertEqual(self.job("restore")["state"], "succeeded")
+        self.assertTrue(self.logback.is_symlink())
+        self.assertEqual(real.read_bytes(), self.LOGBACK)
+
+    # --- the flow file ---
+
+    def test_the_flow_file_is_backed_up_never_written_and_comes_back_with_restore(self):
+        files = [self.entry(self.props, self.NEW, self.OLD)]
+        inode = self.flow.stat().st_ino
+        done = self.job("backup", files, flowFile=True)
+        self.assertEqual(done["state"], "succeeded", done.get("message"))
+        self.assertEqual(done["result"]["backup"], ["nifi.properties", "flow"])
+        self.assertEqual((self.backup_dir() / "flow").read_bytes(), self.FLOW)
+        self.assertEqual(self.props.read_bytes(), self.OLD, "backup does not write")
+        self.assertEqual(self.job("apply", files, {"nifi.properties": self.NEW}, flowFile=True)["state"], "succeeded")
+        self.assertEqual((self.flow.read_bytes(), self.flow.stat().st_ino), (self.FLOW, inode), "apply leaves it")
+
+        self.flow.write_bytes(b"\x1f\x8bwhat the new configuration made of it\n")
+        done = self.job("restore", flowFile=True)
+        self.assertEqual(done["state"], "succeeded", done.get("message"))
+        self.assertEqual(self.flow.read_bytes(), self.FLOW)
+        self.assertEqual(self.props.read_bytes(), self.OLD)
+        self.assertEqual(done["result"]["flowFile"]["after"], sha(self.FLOW))
+        self.assertEqual([f["name"] for f in done["result"]["files"]], ["nifi.properties"])
+
+    def test_the_flow_files_path_comes_from_nifi_properties_and_not_from_the_request(self):
+        other = self.outside / "chosen.gz"
+        other.write_bytes(b"not this one")
+        self.assert_refused(self.job("backup", [], flowFile=str(other)), "true or false")
+        done = self.job("backup", [], flowFile=True, flowPath=str(other), flow=str(other), path=str(other))
+        self.assertEqual(done["state"], "succeeded", done.get("message"))
+        entry = json.loads((self.backup_dir() / "manifest.json").read_text())["entries"][0]
+        self.assertEqual((entry["name"], entry["path"]), ("flow", str(self.flow)), "resolved against the installation")
+        self.assertEqual((self.backup_dir() / "flow").read_bytes(), self.FLOW)
+
+    def test_the_flow_file_cannot_be_named_as_a_file_to_write(self):
+        self.assert_refused(self.job("apply", [self.entry(self.flow, b"x", self.FLOW, name="flow")], {"flow": b"x"}), "names among")
+        self.assertEqual(self.flow.read_bytes(), self.FLOW)
+
+    def test_a_flow_file_that_did_not_exist_is_gone_after_restore(self):
+        self.flow.unlink()
+        self.assertEqual(self.job("backup", [], flowFile=True)["state"], "succeeded")
+        self.flow.write_bytes(self.FLOW)
+        self.assertEqual(self.job("restore")["state"], "succeeded")
+        self.assertFalse(self.flow.exists())
+
+    def test_nifi_properties_naming_no_flow_file_or_something_else_is_refused(self):
+        self.props.write_bytes(b"nifi.web.https.port=9443\n")
+        self.assert_refused(self.job("backup", [], flowFile=True), "does not name")
+        self.props.write_bytes(f"nifi.flow.configuration.file={self.outside}/passwd\n".encode())
+        self.assert_refused(self.job("backup", [], flowFile=True), "not a flow file")
+        self.assertFalse(self.backup_dir().exists())
+
+    def test_a_flow_file_of_another_owner_is_refused(self):
+        real_stat = os.stat
+
+        def other_owner(path, **kw):
+            st = real_stat(path, **kw)
+            if str(path).endswith("nifi.properties"):
+                return mock.Mock(st_uid=st.st_uid + 1, st_mode=st.st_mode)
+            return st
+
+        with mock.patch.object(os, "stat", other_owner):
+            self.assert_refused(self.job("backup", [], flowFile=True), "not a flow file")
+
+    def test_an_apply_without_flow_file_does_not_back_it_up(self):
+        self.apply()
+        self.assertFalse((self.backup_dir() / "flow").exists())
+
+    # --- what stays out of logs and status ---
+
+    def test_no_content_reaches_the_log_the_status_or_the_output(self):
+        real_replace = os.replace
+        replaced = []
+
+        def second_fails(src, dst, **kw):
+            if dst == "logback.xml" and not replaced:
+                replaced.append(dst)
+                raise OSError(5, "Input/output error")
+            return real_replace(src, dst, **kw)
+
+        files = [self.entry(self.props, self.NEW, self.OLD), self.entry(self.logback, self.LOGBACK_NEW, self.LOGBACK)]
+        content = {"nifi.properties": self.NEW, "logback.xml": self.LOGBACK_NEW}
+        self.job("check", files, content)
+        self.job("backup", files, flowFile=True)
+        with mock.patch.object(os, "replace", second_fails):
+            self.job("apply", files, content, change="change-2")
+        self.job("apply", files, content)
+        self.job("apply", files, {"nifi.properties": b"wrong OTHER-SECRET-VALUE", "logback.xml": self.LOGBACK_NEW}, change="change-3")
+        self.job("apply", files, change="change-4", raw_content="OTHER-SECRET-VALUE is not json")
+        self.job("restore")
+        self.ex.flush_log()
+        self.stream.flush()
+        sent = json.dumps(self.api.status) + json.dumps(self.api.logs) + json.dumps(self.api.env) + self.out.read_text()
+        self.assertGreaterEqual(len(self.api.status), 7)
+        self.assertIn("backed up nifi.properties", sent, "the log is there to look through")
+        for needle in ("OLD-SECRET-VALUE", "NEW-SECRET-VALUE", "OTHER-SECRET-VALUE", "nifi.sensitive.props.key", sx.base64.b64encode(self.NEW).decode()[:20]):
+            self.assertNotIn(needle, sent)
+        marker = self.root / "work"
+        for p in marker.rglob("*"):
+            if p.is_file() and "backups" not in p.parts:
+                self.assertNotIn(b"SECRET-VALUE", p.read_bytes(), str(p))
+
+    # --- check ---
+
+    def test_check_writes_nothing(self):
+        before = self.snapshot()
+        files = [self.entry(self.props, self.NEW, self.OLD), self.entry(self.logback, self.LOGBACK_NEW, self.LOGBACK), self.entry(self.conf / "state-management.xml", b"<x/>\n")]
+        done = self.job("check", files, flowFile=True)
+        self.assertEqual(done["state"], "succeeded", done.get("message"))
+        self.assertEqual(self.snapshot(), before, "names, content, inodes, times and modes")
+        self.assertFalse((self.root / "work" / "backups").exists(), "not even the backup directory")
+        self.assertEqual(done["result"]["flowFile"], {"path": str(self.flow), "exists": True})
+        self.assertFalse(done["result"]["selinux"])
+        self.assertEqual({f["name"]: (f["before"], f["after"]) for f in done["result"]["files"]}, {
+            "nifi.properties": (sha(self.OLD), sha(self.OLD)), "logback.xml": (sha(self.LOGBACK), sha(self.LOGBACK)), "state-management.xml": (None, None)})
+
+    def test_check_tries_the_label_on_a_probe_and_removes_it(self):
+        fake = FakeXattrs(self)
+        fake.set(self.props, sx.XATTR_LABEL, b"system_u:object_r:nifi_conf_t:s0")
+        created = []
+        real_open = os.open
+
+        def opened(path, flags, *a, **kw):
+            fd = real_open(path, flags, *a, **kw)
+            if flags & os.O_CREAT:
+                created.append(path)
+            return fd
+
+        with mock.patch.object(os, "open", opened):
+            done = self.job("check", [self.entry(self.props, self.NEW, self.OLD)])
+        self.assertEqual(done["state"], "succeeded", done.get("message"))
+        self.assertTrue(done["result"]["selinux"])
+        self.assertEqual(done["result"]["files"][0]["label"], "system_u:object_r:nifi_conf_t:s0")
+        self.assertEqual(created, [f".nifi.properties{sx.WRITE_TEMP}"])
+        self.assert_no_temp()
+        self.assertEqual(self.props.read_bytes(), self.OLD)
+
+    def test_check_finds_a_label_that_cannot_be_set(self):
+        fake = FakeXattrs(self)
+        fake.set(self.props, sx.XATTR_LABEL, b"system_u:object_r:nifi_conf_t:s0")
+        fake.refuse.add(sx.XATTR_LABEL)
+        done = self.job("check", [self.entry(self.props, self.NEW, self.OLD)])
+        self.assertEqual(done["state"], "failed")
+        self.assertIn(sx.XATTR_LABEL, done["message"])
+        self.assert_no_temp()
+
+    def test_check_refuses_what_changed_since_the_plan_and_paths_out(self):
+        self.assert_refused(self.job("check", [self.entry(self.props, self.NEW, b"another base")]), "changed since the plan")
+        self.assert_refused(self.job("check", [{**self.entry(self.props, self.NEW, self.OLD), "path": f"{self.conf}/../conf/nifi.properties"}]), "plain absolute")
+        self.assert_refused(self.job("check", []), "no files")
+
+    @unittest.skipIf(os.geteuid() == 0, "root writes anywhere")
+    def test_check_finds_a_directory_that_cannot_be_written(self):
+        self.conf.chmod(0o500)
+        self.addCleanup(self.conf.chmod, 0o700)
+        self.assertEqual(self.job("check", [self.entry(self.props, self.NEW, self.OLD)])["state"], "failed")
+        self.assertEqual(self.props.read_bytes(), self.OLD)
+
+    def test_check_checks_content_when_given(self):
+        self.assert_refused(self.job("check", [self.entry(self.props, self.NEW, self.OLD)], {"nifi.properties": b"other"}), "does not have its sha256")
+
+    # --- prune ---
+
+    def test_prune_keeps_the_newest_five_and_always_this_change(self):
+        for i in range(7):
+            self.props.write_bytes(self.OLD)
+            self.assertEqual(self.apply(change=f"c{i}")["state"], "succeeded")
+        (self.backup_dir("c9-cut-short")).mkdir()
+        other = self.root / "work" / "backups" / "othermember"
+        (other / "c0").mkdir(parents=True)
+        done = self.job("prune", change="c0")
+        self.assertEqual(done["state"], "succeeded", done.get("message"))
+        self.assertEqual(sorted(p.name for p in self.backup_dir().parent.iterdir()), ["c0", "c3", "c4", "c5", "c6"])
+        self.assertEqual(done["result"], {"pruned": ["c1", "c2", "c9-cut-short"], "kept": 5})
+        self.assertTrue((other / "c0").is_dir(), "another member's are not touched")
+        self.assertEqual(self.job("prune", change="c9")["result"]["pruned"], [], "five left: nothing goes")
+
+    def test_prune_with_no_backups_is_fine(self):
+        self.assertEqual(self.job("prune")["result"], {"pruned": [], "kept": 0})
+
+    # --- on the change channel ---
+
+    def test_it_runs_on_the_change_channel_beside_the_reads(self):
+        self.api.queue.append({"protocol": 2, "id": "write-job-chan", "kind": "svc-write", "action": "apply", "change": "change-1", "member": "local:nifi",
+                               "files": [self.entry(self.props, self.NEW, self.OLD)],
+                               "content": json.dumps({"files": [{"name": "nifi.properties", "base64": sx.base64.b64encode(self.NEW).decode()}]})})
+        self.assertTrue(self.ex.run_once())
+        self.ex.wait_change()
+        self.assertEqual(self.api.status["write-job-chan"]["state"], "succeeded")
+        self.assertEqual(self.props.read_bytes(), self.NEW)
+        self.assertFalse(self.ex.current_marker().exists())
 
 
 class FakeNifi:

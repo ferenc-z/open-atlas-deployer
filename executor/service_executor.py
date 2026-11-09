@@ -12,7 +12,10 @@ by side, at most EXECUTOR_READ_SLOTS at a time, each within its timeout (the req
 EXECUTOR_READ_TIMEOUT); a job that runs over is reported failed and its late result dropped. The change channel runs one
 job at a time (§16.3): CHANGE_JOBS in a thread of their own, beside the reads, while the loop asks the Deployer only for
 reads (jobs/next?only=read), so that a second change stays queued there and never gets lost in a restart here;
-executor-upgrade (the executor's own release, §8.6) on the loop itself, after the reads in flight have ended. The read
+executor-upgrade (the executor's own release, §8.6) on the loop itself, after the reads in flight have ended. svc-write
+(§16.3) is such a change: it backs up configuration files of a watched NiFi and replaces them atomically, keeping owner,
+mode, SELinux label, ACL and user attributes; only the files registered for it, below its conf directory; it can put
+them back. The read
 jobs so far: svc-state (§16.3), what one watched NiFi looks like now, for the Deployer to decide on: its processes, start
 environment (filtered), limits, the configuration files' hashes and owners, the REST API, the cluster's nodes, invalid
 components; svc-discover (§6 step 2), which finds the NiFi on the machine from their processes and
@@ -47,6 +50,8 @@ Standard library only; Python 3.9.
 import base64
 import calendar
 import collections
+import contextlib
+import errno
 import glob
 import grp
 import gzip
@@ -1916,6 +1921,526 @@ class ProvenanceQuery:
         return {"op": "event", "event": out, "timeOffset": offset, **({"node": node} if node else {})}
 
 
+# --- svc-write: backups and atomic replacement of configuration files (§16.3) -------------------------------------
+
+WRITE_ACTIONS = ("check", "backup", "apply", "restore", "prune")
+BACKUPS_KEPT = 5
+SELINUX_ENFORCE = "/sys/fs/selinux/enforce"
+XATTR_LABEL = "security.selinux"
+XATTR_ACL = "system.posix_acl_access"
+WRITE_TEMP = ".oa-svc-write.tmp"
+FLOW_PROPERTY = "nifi.flow.configuration.file"
+FLOW_ENTRY = "flow"
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+CHANGE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+WriteTarget = collections.namedtuple("WriteTarget", "name path directory leaf base sha256")
+
+
+def selinux_on():
+    return os.path.exists(SELINUX_ENFORCE)
+
+
+def kept_xattrs(fd):
+    """The extended attributes a replacement keeps: the SELinux label, the ACL and user.*."""
+    try:
+        names = os.listxattr(fd)
+    except OSError as e:
+        if e.errno in (errno.ENOTSUP, errno.ENOSYS):
+            return {}
+        raise
+    return {n: os.getxattr(fd, n) for n in names if n in (XATTR_LABEL, XATTR_ACL) or n.startswith("user.")}
+
+
+def attrs_of(fd):
+    st = os.fstat(fd)
+    return {"uid": st.st_uid, "gid": st.st_gid, "mode": stat.S_IMODE(st.st_mode), "xattrs": kept_xattrs(fd)}
+
+
+def set_attrs(fd, attrs, name):
+    """Owner, mode and extended attributes on the temporary file, before it takes the file's place. A label that cannot
+    be set fails while SELinux is on; with it off, a label left on the file means nothing."""
+    on = selinux_on()
+    if on and XATTR_LABEL not in attrs["xattrs"]:
+        raise Failed(f"SELinux is on and there is no label to give {name}")
+    try:
+        os.fchown(fd, attrs["uid"], attrs["gid"])
+        os.fchmod(fd, attrs["mode"])
+    except OSError as e:
+        raise Failed(f"cannot give {name} its owner and mode: {e.strerror or e}") from None
+    for key, value in attrs["xattrs"].items():
+        try:
+            os.setxattr(fd, key, value)
+        except OSError as e:
+            if key != XATTR_LABEL or on:
+                raise Failed(f"cannot set {key} on {name}: {e.strerror or e}") from None
+
+
+def attrs_problem(actual, expected):
+    """What differs between a file's attributes and what they should be; None when nothing does."""
+    for key, what in (("uid", "owner"), ("gid", "group"), ("mode", "mode")):
+        if actual[key] != expected[key]:
+            return f"its {what} is not kept"
+    for key, value in expected["xattrs"].items():
+        if key == XATTR_LABEL and not selinux_on():
+            continue
+        if actual["xattrs"].get(key, b"").rstrip(b"\0") != value.rstrip(b"\0"):
+            return f"its {key} is not kept"
+    return None
+
+
+@contextlib.contextmanager
+def directory(path):
+    """A directory known by its resolved path, as a descriptor the job's file operations go through: a symbolic link
+    put in its place or above it after the path was checked is not followed."""
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        if os.readlink(f"/proc/self/fd/{fd}") != path:
+            raise Refused(f"{path} changed while this job ran")
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def write_all(fd, data):
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+
+
+def hash_fd(fd):
+    h = hashlib.sha256()
+    for chunk in iter(lambda: os.read(fd, 1 << 20), b""):
+        h.update(chunk)
+    return h.hexdigest()
+
+
+class ConfigWriter:
+    """svc-write for one watched installation and one change (§16.3). Files are replaced only through a temporary file
+    in the same directory; backups stay in <work>/backups/<member's hash>/<change>/ (700, files 600), written once per
+    change and file so that a retry never takes a new file for the original. Logs and messages carry names and hashes,
+    never content. self.result is the job's result, also when an action ends in an exception."""
+
+    def __init__(self, work, watch, change, log=lambda text: None):
+        self.watch, self.log, self.result = watch, log, {}
+        self.where = Discovery.layout(watch["installDir"], conf=watch["confDir"])
+        self.conf_root = os.path.realpath(self.where["confDir"])
+        self.registered = {f["name"]: f["path"] for f in watch.get("files") or []}
+        self.backups = pathlib.Path(work) / "backups"
+        self.member_dir = self.backups / hashlib.sha256(watch["member"].encode()).hexdigest()[:16]
+        self.change = change
+        self.dir = self.member_dir / change
+        self.manifest_file = self.dir / "manifest.json"
+
+    # --- what may be touched ---
+
+    def target(self, name, path, base=None, sha256=None):
+        """A configuration file by its name and path: the path where this member has that file, its real location in
+        the conf directory (or, for bootstrap.conf, beside the registered file): no `..`, no link leading out."""
+        if name not in NIFI_CONF_FILES:
+            raise Refused(f"files are names among {', '.join(NIFI_CONF_FILES)}")
+        if not ok_path(path) or ".." in path.split("/") or os.path.normpath(path) != path:
+            raise Refused(f"the path of {name} is not a plain absolute path")
+        if path != (self.registered.get(name) or Discovery.conf_files(self.where)[name]):
+            raise Refused(f"{path} is not where this installation has {name}")
+        real = os.path.realpath(path)
+        roots = [self.conf_root, *([os.path.realpath(os.path.dirname(path))] if name == "bootstrap.conf" else [])]
+        if not any(real.startswith(root.rstrip("/") + "/") for root in roots):
+            raise Refused(f"{path} leads outside this installation's configuration")
+        if not os.path.isdir(os.path.dirname(real)):
+            raise Refused(f"the directory of {path} does not exist")
+        return WriteTarget(name, path, os.path.dirname(real), os.path.basename(real), base, sha256)
+
+    def targets(self, request, need_sha):
+        files = request.get("files")
+        if not isinstance(files, list) or not all(isinstance(f, dict) for f in files):
+            raise Refused("files is a list of {name, path, baseSha256, sha256}")
+        out = []
+        for f in files:
+            base, sha = f.get("baseSha256", ""), f.get("sha256")
+            if base is not None and not (isinstance(base, str) and SHA256_RE.match(base)):
+                raise Refused("baseSha256 is the file's sha256 at the plan, null when it had no such file")
+            if not (isinstance(sha, str) and SHA256_RE.match(sha)) and (need_sha or sha is not None):
+                raise Refused("sha256 is the sha256 of the file to write")
+            out.append(self.target(f.get("name"), f.get("path"), base, sha))
+        if len({t.name for t in out}) != len(out) or len({(t.directory, t.leaf) for t in out}) != len(out):
+            raise Refused("a file comes twice")
+        return out
+
+    def flow_target(self):
+        """The flow file as the present nifi.properties names it (never a path from the request): kept only in the backup."""
+        try:
+            props, st = read_properties(self.where["propertiesFile"]), os.stat(self.where["propertiesFile"])
+        except OSError as e:
+            raise Refused(f"cannot read nifi.properties: {e.strerror or e}") from None
+        value = (props.get(FLOW_PROPERTY) or "").strip()
+        if not value:
+            raise Refused(f"nifi.properties does not name a flow file ({FLOW_PROPERTY})")
+        return self.flow_at(Discovery.resolve(self.where["installDir"], value), st.st_uid)
+
+    @staticmethod
+    def flow_at(path, owner=None):
+        real = os.path.realpath(path)
+        if not real.endswith(".gz") or not os.path.isdir(os.path.dirname(real)):
+            raise Refused(f"{path} is not a flow file (a .gz in an existing directory)")
+        if os.path.lexists(real):
+            st = os.lstat(real)
+            if not stat.S_ISREG(st.st_mode) or (owner is not None and st.st_uid != owner):
+                raise Refused(f"{path} is not a flow file of this installation (a regular file of the owner of nifi.properties)")
+        return WriteTarget(FLOW_ENTRY, path, os.path.dirname(real), os.path.basename(real), None, None)
+
+    def contents(self, request, targets):
+        """The bytes to write by name, each checked against the sha256 it was planned with. No error says anything of them."""
+        try:
+            given = json.loads(request["content"])["files"]
+            data = {f["name"]: base64.b64decode(f["base64"], validate=True) for f in given}
+        except (KeyError, TypeError, ValueError):
+            raise Refused("content is {files: [{name, base64}]}") from None
+        if len(given) != len(data) or set(data) != {t.name for t in targets}:
+            raise Refused("content holds exactly the files named")
+        for t in targets:
+            if hashlib.sha256(data[t.name]).hexdigest() != t.sha256:
+                raise Refused(f"the content of {t.name} does not have its sha256")
+        return data
+
+    # --- files, through their directory ---
+
+    @staticmethod
+    def current(t):
+        """{sha256, attrs} of the file, None when there is none. Its path was resolved, so a link now is a change."""
+        with directory(t.directory) as d:
+            try:
+                fd = os.open(t.leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=d)
+            except FileNotFoundError:
+                return None
+            except OSError as e:
+                if e.errno == errno.ELOOP:
+                    raise Refused(f"{t.path} became a symbolic link") from None
+                raise
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise Refused(f"{t.path} is not a regular file")
+                return {"sha256": hash_fd(fd), "attrs": attrs_of(fd)}
+            finally:
+                os.close(fd)
+
+    @staticmethod
+    def temp_of(t):
+        return f".{t.leaf}{WRITE_TEMP}"
+
+    def sweep(self, targets):
+        """Temporary files a process that was killed left behind."""
+        for path in {t.directory for t in targets}:
+            with directory(path) as d:
+                for name in os.listdir(d):
+                    if name.startswith(".") and name.endswith(WRITE_TEMP):
+                        os.unlink(name, dir_fd=d)
+
+    def prepare(self, t, chunks, sha256, attrs):
+        """§16.3 step 3: the temporary file beside the file, whole, checked and on disk, with the file's attributes."""
+        temp = self.temp_of(t)
+        with directory(t.directory) as d:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temp, dir_fd=d)
+            fd = os.open(temp, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=d)
+            try:
+                try:
+                    for chunk in chunks:
+                        write_all(fd, chunk)
+                except OSError as e:
+                    raise Failed(f"cannot write {t.name}: {e.strerror or e}") from None
+                os.lseek(fd, 0, os.SEEK_SET)
+                if hash_fd(fd) != sha256:
+                    raise Failed(f"{t.name} did not reach the disk as it should (sha256)")
+                os.fsync(fd)
+                set_attrs(fd, attrs, t.name)
+                problem = attrs_problem(attrs_of(fd), attrs)
+                if problem:
+                    raise Failed(f"{t.name}: {problem}")
+                os.fsync(fd)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(temp, dir_fd=d)
+                raise
+            finally:
+                os.close(fd)
+
+    def discard(self, targets):
+        for t in targets:
+            with contextlib.suppress(OSError, Refused), directory(t.directory) as d:
+                os.unlink(self.temp_of(t), dir_fd=d)
+
+    def install(self, t, sha256, attrs):
+        """§16.3 step 4: the temporary file takes the file's place, then what is there now is read back."""
+        with directory(t.directory) as d:
+            os.replace(self.temp_of(t), t.leaf, src_dir_fd=d, dst_dir_fd=d)
+            os.fsync(d)
+        now = self.current(t)
+        if not now or now["sha256"] != sha256:
+            raise Failed(f"{t.name} does not read back as written")
+        problem = attrs_problem(now["attrs"], attrs)
+        if problem:
+            raise Failed(f"{t.name}: {problem}")
+
+    def new_file_attrs(self):
+        """A file that does not exist yet: owner and label of nifi.properties, mode 0640."""
+        try:
+            fd = os.open(self.where["propertiesFile"], os.O_RDONLY)
+        except OSError as e:
+            raise Refused(f"cannot read nifi.properties for a new file's owner: {e.strerror or e}") from None
+        try:
+            a = attrs_of(fd)
+        finally:
+            os.close(fd)
+        return {**a, "mode": 0o640, "xattrs": {k: v for k, v in a["xattrs"].items() if k == XATTR_LABEL}}
+
+    def report(self, t, before):
+        now = self.current(t)
+        out = {"name": t.name, "path": t.path, "before": before, "after": now["sha256"] if now else None}
+        if now:
+            a = now["attrs"]
+            label = a["xattrs"].get(XATTR_LABEL)
+            out.update(owner=user_name(a["uid"]), group=group_name(a["gid"]), mode=f"{a['mode']:04o}",
+                       label=label.rstrip(b"\0").decode(errors="replace") if label else None)
+        return out
+
+    # --- the backup ---
+
+    def manifest(self):
+        try:
+            return json.loads(self.manifest_file.read_text())
+        except FileNotFoundError:
+            return {"member": self.watch["member"], "change": self.change, "at": time.time_ns(), "entries": []}
+
+    def save_manifest(self, manifest):
+        part = self.dir / "manifest.part"
+        fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        try:
+            write_all(fd, json.dumps(manifest, indent=1).encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(part, self.manifest_file)
+
+    def backup_entries(self, targets, cur):
+        """§16.3 step 2: what this change has no copy of yet. A file's copy is whole and on disk before the manifest
+        names it, so one cut short is written again and one the manifest names never is."""
+        for path in (self.backups, self.member_dir, self.dir):
+            path.mkdir(mode=0o700, exist_ok=True)
+            path.chmod(0o700)
+        manifest = self.manifest()
+        for t in targets:
+            if any(e["name"] == t.name for e in manifest["entries"]):
+                continue
+            entry = {"name": t.name, "path": t.path, "existed": bool(cur[t.name]), "flow": t.name == FLOW_ENTRY}
+            if cur[t.name]:
+                self.copy_out(t, cur[t.name]["sha256"])
+                a = cur[t.name]["attrs"]
+                entry.update(sha256=cur[t.name]["sha256"], uid=a["uid"], gid=a["gid"], mode=a["mode"],
+                             xattrs={k: base64.b64encode(v).decode() for k, v in a["xattrs"].items()})
+            manifest["entries"].append(entry)
+            self.save_manifest(manifest)
+            with directory(str(self.dir.resolve())) as d:
+                os.fsync(d)
+            self.log(f"backed up {t.name} ({entry.get('sha256', 'no file')})")
+        return manifest
+
+    def copy_out(self, t, sha256):
+        part = self.dir / f"{t.name}.part"
+        out = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        h = hashlib.sha256()
+        try:
+            with directory(t.directory) as d:
+                fd = os.open(t.leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=d)
+            try:
+                for chunk in iter(lambda: os.read(fd, 1 << 20), b""):
+                    h.update(chunk)
+                    write_all(out, chunk)
+            finally:
+                os.close(fd)
+            os.fsync(out)
+        finally:
+            os.close(out)
+        if h.hexdigest() != sha256:
+            part.unlink()
+            raise Failed(f"{t.name} changed while it was backed up")
+        os.replace(part, self.dir / t.name)
+
+    # --- checks shared by the actions ---
+
+    def looked_at(self, targets):
+        """§16.3 step 1: each file as it is now, refused when it is neither what the plan saw nor already the new one."""
+        cur = {}
+        for t in targets:
+            cur[t.name] = self.current(t)
+            found = cur[t.name]["sha256"] if cur[t.name] else None
+            if found != t.base and not (t.sha256 and found == t.sha256):
+                raise Refused(f"{t.name} changed since the plan: {t.base or 'no file'} expected, {found or 'no file'} found")
+        return cur
+
+    def with_flow(self, request, targets):
+        """The files to back up, the flow file among them when the request asks (a yes or no: never a path)."""
+        flow = request.get("flowFile", False)
+        if not isinstance(flow, bool):
+            raise Refused("flowFile is true or false: the executor reads the flow file's path from nifi.properties")
+        if not targets and not flow:
+            raise Refused("no files named")
+        return [*targets, self.flow_target()] if flow else targets
+
+    # --- the actions ---
+
+    def run(self, request):
+        return getattr(self, f"do_{request['action']}")(request)
+
+    def do_check(self, request):
+        """Writes nothing: the paths, the hashes, and a probe (P14): an empty temporary file beside each file gets the
+        file's owner, mode and label, is read back and removed. The backup directory is not created either."""
+        targets = self.targets(request, False)
+        everything = self.with_flow(request, targets)
+        if request.get("content") is not None:
+            self.contents(request, targets)
+        cur = self.looked_at(targets)
+        empty = hashlib.sha256(b"").hexdigest()
+        files = []
+        for t in targets:
+            self.prepare(t, [], empty, cur[t.name]["attrs"] if cur[t.name] else self.new_file_attrs())
+            self.discard([t])
+            files.append(self.report(t, cur[t.name]["sha256"] if cur[t.name] else None))
+            self.log(f"checked {t.name} ({files[-1]['before'] or 'no file'})")
+        self.result = {"files": files, "selinux": selinux_on()}
+        place = self.dir
+        while not place.exists():
+            place = place.parent
+        if not os.access(place, os.W_OK | os.X_OK):
+            raise Failed(f"cannot write backups below {place}")
+        for t in everything:
+            if t.name == FLOW_ENTRY:
+                if not os.access(t.directory, os.W_OK | os.X_OK):
+                    raise Failed(f"cannot write in the directory of the flow file {t.path}")
+                self.result["flowFile"] = {"path": t.path, "exists": self.current(t) is not None}
+        return f"{len(files)} file(s) can be written"
+
+    def do_backup(self, request):
+        targets = self.targets(request, False)
+        everything = self.with_flow(request, targets)
+        cur = self.looked_at(targets)
+        cur.update({t.name: self.current(t) for t in everything if t.name == FLOW_ENTRY})
+        manifest = self.backup_entries(everything, cur)
+        self.result = {"files": [self.report(t, cur[t.name]["sha256"] if cur[t.name] else None) for t in targets],
+                       "backup": [e["name"] for e in manifest["entries"]]}
+        return f"{len(manifest['entries'])} file(s) in the backup of this change"
+
+    def do_apply(self, request):
+        targets = self.targets(request, True)
+        if not targets:
+            raise Refused("no files named")
+        everything = self.with_flow(request, targets)
+        data = self.contents(request, targets)
+        self.sweep(targets)
+        cur = self.looked_at(targets)
+        before = {t.name: cur[t.name]["sha256"] if cur[t.name] else None for t in targets}
+        cur.update({t.name: self.current(t) for t in everything if t.name == FLOW_ENTRY})
+        manifest = self.backup_entries(everything, cur)
+        todo = [t for t in targets if before[t.name] != t.sha256]
+        try:
+            attrs = {}
+            for t in todo:
+                attrs[t.name] = cur[t.name]["attrs"] if cur[t.name] else self.new_file_attrs()
+                self.prepare(t, [data[t.name]], t.sha256, attrs[t.name])
+            for t in todo:
+                self.install(t, t.sha256, attrs[t.name])
+                self.log(f"wrote {t.name} ({before[t.name] or 'no file'} -> {t.sha256})")
+        except Exception as e:
+            self.discard(todo)
+            self.put_back(targets, before, manifest, e)
+        self.result = {"files": [self.report(t, before[t.name]) for t in targets]}
+        return f"{len(todo)} file(s) written, {len(targets) - len(todo)} already as they should be"
+
+    def put_back(self, targets, before, manifest, cause):
+        """A write that failed halfway: in the same job, every file of the request back as its backup has it."""
+        names = {t.name for t in targets}
+        try:
+            files, failed = self.restore_entries([e for e in manifest["entries"] if e["name"] in names])
+        except Exception as e:
+            files, failed = [], {name: str(e) for name in names}
+        for f in files:
+            f["before"] = before.get(f["name"])
+        self.result = {"files": files, "rolledBack": not failed, "notRestored": sorted(failed)}
+        if failed:
+            raise Failed(f"{cause}; could not put back: {', '.join(f'{k} ({v})' for k, v in sorted(failed.items()))}") from None
+        raise Failed(f"{cause}; every file is back as it was") from None
+
+    def entry_target(self, e):
+        return self.flow_at(e["path"]) if e.get("flow") else self.target(e["name"], e["path"])
+
+    def restore_entries(self, entries):
+        """§16.3 step 5, nothing replaced unless every file could be prepared. (reports, {name: why it could not be restored})."""
+        targets = [self.entry_target(e) for e in entries]
+        self.sweep(targets)
+        before, todo, failed, prepared = {}, [], {}, []
+        for t, e in zip(targets, entries):
+            cur = self.current(t)
+            before[t.name] = cur["sha256"] if cur else None
+            if not e["existed"]:
+                if cur:
+                    todo.append((t, e, None))
+                continue
+            attrs = {"uid": e["uid"], "gid": e["gid"], "mode": e["mode"], "xattrs": {k: base64.b64decode(v) for k, v in e["xattrs"].items()}}
+            if cur and cur["sha256"] == e["sha256"] and not attrs_problem(cur["attrs"], attrs):
+                continue
+            try:
+                with open(self.dir / e["name"], "rb") as fh:
+                    self.prepare(t, iter(lambda: fh.read(1 << 20), b""), e["sha256"], attrs)
+                prepared.append(t)
+                todo.append((t, e, attrs))
+            except Exception as err:
+                failed[t.name] = str(getattr(err, "strerror", None) or err)
+        if failed:
+            self.discard(prepared)
+            return [self.report(t, before[t.name]) for t in targets], failed
+        for t, e, attrs in todo:
+            try:
+                if attrs is None:
+                    with directory(t.directory) as d:
+                        os.unlink(t.leaf, dir_fd=d)
+                        os.fsync(d)
+                else:
+                    self.install(t, e["sha256"], attrs)
+                self.log(f"restored {t.name} ({before[t.name] or 'no file'} -> {e.get('sha256', 'no file')})")
+            except Exception as err:
+                failed[t.name] = str(getattr(err, "strerror", None) or err)
+        self.discard(prepared)
+        return [self.report(t, before[t.name]) for t in targets], failed
+
+    def do_restore(self, request):
+        if not self.manifest_file.is_file():
+            raise Refused("this change has no backup here")
+        files, failed = self.restore_entries(self.manifest()["entries"])
+        self.result = {"files": [f for f in files if f["name"] != FLOW_ENTRY], "notRestored": sorted(failed)}
+        self.result.update({"flowFile": f for f in files if f["name"] == FLOW_ENTRY})
+        if failed:
+            raise Failed(f"could not restore: {', '.join(f'{k} ({v})' for k, v in sorted(failed.items()))}")
+        return f"{len(files)} file(s) as their backup has them"
+
+    def do_prune(self, request):
+        """After a change succeeded: the newest BACKUPS_KEPT backups of this member stay, this change's always."""
+        found = []
+        for path in self.member_dir.iterdir() if self.member_dir.is_dir() else ():
+            if path.is_symlink() or not path.is_dir() or not CHANGE_RE.match(path.name):
+                continue
+            try:
+                at = json.loads((path / "manifest.json").read_text()).get("at", 0)
+            except (OSError, ValueError):
+                at = 0  # cut short before its first file
+            found.append((path.name == self.change, at, path))
+        found.sort(key=lambda f: f[:2], reverse=True)
+        gone = [f[2] for f in found[BACKUPS_KEPT:]]
+        for path in gone:
+            shutil.rmtree(path)
+        self.result = {"pruned": sorted(p.name for p in gone), "kept": len(found) - len(gone)}
+        self.log(f"pruned {len(gone)} backup(s), kept {len(found) - len(gone)}")
+        return f"{len(gone)} old backup(s) removed"
+
+
 class ServiceExecutor(ProtocolExecutor):
     """The service executor: the read channel, and the change channel (executor-upgrade and CHANGE_JOBS)."""
 
@@ -1926,15 +2451,15 @@ class ServiceExecutor(ProtocolExecutor):
     # Read jobs: kind -> method(job) returning the job's result (a dict).
     READ_JOBS = {"svc-discover": "discover", "svc-read": "read_files", "svc-state": "state", "log-read": "log_read", "log-tail": "log_tail",
                  "nifi-provenance": "nifi_provenance"}
-    # Change jobs that run beside the reads: kind -> method(request, status), one at a time. None yet (svc-write and
-    # svc-control come with their own steps, §16.4).
-    CHANGE_JOBS = {}
+    # Change jobs that run beside the reads: kind -> method(request, status), one at a time. svc-control comes with its
+    # own step (§16.4).
+    CHANGE_JOBS = {"svc-write": "svc_write"}
     # What the read jobs can do beyond their first form, named "<kind>@<n>" in the heartbeat's kinds (§15.2): the
     # Deployer looks for one before it sends a request that needs it. svc-discover@2: dirs entries {install, conf};
     # svc-read@2: confDir (and bootstrapFile), an installation's conf directory kept apart from it (S25).
     # nifi-provenance@1: provenance, lineage, event and search-options as ProvenanceQuery reads them (S28).
-    # svc-state@1: the job's first form (§16.3), so the plain kind alone never counts.
-    CAPABILITIES = ["svc-discover@2", "svc-read@2", "nifi-provenance@1", "svc-state@1"]
+    # svc-state@1, svc-write@1: the jobs' first forms (§16.3), so the plain kind alone never counts.
+    CAPABILITIES = ["svc-discover@2", "svc-read@2", "nifi-provenance@1", "svc-state@1", "svc-write@1"]
     # Where discovery looks (tests point these elsewhere; the directories scanned are the configuration's scan_dirs).
     PROC = "/proc"
     AUTOSTART_DIRS = AUTOSTART_DIRS
@@ -2375,6 +2900,23 @@ class ServiceExecutor(ProtocolExecutor):
         out = self.make_collector().state(self.watched(job.request.get("member")))
         job.log(f"running: {out['process']['running']}, REST: {out['rest']['state']}, {len(out['files'])} file(s)")
         return out
+
+    def svc_write(self, req, status):
+        """svc-write (§16.3): request.action (check, backup, apply, restore, prune) for request.change on request.member,
+        a watched installation (ConfigWriter). The status and the log carry names and hashes; the content of the files
+        comes in request.content, for apply, and goes nowhere but into them."""
+        action, change = req.get("action"), req.get("change")
+        if action not in WRITE_ACTIONS:
+            raise Refused(f"action is one of {', '.join(WRITE_ACTIONS)}")
+        if not isinstance(change, str) or not CHANGE_RE.match(change):
+            raise Refused("change is the id of the change this job belongs to")
+        writer = ConfigWriter(self.cfg["work"], self.watched(req.get("member")), change, self.log)
+        self.step(status, action)
+        try:
+            message = writer.run(req)
+        finally:
+            status["result"] = writer.result
+        self.finish(status, "succeeded", message)
 
     def nifi_call(self, w, props):
         """(call(method, path, body, timeout) -> (status, bytes), whether it is a cluster node) for a watched NiFi's
