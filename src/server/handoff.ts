@@ -55,6 +55,8 @@ export interface Heartbeat {
   /** The service executor's read channel: the reads in flight, and how many may run at once. */
   reading?: string[];
   readSlots?: number;
+  /** §16.3: what svc-control has to work with: the operator certificate is set, the executor's unit's KillMode (null: not under systemd), runuser is there. */
+  control?: { operatorCert?: boolean; killMode?: string | null; runuser?: boolean };
 }
 
 export interface ExecutorInfo { online: boolean; host: string; executor?: ExecutorKind; reason?: string; heartbeat?: Heartbeat; ageSeconds?: number }

@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import pathlib
+import pwd
 import shutil
 import subprocess
 import sys
@@ -95,7 +96,7 @@ class RegistrationTest(Base):
         beat = self.api.beats[-1]
         self.assertEqual(beat["executor"], "service")
         self.assertEqual(beat["protocols"], [2])
-        self.assertEqual(beat["kinds"], ["svc-discover", "svc-read", "svc-state", "log-read", "log-tail", "nifi-provenance", "svc-write", "executor-upgrade", "svc-discover@2", "svc-read@2", "nifi-provenance@1", "svc-state@1", "svc-write@1"],
+        self.assertEqual(beat["kinds"], ["svc-discover", "svc-read", "svc-state", "log-read", "log-tail", "nifi-provenance", "svc-write", "svc-control", "executor-upgrade", "svc-discover@2", "svc-read@2", "nifi-provenance@1", "svc-state@1", "svc-write@1", "svc-control@1"],
                          "the service jobs and what they can do (§15.2); never the deploy ones")
         name, root = sx.ServiceExecutor.user()
         self.assertEqual((beat["user"], beat["isRoot"]), (name, root))
@@ -2586,6 +2587,669 @@ class ProvenanceTest(Base):
         result = ex.nifi_provenance(sx.ReadJob({**job.request, "member": "local:/opt/nifi"}, 30))
         self.assertEqual(result, {"op": "search-options", "fields": 4})
         self.assertEqual(len(json.loads(api.content[job.id])["fields"]), 4)
+
+
+FAKE_NIFI_PROCESS = """import os, pathlib, subprocess, sys, time
+main = "org.apache.nifi.NiFi" in sys.argv
+config = next(a.split("=", 1)[1] for a in sys.argv if a.startswith(("-Dnifi.properties.file.path=", "-Dorg.apache.nifi.bootstrap.config.file=")))
+home = pathlib.Path(config).parent.parent
+(home / ("main.pid" if main else "boot.pid")).write_text(str(os.getpid()))
+if main:
+    time.sleep(120)
+else:
+    p = subprocess.Popen([sys.executable, __file__, "-classpath", f"{home}/lib/nifi-runtime.jar", f"-Dnifi.properties.file.path={home}/conf/nifi.properties", "org.apache.nifi.NiFi"])
+    p.wait()
+"""
+
+FAKE_NIFI_SH = """#!/bin/sh
+# nifi.sh as far as svc-control can tell: it says what it was given, and starts and stops two real processes.
+home=@HOME@
+echo "$1" >> "$home/calls"
+env | sort > "$home/last-$1-env"
+pwd > "$home/last-$1-cwd"
+id -u > "$home/last-$1-uid"
+{ ulimit -Sn; ulimit -Hn; ulimit -Su; ulimit -Hu; } > "$home/last-$1-limits"
+case "$1" in
+start)
+  if [ -f "$home/start-fails" ]; then echo "no luck, password=hunter2"; exit 3; fi
+  [ -f "$home/start-nothing" ] && exit 0
+  @PYTHON@ "$home/fake.py" -cp "$home/lib/bootstrap/x.jar" "-Dorg.apache.nifi.bootstrap.config.file=$home/conf/bootstrap.conf" org.apache.nifi.bootstrap.RunNiFi start </dev/null >/dev/null 2>&1 &
+  echo started
+  ;;
+stop)
+  [ -f "$home/stop-hangs" ] && exec @PYTHON@ -c "import time; time.sleep(60)"
+  [ -f "$home/stop-ignored" ] && exit 0
+  kill "$(cat "$home/main.pid")"
+  [ -f "$home/stop-fails" ] && exit 1
+  ;;
+esac
+exit 0
+"""
+
+
+class FakeTool:
+    """A command on PATH that records its arguments and, for a wrapper, runs what follows them."""
+
+    def __init__(self, directory, name, body):
+        self.log = pathlib.Path(directory) / f"{name}.calls"
+        path = pathlib.Path(directory) / name
+        path.write_text(f'#!/bin/sh\nfor a in "$@"; do printf "%s\\n" "$a" >> "{self.log}"; done\n{body}\n')
+        path.chmod(0o755)
+
+    @property
+    def args(self):
+        return self.log.read_text().splitlines() if self.log.exists() else []
+
+
+@unittest.skipUnless(hasattr(os, "geteuid") and pathlib.Path("/proc/self/stat").exists(), "needs a POSIX system with /proc")
+class SvcControlTest(Base):
+    """svc-control against a fake nifi.sh whose processes are real: real /proc, real exits, real limits. Nothing of a real
+    NiFi is involved. Root is played with wrappers named runuser and prlimit on PATH."""
+
+    ENV = {"JAVA_HOME": "/jdk/21", "PATH": "/usr/bin:/bin", "NIFI_LOG_DIR": "/var/log/nifi"}
+
+    def setUp(self):
+        super().setUp()
+        self.home = nifi_home(self.root, "nifi", "2.0.0", {"nifi.web.https.port": "18444"})
+        script = self.home / "bin" / "nifi.sh"
+        script.write_text(FAKE_NIFI_SH.replace("@HOME@", str(self.home)).replace("@PYTHON@", sys.executable))
+        script.chmod(0o755)
+        (self.home / "fake.py").write_text(FAKE_NIFI_PROCESS)
+        self.me = pwd.getpwuid(os.geteuid()).pw_name
+        self.api = WatchApi()
+        self.api.watch = [{"service": "nifi", "member": "local:nifi", "profile": "nifi", "installDir": str(self.home), "confDir": str(self.home / "conf"),
+                           "https": {"host": "localhost", "port": 18444}, "nodeAddress": "localhost", "logDir": None, "files": []}]
+        self.cgroup = self.root / "cgroup"
+        self.cgroup.write_text("0::/user.slice/session-1.scope\n")
+        self.ex = self.make_ex()
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        patch = mock.patch.dict(os.environ, {"PATH": f"{self.bin}:{os.environ.get('PATH', '')}", "EXECUTOR_LEAK": "from-the-executor"})
+        patch.start()
+        self.addCleanup(patch.stop)
+        poll = mock.patch.object(sx, "CONTROL_POLL", 0.02)
+        poll.start()
+        self.addCleanup(poll.stop)
+        self.addCleanup(self.kill_all)
+        self.jobs = 0
+
+    def make_ex(self, **over):
+        ex = sx.ServiceExecutor(cfg(self.root, **over), out=self.devnull, api=self.api)
+        ex.sleep = lambda s: None
+        ex.CGROUP = str(self.cgroup)
+        ex.watch = sx.watch_entries(self.api.watch)
+        return ex
+
+    def pid_of(self, name):
+        return int((self.home / name).read_text())
+
+    def kill_all(self):
+        for name in ("boot.pid", "main.pid"):
+            try:
+                pid = self.pid_of(name)
+                # Its pid file may be old by now: only a process of this test.
+                if str(self.home).encode() in pathlib.Path(f"/proc/{pid}/cmdline").read_bytes():
+                    os.kill(pid, 9)
+            except (OSError, ValueError):
+                pass
+
+    def job(self, action, timeout=10, member="local:nifi", change="change-1", ex=None, **extra):
+        self.jobs += 1
+        job_id = f"control-job-{self.jobs:04}"
+        (ex or self.ex).handle({"protocol": 2, "id": job_id, "kind": "svc-control", "action": action, "change": change, "member": member, "timeoutSeconds": timeout, **extra})
+        self.last = job_id
+        return self.api.status[job_id]
+
+    def start(self, **extra):
+        return self.job("start", **{"serviceUser": self.me, "env": self.ENV, "limits": None, **extra})
+
+    def stop(self, **extra):
+        return self.job("stop", **{"serviceUser": self.me, "env": self.ENV, **extra})
+
+    def running(self, pid):
+        try:
+            return (pathlib.Path("/proc") / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+        except OSError:
+            return False
+
+    def calls(self):
+        p = self.home / "calls"
+        return p.read_text().split() if p.exists() else []
+
+    def seen(self, name):
+        return (self.home / name).read_text()
+
+    def assert_started(self):
+        done = self.start()
+        self.assertEqual(done["state"], "succeeded", done.get("message"))
+        return done
+
+    # --- starting ---
+
+    def test_the_kind_and_its_first_form_are_in_the_heartbeat(self):
+        self.ex.heartbeat()
+        self.assertIn("svc-control", self.api.beats[-1]["kinds"])
+        self.assertIn("svc-control@1", self.api.beats[-1]["kinds"])
+
+    def test_a_start_runs_nifi_sh_with_only_the_filtered_environment_in_its_directory(self):
+        done = self.start(env={**self.ENV, "NIFI_SENSITIVE_KEY": "s3cret-value", "SOMETHING_ELSE": "other-value"})
+        self.assertEqual(done["state"], "succeeded", done.get("message"))
+        env = dict(line.split("=", 1) for line in self.seen("last-start-env").splitlines())
+        env.pop("PWD", None)  # the shell's own
+        self.assertEqual(env, self.ENV, "env -i: not the executor's environment, and nothing the filter drops")
+        self.assertEqual(self.seen("last-start-cwd").strip(), str(self.home))
+        p = done["result"]["process"]
+        self.assertEqual((p["pid"], p["bootstrapPid"], p["user"]), (self.pid_of("main.pid"), self.pid_of("boot.pid"), self.me))
+        self.assertTrue(p["startedAt"] and p["bootstrapStartedAt"])
+        self.assertEqual(done["result"]["environmentDropped"], ["NIFI_SENSITIVE_KEY", "SOMETHING_ELSE"])
+        self.assertNotEqual(os.getsid(p["bootstrapPid"]), os.getsid(0), "its own session")
+        everything = json.dumps(done) + self.api.logs.get(self.last, "")
+        for value in ("s3cret-value", "other-value", "/jdk/21"):
+            self.assertNotIn(value, everything, "the status and the log carry no values of the environment")
+
+    def test_the_job_ends_while_the_nifi_it_started_keeps_running(self):
+        p = self.assert_started()["result"]["process"]
+        self.assertTrue(self.running(p["pid"]) and self.running(p["bootstrapPid"]))
+
+    def test_limits_reach_the_process(self):
+        soft, hard = sx.resource.getrlimit(sx.resource.RLIMIT_NOFILE)
+        wanted = min(soft, 512)
+        done = self.start(limits={"nofile": {"soft": wanted, "hard": hard if hard != sx.resource.RLIM_INFINITY else "unlimited"}})
+        self.assertEqual(done["state"], "succeeded", done.get("message"))
+        self.assertEqual(self.seen("last-start-limits").split()[0], str(wanted))
+        self.assertEqual(done["result"]["limits"]["nofile"]["soft"], wanted, "read back from the process")
+        self.assertNotIn("limitsLowered", done["result"])
+
+    def test_no_limits_no_prlimit(self):
+        prlimit = FakeTool(self.bin, "prlimit", 'echo "prlimit was run" >&2; exit 9')
+        self.assert_started()
+        self.assertEqual(prlimit.args, [])
+
+    @unittest.skipIf(os.geteuid() == 0, "root can raise a hard limit")
+    def test_not_root_it_cannot_raise_a_hard_limit_and_says_so(self):
+        _, hard = sx.resource.getrlimit(sx.resource.RLIMIT_NOFILE)
+        if hard == sx.resource.RLIM_INFINITY:
+            self.skipTest("no hard limit here")
+        done = self.start(limits={"nofile": {"soft": hard + 1000, "hard": hard + 1000}})
+        self.assertEqual(done["state"], "succeeded", done.get("message"))
+        self.assertEqual(done["result"]["limitsLowered"], {"nofile": {"asked": hard + 1000, "used": hard}})
+        self.assertEqual(done["result"]["limits"]["nofile"]["hard"], hard)
+        self.assertIn("nofile", self.api.logs[self.last])
+
+    def test_limits_that_make_no_sense_are_refused(self):
+        for limits in ({"nofile": {"soft": 10, "hard": 5}}, {"nofile": {"soft": "--evil", "hard": 5}}, {"nofile": 5}, {"as": {"soft": 1, "hard": 1}},
+                       {"nofile": {"soft": True, "hard": 5}}, ["nofile"], {"nproc": {"soft": -1, "hard": 5}}):
+            done = self.start(limits=limits)
+            self.assertEqual(done["state"], "refused", limits)
+        self.assertEqual(self.calls(), [])
+
+    def test_as_root_prlimit_wraps_runuser_wraps_env(self):
+        prlimit = FakeTool(self.bin, "prlimit", 'while [ "${1#--}" != "$1" ]; do shift; done\nexec "$@"')
+        runuser = FakeTool(self.bin, "runuser", 'shift 3\nexec "$@"')
+        entry = mock.Mock(pw_uid=os.geteuid())
+        with mock.patch.object(sx.ServiceExecutor, "user", staticmethod(lambda: ("root", True))), mock.patch.object(sx.pwd, "getpwnam", return_value=entry):
+            done = self.start(serviceUser="nifisvc", env={"JAVA_HOME": "/jdk/21"}, limits={"nofile": {"soft": 256, "hard": "unlimited"}, "nproc": {"soft": 100, "hard": 200}})
+        self.assertEqual(done["state"], "succeeded", done.get("message"))
+        self.assertEqual(prlimit.args[:2], ["--nofile=256:unlimited", "--nproc=100:200"])
+        self.assertEqual(prlimit.args[2:6], ["runuser", "-u", "nifisvc", "--"])
+        self.assertEqual(runuser.args, ["-u", "nifisvc", "--", "env", "-i", "JAVA_HOME=/jdk/21", str(self.home / "bin" / "nifi.sh"), "start"])
+
+    def test_a_nifi_that_came_up_as_someone_else_is_a_failure_and_is_left_alone(self):
+        FakeTool(self.bin, "runuser", 'shift 3\nexec "$@"')
+        entry = mock.Mock(pw_uid=os.geteuid() + 1)
+        with mock.patch.object(sx.ServiceExecutor, "user", staticmethod(lambda: ("root", True))), mock.patch.object(sx.pwd, "getpwnam", return_value=entry):
+            done = self.start(serviceUser="nifisvc")
+        self.assertEqual(done["state"], "failed")
+        self.assertIn("not as nifisvc", done["message"])
+        self.assertTrue(self.running(self.pid_of("main.pid")))
+
+    def test_root_is_never_the_service_user(self):
+        for who in (("root", True), (self.me, False)):
+            with mock.patch.object(sx.ServiceExecutor, "user", staticmethod(lambda who=who: who)):
+                done = self.start(serviceUser="root")
+            self.assertEqual(done["state"], "refused")
+            self.assertIn("root", done["message"])
+        # Any name with uid 0.
+        with mock.patch.object(sx.pwd, "getpwnam", return_value=mock.Mock(pw_uid=0)):
+            self.assertEqual(self.start(serviceUser="toor")["state"], "refused")
+        self.assertEqual(self.calls(), [])
+
+    def test_a_service_user_it_cannot_be_is_refused(self):
+        self.assertEqual(self.start(serviceUser="no-such-user-here")["state"], "refused")
+        self.assertEqual(self.start(serviceUser="-x")["state"], "refused")
+        self.assertEqual(self.start(serviceUser=None)["state"], "refused")
+        if os.geteuid() != 0:
+            with mock.patch.object(sx.pwd, "getpwnam", return_value=mock.Mock(pw_uid=os.geteuid() + 1)):
+                done = self.start(serviceUser="someone")
+            self.assertEqual(done["state"], "refused")
+            self.assertIn("cannot act as", done["message"])
+        self.assertEqual(self.calls(), [])
+
+    def test_run_as_in_bootstrap_conf_must_be_the_service_user(self):
+        (self.home / "conf" / "bootstrap.conf").write_text("run.as=someoneelse\n")
+        done = self.start()
+        self.assertEqual(done["state"], "refused")
+        self.assertIn("run.as=someoneelse", done["message"])
+        self.assertEqual(self.calls(), [])
+        (self.home / "conf" / "bootstrap.conf").write_text(f"run.as={self.me}\n")
+        self.assert_started()
+
+    def test_an_environment_with_a_name_or_value_that_is_no_string_is_refused(self):
+        for env in (None, "PATH=/bin", {"PATH": 1}, {"PATH": "/bin\0x"}):
+            self.assertEqual(self.start(env=env)["state"], "refused", env)
+        self.assertEqual(self.calls(), [])
+
+    def test_running_already_nothing_is_run(self):
+        first = self.assert_started()["result"]["process"]
+        again = self.start()
+        self.assertEqual(again["state"], "succeeded")
+        self.assertTrue(again["result"]["alreadyRunning"])
+        self.assertEqual(again["result"]["process"]["pid"], first["pid"])
+        self.assertEqual(self.calls(), ["start"])
+
+    def test_a_start_that_fails_says_so_and_hides_secrets_in_the_log(self):
+        (self.home / "start-fails").write_text("")
+        done = self.start(timeout=2)
+        self.assertEqual(done["state"], "failed")
+        self.assertIn("exit 3", done["message"])
+        self.assertEqual(done["result"]["scriptExit"], 3)
+        self.assertIn("no luck", self.api.logs[self.last])
+        self.assertNotIn("hunter2", self.api.logs[self.last])
+
+    def test_a_start_after_which_nothing_runs_fails_at_the_deadline(self):
+        (self.home / "start-nothing").write_text("")
+        done = self.start(timeout=1)
+        self.assertEqual(done["state"], "failed")
+        self.assertIn("not running", done["message"])
+        self.assertIsNone(done["result"]["process"])
+
+    def test_a_script_that_is_not_there_fails(self):
+        (self.home / "bin" / "nifi.sh").unlink()
+        done = self.start()
+        self.assertEqual(done["state"], "failed")
+        self.assertIn("not an executable", done["message"])
+
+    # --- KillMode (§16.3) ---
+
+    def test_under_systemd_another_killmode_refuses_a_start_only(self):
+        self.cgroup.write_text("0::/system.slice/open-atlas-service-executor.service\n")
+        systemctl = FakeTool(self.bin, "systemctl", "echo control-group")
+        done = self.start()
+        self.assertEqual(done["state"], "refused")
+        self.assertIn("KillMode=control-group", done["message"])
+        self.assertIn("install.sh", done["message"])
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(systemctl.args[:5], ["show", "open-atlas-service-executor.service", "-p", "KillMode", "--value"], "asked at the start itself, as the unit may have changed since the last heartbeat")
+        # Stopping is not what it endangers.
+        self.assertEqual(self.stop()["state"], "succeeded")
+
+    def test_under_systemd_killmode_process_may_start(self):
+        self.cgroup.write_text("0::/system.slice/open-atlas-service-executor.service\n")
+        FakeTool(self.bin, "systemctl", "echo process")
+        self.assert_started()
+
+    def test_a_killmode_it_cannot_read_refuses_a_start(self):
+        self.cgroup.write_text("0::/system.slice/x.service\n")
+        FakeTool(self.bin, "systemctl", "exit 1")
+        done = self.start()
+        self.assertEqual(done["state"], "refused")
+        self.assertIn("KillMode=unknown", done["message"])
+
+    def test_a_users_unit_is_asked_of_the_users_manager(self):
+        self.cgroup.write_text("0::/user.slice/user-1000.slice/user@1000.service/app.slice/oa-x.service\n")
+        systemctl = FakeTool(self.bin, "systemctl", "echo process")
+        self.assertEqual(sx.kill_mode(str(self.cgroup)), "process")
+        self.assertEqual(systemctl.args[:3], ["--user", "show", "oa-x.service"])
+
+    def test_own_unit_reads_the_cgroup(self):
+        for text, want in (("0::/system.slice/a.service\n", ("a.service", False)),
+                           ("0::/user.slice/user-1000.slice/session-3.scope\n", (None, False)),
+                           ("0::/user.slice/user-1000.slice/user@1000.service/init.scope\n", (None, False)),
+                           ("0::/init.scope\n", (None, False)),
+                           ("12:cpu:/x.service\n1:name=systemd:/system.slice/b.service\n", ("b.service", False)),
+                           ("12:cpu:/x.service\n", (None, False))):
+            self.cgroup.write_text(text)
+            self.assertEqual(sx.own_unit(str(self.cgroup)), want, text)
+        self.assertEqual(sx.own_unit(str(self.root / "none")), (None, False))
+
+    def test_the_unit_keeps_a_nifi_alive_and_gives_it_nothing_it_should_not_inherit(self):
+        unit = (HERE / "service" / "open-atlas-service-executor.service").read_text()
+        lines = [line.strip() for line in unit.splitlines() if not line.startswith("#")]
+        self.assertIn("KillMode=process", lines)
+        self.assertIn("TasksMax=infinity", lines)
+        for word in ("NoNewPrivileges", "ProtectSystem", "PrivateTmp"):
+            self.assertFalse([line for line in lines if line.startswith(word)], word)
+
+    # --- the heartbeat ---
+
+    def test_the_heartbeat_says_what_control_has_without_a_path(self):
+        ex = self.make_ex(nifi_operator_cert="/secret/place/op.crt", nifi_operator_key="/secret/place/op.key")
+        ex.heartbeat()
+        beat = self.api.beats[-1]
+        self.assertEqual(beat["control"], {"operatorCert": True, "killMode": None, "runuser": bool(sx.shutil.which("runuser"))})
+        self.assertNotIn("/secret/place", json.dumps(beat))
+        self.ex.heartbeat()
+        self.assertFalse(self.api.beats[-1]["control"]["operatorCert"])
+        self.cgroup.write_text("0::/system.slice/x.service\n")
+        FakeTool(self.bin, "systemctl", "echo mixed")
+        fresh = self.make_ex()
+        fresh.heartbeat()
+        self.assertEqual(self.api.beats[-1]["control"]["killMode"], "mixed")
+
+    # --- stopping ---
+
+    def test_a_stop_waits_for_both_processes_to_exit(self):
+        p = self.assert_started()["result"]["process"]
+        done = self.stop()
+        self.assertEqual(done["state"], "succeeded", done.get("message"))
+        self.assertFalse(self.running(p["pid"]) or self.running(p["bootstrapPid"]))
+        self.assertEqual(done["result"]["stopped"]["pid"], p["pid"])
+        self.assertIsNone(done["result"]["process"])
+        env = dict(line.split("=", 1) for line in self.seen("last-stop-env").splitlines())
+        env.pop("PWD", None)
+        self.assertEqual(env, self.ENV)
+
+    def test_a_script_that_failed_but_stopped_it_is_a_stop(self):
+        self.assert_started()
+        (self.home / "stop-fails").write_text("")
+        done = self.stop()
+        self.assertEqual(done["state"], "succeeded", done.get("message"))
+        self.assertEqual(done["result"]["scriptExit"], 1)
+
+    def test_stopped_already_nothing_is_run(self):
+        done = self.stop()
+        self.assertEqual(done["state"], "succeeded")
+        self.assertTrue(done["result"]["alreadyStopped"])
+        self.assertEqual(self.calls(), [])
+
+    def test_a_stop_that_runs_out_of_time_kills_nothing_and_names_the_pair(self):
+        p = self.assert_started()["result"]["process"]
+        (self.home / "stop-ignored").write_text("")
+        done = self.stop(timeout=1)
+        self.assertEqual(done["state"], "failed")
+        self.assertIn("nothing was killed", done["message"])
+        self.assertTrue(done["result"]["stillRunning"])
+        self.assertTrue(self.running(p["pid"]) and self.running(p["bootstrapPid"]))
+        left = done["result"]["process"]
+        self.assertEqual((left["pid"], left["startedAt"], left["bootstrapPid"], left["bootstrapStartedAt"]), (p["pid"], p["startedAt"], p["bootstrapPid"], p["bootstrapStartedAt"]))
+
+    def test_a_script_that_hangs_gets_a_signal_but_the_nifi_does_not(self):
+        p = self.assert_started()["result"]["process"]
+        (self.home / "stop-hangs").write_text("")
+        before = time.monotonic()
+        done = self.stop(timeout=2)
+        self.assertLess(time.monotonic() - before, 8, "it does not wait for the script")
+        self.assertEqual(done["state"], "failed")
+        self.assertIsNone(done["result"]["scriptExit"])
+        self.assertTrue(self.running(p["pid"]) and self.running(p["bootstrapPid"]))
+
+    def test_a_nifi_running_as_another_user_is_not_stopped_as_this_one(self):
+        self.assert_started()
+        with mock.patch.object(sx.ServiceExecutor, "user", staticmethod(lambda: ("root", True))), mock.patch.object(sx.pwd, "getpwnam", return_value=mock.Mock(pw_uid=os.geteuid() + 1)):
+            done = self.stop(serviceUser="nifisvc")
+        self.assertEqual(done["state"], "refused")
+        self.assertEqual(self.calls(), ["start"])
+
+    def test_root_never_runs_the_stop_script_either(self):
+        self.assertEqual(self.stop(serviceUser="root")["state"], "refused")
+
+    # --- force ---
+
+    def pair(self, p):
+        return {k: p[k] for k in ("pid", "startedAt", "bootstrapPid", "bootstrapStartedAt")}
+
+    def test_kill_is_what_a_timeout_never_does_and_takes_the_pair(self):
+        self.assert_started()
+        (self.home / "stop-ignored").write_text("")
+        stuck = self.stop(timeout=1)
+        p = stuck["result"]["process"]
+        done = self.job("kill", **self.pair(p))
+        self.assertEqual(done["state"], "succeeded", done.get("message"))
+        self.assertEqual(done["result"]["killed"], [p["bootstrapPid"], p["pid"]], "the bootstrap first: it would start the JVM again")
+        self.assertFalse(self.running(p["pid"]) or self.running(p["bootstrapPid"]))
+        self.assertIsNone(done["result"]["process"])
+        self.assertIn("SIGKILL", self.api.logs[self.last])
+
+    def test_kill_refuses_a_pid_with_another_start_time(self):
+        p = self.assert_started()["result"]["process"]
+        done = self.job("kill", **{**self.pair(p), "startedAt": "2001-01-01T00:00:00Z"})
+        self.assertEqual(done["state"], "refused")
+        self.assertIn("nothing was killed", done["message"])
+        self.assertTrue(self.running(p["pid"]) and self.running(p["bootstrapPid"]))
+
+    def test_kill_refuses_when_it_names_only_part_of_what_runs(self):
+        p = self.assert_started()["result"]["process"]
+        done = self.job("kill", pid=p["pid"], startedAt=p["startedAt"])
+        self.assertEqual(done["state"], "refused")
+        self.assertTrue(self.running(p["pid"]) and self.running(p["bootstrapPid"]))
+
+    def test_kill_touches_nothing_that_is_not_this_nifi(self):
+        other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(other.wait)
+        self.addCleanup(other.kill)
+        wait_until(lambda: sx.Discovery("/proc").started_at(other.pid))
+        at = sx.Discovery("/proc").started_at(other.pid)
+        done = self.job("kill", pid=other.pid, startedAt=at)
+        self.assertEqual(done["state"], "succeeded", done.get("message"))
+        self.assertEqual(done["result"]["killed"], [])
+        self.assertTrue(self.running(other.pid))
+
+    def test_kill_of_what_has_gone_is_done_already(self):
+        p = self.assert_started()["result"]["process"]
+        self.assertEqual(self.stop()["state"], "succeeded")
+        done = self.job("kill", **self.pair(p))
+        self.assertEqual(done["state"], "succeeded")
+        self.assertEqual(done["result"]["killed"], [])
+
+    def test_kill_needs_a_whole_pair(self):
+        for extra in ({}, {"pid": 1234}, {"startedAt": "2020-01-01T00:00:00Z"}, {"pid": 1, "startedAt": "x"}, {"pid": "12", "startedAt": "x"}, {"pid": True, "startedAt": "x"}):
+            self.assertEqual(self.job("kill", **extra)["state"], "refused", extra)
+
+    def test_pid_reuse_counts_as_exited_and_a_zombie_too(self):
+        proc = FakeProc(self.root / "proc")
+        proc.add(4000, ["java"])
+        w = sx.watch_entries(self.api.watch)[0]
+        control = sx.ServiceControl(cfg(self.root), w, (self.me, False), proc=str(self.root / "proc"))
+        at = control.discovery.started_at(4000)
+        self.assertTrue(control.alive(4000, at))
+        self.assertFalse(control.alive(4000, "2001-01-01T00:00:00Z"), "another process on the same pid")
+        self.assertFalse(control.alive(4001, at), "gone")
+        stat = self.root / "proc" / "4000" / "stat"
+        stat.write_text(stat.read_text().replace(" S ", " Z "))
+        self.assertFalse(control.alive(4000, at), "a zombie has exited")
+
+    # --- the request ---
+
+    def test_the_request_is_checked_first(self):
+        self.assertEqual(self.job("restart")["state"], "refused")
+        self.assertEqual(self.job("start", change="../x")["state"], "refused")
+        self.assertEqual(self.job("start", change=None)["state"], "refused")
+        self.assertEqual(self.job("start", member="local:other")["state"], "refused")
+        for timeout in (0, -1, "10", True, None, sx.CONTROL_TIMEOUT_MAX + 1):
+            self.assertEqual(self.start(timeout=timeout)["state"], "refused", timeout)
+        self.assertEqual(self.calls(), [])
+
+    def test_it_runs_on_the_change_channel(self):
+        self.api.queue.append({"protocol": 2, "id": "control-job-chan", "kind": "svc-control", "action": "start", "change": "c1", "member": "local:nifi", "timeoutSeconds": 10,
+                               "serviceUser": self.me, "env": self.ENV, "limits": None})
+        self.assertTrue(self.ex.run_once())
+        self.assertTrue(self.ex.change_thread is not None)
+        self.ex.wait_change()
+        self.assertEqual(self.api.status["control-job-chan"]["state"], "succeeded")
+
+
+class FakeCluster:
+    """What NiFi answers on /controller/cluster/nodes/<id>. A PUT moves the node to the state asked for, and a later GET
+    (`settle`) to where that ends."""
+
+    SETTLED = {"DISCONNECTING": "DISCONNECTED", "OFFLOADING": "OFFLOADED", "CONNECTING": "CONNECTED"}
+
+    def __init__(self, status="CONNECTED", settle=2, put_answers=()):
+        self.status, self.settle, self.put_answers = status, settle, list(put_answers)
+        self.puts, self.gets, self.down = [], 0, 0
+
+    def call(self, method, path, body, timeout):
+        assert path == "controller/cluster/nodes/node-1", path
+        if self.down > 0:
+            self.down -= 1
+            raise OSError("connection refused")
+        if method == "GET":
+            self.gets += 1
+            if self.status in self.SETTLED and self.settle is not None:
+                self.settle -= 1
+                if self.settle < 0:
+                    self.status = self.SETTLED[self.status]
+            return 200, json.dumps({"node": {"nodeId": "node-1", "status": self.status}}).encode()
+        self.puts.append(body)
+        if self.put_answers:
+            answer = self.put_answers.pop(0)
+            if answer != 200:
+                return answer, b'{"message": "not now, password=hunter2"}'
+        self.status = body["node"]["status"]
+        return 200, b"{}"
+
+
+class SvcControlNodeTest(Base):
+    """node-*: fake REST; which certificate is loaded is the real code's (ssl's load_cert_chain is watched)."""
+
+    CERTS = {"nifi_operator_cert": "/certs/operator.crt", "nifi_operator_key": "/certs/operator.key", "nifi_client_cert": "/certs/monitor.crt", "nifi_client_key": "/certs/monitor.key"}
+
+    def setUp(self):
+        super().setUp()
+        self.home = nifi_home(self.root, "nifi", "2.5.0", {"nifi.web.https.port": "18445", "nifi.cluster.is.node": "true", "nifi.web.https.host": "localhost"})
+        self.api = WatchApi()
+        self.api.watch = [{"service": "c", "member": "local:node", "profile": "nifi", "installDir": str(self.home), "confDir": str(self.home / "conf"),
+                           "https": {"host": "localhost", "port": 18445}, "nodeAddress": "localhost", "logDir": None, "files": []}]
+        self.ex = self.make_ex(**self.CERTS)
+        self.loaded = []
+        load = mock.patch.object(sx.ssl.SSLContext, "load_cert_chain", side_effect=lambda cert, key=None: self.loaded.append(cert))
+        load.start()
+        self.addCleanup(load.stop)
+        poll = mock.patch.object(sx, "CONTROL_POLL", 0.01)
+        poll.start()
+        self.addCleanup(poll.stop)
+        self.jobs = 0
+        self.targets = []
+
+    def make_ex(self, **over):
+        ex = sx.ServiceExecutor(cfg(self.root, **over), out=self.devnull, api=self.api)
+        ex.sleep = lambda s: None
+        ex.CGROUP = str(self.root / "none")
+        ex.watch = sx.watch_entries(self.api.watch)
+        return ex
+
+    def job(self, action, cluster, timeout=5, ex=None, nodeId="node-1", member="local:node"):
+        self.jobs += 1
+        job_id = f"node-job-{self.jobs:04}"
+        self.last = job_id
+
+        def caller(ctx, connect, sni, port, limit=None):
+            self.targets.append((connect, sni, port))
+            return cluster.call
+        with mock.patch.object(sx, "nifi_caller", caller):
+            (ex or self.ex).handle({"protocol": 2, "id": job_id, "kind": "svc-control", "action": action, "change": "c1", "member": member, "nodeId": nodeId, "timeoutSeconds": timeout})
+        return self.api.status[job_id]
+
+    def test_disconnect_asks_and_waits_with_the_operator_certificate_only(self):
+        cluster = FakeCluster()
+        done = self.job("node-disconnect", cluster)
+        self.assertEqual(done["state"], "succeeded", done.get("message"))
+        self.assertEqual(cluster.puts, [{"node": {"nodeId": "node-1", "status": "DISCONNECTING"}}])
+        self.assertEqual((done["result"]["before"], done["result"]["status"], done["result"]["nodeId"]), ("CONNECTED", "DISCONNECTED", "node-1"))
+        self.assertEqual(self.loaded, ["/certs/operator.crt"])
+        self.assertEqual(self.targets, [("localhost", "localhost", 18445)])
+
+    def test_offload_and_connect(self):
+        cluster = FakeCluster(status="DISCONNECTED")
+        self.assertEqual(self.job("node-offload", cluster)["result"]["status"], "OFFLOADED")
+        self.assertEqual(cluster.puts[-1]["node"]["status"], "OFFLOADING")
+        self.assertEqual(self.job("node-connect", cluster)["result"]["status"], "CONNECTED")
+        self.assertEqual(cluster.puts[-1]["node"]["status"], "CONNECTING")
+
+    def test_there_already_nothing_is_sent(self):
+        for action, status in (("node-disconnect", "DISCONNECTED"), ("node-disconnect", "OFFLOADED"), ("node-offload", "OFFLOADED"), ("node-connect", "CONNECTED")):
+            cluster = FakeCluster(status=status)
+            done = self.job(action, cluster)
+            self.assertEqual(done["state"], "succeeded", (action, status))
+            self.assertEqual(cluster.puts, [], (action, status))
+
+    def test_on_its_way_already_it_is_only_waited_for(self):
+        cluster = FakeCluster(status="DISCONNECTING")
+        self.assertEqual(self.job("node-disconnect", cluster)["state"], "succeeded")
+        self.assertEqual(cluster.puts, [])
+
+    def test_without_the_operator_certificate_it_is_refused_and_the_monitor_one_is_no_fallback(self):
+        ex = self.make_ex(nifi_client_cert="/certs/monitor.crt", nifi_client_key="/certs/monitor.key")
+        cluster = FakeCluster()
+        done = self.job("node-disconnect", cluster, ex=ex)
+        self.assertEqual(done["state"], "refused")
+        self.assertIn("EXECUTOR_NIFI_OPERATOR_CERT", done["message"])
+        self.assertEqual((self.loaded, cluster.puts, cluster.gets), ([], [], 0))
+
+    def test_a_certificate_that_does_not_load_is_refused(self):
+        with mock.patch.object(sx.ssl.SSLContext, "load_cert_chain", side_effect=OSError(2, "No such file")):
+            done = self.job("node-disconnect", FakeCluster())
+        self.assertEqual(done["state"], "refused")
+        self.assertIn("operator certificate", done["message"])
+
+    def test_nifi_saying_no_ends_it_at_once(self):
+        cluster = FakeCluster(put_answers=[409])
+        before = time.monotonic()
+        done = self.job("node-disconnect", cluster, timeout=30)
+        self.assertLess(time.monotonic() - before, 5)
+        self.assertEqual(done["state"], "failed")
+        self.assertIn("HTTP 409", done["message"])
+        self.assertNotIn("hunter2", json.dumps(done))
+        self.assertEqual(len(cluster.puts), 1)
+
+    def test_a_node_that_does_not_answer_yet_is_waited_for(self):
+        cluster = FakeCluster(status="DISCONNECTED", put_answers=[503])
+        cluster.down = 2
+        done = self.job("node-connect", cluster)
+        self.assertEqual(done["state"], "succeeded", done.get("message"))
+        self.assertEqual(len(cluster.puts), 2, "a 503 is asked again")
+
+    def test_it_stops_at_the_deadline(self):
+        cluster = FakeCluster(settle=None)
+        before = time.monotonic()
+        done = self.job("node-disconnect", cluster, timeout=0.2)
+        self.assertLess(time.monotonic() - before, 3)
+        self.assertEqual(done["state"], "failed")
+        self.assertIn("not DISCONNECTED", done["message"])
+        self.assertEqual(done["result"]["status"], "DISCONNECTING")
+        self.assertEqual(len(cluster.puts), 1, "asked once")
+
+    def test_the_request_is_checked_first(self):
+        cluster = FakeCluster()
+        for bad in (None, "../x", "a/b", ""):
+            self.assertEqual(self.job("node-disconnect", cluster, nodeId=bad)["state"], "refused", bad)
+        (self.home / "conf" / "nifi.properties").write_text("nifi.web.https.port=18445\n")
+        done = self.job("node-disconnect", cluster)
+        self.assertEqual(done["state"], "refused")
+        self.assertIn("not a cluster node", done["message"])
+        (self.home / "conf" / "nifi.properties").write_text("nifi.cluster.is.node=true\n")
+        self.ex.watch = [{**self.ex.watch[0], "https": {"host": None, "port": None}}]
+        self.api.watch[0]["https"] = {}
+        self.assertEqual(self.job("node-disconnect", cluster)["state"], "refused")
+        self.assertEqual((self.loaded, cluster.puts, cluster.gets), ([], [], 0))
+
+    def test_reads_and_the_collector_never_get_the_operator_certificate(self):
+        collector = self.ex.make_collector()
+        self.assertFalse([k for k in collector.cfg if "operator" in k])
+        self.assertIn("/certs/operator.crt", json.dumps(self.ex.cfg, default=str), "the fixture has it")
+        collector.context()
+        sx.nifi_context(self.ex.cfg)
+        self.assertEqual(self.loaded, ["/certs/monitor.crt"] * 2)
+        # A whole svc-state, a sample, and provenance's call.
+        self.loaded.clear()
+        api_calls = []
+        with mock.patch.object(sx.Collector, "fetch", side_effect=lambda *a: api_calls.append(a) or (503, b"")), \
+                mock.patch.object(sx.Discovery, "running", return_value={(str(self.home), str(self.home / "conf")): {"pid": os.getpid(), "bootstrapPid": None, "uid": os.geteuid(), "environment": {}, "problems": []}}):
+            self.ex.state(sx.ReadJob({"id": "state-job-0001", "member": "local:node"}, 10))
+            self.ex.make_collector().round(self.ex.watch)
+        self.ex.nifi_call(self.ex.watch[0], {"nifi.web.https.port": "18445"})
+        self.assertTrue(api_calls, "it did call")
+        self.assertEqual(set(self.loaded), {"/certs/monitor.crt"})
 
 
 class ReleaseTest(Base):

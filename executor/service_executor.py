@@ -64,13 +64,16 @@ import os
 import pathlib
 import pwd
 import re
+import resource
 import shutil
+import signal
 import socket
 import ssl
 import stat
 import subprocess
 import sys
 import tarfile
+import tempfile
 import threading
 import time
 
@@ -114,6 +117,10 @@ def config(env_file=None, environ=None):
         "nifi_client_key": e.get("EXECUTOR_NIFI_CLIENT_KEY", "").strip(),
         "nifi_ca": e.get("EXECUTOR_NIFI_CA", "").strip(),
         "nifi_ca_relaxed": e.get("EXECUTOR_NIFI_CA_RELAXED", "").strip().lower() in ("1", "true", "yes"),
+        # svc-control's node-* (S11, §16.3): the certificate that may disconnect and connect nodes. Only that branch loads
+        # it; the reads and the collector never get these settings.
+        "nifi_operator_cert": e.get("EXECUTOR_NIFI_OPERATOR_CERT", "").strip(),
+        "nifi_operator_key": e.get("EXECUTOR_NIFI_OPERATOR_KEY", "").strip(),
         # Back pressure (owner 2026-11-07): the root group's recursive status every this many seconds (default 300,
         # from 30 up to 3600), summed up to the connections at their threshold and the fullest N queues
         # (EXECUTOR_BACKPRESSURE_TOP, default 5, 1 to 50); the samples between carry none.
@@ -2441,6 +2448,415 @@ class ConfigWriter:
         return f"{len(gone)} old backup(s) removed"
 
 
+# --- svc-control: starting and stopping a NiFi, and its place in the cluster (§8, §16.3) ---------------------------------
+
+CONTROL_ACTIONS = ("start", "stop", "kill", "node-disconnect", "node-offload", "node-connect")
+CONTROL_TIMEOUT_MAX = 3600
+CONTROL_POLL = 1.0
+CONTROL_OUTPUT_MAX = 2000
+USER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
+PROC_CGROUP = "/proc/self/cgroup"
+KILL_MODE_SECONDS = 300
+# action -> what is asked of NiFi, and the states that mean it is done (an offloaded node is disconnected too).
+NODE_ACTIONS = {"node-disconnect": ("DISCONNECTING", ("DISCONNECTED", "OFFLOADED")), "node-offload": ("OFFLOADING", ("OFFLOADED",)), "node-connect": ("CONNECTING", ("CONNECTED",))}
+LIMIT_RESOURCES = {"nofile": getattr(resource, "RLIMIT_NOFILE", None), "nproc": getattr(resource, "RLIMIT_NPROC", None)}
+
+
+def operator_context(cfg):
+    """The TLS context of the node-* calls: the operator certificate (S11), which may change a cluster. Only
+    ServiceControl's node branch calls this; the reads and the collector use nifi_context, and never see these settings
+    (make_collector). (context, None), or (None, why not)."""
+    cert, key, ca = cfg.get("nifi_operator_cert"), cfg.get("nifi_operator_key"), cfg.get("nifi_ca")
+    if not cert or not key:
+        return None, "no operator certificate (EXECUTOR_NIFI_OPERATOR_CERT and EXECUTOR_NIFI_OPERATOR_KEY are not set)"
+    try:
+        ctx = ssl.create_default_context(cafile=ca or None)
+        if cfg.get("nifi_ca_relaxed"):
+            ctx.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)
+        ctx.load_cert_chain(cert, key)
+    except (OSError, ssl.SSLError) as e:
+        return None, f"cannot load the operator certificate: {getattr(e, 'strerror', None) or e}"
+    return ctx, None
+
+
+def nifi_caller(ctx, connect, sni, port, limit=REST_MAX):
+    """call(method, path, body, timeout) -> (status, bytes) on one NiFi's REST API, with the given certificate."""
+    def call(method, path, body, timeout):
+        conn = SniConnection(connect, port, sni, ctx, timeout)
+        try:
+            data = json.dumps(body).encode() if body is not None else None
+            conn.request(method, f"/nifi-api/{path}", body=data, headers={"Host": f"{sni}:{port}", "Accept": "application/json", "User-Agent": f"{PACKAGE}/{VERSION}",
+                                                                      **({"Content-Type": "application/json"} if data is not None else {})})
+            r = conn.getresponse()
+            return r.status, r.read(limit)
+        finally:
+            conn.close()
+    return call
+
+
+def own_unit(cgroup_file=PROC_CGROUP):
+    """(the systemd service this process runs in, whether a user's manager runs it), or (None, False) outside one: a
+    terminal's session is a .scope. The unified hierarchy's line, or v1's name=systemd."""
+    try:
+        lines = pathlib.Path(cgroup_file).read_text().splitlines()
+    except OSError:
+        return None, False
+    for line in lines:
+        parts = line.split(":", 2)
+        if len(parts) == 3 and (parts[1] == "" or parts[1] == "name=systemd"):
+            last = parts[2].rstrip("/").rsplit("/", 1)[-1]
+            return (last, "/user@" in parts[2]) if last.endswith(".service") else (None, False)
+    return None, False
+
+
+def kill_mode(cgroup_file=PROC_CGROUP):
+    """The KillMode of the unit this executor runs in; None outside systemd, "unknown" when systemctl does not say."""
+    unit, user = own_unit(cgroup_file)
+    if not unit:
+        return None
+    try:
+        p = subprocess.run(["systemctl", *(["--user"] if user else []), "show", unit, "-p", "KillMode", "--value"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    return (p.stdout.strip() or "unknown") if p.returncode == 0 else "unknown"
+
+
+class ServiceControl:
+    """One svc-control job on one watched NiFi. run returns the job's message, self.result what it found out. Refused:
+    nothing was touched. The script's arguments hold the start environment, so it runs without Protocol's sh (which logs
+    its commands); the status and the log carry names, pids and an exit code. Nothing here kills a NiFi but do_kill."""
+
+    def __init__(self, cfg, w, who, proc="/proc", cgroup_file=PROC_CGROUP, log=lambda text: None):
+        self.cfg, self.w, self.log, self.cgroup_file = cfg, w, log, cgroup_file
+        self.user_name, self.root = who
+        self.where = Discovery.layout(w["installDir"], conf=w["confDir"])
+        self.discovery = Discovery(proc, uid=None if self.root else os.geteuid())
+        self.deadline = 0.0
+        self.result = {}
+
+    def left(self):
+        return self.deadline - time.monotonic()
+
+    def run(self, request):
+        timeout = request.get("timeoutSeconds")
+        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or not 0 < timeout <= CONTROL_TIMEOUT_MAX:
+            raise Refused(f"timeoutSeconds is a number of seconds up to {CONTROL_TIMEOUT_MAX}")
+        self.deadline = time.monotonic() + timeout
+        action = request["action"]
+        self.result = {"action": action, "member": self.w["member"]}
+        if action in NODE_ACTIONS:
+            return self.node(request, action)
+        return getattr(self, f"do_{action}")(request)
+
+    # --- the request ---
+
+    def service_user(self, request):
+        """S10: NiFi runs as its service user, and never as root; an executor that is not root can only be that user."""
+        name = request.get("serviceUser")
+        if not isinstance(name, str) or not USER_RE.match(name):
+            raise Refused("serviceUser is the name of the user this NiFi runs as")
+        try:
+            entry = pwd.getpwnam(name)
+        except KeyError:
+            raise Refused(f"there is no user {name} on this host")
+        if entry.pw_uid == 0:
+            raise Refused("NiFi is not run as root (S10)")
+        if not self.root and entry.pw_uid != os.geteuid():
+            raise Refused(f"this executor runs as {self.user_name} and cannot act as {name}")
+        return name, entry.pw_uid
+
+    @staticmethod
+    def environment(request):
+        """The start environment, through the same filter as svc-state (a value a person typed comes here too)."""
+        env = request.get("env")
+        if not isinstance(env, dict) or not all(isinstance(k, str) and isinstance(v, str) and "\0" not in v for k, v in env.items()):
+            raise Refused("env is the start environment: names and values")
+        return filter_start_environment(env)
+
+    def limits(self, request):
+        """prlimit's arguments for request.limits ({nofile, nproc: {soft, hard}}, null: none). Only root can raise a hard
+        limit: an executor that is not root starts with what it has, and the job says so (limitsLowered)."""
+        limits = request.get("limits")
+        if limits is None:
+            return []
+        if not isinstance(limits, dict) or not set(limits) <= set(LIMIT_LINES.values()):
+            raise Refused("limits are nofile and nproc, each {soft, hard}")
+        args, lowered = [], {}
+        for name, value in sorted(limits.items()):
+            soft, hard = self.limit_number(value, "soft"), self.limit_number(value, "hard")
+            if soft > hard:
+                raise Refused(f"limits: the soft {name} is above the hard one")
+            if not self.root:
+                own = resource.getrlimit(LIMIT_RESOURCES[name])[1]
+                own = float("inf") if own == resource.RLIM_INFINITY else own
+                if hard > own:
+                    lowered[name] = {"asked": value["hard"], "used": own if own != float("inf") else "unlimited"}
+                    hard, soft = own, min(soft, own)
+            args.append(f"--{name}={self.limit_text(soft)}:{self.limit_text(hard)}")
+        if lowered:
+            self.result["limitsLowered"] = lowered
+            self.log(f"limits lowered to what this executor has (it is not root): {', '.join(sorted(lowered))}")
+        return args
+
+    @staticmethod
+    def limit_number(value, which):
+        n = value.get(which) if isinstance(value, dict) else None
+        if n == "unlimited":
+            return float("inf")
+        if not isinstance(n, int) or isinstance(n, bool) or n < 0:
+            raise Refused("limits are nofile and nproc, each {soft, hard}: a number or \"unlimited\"")
+        return n
+
+    @staticmethod
+    def limit_text(n):
+        return "unlimited" if n == float("inf") else str(n)
+
+    # --- the processes ---
+
+    def processes(self):
+        """{pid, startedAt, bootstrapPid, bootstrapStartedAt, uid, user} of this NiFi now, or None. A pid alone says
+        little: svc-control only ever trusts it with its start time."""
+        proc = self.discovery.running().get((self.where["installDir"], self.where["confDir"]))
+        if not proc:
+            return None
+        main, boot = proc.get("pid"), proc.get("bootstrapPid")
+        return {"pid": main, "startedAt": self.discovery.started_at(main) if main else None, "bootstrapPid": boot,
+                "bootstrapStartedAt": self.discovery.started_at(boot) if boot else None, "uid": proc["uid"], "user": user_name(proc["uid"])}
+
+    @staticmethod
+    def pairs(p):
+        """(role, pid, start time) of a processes() answer, the bootstrap first: it starts the JVM again if the JVM goes first."""
+        return [(role, p.get(pid), p.get(at)) for role, pid, at in (("bootstrap", "bootstrapPid", "bootstrapStartedAt"), ("nifi", "pid", "startedAt")) if p.get(pid)]
+
+    def alive(self, pid, started_at):
+        """Whether that process still runs. Another process on the same pid (its start time differs) means it does not; a
+        zombie has exited."""
+        try:
+            state = (self.discovery.proc / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[0]
+        except (OSError, IndexError):
+            return False
+        return state not in ("Z", "X") and self.discovery.started_at(pid) == started_at
+
+    def wait_gone(self, pairs):
+        """Polls until none of them runs, up to the deadline. True when they all exited."""
+        while True:
+            if not any(self.alive(pid, at) for _, pid, at in pairs):
+                return True
+            if self.left() <= 0:
+                return False
+            time.sleep(min(CONTROL_POLL, max(self.left(), 0.01)))
+
+    def script_command(self, word, env, limit_args):
+        script = os.path.join(self.where["installDir"], "bin", "nifi.sh")
+        if "=" in script:
+            raise Refused("the installation's path holds a =, which env would take for a variable")
+        if not os.path.isfile(script) or not os.access(script, os.X_OK):
+            raise Failed(f"{script} is not an executable file")
+        return [*(["prlimit", *limit_args] if limit_args else []), *(["runuser", "-u", self.service, "--"] if self.root else []),
+                "env", "-i", *(f"{k}={v}" for k, v in sorted(env.items())), script, word]
+
+    def script(self, word, env, limit_args=()):
+        """Runs nifi.sh and waits for it, leaving time to look at the processes after it: its exit code, None when it
+        did not return. Its output goes to a file: a pipe would stay open for as long as a NiFi that inherited it runs.
+        A script that hangs gets a signal itself, never its process group: a NiFi it started is in that group."""
+        cmd = self.script_command(word, env, limit_args)
+        margin = max(1.0, min(5.0, self.left() / 10))
+        with tempfile.TemporaryFile(dir=self.cfg["work"]) as out:
+            try:
+                p = subprocess.Popen(cmd, cwd=self.where["installDir"], stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+            except OSError as e:
+                raise Failed(f"cannot run {cmd[0]}: {e.strerror or e}")
+            try:
+                code = p.wait(max(self.left() - margin, 0.1))
+            except subprocess.TimeoutExpired:
+                code = None
+                p.terminate()
+                try:
+                    p.wait(3)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    p.wait()
+            out.seek(max(0, os.fstat(out.fileno()).st_size - CONTROL_OUTPUT_MAX))
+            text = out.read().decode("utf-8", "replace").strip()
+        self.result["scriptExit"] = code
+        self.log(f"nifi.sh {word}: " + (f"exit {code}" if code is not None else "did not return in time; it got SIGTERM") + (f"\n{redact(text)}" if text else ""))
+        return code
+
+    @staticmethod
+    def report(p):
+        return {k: v for k, v in p.items() if k != "uid"} if p else None
+
+    def wait_jvm(self):
+        """Polls until the NiFi JVM runs (the bootstrap starts it), up to the deadline. What runs of it, or None."""
+        while True:
+            p = self.processes()
+            if (p and p.get("pid")) or self.left() <= 0:
+                return p
+            time.sleep(min(CONTROL_POLL, max(self.left(), 0.01)))
+
+    # --- the actions ---
+
+    def do_start(self, request):
+        """§8, §16.3: nifi.sh start as the service user, with its environment and limits. Done when the NiFi JVM runs;
+        whether it comes up is the Deployer's to watch (svc-state). Running already: nothing to do, so a retry is safe."""
+        self.service, uid = self.service_user(request)
+        mode = kill_mode(self.cgroup_file)
+        if mode not in (None, "process"):
+            raise Refused(f"this executor's systemd unit has KillMode={mode}: restarting the executor would kill a NiFi it started. Run install.sh again (it installs the unit), then restart the executor")
+        try:
+            run_as = read_properties(self.where["bootstrapFile"]).get("run.as", "").strip()
+        except OSError as e:
+            raise Refused(f"cannot read {self.where['bootstrapFile']}: {e.strerror or e}")
+        if run_as and run_as != self.service:
+            raise Refused(f"bootstrap.conf says run.as={run_as}, not the service user {self.service}")
+        env, dropped = self.environment(request)
+        limit_args = self.limits(request)
+        before = self.processes()
+        if before:
+            self.result.update(alreadyRunning=True, process=self.report(before))
+            return f"Already running (pid {before.get('pid') or before.get('bootstrapPid')})"
+        if dropped:
+            self.result["environmentDropped"] = dropped
+        code = self.script("start", env, limit_args)
+        p = self.wait_jvm()
+        self.result["process"] = self.report(p)
+        if p:
+            boot = p.get("bootstrapPid") or p.get("pid")
+            self.result["limits"] = read_limits(self.discovery.proc, boot)
+            if p["uid"] != uid:
+                raise Failed(f"NiFi started, but as {p['user']} and not as {self.service}")
+        if not p or not p.get("pid"):
+            raise Failed(f"The NiFi JVM is not running after nifi.sh start (exit {code})")
+        return f"Started as {self.service} (pid {p['pid']})"
+
+    def do_stop(self, request):
+        """§8, §16.3: nifi.sh stop as the service user, then both processes must be gone, told by pid and start time.
+        Not gone in time is a failure with the pair for a kill, which only a person asks for. Stopped already: nothing
+        to do. A retry after a stop that timed out finds the same processes."""
+        self.service, uid = self.service_user(request)
+        env, _ = self.environment(request)
+        before = self.processes()
+        if not before:
+            self.result.update(alreadyStopped=True, process=None)
+            return "Not running"
+        if before["uid"] != uid:
+            raise Refused(f"it runs as {before['user']}, not as the service user {self.service}")
+        self.result["stopped"] = self.report(before)
+        code = self.script("stop", env)
+        gone = self.wait_gone(self.pairs(before))
+        now = self.processes()
+        self.result["process"] = self.report(now)
+        if not gone or now:
+            self.result["stillRunning"] = True
+            raise Failed(f"Still running after nifi.sh stop (exit {code}) and {request['timeoutSeconds']} seconds; nothing was killed. To force it: a kill of this pid and start time")
+        return f"Stopped (nifi.sh exit {code}): the processes have exited"
+
+    def do_kill(self, request):
+        """§8: SIGKILL, on explicit request only (a person confirmed it on the page), for exactly the processes named
+        by pid and start time: the answer of a stop, or svc-state's. All or nothing: if this NiFi runs anything else now,
+        what the person saw is out of date and nothing is killed."""
+        asked = []
+        for role, pid_key, at_key in (("bootstrap", "bootstrapPid", "bootstrapStartedAt"), ("nifi", "pid", "startedAt")):
+            pid, at = request.get(pid_key), request.get(at_key)
+            if pid is None and at is None:
+                continue
+            if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1 or not isinstance(at, str) or not at:
+                raise Refused(f"{pid_key} and {at_key} name one process: its pid and its start time")
+            asked.append((role, pid, at))
+        if not asked:
+            raise Refused("kill names the processes: pid and startedAt, bootstrapPid and bootstrapStartedAt")
+        now = self.processes()
+        running = self.pairs(now) if now else []
+        others = [(pid, at) for _, pid, at in running if (pid, at) not in [(p, a) for _, p, a in asked]]
+        if others:
+            self.result["process"] = self.report(now)
+            raise Refused(f"it now runs other processes than the ones named ({', '.join(str(p) for p, _ in others)}); nothing was killed")
+        targets = [t for t in asked if (t[1], t[2]) in [(p, a) for _, p, a in running]]
+        killed = []
+        for role, pid, at in targets:
+            if not self.alive(pid, at):
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+                killed.append(pid)
+                self.log(f"SIGKILL {role} {pid} (started {at})")
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                raise Failed(f"not allowed to kill {pid}")
+        self.result["killed"] = killed
+        gone = self.wait_gone(targets)
+        self.result["process"] = self.report(self.processes())
+        if not gone:
+            raise Failed(f"Still running after SIGKILL: {', '.join(str(p) for _, p, a in targets if self.alive(p, a))}")
+        return f"Killed {', '.join(map(str, killed))}" if killed else "Those processes had already exited"
+
+    def node(self, request, action):
+        """§8, S11: asks the cluster, through this member's REST API, to change a node's state, and waits for it. The
+        operator certificate is loaded here and nowhere else; the monitor certificate is no fallback. Done already:
+        nothing is sent, so a retry is safe. A node that does not answer yet is waited for; NiFi's refusal (4xx) ends it."""
+        node_id = request.get("nodeId")
+        if not isinstance(node_id, str) or not NIFI_ID_RE.match(node_id):
+            raise Refused("nodeId is the node's id in the cluster")
+        self.result["nodeId"] = node_id
+        try:
+            props = read_properties(self.where["propertiesFile"])
+        except OSError as e:
+            raise Refused(f"cannot read {self.where['propertiesFile']}: {e.strerror or e}")
+        if props.get("nifi.cluster.is.node", "false").strip().lower() != "true":
+            raise Refused("this NiFi is not a cluster node")
+        target = nifi_target(self.w, props)
+        if not target:
+            raise Refused("nifi.web.https.port is not set: NiFi is only called over HTTPS")
+        ctx, why_not = operator_context(self.cfg)
+        if ctx is None:
+            raise Refused(why_not)
+        call = nifi_caller(ctx, *target)
+        ask, done = NODE_ACTIONS[action]
+        path = f"controller/cluster/nodes/{node_id}"
+        asked, last = False, "no answer yet"
+        while True:
+            now, why = self.node_status(call, path)
+            last = why or last
+            if now:
+                self.result["status"] = now
+                self.result.setdefault("before", now)
+                if now in done:
+                    return f"Node {node_id}: {now}"
+                if not asked and now != ask:
+                    asked, why = self.node_ask(call, path, node_id, ask)
+                    last = why or last
+                elif now == ask:
+                    asked = True
+            if self.left() <= 0:
+                raise Failed(f"Node {node_id}: not {done[0]} within {request['timeoutSeconds']} seconds (last: {now or last})")
+            time.sleep(min(CONTROL_POLL, max(self.left(), 0.01)))
+
+    def node_status(self, call, path):
+        try:
+            code, body = call("GET", path, None, min(REQUEST_TIMEOUT, max(self.left(), 0.5)))
+        except (OSError, ssl.SSLError, http.client.HTTPException) as e:
+            return None, (str(e) or type(e).__name__)[:300]
+        if code != 200:
+            return None, f"HTTP {code}: {redact(body[:200].decode('utf-8', 'replace')).strip()}"
+        try:
+            return json.loads(body)["node"]["status"], None
+        except (ValueError, KeyError, TypeError) as e:
+            return None, f"unexpected answer: {e}"[:300]
+
+    def node_ask(self, call, path, node_id, ask):
+        """PUT the state wanted. (whether it was taken, why not); a 4xx is NiFi saying no, and ends the job."""
+        try:
+            code, body = call("PUT", path, {"node": {"nodeId": node_id, "status": ask}}, min(REQUEST_TIMEOUT, max(self.left(), 0.5)))
+        except (OSError, ssl.SSLError, http.client.HTTPException) as e:
+            return False, (str(e) or type(e).__name__)[:300]
+        text = f"HTTP {code}: {redact(body[:300].decode('utf-8', 'replace')).strip()}"
+        self.log(f"{ask}: HTTP {code}")
+        if 400 <= code < 500:
+            raise Failed(f"NiFi refused {ask} for {node_id}: {text}")
+        return code == 200, None if code == 200 else text
+
+
 class ServiceExecutor(ProtocolExecutor):
     """The service executor: the read channel, and the change channel (executor-upgrade and CHANGE_JOBS)."""
 
@@ -2451,18 +2867,18 @@ class ServiceExecutor(ProtocolExecutor):
     # Read jobs: kind -> method(job) returning the job's result (a dict).
     READ_JOBS = {"svc-discover": "discover", "svc-read": "read_files", "svc-state": "state", "log-read": "log_read", "log-tail": "log_tail",
                  "nifi-provenance": "nifi_provenance"}
-    # Change jobs that run beside the reads: kind -> method(request, status), one at a time. svc-control comes with its
-    # own step (§16.4).
-    CHANGE_JOBS = {"svc-write": "svc_write"}
+    # Change jobs that run beside the reads: kind -> method(request, status), one at a time.
+    CHANGE_JOBS = {"svc-write": "svc_write", "svc-control": "svc_control"}
     # What the read jobs can do beyond their first form, named "<kind>@<n>" in the heartbeat's kinds (§15.2): the
     # Deployer looks for one before it sends a request that needs it. svc-discover@2: dirs entries {install, conf};
     # svc-read@2: confDir (and bootstrapFile), an installation's conf directory kept apart from it (S25).
     # nifi-provenance@1: provenance, lineage, event and search-options as ProvenanceQuery reads them (S28).
-    # svc-state@1, svc-write@1: the jobs' first forms (§16.3), so the plain kind alone never counts.
-    CAPABILITIES = ["svc-discover@2", "svc-read@2", "nifi-provenance@1", "svc-state@1", "svc-write@1"]
+    # svc-state@1, svc-write@1, svc-control@1: the jobs' first forms (§16.3), so the plain kind alone never counts.
+    CAPABILITIES = ["svc-discover@2", "svc-read@2", "nifi-provenance@1", "svc-state@1", "svc-write@1", "svc-control@1"]
     # Where discovery looks (tests point these elsewhere; the directories scanned are the configuration's scan_dirs).
     PROC = "/proc"
     AUTOSTART_DIRS = AUTOSTART_DIRS
+    CGROUP = PROC_CGROUP
     INTERRUPTED = "The service executor stopped while this job ran."
 
     def __init__(self, cfg, out=sys.stdout, api=None):
@@ -2478,6 +2894,7 @@ class ServiceExecutor(ProtocolExecutor):
         self.backlog_lock = threading.Lock()
         self.stopping = threading.Event()
         self.collector = None
+        self.kill_mode_seen = None  # (monotonic time, KillMode) for the heartbeat; a start asks systemd itself
 
     # --- the collector (§9.1, §15.3) ---
 
@@ -2493,7 +2910,9 @@ class ServiceExecutor(ProtocolExecutor):
 
     def make_collector(self):
         name, root = self.user()
-        return Collector(self.cfg, proc=self.PROC, uid=None if root else os.geteuid(), log=self.say)
+        # S11: reads and samples never hold the operator certificate, not even its paths.
+        reads = {k: v for k, v in self.cfg.items() if not k.startswith("nifi_operator")}
+        return Collector(reads, proc=self.PROC, uid=None if root else os.geteuid(), log=self.say)
 
     def collect_once(self):
         """One round: a sample of each watched NiFi into the backlog, then as much of the backlog as the Deployer takes."""
@@ -2918,6 +3337,30 @@ class ServiceExecutor(ProtocolExecutor):
             status["result"] = writer.result
         self.finish(status, "succeeded", message)
 
+    def svc_control(self, req, status):
+        """svc-control (§8, §16.3): request.action on request.member, a watched installation (ServiceControl). What it
+        found goes in the result: pids and start times, the node's state; the start environment goes nowhere but to the
+        script."""
+        action, change = req.get("action"), req.get("change")
+        if action not in CONTROL_ACTIONS:
+            raise Refused(f"action is one of {', '.join(CONTROL_ACTIONS)}")
+        if not isinstance(change, str) or not CHANGE_RE.match(change):
+            raise Refused("change is the id of the change this job belongs to")
+        control = ServiceControl(self.cfg, self.watched(req.get("member")), self.user(), proc=self.PROC, cgroup_file=self.CGROUP, log=self.log)
+        self.step(status, action)
+        try:
+            message = control.run(req)
+        finally:
+            status["result"] = control.result
+        self.finish(status, "succeeded", message)
+
+    def control_state(self):
+        """§16.3: what starting, stopping and node-* have to work with, for the plan to report early (never a path)."""
+        seen = self.kill_mode_seen
+        if seen is None or time.monotonic() - seen[0] > KILL_MODE_SECONDS:
+            seen = self.kill_mode_seen = (time.monotonic(), kill_mode(self.CGROUP))
+        return {"operatorCert": bool(self.cfg.get("nifi_operator_cert") and self.cfg.get("nifi_operator_key")), "killMode": seen[1], "runuser": bool(shutil.which("runuser"))}
+
     def nifi_call(self, w, props):
         """(call(method, path, body, timeout) -> (status, bytes), whether it is a cluster node) for a watched NiFi's
         REST API with the monitor certificate, the TLS name and Host header as the collector uses them."""
@@ -2927,19 +3370,7 @@ class ServiceExecutor(ProtocolExecutor):
         target = nifi_target(w, props)
         if not target:
             raise Failed("nifi.web.https.port is not set: provenance is only read over HTTPS")
-        connect, sni, port = target
-
-        def call(method, path, body, timeout):
-            conn = SniConnection(connect, port, sni, ctx, timeout)
-            try:
-                data = json.dumps(body).encode() if body is not None else None
-                conn.request(method, f"/nifi-api/{path}", body=data, headers={"Host": f"{sni}:{port}", "Accept": "application/json", "User-Agent": f"{PACKAGE}/{VERSION}",
-                                                                          **({"Content-Type": "application/json"} if data is not None else {})})
-                r = conn.getresponse()
-                return r.status, r.read(PROV_BYTES + 1)
-            finally:
-                conn.close()
-        return call, props.get("nifi.cluster.is.node", "false").strip().lower() == "true"
+        return nifi_caller(ctx, *target, limit=PROV_BYTES + 1), props.get("nifi.cluster.is.node", "false").strip().lower() == "true"
 
     def nifi_provenance(self, job):
         """nifi-provenance (S28): request.member (a watched installation) and request.op (ProvenanceQuery: provenance,
@@ -2980,6 +3411,7 @@ class ServiceExecutor(ProtocolExecutor):
                              "backpressureSeconds": self.cfg.get("backpressure_seconds", BACKPRESSURE_DEFAULT),
                              "watching": watching, "backlog": backlog,
                              "certificate": bool(self.cfg.get("nifi_client_cert") and self.cfg.get("nifi_client_key"))}
+        body["control"] = self.control_state()
         return body
 
     # --- the loop: reads side by side, changes one at a time ------------------------------------------------

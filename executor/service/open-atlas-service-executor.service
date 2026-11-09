@@ -5,17 +5,20 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# Root: it reads the managed services' files and later starts and stops them as each service's own user (runuser, S10).
+# Root: it reads the managed services' files and starts and stops them as each service's own user (runuser, S10).
 # Requests name fixed actions only, on the paths the Deployer registered. No Docker.
 User=root
+# A NiFi it starts stays in this unit's cgroup and inherits its settings (§16.3). KillMode=process: restarting or
+# upgrading the executor must not kill that NiFi (the executor refuses to start one under any other KillMode).
+# TasksMax: NiFi's threads count against this unit. No NoNewPrivileges, ProtectSystem or PrivateTmp: NiFi would inherit
+# them (a private /tmp, read-only /usr and /etc), and this executor writes configuration under /usr/local/nifi*.
+KillMode=process
+TasksMax=infinity
 EnvironmentFile=/etc/open-atlas-deployer/service-executor.env
 ExecStart=/opt/open-atlas-deployer/service-executor/launch.sh
 Restart=always
 RestartSec=5
 UMask=0022
-NoNewPrivileges=yes
-ProtectSystem=full
-PrivateTmp=yes
 
 [Install]
 WantedBy=multi-user.target

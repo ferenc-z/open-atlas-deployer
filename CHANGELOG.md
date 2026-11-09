@@ -11,6 +11,14 @@ logs, the AI's read-only tools, Studio's `nifi-ops` graph, the FlowFile trace). 
 `EXECUTOR_VERSION` with it).
 
 **Service executor**
+- **Run `install.sh` again on hosts with a service executor before it starts or stops anything** (a self-upgrade does
+  not update the systemd unit): the unit now has `KillMode=process` and `TasksMax=infinity`, and no longer
+  `NoNewPrivileges`, `ProtectSystem` or `PrivateTmp`, which a NiFi it starts would inherit. Under another `KillMode` a
+  start is refused.
+- `svc-control`: starts and stops a NiFi as its service user (`runuser`; never root) with its start environment and
+  limits (`env -i`, `prlimit`), and confirms by pid and start time that a stop really ended; a timeout never kills, a
+  `kill` is its own request. Disconnects, offloads and connects nodes with the operator certificate
+  (`EXECUTOR_NIFI_OPERATOR_CERT`, `EXECUTOR_NIFI_OPERATOR_KEY`), which reads and samples never get.
 - A second executor, installed only where services are managed: `open-atlas-service-executor-<version>.tar.gz` in
   the same `executor-v<version>` release, its own `install.sh` (no Docker check; runs as root or as a plain user, who
   then sees only their own processes). The deploy executor and the service executor share `executor_core.py`, and
