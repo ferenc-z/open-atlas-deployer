@@ -7,7 +7,7 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
 
 Managed services, phases 1 and 2 (NiFi 1.x and 2.x, read only): every NiFi on the hosts in one place (phase 1), and
 looking into them without logging on to a server (phase 2: samples and metrics, health rules, alerts and a timeline,
-logs, the AI's read-only tools, Studio's `nifi-ops` graph, the FlowFile trace). Executor 0.8.0 (both executors;
+logs, the AI's read-only tools, Studio's `nifi-ops` graph, the FlowFile trace). Executor 0.9.0 (both executors;
 `EXECUTOR_VERSION` with it).
 
 **Service executor**

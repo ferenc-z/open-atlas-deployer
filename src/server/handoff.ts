@@ -15,7 +15,7 @@ export { EXECUTOR_KINDS, type ExecutorKind } from "./store.ts";
 
 export const PROTOCOL = 2;
 /** §8.6: the executor release this Deployer ships with (executor/deployer_executor.py VERSION); hosts on an older one are offered the upgrade. */
-export const EXECUTOR_VERSION = "0.8.0";
+export const EXECUTOR_VERSION = "0.9.0";
 
 export interface Heartbeat {
   /** S18: which executor sent it; absent from deploy executors before S18. */
