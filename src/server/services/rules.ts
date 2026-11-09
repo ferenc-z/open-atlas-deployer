@@ -88,9 +88,12 @@ export function evaluate(store: Store, s: ServiceStatus, t: Thresholds, now: Dat
   const hold = (rule: RuleId, member: string) => held.add(keyOf(rule, member));
   const cluster = s.kind === "cluster";
   const memberFiles = store.serviceMemberFiles(s.id);
-  // §16.3 no. 8: the member a running change is working on is expected to look down; a stopped change is judged again.
+  // §16.3 no. 8: the member a running change is working on is expected to look down, and in a full change (S31) every member
+  // and the cluster as a whole; a stopped change is judged again.
   const change = store.activeServiceChange(s.id);
-  const working = change?.state === "running" ? change.currentMember : null;
+  const running = change?.state === "running" ? change : null;
+  const whole = running?.mode === "full";
+  const working = new Set<string | null>(whole ? s.members.map((m) => m.key) : [running?.currentMember ?? null]);
 
   for (const m of s.members) {
     const name = memberName(s, m);
@@ -106,14 +109,14 @@ export function evaluate(store: Store, s: ServiceStatus, t: Thresholds, now: Dat
     // Overdue samples, once the executor has been online for 3 periods (just back, its first sample is on the way).
     if (m.state === "unknown" && m.source === "samples") {
       const since = onlineSince.get(k);
-      if (k !== working && since && nowMs - Date.parse(since) >= 3 * period * 1000) add("no-samples", k, "WARN", `${name}: no sample since ${m.asOf}`, { ...base, asOf: m.asOf });
+      if (!working.has(k) && since && nowMs - Date.parse(since) >= 3 * period * 1000) add("no-samples", k, "WARN", `${name}: no sample since ${m.asOf}`, { ...base, asOf: m.asOf });
       else hold("no-samples", k);
     }
     // What the samples say, only from a fresh one.
     const sampled: RuleId[] = ["process-down", "heap", "repo-disk", "no-certificate", "version-mismatch"];
     if (!fresh) for (const r of sampled) if (r !== "version-mismatch") hold(r, k);
     if (fresh && m.live) {
-      if (m.live.running === false && k === working) hold("process-down", k);
+      if (m.live.running === false && working.has(k)) hold("process-down", k);
       else if (m.live.running === false) add("process-down", k, "CRIT", `${name}: no NiFi process at ${m.live.at}`, { ...base, at: m.live.at });
       if (m.live.nifi === "no-certificate") add("no-certificate", k, "WARN", `${name}: the service executor has no monitor certificate`, base);
       if (m.live.running) {
@@ -137,7 +140,7 @@ export function evaluate(store: Store, s: ServiceStatus, t: Thresholds, now: Dat
     // A cluster node's connection, in the coordinator's view (none: cannot tell).
     if (cluster) {
       const c = m.live?.connection ?? null;
-      if (!c || k === working) hold("node-disconnected", k);
+      if (!c || working.has(k)) hold("node-disconnected", k);
       else if (DOWN.has(c)) add("node-disconnected", k, "CRIT", `${name} is ${c.toLowerCase()} in the coordinator's view`, { ...base, connection: c });
     }
     // Certificates: the newest reading of each (kept apart from the samples, so they count even when the sample is old).
@@ -154,7 +157,7 @@ export function evaluate(store: Store, s: ServiceStatus, t: Thresholds, now: Dat
     if (unreadable.length) add("cert-unreadable", k, "WARN", `${name}: ${unreadable.map((c) => `${c.store}: ${c.error}`).join("; ")}`, { ...base, stores: unreadable.map((c) => ({ store: c.store, error: c.error })) });
     // §16.3: the fingerprints. Names only here: this goes on the timeline, and from there to the AI.
     const drift = memberDrift(m, memberFiles);
-    if (drift.state === "unknown" || k === working) hold("config-drift", k);
+    if (drift.state === "unknown" || working.has(k)) hold("config-drift", k);
     else if (drift.state === "drift") {
       const off = drift.files.filter((f) => f.state === "changed" || f.state === "missing");
       add("config-drift", k, "WARN", `${name}: ${off.map((f) => `${f.name}${f.state === "missing" ? " (gone)" : ""}`).join(", ")} on the host ${off.length > 1 ? "are" : "is"} not what is kept`, { ...base, files: off.map((f) => f.name) });
@@ -164,7 +167,7 @@ export function evaluate(store: Store, s: ServiceStatus, t: Thresholds, now: Dat
   // The whole service.
   if (cluster) {
     const viewed = s.members.filter((m) => m.live?.connection);
-    if (!viewed.length) hold("no-coordinator", "*");
+    if (!viewed.length || whole) hold("no-coordinator", "*");
     else if (!viewed.some((m) => m.live!.roles.includes("Cluster Coordinator"))) add("no-coordinator", "*", "CRIT", "No node is the cluster coordinator in the newest view", {});
     const versions = [...new Set(s.members.filter((m) => m.source === "samples" && m.state === "running" && m.live?.version).map((m) => m.live!.version!))];
     if (versions.length > 1) add("version-mismatch", "*", "WARN", `The nodes run ${versions.join(" and ")}`, { versions });
@@ -188,7 +191,8 @@ export function evaluate(store: Store, s: ServiceStatus, t: Thresholds, now: Dat
   const logs = store.serviceLogCounts(s.id, bucketOf(iso(nowMs - t.zkMinutes * MIN)))
     .filter((c) => c.level !== "INFO" && c.level !== "DEBUG" && ZK_LOG.test(`${c.logger ?? ""} ${c.template} ${c.exception ?? ""}`));
   const fromLogs = logs.reduce((n, c) => n + c.count, 0);
-  if (zk.length + fromLogs >= t.zkErrors) {
+  if (whole) hold("zk-errors", "*");
+  else if (zk.length + fromLogs >= t.zkErrors) {
     const newest = logs.length ? logs[logs.length - 1]! : null;
     const example = zk[0]?.message ?? (newest ? `${newest.logger ?? ""} ${newest.template}` : "");
     add("zk-errors", "*", "WARN", `${zk.length + fromLogs} ZooKeeper connection messages in ${t.zkMinutes} min (${zk.length} bulletins, ${fromLogs} in nifi-app.log; e.g. ${example.slice(0, 200)})`, { count: zk.length + fromLogs, bulletins: zk.length, log: fromLogs, minutes: t.zkMinutes });
@@ -240,7 +244,7 @@ function changes(store: Store, s: ServiceStatus): number {
   let events = 0;
   // §16.3 no. 8: what a running change does to a member is on the timeline as the change's steps, not twice.
   const change = store.activeServiceChange(s.id);
-  const inChange = change?.state === "running" ? new Set([change.currentMember, ...((change.progress as { done?: string[] }).done ?? [])]) : new Set<string | null>();
+  const inChange = change?.state === "running" ? new Set(change.mode === "full" ? s.members.map((m) => m.key) : [change.currentMember, ...((change.progress as { done?: string[] }).done ?? [])]) : new Set<string | null>();
   const event = (m: MemberStatus, at: string, kind: string, detail: Record<string, unknown>) => {
     if (inChange.has(m.key) && kind !== "version-changed") return;
     store.addServiceEvent({ service: s.id, member: m.key, at, kind, detail });

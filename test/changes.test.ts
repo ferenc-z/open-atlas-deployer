@@ -1,5 +1,6 @@
 // Phase 3 step 11 (§7, §8, §13, §16.3): the change engine against a stand-in for the service executors: a cluster and a
-// standalone whose processes, files, connections and roles only exist here. Rolling order and roles that move, the check
+// standalone whose processes, files, connections and roles only exist here. Step 11b's full stop and start is at the end.
+// Rolling order and roles that move, the check
 // before each member, every step's timeout, failing and rolling back, an executor or the Deployer restarting, jobs that
 // expire, one change per service, who may do what, and what the rules and the timeline make of it.
 
@@ -39,7 +40,7 @@ const USERS: Record<string, { groups: string[]; isAdmin?: boolean }> = { viewer:
 const keyPrincipal = (id: string, via: "key" | "service", groups: string[]): Principal => ({ id, displayName: id, via, groups, isAdmin: false, permissions: via === "service" ? ["view"] : permissionsFor(groups, false), csrfToken: "" });
 const KEYS: Record<string, Principal> = { dpk_uat: keyPrincipal("u@x", "key", ["deploy-uat"]), dpk_prod: keyPrincipal("p@x", "key", ["deploy-prod"]), dps_assistant: keyPrincipal("assistant", "service", []) };
 
-interface Node { key: string; nodeId: string | null; running: boolean; pid: number; startedAt: string; files: Map<string, string>; status: string; roles: string[]; invalid: number; rest: boolean; joining: boolean; connects: boolean; dies: boolean; env: Record<string, string> }
+interface Node { key: string; nodeId: string | null; running: boolean; pid: number; startedAt: string; files: Map<string, string>; status: string; roles: string[]; invalid: number; rest: boolean; joining: boolean; connects: boolean; dies: boolean; env: Record<string, string>; flow: string; backup?: Map<string, string>; flowBackup?: string; saved?: string[] }
 type Answer = { state: string; message?: string; result?: Record<string, unknown> };
 
 /** The hosts: answers every job as the service executor would, and does what it says to the members. */
@@ -57,7 +58,7 @@ function world(t: { store: Store; handoff: Handoff; now: { t: number } }) {
     pidNext: 1000,
     add(key: string, nodeId: string | null, roles: string[] = []) {
       const files = new Map(t.store.serviceMemberFiles(nodeId ? "flow" : "solo").filter((f) => f.member === key).map((f) => [f.file, f.expectedSha256]));
-      w.nodes.set(key, { key, nodeId, running: true, pid: w.pidNext++, startedAt: "2026-11-01T00:00:00Z", files, status: "CONNECTED", roles, invalid: 2, rest: true, joining: false, connects: true, dies: false, env: { JAVA_HOME: "/jdk" } });
+      w.nodes.set(key, { key, nodeId, running: true, pid: w.pidNext++, startedAt: "2026-11-01T00:00:00Z", files, status: "CONNECTED", roles, invalid: 2, rest: true, joining: false, connects: true, dies: false, env: { JAVA_HOME: "/jdk" }, flow: `flow-of-${key}` });
     },
     table(me: Node) {
       if (!me.nodeId || !me.running || !me.rest) return undefined;
@@ -114,17 +115,22 @@ function world(t: { store: Store; handoff: Handoff; now: { t: number } }) {
         if (n.running) finish({ state: "succeeded", result: { alreadyRunning: true } });
         else { n.running = true; n.pid = w.pidNext++; n.startedAt = new Date(t.now.t).toISOString(); n.joining = true; finish({ state: "succeeded", result: { process: { pid: n.pid } } }); }
       } else if (action === "kill") { n.running = false; finish({ state: "succeeded", result: { killed: [job.pid] } }); }
-      else if (action === "apply") {
+      else if (action === "check" || action === "backup") {
+        const files = job.files as { name: string; baseSha256: string | null; sha256?: string }[];
+        for (const f of files) if (n.files.get(f.name) !== f.baseSha256 && n.files.get(f.name) !== f.sha256) return finish({ state: "refused", message: `${f.name} changed` });
+        if (action === "backup") { n.backup ??= new Map(n.files); if (job.flowFile) n.flowBackup ??= n.flow; }
+        finish({ state: "succeeded", result: { files: [] } });
+      } else if (action === "apply") {
         const files = job.files as { name: string; baseSha256: string | null; sha256: string }[];
         for (const f of files) if (n.files.get(f.name) !== f.baseSha256 && n.files.get(f.name) !== f.sha256) return finish({ state: "refused", message: `${f.name} changed` });
         const content = JSON.parse(String(job.content)) as { files: { name: string; base64: string }[] };
-        (n as Node & { backup?: Map<string, string> }).backup ??= new Map(n.files);
+        n.backup ??= new Map(n.files);
         for (const f of files) { assert.equal(sha(Buffer.from(content.files.find((x) => x.name === f.name)!.base64, "base64")), f.sha256, "the content is what it says"); n.files.set(f.name, f.sha256); }
         finish({ state: "succeeded", result: { files: [] } });
       } else if (action === "restore") {
-        const backup = (n as Node & { backup?: Map<string, string> }).backup;
-        if (!backup) return finish({ state: "refused", message: "this change has no backup here" });
-        n.files = new Map(backup);
+        if (!n.backup) return finish({ state: "refused", message: "this change has no backup here" });
+        n.files = new Map(n.backup);
+        if (n.flowBackup) n.flow = n.flowBackup;
         finish({ state: "succeeded", result: { files: [] } });
       } else if (action === "prune") finish({ state: "succeeded", result: { pruned: [], kept: 1 } });
       else assert.fail(`no such action: ${action}`);
@@ -194,12 +200,12 @@ function takenOver(t: T, user: string | null = "nifi") {
   t.w.add(SOLO, null);
 }
 
-const fast = { stableSeconds: 6, timeouts: { disconnect: 20, stop: 20, write: 20, start: 20, rest: 40, connect: 90, stable: 40, gate: 40, offload: 20 } };
+const fast = { stableSeconds: 6, timeouts: { disconnect: 20, stop: 20, write: 20, start: 20, rest: 40, connect: 90, stable: 40, gate: 40, offload: 20, compose: 60 } };
 
-async function revision(t: T, service: string, changes: unknown[] = [{ file: "nifi.properties", key: "nifi.ui.banner.text", value: "hello" }]) {
-  const draft = await t.call("POST", `/api/services/${service}/config/drafts`, { as: "uat" }, { changes });
+async function revision(t: T, service: string, changes: unknown[] = [{ file: "nifi.properties", key: "nifi.ui.banner.text", value: "hello" }], who: { as: string } = { as: "uat" }) {
+  const draft = await t.call("POST", `/api/services/${service}/config/drafts`, who, { changes });
   assert.equal(draft.status, 201, await draft.clone().text());
-  const saved = await t.call("POST", `/api/services/${service}/config/drafts/${(await draft.json()).id}/save`, { as: "uat" }, {});
+  const saved = await t.call("POST", `/api/services/${service}/config/drafts/${(await draft.json()).id}/save`, who, {});
   assert.equal(saved.status, 201, await saved.clone().text());
   return (await saved.json()).revision as number;
 }
@@ -826,17 +832,6 @@ test("what stops a plan early: the executor's state, the service user, a file on
   assert.equal((await quiet.call("POST", "/api/services/nope/changes/plan", { as: "uat" }, { kind: "restart" })).status, 404);
 });
 
-test("keys that cannot roll: the plan says full and that this version refuses it, whatever else changes", async () => {
-  const t = setup();
-  takenOver(t);
-  await revision(t, "flow", [{ file: "nifi.properties", key: "nifi.zookeeper.root.node", value: "/other" }, { file: "nifi.properties", key: "nifi.ui.banner.text", value: "hi" }]);
-  const plan = await planOf(t, "flow", { kind: "apply" });
-  assert.equal(plan.mode, "full");
-  assert.ok(plan.fullBecause.some((f: { key?: string }) => f.key === "nifi.zookeeper.root.node"));
-  assert.ok(plan.blocking.some((f: { code: string }) => f.code === "change/full-not-yet"));
-  assert.equal((await t.call("POST", "/api/services/flow/changes", { as: "uat" }, { kind: "apply", planHash: plan.planHash })).status, 409);
-});
-
 test("overwriting drift: writes back what is kept, from what the host has now", async () => {
   const t = setup();
   takenOver(t);
@@ -949,4 +944,712 @@ test("what a member goes through: the stages and what is left given what the hos
 test("the executor says interrupted the way the engine knows", () => {
   const python = readFileSync(new URL("../executor/service_executor.py", import.meta.url), "utf8");
   assert.ok(python.includes(`INTERRUPTED = "${INTERRUPTED}"`));
+});
+
+/** ZooKeeper messages enough to open zk-errors, were it judged. */
+function zkMessages(t: T) {
+  const at = new Date(t.now.t - 1000).toISOString();
+  t.store.addServiceBulletins([1, 2, 3, 4, 5].map((i) => ({ service: "flow", member: A, node: "n", id: t.now.t + i, at, level: "ERROR", category: "x", source: "x", sourceType: "x", message: "ZooKeeper ConnectionLoss" })));
+}
+
+// --- the whole cluster (S31, §8, §16.3) ----------------------------------------------------------------------------------
+
+const ROOT = [{ file: "nifi.properties", key: "nifi.zookeeper.root.node", value: "/other" }, { file: "nifi.properties", key: "nifi.ui.banner.text", value: "hi" }];
+const NODES = [A, B, C];
+const cluster = (t: T) => NODES.map((k) => t.w.nodes.get(k)!);
+const calls = (t: T, action: string) => t.w.calls.filter((x) => x.startsWith(`${action} `));
+const propsOf = (t: T) => cluster(t).map((n) => n.files.get("nifi.properties"));
+
+/** The rules of the flow, checked at every job the hosts get: nothing written while a node runs, nothing written before every backup, no start over a mix. */
+function guard(t: T, more?: (action: string, member: string) => void) {
+  const old = new Map(cluster(t).map((n) => [n.key, n.files.get("nifi.properties")]));
+  t.w.onJob = (action, member) => {
+    if (action === "backup" || action === "apply" || action === "restore") assert.ok(cluster(t).every((n) => !n.running), `${action} on ${member} while a node runs`);
+    if (action === "apply") assert.ok(cluster(t).every((n) => n.backup), `apply on ${member} before every backup`);
+    if (action === "start") {
+      const fresh = cluster(t).filter((n) => n.files.get("nifi.properties") !== old.get(n.key)).length;
+      assert.ok(fresh === 0 || fresh === NODES.length, `start on ${member} over a mix of old and new`);
+    }
+    more?.(action, member);
+  };
+}
+async function fullChange(t: T, who: { as: string } = { as: "uat" }) {
+  takenOver(t);
+  const rev = await revision(t, "flow", ROOT, who);
+  return { rev, old: propsOf(t) };
+}
+
+test("full: a key that cannot roll takes the ordinary keys along: every node stopped and confirmed one by one, all backed up, all written, all started at once, the cluster waited for", async () => {
+  const t = setup();
+  const { rev, old } = await fullChange(t);
+  guard(t);
+  const plan = await planOf(t, "flow", { kind: "apply", options: fast });
+  assert.equal(plan.mode, "full");
+  assert.deepEqual(plan.fullBecause, [{ file: "nifi.properties", key: "nifi.zookeeper.root.node" }]);
+  assert.deepEqual(plan.blocking, [], "change/full-not-yet is gone");
+  assert.ok(plan.findings.some((f: { code: string }) => f.code === "config/not-rolling-safe"));
+  assert.equal(plan.members.length, 3);
+  assert.ok(plan.members.every((m: { restart: boolean; stages: string[] }) => m.restart && m.stages.join() === "stop,write,start"));
+  assert.match(plan.order, /whole cluster/);
+  // A request cannot choose: the mode is the server's, in the plan and its hash.
+  const asked = await planOf(t, "flow", { kind: "apply", mode: "rolling", options: fast });
+  assert.equal(asked.mode, "full");
+  assert.equal(asked.planHash, plan.planHash);
+
+  const id = await begin(t, "flow", { kind: "apply" });
+  const c = await drive(t, "flow", id);
+  assert.equal(c.state, "succeeded", c.message ?? "");
+  assert.equal(c.mode, "full");
+  assert.deepEqual(touched(t), [
+    ...NODES.map((m) => `check ${m}`),
+    `stop ${B}`, `stop ${C}`, `stop ${A}`,
+    ...NODES.flatMap((m) => [`backup ${m}`]), ...NODES.map((m) => `apply ${m}`), ...NODES.map((m) => `start ${m}`),
+  ]);
+  assert.ok(!t.w.calls.some((x) => /node-|kill|restore/.test(x)), "not disconnected, not offloaded, nothing else");
+  assert.equal(calls(t, "prune").length, 3);
+  const steps = t.store.serviceChangeSteps(id);
+  const startedAt = (name: string) => steps.filter((s) => s.step === name).map((s) => s.startedAt);
+  assert.equal(new Set(startedAt("start")).size, 1, "sent together");
+  assert.equal(new Set(startedAt("stop")).size, 3, "each after the one before");
+  assert.equal(steps.find((s) => s.step === "compose")!.member, null, "a step of the cluster's");
+  assert.ok(steps.every((s) => s.state === "succeeded"));
+  for (const job of steps.filter((s) => s.step === "backup" || s.step === "check")) assert.equal(t.store.executorJob(job.job!)!.request.flowFile, true, "the flow file with the backup");
+  for (const n of cluster(t)) {
+    assert.equal(n.flowBackup, n.flow);
+    assert.notEqual(n.files.get("nifi.properties"), old[NODES.indexOf(n.key)]);
+    assert.equal(n.running && n.status, "CONNECTED");
+  }
+  for (const f of t.store.serviceMemberFiles("flow").filter((x) => x.file === "nifi.properties")) {
+    assert.equal(f.revision, rev);
+    assert.equal(f.change, id);
+    assert.equal(f.actualSha256, f.expectedSha256);
+  }
+  const kinds = events(t, "flow");
+  assert.equal(kinds.filter((k) => k === "node-stopped").length, 3);
+  assert.equal(kinds.filter((k) => k === "node-started").length, 3);
+  assert.equal(kinds.filter((k) => k === "config-applied").length, 3);
+  assert.equal(kinds.at(-1), "change-finished");
+  assert.equal(t.store.activeServiceChange("flow"), undefined);
+  const status = await (await t.call("GET", "/api/services/flow/status", { as: "viewer" })).json();
+  assert.deepEqual(status.members.flatMap((m: { configPending: string[] }) => m.configPending), []);
+});
+
+test("full: a member whose own files do not change still stops and starts, and is backed up with its flow, with nothing to write", async () => {
+  const t = setup();
+  const { rev } = await fullChange(t);
+  const target = t.store.serviceConfig("flow", rev)!.body.members.find((m) => `${m.host}:${m.installDir}` === B)!.files.find((f) => f.name === "nifi.properties")!;
+  t.store.setMemberFilesApplied("flow", B, [{ file: "nifi.properties", path: target.path, sha256: target.sha256, revision: rev }], "earlier");
+  t.w.nodes.get(B)!.files.set("nifi.properties", target.sha256);
+  const id = await begin(t, "flow", { kind: "apply" });
+  assert.equal((await drive(t, "flow", id)).state, "succeeded");
+  assert.ok(t.w.calls.includes(`stop ${B}`) && t.w.calls.includes(`start ${B}`) && t.w.calls.includes(`backup ${B}`));
+  assert.ok(!t.w.calls.includes(`apply ${B}`));
+  assert.ok(t.w.calls.includes(`apply ${A}`));
+  const job = t.store.serviceChangeSteps(id).find((s) => s.step === "backup" && s.member === B)!.job!;
+  assert.deepEqual(t.store.executorJob(job)!.request.files, []);
+});
+
+test("full: the plan: all members or none, no offload, the time to come together follows the flow election, a changed plan is refused, the P15 warning does not stop it", async () => {
+  const t = setup();
+  takenOver(t);
+  await revision(t, "flow", [...ROOT, { file: "nifi.properties", key: "nifi.sensitive.props.key", secret: "new-props-key" }, { file: "nifi.properties", key: "nifi.cluster.flow.election.max.wait.time", value: "40 mins" }]);
+  const subset = await planOf(t, "flow", { kind: "apply", members: [A] });
+  assert.ok(subset.blocking.some((f: { code: string }) => f.code === "config/full-needs-all-members"));
+  const refused = await t.call("POST", "/api/services/flow/changes", { as: "uat" }, { kind: "apply", members: [A], planHash: subset.planHash });
+  assert.equal(refused.status, 409);
+  assert.equal((await refused.json()).error, "service-change/blocked");
+
+  const plan = await planOf(t, "flow", { kind: "apply", options: { offload: true } });
+  assert.equal(plan.options.offload, false);
+  assert.ok(plan.findings.some((f: { code: string }) => f.code === "change/full-no-offload"));
+  assert.ok(plan.members.every((m: { stages: string[] }) => !m.stages.includes("offload") && !m.stages.includes("disconnect")));
+  assert.equal(plan.options.timeouts.compose, 40 * 60 + 600, "the election's wait and ten minutes");
+  assert.equal((await planOf(t, "flow", { kind: "apply", options: { timeouts: { compose: 77 } } })).options.timeouts.compose, 77);
+
+  const migration = plan.findings.find((f: { code: string }) => f.code === "config/sensitive-key-migration");
+  assert.equal(migration.severity, "warning", "P15: told, not stopped, and no migration is in the flow");
+  assert.deepEqual(plan.blocking, []);
+  assert.ok(plan.fullBecause.some((f: { key?: string }) => f.key === "nifi.sensitive.props.key"));
+
+  await revision(t, "flow", [{ file: "nifi.properties", key: "nifi.ui.banner.text", value: "newer" }]);
+  const stale = await t.call("POST", "/api/services/flow/changes", { as: "uat" }, { kind: "apply", options: { offload: true }, planHash: plan.planHash });
+  assert.equal(stale.status, 409);
+  assert.equal((await stale.json()).error, "service-change/plan-changed");
+  assert.deepEqual(t.w.calls.filter((x) => !x.startsWith("svc")), [], "nothing was touched");
+
+  // Without the default wait written anywhere, the design's 15 minutes hold.
+  const quiet = setup();
+  await fullChange(quiet);
+  assert.equal((await planOf(quiet, "flow", { kind: "apply" })).options.timeouts.compose, 900);
+  // No operator certificate is needed: nothing is disconnected.
+  quiet.w.control = { operatorCert: false, killMode: "process", runuser: true };
+  assert.deepEqual((await planOf(quiet, "flow", { kind: "apply" })).blocking, []);
+  // And a standalone is never full.
+  const solo = setup();
+  takenOver(solo);
+  await revision(solo, "solo", ROOT);
+  assert.equal((await planOf(solo, "solo", { kind: "apply" })).mode, "rolling");
+});
+
+test("full: a sensitive key whose flow cannot be read: told, tried, and rolled back by itself (P15)", async () => {
+  const t = setup();
+  takenOver(t);
+  await revision(t, "flow", [{ file: "nifi.properties", key: "nifi.sensitive.props.key", secret: "new-props-key" }]);
+  guard(t);
+  t.w.failing.set(`start ${A}`, { state: "failed", message: "the flow could not be decrypted" });
+  const id = await begin(t, "flow", { kind: "apply" });
+  const c = await drive(t, "flow", id);
+  assert.equal(c.state, "rolled-back", c.message ?? "");
+  assert.match(c.message!, /could not be decrypted/);
+  assert.ok(!t.w.calls.some((x) => /migrat|set-sensitive/.test(x)));
+});
+
+test("full: the check before anything: what fails ends the change with nothing touched; a node down or away only warns", async () => {
+  for (const [spoil, says] of [
+    [(t: T) => { t.w.failing.set(`check ${B}`, { state: "refused", message: "cannot write in the directory" }); }, /cannot write/],
+    [(t: T) => { t.w.nodes.get(C)!.files.set("nifi.properties", "f".repeat(64)); }, /changed on the host/],
+    [(t: T) => { t.store.setServiceMemberStart("flow", C, null, null); t.w.nodes.get(C)!.running = false; }, /no start environment/],
+  ] as const) {
+    const t = setup();
+    await fullChange(t);
+    const plan = await planOf(t, "flow", { kind: "apply", options: fast });
+    spoil(t);
+    const r = await t.call("POST", "/api/services/flow/changes", { as: "uat" }, { kind: "apply", options: fast, planHash: plan.planHash });
+    assert.equal(r.status, 201, await r.clone().text());
+    const c = await drive(t, "flow", (await r.json()).id);
+    assert.equal(c.state, "closed", c.message ?? "");
+    assert.match(c.message!, says);
+    assert.match(c.message!, /Nothing was touched/);
+    assert.deepEqual(t.w.calls.filter((x) => !x.startsWith("check")), []);
+    assert.equal(t.store.activeServiceChange("flow"), undefined);
+  }
+  const off = setup();
+  await fullChange(off);
+  const id0 = await begin(off, "flow", { kind: "apply" });
+  off.w.offline = true;
+  off.now.t += 60_000;
+  // Started while it was still there; gone by the time of the check.
+  const c0 = await drive(off, "flow", id0);
+  assert.equal(c0.state, "closed", c0.message ?? "");
+  assert.deepEqual(off.w.calls, []);
+
+  const t = setup();
+  await fullChange(t);
+  guard(t);
+  const down = t.w.nodes.get(B)!;
+  down.running = false;
+  down.status = "DISCONNECTED";
+  t.w.nodes.get(C)!.status = "DISCONNECTED";
+  const id = await begin(t, "flow", { kind: "apply" });
+  const c = await drive(t, "flow", id);
+  assert.equal(c.state, "succeeded", c.message ?? "");
+  assert.ok(!t.w.calls.includes(`stop ${B}`), "it was not running");
+  assert.ok(t.w.calls.includes(`start ${B}`), "and the end is the same: all of them up");
+  const gate = t.store.serviceChangeSteps(id).find((s) => s.step === "gate")!;
+  assert.deepEqual(gate.detail.warnings, [`${B} is not running`, `${C} is not connected`]);
+});
+
+test("full: a stop that fails or times out stops there: files untouched, nothing killed, nothing started; the person kills and goes on, or starts what was stopped", async () => {
+  const stuck = async () => {
+    const t = setup();
+    await fullChange(t);
+    guard(t);
+    const n = t.w.nodes.get(C)!;
+    t.w.failing.set(`stop ${C}`, { state: "failed", message: "still running", result: { stillRunning: true, process: { pid: n.pid, startedAt: n.startedAt } } });
+    const id = await begin(t, "flow", { kind: "apply" });
+    const c = await drive(t, "flow", id);
+    assert.equal(c.state, "stopped", c.message ?? "");
+    assert.equal(c.currentMember, C);
+    assert.deepEqual(touched(t).filter((x) => !x.startsWith("check")), [`stop ${B}`, `stop ${C}`], "the next was not stopped, and nothing else");
+    assert.equal(t.w.nodes.get(B)!.running, false, "not started by itself");
+    const view = await (await t.call("GET", `/api/services/flow/changes/${id}`, { as: "viewer" })).json();
+    assert.equal(view.progress.canForceKill, true);
+    assert.equal(view.progress.canRollBack, true);
+    assert.equal(view.progress.wrote, false);
+    return { t, id };
+  };
+  const killed = await stuck();
+  assert.equal((await act(killed.t, "flow", killed.id, "force-kill")).status, 200);
+  assert.match((await drive(killed.t, "flow", killed.id)).message!, /killed: continue/);
+  assert.equal(killed.t.w.nodes.get(C)!.running, false);
+  assert.equal((await act(killed.t, "flow", killed.id, "continue")).status, 200);
+  const on = await drive(killed.t, "flow", killed.id);
+  assert.equal(on.state, "succeeded", on.message ?? "");
+  assert.equal(calls(killed.t, "stop").length, 3, "b is not stopped twice, a is stopped now");
+
+  const back = await stuck();
+  const old = propsOf(back.t);
+  assert.equal((await act(back.t, "flow", back.id, "rollback")).status, 200);
+  const after = await drive(back.t, "flow", back.id);
+  assert.equal(after.state, "rolled-back", after.message ?? "");
+  assert.deepEqual(calls(back.t, "start"), [`start ${B}`], "only what was stopped; the others keep running");
+  assert.equal(calls(back.t, "restore").length, 0, "no file was touched");
+  assert.equal(calls(back.t, "backup").length, 0);
+  assert.deepEqual(propsOf(back.t), old);
+  assert.ok(cluster(back.t).every((n) => n.running && n.status === "CONNECTED"));
+
+  const t = setup();
+  await fullChange(t);
+  t.w.held.add(`stop ${B}`);
+  const id = await begin(t, "flow", { kind: "apply" });
+  const c = await drive(t, "flow", id);
+  assert.equal(c.state, "stopped");
+  assert.match(c.message!, /stop on .* timed out/);
+  assert.ok(!t.w.calls.includes(`stop ${C}`));
+  assert.equal(t.store.serviceChangeSteps(id).at(-1)!.state, "timed-out");
+});
+
+test("full: a backup that fails: no file written, no restore, all started again, rolled back", async () => {
+  const t = setup();
+  const { old } = await fullChange(t);
+  guard(t);
+  t.w.failing.set(`backup ${C}`, { state: "failed", message: "no space left" });
+  const id = await begin(t, "flow", { kind: "apply" });
+  const c = await drive(t, "flow", id);
+  assert.equal(c.state, "rolled-back", c.message ?? "");
+  assert.match(c.message!, /no space left/);
+  assert.equal(calls(t, "apply").length, 0, "none written though two backups went well");
+  assert.equal(calls(t, "restore").length, 0);
+  assert.equal(calls(t, "start").length, 3);
+  assert.deepEqual(propsOf(t), old);
+  assert.ok(events(t, "flow").includes("config-rolled-back"));
+  assert.equal(t.store.activeServiceChange("flow"), undefined);
+});
+
+test("full: a write that fails: every member back from its backup, the flow too, all started, rolled back once and no more", async () => {
+  const t = setup();
+  const { old } = await fullChange(t);
+  guard(t);
+  t.w.failing.set(`apply ${C}`, { state: "failed", message: "disk full", result: { rolledBack: true, notRestored: [] } });
+  const id = await begin(t, "flow", { kind: "apply" });
+  t.w.nodes.get(A)!.flow = "flow-a";
+  const c = await drive(t, "flow", id);
+  assert.equal(c.state, "rolled-back", c.message ?? "");
+  assert.equal(calls(t, "restore").length, 3);
+  assert.equal(calls(t, "start").length, 3);
+  assert.deepEqual(propsOf(t), old);
+  assert.ok(t.store.serviceMemberFiles("flow").every((f) => f.revision === 1), "what they should be has not moved");
+  assert.ok(!t.w.calls.some((x) => x.startsWith("prune")), "failed changes keep their backups");
+  assert.equal(calls(t, "apply").length, 3, "not tried again");
+});
+
+test("full: starting fails, a node dies, the cluster does not come together, or the health check does not pass: rolled back by itself", async () => {
+  const running = async (t: T) => {
+    const id = await begin(t, "flow", { kind: "apply" });
+    const c = await drive(t, "flow", id);
+    assert.equal(c.state, "rolled-back", c.message ?? "");
+    assert.equal(calls(t, "restore").length, 3);
+    assert.equal(calls(t, "apply").length, 3, "not tried again");
+    assert.ok(cluster(t).every((n) => n.running && n.status === "CONNECTED"));
+    return c;
+  };
+  const failed = setup();
+  await fullChange(failed);
+  guard(failed);
+  failed.w.failing.set(`start ${B}`, { state: "failed", message: "no JVM" });
+  assert.match((await running(failed)).message!, /no JVM/);
+
+  const dies = setup();
+  await fullChange(dies);
+  let once = true;
+  guard(dies, (action, member) => { if (action === "start" && member === C && once) { once = false; dies.w.nodes.get(C)!.dies = true; } });
+  assert.match((await running(dies)).message!, /not running any more/);
+
+  // No coordinator ever: the election does not end under the new settings.
+  const election = setup();
+  await fullChange(election);
+  let restored = false;
+  guard(election, (action) => {
+    if (action === "restore") restored = true;
+    if (action === "start" && !restored) for (const n of cluster(election)) { n.saved ??= n.roles; n.roles = []; }
+    if (action === "start" && restored) for (const n of cluster(election)) if (n.saved) { n.roles = n.saved; }
+  });
+  assert.match((await running(election)).message!, /did not come together in time: no cluster coordinator/);
+
+  // A node that does not connect.
+  const away = setup();
+  await fullChange(away);
+  let back = false;
+  guard(away, (action) => {
+    if (action === "restore") back = true;
+    if (action === "start") away.w.nodes.get(C)!.connects = back;
+  });
+  assert.match((await running(away)).message!, /did not come together in time: local:\/opt\/c not connected/);
+
+  // A node short: the table has fewer than the members.
+  const short = setup();
+  await fullChange(short);
+  let whole = false;
+  const nope = short.w.table;
+  short.w.table = (me) => { const x = nope(me); return x && !whole ? { ...x, nodes: x.nodes.filter((n) => n.nodeId !== "node-b") } : x; };
+  guard(short, (action) => { if (action === "restore") whole = true; });
+  assert.match((await running(short)).message!, /2 of 3 nodes/);
+
+  const health = setup();
+  await fullChange(health);
+  guard(health, (action) => {
+    if (action === "apply") for (const n of cluster(health)) n.invalid = 9;
+    if (action === "restore") for (const n of cluster(health)) n.invalid = 2;
+  });
+  assert.match((await running(health)).message!, /9 invalid components, 2 before/);
+});
+
+test("full: an election that takes its time, REST away and no table meanwhile, is waiting and not failing", async () => {
+  const t = setup();
+  await fullChange(t);
+  guard(t, (action, member) => { if (action === "start") { t.w.nodes.get(member)!.rest = false; } });
+  const id = await begin(t, "flow", { kind: "apply" });
+  await drive(t, "flow", id, (c) => c.phase === "compose");
+  for (let i = 0; i < 6; i++) { await t.w.run(); t.engine.changes.tick(); t.now.t += 3000; }
+  const c = changeOf(t, "flow", id);
+  assert.equal(c.state, "running");
+  const view = await (await t.call("GET", `/api/services/flow/changes/${id}`, { as: "viewer" })).json();
+  assert.equal(view.progress.composing, "no cluster coordinator");
+  for (const n of cluster(t)) n.rest = true;
+  assert.equal((await drive(t, "flow", id)).state, "succeeded");
+});
+
+test("full: rolling back that fails stops at once, says so, and is not tried again by itself", async () => {
+  const restoreFails = setup();
+  const r = await fullChange(restoreFails);
+  guard(restoreFails);
+  restoreFails.w.failing.set(`apply ${A}`, { state: "failed", message: "disk full" });
+  restoreFails.w.failing.set(`restore ${B}`, { state: "failed", message: "read-only file system" });
+  const id = await begin(restoreFails, "flow", { kind: "apply" });
+  const c = await drive(restoreFails, "flow", id);
+  assert.equal(c.state, "stopped");
+  assert.match(c.message!, /Rolling back failed.*read-only/);
+  assert.equal(calls(restoreFails, "restore").length, 3);
+  assert.equal(calls(restoreFails, "start").length, 0, "the files may be a mix: nothing started");
+  // A person's rollback goes on from what the hosts have.
+  assert.equal((await act(restoreFails, "flow", id, "rollback")).status, 200);
+  const again = await drive(restoreFails, "flow", id);
+  assert.equal(again.state, "rolled-back", again.message ?? "");
+  assert.deepEqual(propsOf(restoreFails), r.old);
+
+  const startFails = setup();
+  await fullChange(startFails);
+  guard(startFails, (action) => { if (action === "restore") startFails.w.failing.set(`start ${C}`, { state: "failed", message: "no JVM either" }); });
+  startFails.w.failing.set(`apply ${A}`, { state: "failed", message: "disk full" });
+  const id2 = await begin(startFails, "flow", { kind: "apply" });
+  const c2 = await drive(startFails, "flow", id2);
+  assert.equal(c2.state, "stopped");
+  assert.match(c2.message!, /Rolling back failed.*no JVM either/);
+  assert.equal(calls(startFails, "restore").length, 3);
+  assert.equal(calls(startFails, "start").length, 3);
+
+  const neverUp = setup();
+  await fullChange(neverUp);
+  guard(neverUp, (action) => { if (action === "restore") for (const n of cluster(neverUp)) n.roles = []; });
+  neverUp.w.failing.set(`apply ${A}`, { state: "failed", message: "disk full" });
+  const id3 = await begin(neverUp, "flow", { kind: "apply" });
+  const c3 = await drive(neverUp, "flow", id3);
+  assert.equal(c3.state, "stopped");
+  assert.match(c3.message!, /Rolling back failed.*no cluster coordinator/);
+  assert.equal(calls(neverUp, "restore").length, 3);
+  assert.equal(calls(neverUp, "start").length, 3);
+  assert.equal(calls(neverUp, "apply").length, 3);
+});
+
+test("full: the hard rule: whatever the jobs said, the hosts are asked before any start, and a mix never starts", async () => {
+  // The write said it went well, and c has the old file: a mix. Rolled back, with nothing started over it.
+  const t = setup();
+  const { old } = await fullChange(t);
+  guard(t);
+  const original = t.w.handle;
+  t.w.handle = (job) => {
+    if (job.action === "apply" && job.member === C) { t.w.calls.push(`apply ${C}`); return t.handoff.putStatus(String(job.id), { state: "succeeded" as never, steps: [], result: {} as never }); }
+    original(job);
+  };
+  const id = await begin(t, "flow", { kind: "apply" });
+  const c = await drive(t, "flow", id);
+  assert.equal(c.state, "rolled-back", c.message ?? "");
+  assert.match(c.message!, /local:\/opt\/c does not have the new files/);
+  assert.deepEqual(propsOf(t), old);
+  assert.ok(t.w.calls.indexOf(`restore ${A}`) < t.w.calls.indexOf(`start ${A}`));
+
+  // Rolling back, the restore says it went well and b has the new file: nothing starts, and a person is asked.
+  const t2 = setup();
+  await fullChange(t2);
+  guard(t2);
+  t2.w.failing.set(`start ${A}`, { state: "failed", message: "no JVM", didIt: false });
+  const original2 = t2.w.handle;
+  t2.w.handle = (job) => {
+    if (job.action === "restore" && job.member === B) { t2.w.calls.push(`restore ${B}`); return t2.handoff.putStatus(String(job.id), { state: "succeeded" as never, steps: [], result: {} as never }); }
+    original2(job);
+  };
+  const id2 = await begin(t2, "flow", { kind: "apply" });
+  const c2 = await drive(t2, "flow", id2);
+  assert.equal(c2.state, "stopped");
+  assert.match(c2.message!, /Rolling back failed.*local:\/opt\/b does not have the old files.*No node was started/);
+  const started = t2.w.calls.filter((x, i) => x.startsWith("start ") && i > t2.w.calls.indexOf(`restore ${A}`));
+  assert.deepEqual(started, []);
+});
+
+test("full: the executor gone in the middle of a job: stopped, nothing rolled back; continuing writes only what is left, and refuses a mix with a node running", async () => {
+  const t = setup();
+  await fullChange(t);
+  guard(t);
+  t.w.failing.set(`apply ${C}`, { state: "failed", message: INTERRUPTED });
+  const id = await begin(t, "flow", { kind: "apply" });
+  const c = await drive(t, "flow", id);
+  assert.equal(c.state, "stopped", c.message ?? "");
+  assert.match(c.message!, /stopped while this job ran.*not known/);
+  assert.equal(calls(t, "restore").length, 0, "no rollback by itself");
+  assert.equal(calls(t, "start").length, 0, "a mix does not start");
+  const view = await (await t.call("GET", `/api/services/flow/changes/${id}`, { as: "viewer" })).json();
+  assert.equal(view.progress.wrote, true);
+
+  // Someone started a node meanwhile: a mix with a node running goes to a person.
+  t.w.nodes.get(A)!.running = true;
+  assert.equal((await act(t, "flow", id, "continue")).status, 200);
+  const refused = await drive(t, "flow", id);
+  assert.equal(refused.state, "stopped");
+  assert.match(refused.message!, /mix of old and new and local:\/opt\/a is running/);
+  assert.equal(calls(t, "apply").length, 3);
+  t.w.nodes.get(A)!.running = false;
+
+  assert.equal((await act(t, "flow", id, "continue")).status, 200);
+  const on = await drive(t, "flow", id);
+  assert.equal(on.state, "succeeded", on.message ?? "");
+  assert.equal(calls(t, "apply").filter((x) => x === `apply ${C}`).length, 2, "only what was left");
+  assert.equal(calls(t, "apply").filter((x) => x === `apply ${A}`).length, 1);
+  assert.equal(calls(t, "backup").length, 3, "the backups stay as they were");
+  assert.ok(stepsOf(t, id).includes("reconcile succeeded"));
+
+  // Or rolled back from the same place.
+  const t2 = setup();
+  const r = await fullChange(t2);
+  guard(t2);
+  t2.w.failing.set(`apply ${C}`, { state: "failed", message: INTERRUPTED });
+  const id2 = await begin(t2, "flow", { kind: "apply" });
+  await drive(t2, "flow", id2);
+  assert.equal((await act(t2, "flow", id2, "rollback")).status, 200);
+  const back = await drive(t2, "flow", id2);
+  assert.equal(back.state, "rolled-back", back.message ?? "");
+  assert.deepEqual(propsOf(t2), r.old);
+  assert.equal(calls(t2, "restore").length, 3);
+
+  // A stop interrupted: going on stops the rest.
+  const t3 = setup();
+  await fullChange(t3);
+  guard(t3);
+  t3.w.failing.set(`stop ${C}`, { state: "failed", message: INTERRUPTED, didIt: true });
+  const id3 = await begin(t3, "flow", { kind: "apply" });
+  const c3 = await drive(t3, "flow", id3);
+  assert.equal(c3.state, "stopped");
+  assert.equal(calls(t3, "backup").length, 0);
+  assert.equal((await act(t3, "flow", id3, "continue")).status, 200);
+  const on3 = await drive(t3, "flow", id3);
+  assert.equal(on3.state, "succeeded", on3.message ?? "");
+  assert.deepEqual(calls(t3, "stop"), [`stop ${B}`, `stop ${C}`, `stop ${A}`]);
+
+  // A job taken and never answered: at its deadline it stops, for the same reason. So does a start.
+  const t4 = setup();
+  await fullChange(t4);
+  guard(t4);
+  t4.w.held.add(`start ${C}`);
+  const id4 = await begin(t4, "flow", { kind: "apply" });
+  const c4 = await drive(t4, "flow", id4);
+  assert.equal(c4.state, "stopped");
+  assert.match(c4.message!, /start on local:\/opt\/c timed out.*not known/);
+  assert.equal(calls(t4, "restore").length, 0);
+  t4.w.held.clear();
+  assert.equal((await act(t4, "flow", id4, "continue")).status, 200);
+  const on4 = await drive(t4, "flow", id4);
+  assert.equal(on4.state, "succeeded", on4.message ?? "");
+  assert.equal(calls(t4, "start").filter((x) => x === `start ${A}`).length, 1, "what runs is not started again");
+});
+
+test("full: an executor gone while the cluster comes together: stopped at the deadline with nothing rolled back, and it can go on", async () => {
+  const t = setup();
+  await fullChange(t);
+  guard(t);
+  const id = await begin(t, "flow", { kind: "apply" });
+  await drive(t, "flow", id, (c) => c.phase === "compose");
+  t.w.offline = true;
+  const c = await drive(t, "flow", id);
+  assert.equal(c.state, "stopped", c.message ?? "");
+  assert.match(c.message!, /did not come together.*no answer.*not known/);
+  assert.equal(calls(t, "restore").length, 0);
+  t.w.offline = false;
+  await t.w.run();
+  assert.equal((await act(t, "flow", id, "continue")).status, 200);
+  assert.equal((await drive(t, "flow", id)).state, "succeeded");
+  assert.equal(calls(t, "start").length, 3);
+});
+
+test("full: the Deployer restarting before any file is written: paused, and a person chooses; after, it goes on by itself; a deadline passed meanwhile stops it, nothing rolled back", async () => {
+  const fresh = (t: T) => {
+    t.engine.changes = new ServiceChanges({ store: t.store, handoff: t.handoff, box, now: () => t.now.t });
+    t.engine.changes.recover();
+  };
+  const t = setup();
+  await fullChange(t);
+  guard(t);
+  const id = await begin(t, "flow", { kind: "apply" });
+  await drive(t, "flow", id, () => t.w.calls.includes(`stop ${C}`));
+  fresh(t);
+  const c = await drive(t, "flow", id, (x) => x.state !== "running");
+  assert.equal(c.state, "paused", c.message ?? "");
+  assert.equal(c.currentMember, null);
+  assert.ok(events(t, "flow").includes("change-paused"));
+  assert.equal(calls(t, "backup").length, 0);
+  const view = await (await t.call("GET", `/api/services/flow/changes/${id}`, { as: "viewer" })).json();
+  assert.equal(view.progress.canRollBack, true);
+  assert.equal((await act(t, "flow", id, "continue")).status, 200);
+  const on = await drive(t, "flow", id);
+  assert.equal(on.state, "succeeded", on.message ?? "");
+  assert.equal(new Set(calls(t, "stop")).size, 3);
+  assert.equal((on.progress as { resume: boolean }).resume, false);
+
+  // Or a person rolls it back: what was stopped starts, nothing written.
+  const t2 = setup();
+  await fullChange(t2);
+  const id2 = await begin(t2, "flow", { kind: "apply" });
+  await drive(t2, "flow", id2, () => t2.w.calls.includes(`stop ${C}`));
+  fresh(t2);
+  assert.equal((await drive(t2, "flow", id2)).state, "paused");
+  assert.equal((await act(t2, "flow", id2, "rollback")).status, 200);
+  const back = await drive(t2, "flow", id2);
+  assert.equal(back.state, "rolled-back", back.message ?? "");
+  assert.ok(cluster(t2).every((n) => n.running && n.status === "CONNECTED"));
+  assert.equal(calls(t2, "restore").length, 0);
+  assert.equal(calls(t2, "apply").length, 0);
+
+  // After the first write: no pause, service first.
+  const t3 = setup();
+  await fullChange(t3);
+  guard(t3);
+  const id3 = await begin(t3, "flow", { kind: "apply" });
+  await drive(t3, "flow", id3, () => calls(t3, "apply").length > 0);
+  fresh(t3);
+  const went = await drive(t3, "flow", id3);
+  assert.equal(went.state, "succeeded", went.message ?? "");
+  assert.ok(!events(t3, "flow").includes("change-paused"));
+
+  // Restarting while rolling back, too, goes on.
+  const t4 = setup();
+  await fullChange(t4);
+  guard(t4);
+  t4.w.failing.set(`backup ${A}`, { state: "failed", message: "no space" });
+  const id4 = await begin(t4, "flow", { kind: "apply" });
+  await drive(t4, "flow", id4, (c) => (c.progress as { rollingBack: boolean }).rollingBack);
+  fresh(t4);
+  assert.equal((await drive(t4, "flow", id4)).state, "rolled-back");
+
+  // Away past the deadline, the cluster half way up: stopped, not rolled back.
+  const t5 = setup();
+  await fullChange(t5);
+  guard(t5);
+  const id5 = await begin(t5, "flow", { kind: "apply" });
+  await drive(t5, "flow", id5, (c) => c.phase === "compose");
+  fresh(t5);
+  t5.now.t += 3600_000;
+  t5.engine.changes.tick();
+  const late = changeOf(t5, "flow", id5);
+  assert.equal(late.state, "stopped");
+  assert.match(late.message!, /away past the deadline of compose: nothing is rolled back/);
+  assert.equal(calls(t5, "restore").length, 0);
+  assert.equal((await act(t5, "flow", id5, "continue")).status, 200);
+  assert.equal((await drive(t5, "flow", id5)).state, "succeeded");
+});
+
+test("full: stopping by hand takes back everything queued; closing after the first write takes saying so, and the timeline has it", async () => {
+  const t = setup();
+  await fullChange(t);
+  const id = await begin(t, "flow", { kind: "apply" });
+  await drive(t, "flow", id, (c) => c.phase === "write" && t.store.serviceChangeSteps(id).filter((s) => s.step === "write").length === 3);
+  const jobs = t.store.serviceChangeSteps(id).filter((s) => s.step === "write").map((s) => s.job!);
+  assert.equal((await act(t, "flow", id, "stop")).status, 200);
+  for (const j of jobs) assert.equal(t.store.executorJob(j)!.status!.state, "refused");
+  assert.equal(t.store.serviceChangeSteps(id).filter((s) => s.state === "running").length, 0);
+  await t.w.run();
+  assert.equal(calls(t, "apply").length, 0);
+  const refused = await act(t, "flow", id, "close");
+  assert.equal(refused.status, 409);
+  assert.equal((await refused.json()).error, "service-change/files-mixed");
+  assert.equal(changeOf(t, "flow", id).state, "stopped");
+  const closed = await t.call("POST", `/api/services/flow/changes/${id}/close`, { as: "uat" }, { filesMayBeMixed: true });
+  assert.equal(closed.status, 200);
+  assert.equal(changeOf(t, "flow", id).state, "closed");
+  const finished = t.store.serviceEvents("flow").find((e) => e.kind === "change-finished")!;
+  assert.match(String(finished.detail.text), /mix of old and new/);
+  assert.equal(t.store.activeServiceChange("flow"), undefined);
+
+  // Before any write there is nothing to say.
+  const t2 = setup();
+  await fullChange(t2);
+  t2.w.held.add("stop");
+  const id2 = await begin(t2, "flow", { kind: "apply" });
+  await drive(t2, "flow", id2, () => t2.w.calls.some((x) => x.startsWith("stop")));
+  assert.equal((await act(t2, "flow", id2, "stop")).status, 200);
+  assert.equal((await act(t2, "flow", id2, "close")).status, 200);
+});
+
+test("full: PROD takes it only from a browser (D7); UAT's personal key may; what a change shows holds no hash, no secret, no environment", async () => {
+  const prod = setup("prod");
+  await fullChange(prod, { as: "prod" });
+  const planned = await planOf(prod, "flow", { kind: "apply", options: fast }, { key: "dpk_prod" });
+  assert.equal(planned.mode, "full");
+  const refused = await prod.call("POST", "/api/services/flow/changes", { key: "dpk_prod" }, { kind: "apply", options: fast, planHash: planned.planHash });
+  assert.equal(refused.status, 403);
+  assert.equal((await refused.json()).error, "auth/browser-only");
+  assert.equal((await prod.call("POST", "/api/services/flow/changes", { key: "dps_assistant" }, { kind: "apply", options: fast, planHash: planned.planHash })).status, 403);
+  const browser = await prod.call("POST", "/api/services/flow/changes", { as: "prod" }, { kind: "apply", options: fast, planHash: planned.planHash, reason: "a new ZooKeeper" });
+  assert.equal(browser.status, 201, await browser.clone().text());
+  const id = (await browser.json()).id as string;
+  for (const what of ["stop", "continue", "rollback", "force-kill", "close"]) {
+    const r = await act(prod, "flow", id, what, { key: "dpk_prod" });
+    assert.equal(r.status, 403, what);
+    assert.equal((await r.json()).error, "auth/browser-only");
+  }
+  assert.equal((await drive(prod, "flow", id)).state, "succeeded");
+
+  const uat = setup();
+  await fullChange(uat);
+  const plan = await planOf(uat, "flow", { kind: "apply", options: fast });
+  const viaKey = await uat.call("POST", "/api/services/flow/changes", { key: "dpk_uat" }, { kind: "apply", options: fast, planHash: plan.planHash });
+  assert.equal(viaKey.status, 201);
+  const made = await viaKey.json();
+  await drive(uat, "flow", made.id, (c) => c.phase === "compose");
+  const one = await (await uat.call("GET", `/api/services/flow/changes/${made.id}`, { as: "viewer" })).text();
+  assert.doesNotMatch(one, /[0-9a-f]{64}/, "no hash");
+  assert.doesNotMatch(one, /JAVA_HOME/, "no environment");
+  const seen = JSON.parse(one).progress.seen;
+  assert.equal(seen.members[A].files, "new");
+  assert.equal(typeof seen.coordinator, "boolean");
+});
+
+test("full: the rules leave every member and the cluster alone while it runs, and judge them again once it has stopped", async () => {
+  const t = setup();
+  await fullChange(t);
+  const online: ExecutorInfo = { online: true, host: "local", ageSeconds: 5, heartbeat: { collector: { seconds: 30 } } as never };
+  const rule = () => t.store.serviceAlerts({ service: "flow", state: "open" }).map((a) => `${a.rule} ${a.member}`).sort();
+  const before = new Date(t.now.t).toISOString();
+  for (const m of NODES) await sampled(t, m, true);
+  check(t.store, () => online, "flow", new Date(t.now.t));
+  t.w.held.add("start");
+  const id = await begin(t, "flow", { kind: "apply" });
+  await drive(t, "flow", id, () => calls(t, "start").length === 3);
+  assert.equal(changeOf(t, "flow", id).currentMember, null, "no member in particular");
+
+  t.now.t += 30_000;
+  for (const m of NODES) await sampled(t, m, false, "e".repeat(64));
+  zkMessages(t);
+  check(t.store, () => online, "flow", new Date(t.now.t));
+  assert.deepEqual(rule().filter((r) => /process-down|node-disconnected|no-samples|no-coordinator|zk-errors|config-drift/.test(r)), []);
+
+  const c = await drive(t, "flow", id);
+  assert.equal(c.state, "stopped");
+  t.now.t += 3000;
+  for (const m of NODES) await sampled(t, m, false);
+  zkMessages(t);
+  check(t.store, () => online, "flow", new Date(t.now.t));
+  for (const m of NODES) assert.ok(rule().includes(`process-down ${m}`), `${m} is judged again`);
+  assert.ok(rule().includes("zk-errors *"), "and the cluster");
+  await sampled(t, B, true);
+  check(t.store, () => online, "flow", new Date(t.now.t));
+  assert.ok(rule().includes("no-coordinator *"));
+  assert.ok(!t.store.serviceEvents("flow", { from: before }).some((e) => e.kind === "process-restarted" || e.kind === "node-disconnected"), "the timeline has the change's steps");
 });

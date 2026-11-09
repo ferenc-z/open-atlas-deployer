@@ -1017,7 +1017,10 @@ export function createApp({ config, store, sessions, observer, deployments, vers
       const p = await changeOperator(c);
       if (p instanceof Response) return p;
       try {
-        const out = changes[act](c.req.param("id")!, c.req.param("change")!, actorOf(p));
+        const id = c.req.param("id")!, change = c.req.param("change")!;
+        const out = act === "close"
+          ? changes.close(id, change, actorOf(p), ((await c.req.json().catch(() => ({}))) as { filesMayBeMixed?: unknown }).filesMayBeMixed === true)
+          : changes[act](id, change, actorOf(p));
         return c.json(serviceChangeView(out, store.serviceChangeSteps(out.id)));
       } catch (error) { return changeFailed(c, error); }
     });

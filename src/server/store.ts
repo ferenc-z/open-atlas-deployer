@@ -1111,10 +1111,23 @@ export class Store {
 
   /** A member's files as a change has just left them (§16.3): what they should be from now on, and what they are, so that no older sample calls it drift. */
   setMemberFilesApplied(service: string, member: string, files: { file: string; path: string; sha256: string; revision: number }[], change: string) {
+    this.inTransaction(() => this.upsertMemberFiles(service, member, files, change));
+  }
+
+  private upsertMemberFiles(service: string, member: string, files: { file: string; path: string; sha256: string; revision: number }[], change: string) {
     const at = this.stamp();
     const upsert = this.db.prepare(`INSERT INTO service_member_files (service, member, file, path, expected_sha256, revision, applied_at, change, actual_sha256, actual_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT (service, member, file) DO UPDATE SET path = excluded.path, expected_sha256 = excluded.expected_sha256, revision = excluded.revision, applied_at = excluded.applied_at, change = excluded.change, actual_sha256 = excluded.actual_sha256, actual_at = excluded.actual_at`);
-    this.inTransaction(() => { for (const f of files) upsert.run(service, member, f.file, f.path, f.sha256, f.revision, at, change, f.sha256, at); });
+    for (const f of files) upsert.run(service, member, f.file, f.path, f.sha256, f.revision, at, change, f.sha256, at);
+  }
+
+  /** §16.3 (S31): the cluster as a full change has just left it, in one go: what each member should have from now on, the timeline, and the change itself. */
+  setFullChangeApplied(c: Pick<ServiceChange, "id" | "service" | "state" | "phase" | "currentMember" | "message" | "finishedAt" | "progress">, members: { member: string; files: { file: string; path: string; sha256: string; revision: number }[] }[], events: Omit<ServiceEvent, "id">[]) {
+    this.inTransaction(() => {
+      for (const m of members) this.upsertMemberFiles(c.service, m.member, m.files, c.id);
+      for (const e of events) this.insertServiceEvent(e);
+      this.updateServiceChange(c.id, c);
+    });
   }
 
   /** How a member is started from now on (§16.3): what the running process had. */

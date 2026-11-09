@@ -5,8 +5,9 @@
 // member is touched the cluster is looked at afresh (svc-state): ordinary nodes go first and the primary node and the
 // coordinator last, since those roles move while it rolls. A step that fails for a clear reason rolls that member back
 // and stops; a step past its deadline just stops, since what happened on the host is not known. Going on (continue)
-// always compares with what the hosts have first. mode "full" (S31) shares the tables, the lock and the routes; its flow
-// is planned here and refused at the start until step 11b.
+// always compares with what the hosts have first. mode "full" (S31) shares the tables, the lock and the routes: every node
+// stopped one by one, every node backed up, every file written, every node started at once, and the cluster waited for.
+// Its rule above the others: no node starts while the nodes' files are a mix of old and new.
 
 import { createHash, randomBytes } from "node:crypto";
 import type { Handoff } from "../handoff.ts";
@@ -29,7 +30,7 @@ export type Stage = "disconnect" | "offload" | "stop" | "write" | "start" | "wai
 export const INTERRUPTED = "The service executor stopped while this job ran.";
 
 /** §16.3: seconds for each step; the first five are what the design names, to be set from the measurements of steps 13 and 14. */
-export const DEFAULT_TIMEOUTS = { disconnect: 60, offload: 900, stop: 120, rest: 600, connect: 600, write: 120, start: 300, stable: 300, gate: 180 };
+export const DEFAULT_TIMEOUTS = { disconnect: 60, offload: 900, stop: 120, rest: 600, connect: 600, write: 120, start: 300, stable: 300, gate: 180, compose: 900 };
 export type Timeouts = typeof DEFAULT_TIMEOUTS;
 const TIMEOUT_MAX = 3600; // svc-control's own limit (CONTROL_TIMEOUT_MAX)
 const STAGE_TIMEOUT: Record<Stage, keyof Timeouts> = { disconnect: "disconnect", offload: "offload", stop: "stop", write: "write", start: "start", restore: "write", "wait-rest": "rest", "wait-connected": "connect", "wait-stable": "stable" };
@@ -46,6 +47,14 @@ const CONNECT_NUDGE_MS = 60_000;
 const COORDINATOR = "Cluster Coordinator", PRIMARY = "Primary Node";
 const AWAY = new Set(["DISCONNECTED", "DISCONNECTING", "OFFLOADING", "OFFLOADED"]);
 const FINAL = new Set(["succeeded", "failed", "refused", "rolled-back"]);
+const ELECTION_WAIT = "nifi.cluster.flow.election.max.wait.time";
+const UNIT_SECONDS: [RegExp, number][] = [[/^(ns|nano)/, 1e-9], [/^(ms|milli)/, 1e-3], [/^s/, 1], [/^m/, 60], [/^h/, 3600], [/^d/, 86400], [/^w/, 604800]];
+/** A NiFi duration ("5 mins") in seconds; null when it is not one. */
+function durationSeconds(text: string | undefined): number | null {
+  const m = /^(\d+(?:\.\d+)?)\s*([a-z]+)$/i.exec(text?.trim() ?? "");
+  const unit = m && UNIT_SECONDS.find(([re]) => re.test(m[2]!.toLowerCase()));
+  return m && unit ? Number(m[1]) * unit[1] : null;
+}
 
 export interface PlanFile extends Omit<FileChange, "name" | "change"> { name: string; change: FileChange["change"]; path: string; baseSha256: string | null; sha256: string; revision: number }
 export interface PlanMember { member: string; host: string; restart: boolean; files: PlanFile[]; stages: Stage[]; differences?: unknown[] }
@@ -64,7 +73,11 @@ export interface ChangeProgress {
   rollingBack: boolean; wrote: boolean; before: ProcessPair | null; stuck: ProcessPair | null;
   probes: Record<string, string>; probedAt: string | null; nextProbe: string | null; stableSince: string | null; invalidHigh: boolean;
   nudge: string | null; resume: boolean; intent: "forward" | "rollback"; pruning: string[];
+  /** The rest is a full change's: whether a node has been touched, the jobs sent at once, what the last look saw (nothing secret, no hash), and what the cluster is still short of. */
+  touched?: boolean; batch?: Batch | null; seen?: Seen | null; composing?: string | null;
 }
+interface Batch { stage: string; members: string[]; ended: Record<string, "ok" | "failed" | "unknown">; why: string[] }
+interface Seen { at: string; members: Record<string, { running: boolean | null; files: "old" | "new" | "mixed" | "changed" | "unknown"; status: string | null }>; coordinator: boolean; primary: boolean }
 export const newProgress = (): ChangeProgress => ({ done: [], remaining: [], baseline: null, nodeId: null, rollingBack: false, wrote: false, before: null, stuck: null, probes: {}, probedAt: null, nextProbe: null, stableSince: null, invalidHigh: false, nudge: null, resume: false, intent: "forward", pruning: [] });
 
 interface StateFile { name: string; sha256?: string; missing?: boolean; error?: string }
@@ -199,7 +212,7 @@ export class ServiceChanges {
   }
 
   /** §16.3: what stops a plan early on the executors' side; their own refusals remain the last word. */
-  private capabilityFindings(service: Registered, kind: ChangeKind, chosen: ServiceMember[], writes: boolean): { findings: ConfigFinding[]; executors: ChangePlan["executors"] } {
+  private capabilityFindings(service: Registered, kind: ChangeKind, chosen: ServiceMember[], writes: boolean, full: boolean): { findings: ConfigFinding[]; executors: ChangePlan["executors"] } {
     const out: ConfigFinding[] = [];
     const error = (code: string, message: string, member?: string) => out.push({ severity: "error", code, message, ...(member ? { member } : {}), introduced: true });
     const executors = [...new Set(membersOf(service).map((m) => m.host))].map((host) => {
@@ -218,7 +231,7 @@ export class ServiceChanges {
       else if (m.serviceUser === "root") error("change/service-user", `${key}: NiFi is not run as root (S10).`, key);
       else if (hb && hb.isRoot === false && hb.user && hb.user !== m.serviceUser) error("change/other-user", `${key}: the service executor runs as ${hb.user} and cannot act as ${m.serviceUser}.`, key);
       if (kind !== "stop" && control && control.killMode && control.killMode !== "process") error("change/kill-mode", `${m.host}: the service executor's unit has KillMode=${control.killMode}: NiFi would die with it. Run its install.sh again first.`, key);
-      if (service.kind === "cluster" && kind !== "start" && control && !control.operatorCert) error("change/no-operator-cert", `${m.host}: the service executor has no operator certificate (EXECUTOR_NIFI_OPERATOR_CERT): it cannot disconnect a node.`, key);
+      if (service.kind === "cluster" && kind !== "start" && !full && control && !control.operatorCert) error("change/no-operator-cert", `${m.host}: the service executor has no operator certificate (EXECUTOR_NIFI_OPERATOR_CERT): it cannot disconnect a node.`, key);
       if (kind !== "stop" && !m.startEnvironment) out.push({ severity: "warning", code: "change/no-start-env", message: `${key}: no start environment is known (it never ran under the Deployer's eye): NiFi starts with what its own scripts set.`, member: key, introduced: true });
     }
     return { findings: out, executors };
@@ -229,7 +242,9 @@ export class ServiceChanges {
     if (!service) throw new ChangeError(404, "service/unknown", `No standalone instance or cluster ${id}.`);
     if (!CHANGE_KINDS.includes(req.kind as ChangeKind)) throw new ChangeError(400, "service-change/invalid", `kind is one of ${CHANGE_KINDS.join(", ")}.`);
     const kind = req.kind as ChangeKind;
-    const { options, problems } = this.options(req.options, service);
+    const parsed = this.options(req.options, service);
+    let options = parsed.options;
+    const problems = parsed.problems;
     if (problems.length) throw new ChangeError(400, "service-change/invalid", "Some options are not valid.", problems);
     const chosen = this.selected(service, kind, req.members);
     const cluster = service.kind === "cluster";
@@ -241,6 +256,11 @@ export class ServiceChanges {
     let mode: ChangeMode = "rolling", fullBecause: ChangePlan["fullBecause"] = [];
     const files = new Map<string, PlanFile[]>();
     const differences = new Map<string, unknown[]>();
+    const electionWaits: (number | null)[] = [];
+    const waitsOf = (m: CheckMember) => {
+      const bytes = m.files.find((f) => f.name === "nifi.properties")?.bytes;
+      if (bytes) electionWaits.push(durationSeconds(effectiveProperties(bytes).get(ELECTION_WAIT)?.value));
+    };
     const add = (member: string, list: readonly FileChange[], fileOf: (name: string) => Omit<PlanFile, keyof FileChange> | undefined) => {
       files.set(member, list.flatMap((f) => {
         const at = fileOf(f.name);
@@ -263,7 +283,9 @@ export class ServiceChanges {
           const key = installKey(m);
           return { ...m, files: rows.filter((r) => r.member === key).flatMap((r) => kept(r.revision, key, r.file) ?? []) };
         });
-        const checked = checkConfig({ ...context, profile: context.profile, members: openMembers(target.body.members, box), base: openMembers(base, box) });
+        const openedTarget = openMembers(target.body.members, box), openedBase = openMembers(base, box);
+        for (const m of [...openedTarget, ...openedBase]) waitsOf(m);
+        const checked = checkConfig({ ...context, profile: context.profile, members: openedTarget, base: openedBase });
         found.push(...checked.findings);
         mode = checked.change!.mode;
         fullBecause = checked.change!.fullBecause;
@@ -296,7 +318,12 @@ export class ServiceChanges {
           const opened = (records: ConfigFileRecord[]) => openMembers([{ host: m.host, installDir: m.installDir, confDir: confDirOf(m), missing: [], files: records }], box)[0]!;
           const basis: CheckMember = { ...opened([]), files: live.flatMap((f) => (f.bytes && f.sha256 ? [{ name: f.name, sha256: f.sha256, bytes: f.bytes }] : [])) };
           const change = assessChange({ profile: context.profile, kind: service.kind, members: [opened(targets)], base: [basis] });
-          if (change.mode === "full") { mode = "full"; fullBecause.push(...change.fullBecause); }
+          waitsOf(opened(targets));
+          waitsOf(basis);
+          if (change.mode === "full") {
+            mode = "full";
+            for (const f of change.fullBecause) if (!fullBecause.some((x) => x.file === f.file && x.key === f.key)) fullBecause.push(f);
+          }
           add(key, change.members[0]?.files ?? [], (name) => {
             const row = off.find((r) => r.file === name)!, rec = targets.find((f) => f.name === name);
             return rec && { path: rec.path, baseSha256: live.find((f) => f.name === name)?.sha256 ?? null, sha256: rec.sha256, revision: row.revision };
@@ -322,20 +349,30 @@ export class ServiceChanges {
     }
 
     const writes = kind === "apply" || kind === "overwrite";
-    const capability = this.capabilityFindings(service, kind, chosen, writes);
+    const full = mode === "full";
+    const capability = this.capabilityFindings(service, kind, chosen, writes, full);
     found.push(...capability.findings);
-    // S31's flow is step 11b: the plan already says what the change would be.
-    if (mode === "full") found.push({ severity: "error", code: "change/full-not-yet", message: "This change has to stop and start the whole cluster, which this version cannot do yet.", introduced: true });
+    if (full) {
+      // S31: the whole cluster or nothing, and no node is disconnected first, so nothing to offload.
+      if (chosen.length < membersOf(service).length) found.push({ severity: "error", code: "config/full-needs-all-members", message: "This change stops and starts the whole cluster, so it cannot be limited to some members.", introduced: true });
+      if (options.offload) found.push({ severity: "warning", code: "change/full-no-offload", message: "Offload does not apply: the whole cluster stops, and nothing is disconnected first.", introduced: true });
+      // §16.3: long enough for the flow election to end by waiting, under the old settings or the new (rolling back waits too).
+      const asked = (req.options as { timeouts?: { compose?: unknown } } | undefined)?.timeouts?.compose;
+      const wait = Math.max(0, ...electionWaits.map((x) => x ?? 300));
+      const compose = asked !== undefined ? options.timeouts.compose : Math.min(TIMEOUT_MAX, Math.max(DEFAULT_TIMEOUTS.compose, Math.ceil(wait) + 600));
+      options = { ...options, offload: false, timeouts: { ...options.timeouts, compose } };
+    }
 
-    const planned = (writes ? chosen.filter((m) => files.get(installKey(m))?.length) : chosen).map((m): PlanMember => {
+    const planned = (writes && !full ? chosen.filter((m) => files.get(installKey(m))?.length) : chosen).map((m): PlanMember => {
       const key = installKey(m), own = files.get(key) ?? [];
-      const restart = kind === "restart" || kind === "rolling-restart" || own.some((f) => f.restart);
-      return { member: key, host: m.host, restart, files: own, stages: stagesFor(kind, cluster, { restart, files: own }, options.offload), ...(differences.has(key) ? { differences: differences.get(key)! } : {}) };
+      const restart = full || kind === "restart" || kind === "rolling-restart" || own.some((f) => f.restart);
+      const stages: Stage[] = full ? ["stop", ...(own.length ? (["write"] as Stage[]) : []), "start"] : stagesFor(kind, cluster, { restart, files: own }, options.offload);
+      return { member: key, host: m.host, restart, files: own, stages, ...(differences.has(key) ? { differences: differences.get(key)! } : {}) };
     });
     const hash = createHash("sha256").update(JSON.stringify({ kind, revision, mode, fullBecause, options, members: planned.map((m) => ({ member: m.member, restart: m.restart, files: m.files.map((f) => [f.name, f.path, f.baseSha256, f.sha256, f.revision]) })) })).digest("hex");
     return {
       service: id, kind, revision, mode, fullBecause, restart: planned.some((m) => m.restart), members: planned,
-      order: cluster && planned.length > 1 ? "One node at a time: ordinary nodes first, the primary node and the coordinator last, decided each round." : "As listed.",
+      order: full ? "The whole cluster: every node stopped one by one (ordinary nodes first, the primary node and the coordinator last), every file written, then all started at once." : cluster && planned.length > 1 ? "One node at a time: ordinary nodes first, the primary node and the coordinator last, decided each round." : "As listed.",
       options, findings: found, blocking: blockingFindings(found), executors: capability.executors, empty: planned.length === 0, planHash: hash,
     };
   }
@@ -369,7 +406,8 @@ export class ServiceChanges {
     if (c.state !== "paused" && c.state !== "stopped") throw new ChangeError(409, "service-change/state", `This change is ${c.state}: there is nothing to continue.`);
     const p = c.progress as ChangeProgress;
     Object.assign(p, { resume: false, rollingBack: false, stuck: null, intent: "forward", probes: {}, nextProbe: null, stableSince: null, nudge: null, invalidHigh: false });
-    this.save(c, { state: "running", phase: c.currentMember ? "reconcile" : "gate", message: null });
+    if (c.mode === "full") Object.assign(p, { batch: null, composing: null });
+    this.save(c, { state: "running", phase: c.mode === "full" || c.currentMember ? "reconcile" : "gate", ...(c.mode === "full" ? { currentMember: null } : {}), message: null });
     this.store.audit(actor, "service.change-continued", `${id}/${change}`, { member: c.currentMember });
     this.event(c, "change-resumed", c.currentMember, `Change continued by ${actor.id}`);
     this.advanceSafely(c);
@@ -381,8 +419,7 @@ export class ServiceChanges {
     const c = this.mine(id, change);
     if (c.state !== "running" && c.state !== "paused") throw new ChangeError(409, "service-change/state", `This change is ${c.state}: there is nothing to stop.`);
     this.store.audit(actor, "service.change-stopped", `${id}/${change}`, { member: c.currentMember });
-    const step = this.store.runningServiceChangeStep(c.id);
-    if (step) this.closeStep(step, "failed", `Stopped by ${actor.id}`);
+    for (const step of this.openSteps(c)) this.closeStep(step, "failed", `Stopped by ${actor.id}`);
     this.stopHere(c, `Stopped by ${actor.id}`);
     return this.store.serviceChange(id, change)!;
   }
@@ -390,6 +427,7 @@ export class ServiceChanges {
   /** §7: this member back to its backup and started, by a person, after a stop. */
   rollback(id: string, change: string, actor: Actor): ServiceChange {
     const c = this.mine(id, change);
+    if (c.mode === "full") return this.rollbackFull(c, actor);
     if (c.state !== "stopped") throw new ChangeError(409, "service-change/state", `This change is ${c.state}: only a stopped change is rolled back.`);
     const pm = (c.plan as ChangePlan).members.find((m) => m.member === c.currentMember);
     if (!pm?.files.length) throw new ChangeError(409, "service-change/nothing-to-roll-back", "No member's files are in the middle of this change: there is nothing to put back. Continue or close it.");
@@ -413,12 +451,15 @@ export class ServiceChanges {
   }
 
   /** "Accept things as they are": frees the service for other changes. Members already done keep what they got. */
-  close(id: string, change: string, actor: Actor): ServiceChange {
+  close(id: string, change: string, actor: Actor, filesMayBeMixed = false): ServiceChange {
     const c = this.mine(id, change);
     if (c.state !== "stopped" && c.state !== "paused") throw new ChangeError(409, "service-change/state", `This change is ${c.state}: only a stopped or paused change is closed.`);
     const p = c.progress as ChangeProgress;
-    this.store.audit(actor, "service.change-closed", `${id}/${change}`, { member: c.currentMember, done: p.done });
-    this.finish(c, "closed", `Closed by ${actor.id} with things as they are${c.currentMember ? ` (${c.currentMember} was in the middle of it)` : ""}`);
+    // §16.3: a full change may leave the nodes with old and new values side by side; closing that takes saying so.
+    const mixed = c.mode === "full" && p.wrote;
+    if (mixed && !filesMayBeMixed) throw new ChangeError(409, "service-change/files-mixed", "Writing the files has begun and they are not back: the nodes may hold old and new values side by side. Close only if you accept that (filesMayBeMixed), or continue or roll back.");
+    this.store.audit(actor, "service.change-closed", `${id}/${change}`, { member: c.currentMember, done: p.done, ...(mixed ? { filesMayBeMixed: true } : {}) });
+    this.finish(c, "closed", `Closed by ${actor.id} with things as they are${c.currentMember ? ` (${c.currentMember} was in the middle of it)` : ""}${mixed ? ": the nodes' files may be a mix of old and new" : ""}`);
     return this.store.serviceChange(id, change)!;
   }
 
@@ -441,15 +482,14 @@ export class ServiceChanges {
   private advanceSafely(c: ServiceChange) {
     try { this.advance(c); } catch (error) {
       console.error(`service change ${c.id}:`, error);
-      const step = this.store.runningServiceChangeStep(c.id);
-      if (step) this.closeStep(step, "failed", (error as Error).message);
+      for (const step of this.openSteps(c)) this.closeStep(step, "failed", (error as Error).message);
       this.stopHere(c, (error as Error).message);
     }
   }
 
   private advance(c: ServiceChange) {
     if (c.state !== "running") return;
-    if (c.mode === "full") throw new Error("A full stop and start is not implemented yet (step 11b)."); // advanceFull in step 11b
+    if (c.mode === "full") return this.advanceFull(c);
     if (c.phase === "gate") this.gate(c);
     else if (c.phase === "reconcile") this.reconcile(c);
     else if (c.phase === "member") this.member(c);
@@ -475,6 +515,7 @@ export class ServiceChanges {
   private stopHere(c: ServiceChange, message: string) {
     const p = c.progress as ChangeProgress;
     this.dropProbes(p);
+    p.batch = null;
     this.save(c, { state: "stopped", message });
     this.event(c, "change-stopped", c.currentMember, `Change stopped: ${message}`);
   }
@@ -483,6 +524,7 @@ export class ServiceChanges {
     const p = c.progress as ChangeProgress;
     this.dropProbes(p);
     p.remaining = [];
+    p.batch = null;
     const member = c.currentMember;
     this.save(c, { state, phase: "done", currentMember: null, message, finishedAt: this.iso() });
     if (state === "rolled-back") this.event(c, "config-rolled-back", member, message);
@@ -501,6 +543,8 @@ export class ServiceChanges {
     if (!m) throw new Error(`${key} is not in the plan of ${c.id}`);
     return m;
   }
+
+  private openSteps(c: ServiceChange) { return this.store.serviceChangeSteps(c.id).filter((s) => s.state === "running"); }
 
   private addStep(c: ServiceChange, step: string, member: string | null, deadlineMs: number, job: string | null = null): ServiceChangeStep {
     return this.store.addServiceChangeStep({ change: c.id, member, step, job, deadline: this.iso(deadlineMs), startedAt: this.iso() });
@@ -559,12 +603,13 @@ export class ServiceChanges {
   /** §16.3: an ordinary node first; only when just those are left the primary node, the coordinator last. */
   private pick(c: ServiceChange, s: Registered, view: View): PlanMember {
     const plan = c.plan as ChangePlan, done = (c.progress as ChangeProgress).done;
-    const weight = (pm: PlanMember) => {
-      const roles = this.nodeOf(view, membersOf(s).find((m) => installKey(m) === pm.member)!)?.roles ?? [];
-      return (roles.includes(PRIMARY) ? 1 : 0) + (roles.includes(COORDINATOR) ? 2 : 0);
-    };
     const left = plan.members.filter((m) => !done.includes(m.member));
-    return left.reduce((a, b) => (weight(b) < weight(a) ? b : a));
+    return left.reduce((a, b) => (this.weight(s, view, b.member) < this.weight(s, view, a.member) ? b : a));
+  }
+
+  private weight(s: Registered, view: View, key: string) {
+    const roles = this.nodeOf(view, membersOf(s).find((m) => installKey(m) === key)!)?.roles ?? [];
+    return (roles.includes(PRIMARY) ? 1 : 0) + (roles.includes(COORDINATOR) ? 2 : 0);
   }
 
   /** What in a member's files is neither what the plan started from nor what it writes: someone changed it. */
@@ -898,6 +943,437 @@ export class ServiceChanges {
     }
   }
 
+  // --- the whole cluster (S31, §8, §16.3) ------------------------------------------------------------------------------
+
+  /** Phases: gate, check, stopping, backup, write, verify, start, compose, finish; rolling back: stopping, restore, verify, start, compose; and reconcile, kill. */
+  private advanceFull(c: ServiceChange): void {
+    const p = c.progress as ChangeProgress;
+    if (p.resume && c.phase !== "kill" && c.phase !== "finish") {
+      // The Deployer restarted. Before any file was written a person chooses; after that, service comes first and it goes
+      // on, unless a deadline passed meanwhile: then what happened is not known, and it stops with nothing rolled back.
+      if (!p.wrote && !p.rollingBack) return this.pauseFull(c);
+      const late = this.openSteps(c).filter((s) => this.iso() > s.deadline);
+      if (late.length) {
+        for (const s of this.openSteps(c)) this.closeStep(s, "timed-out", "The Deployer was away past its deadline");
+        return this.stopHere(c, `The Deployer was away past the deadline of ${[...new Set(late.map((s) => s.step))].join(", ")}: nothing is rolled back by itself. Look at the nodes, then continue, roll back or close.`);
+      }
+      p.resume = false;
+      this.save(c);
+    }
+    if (c.phase === "gate") this.fullGate(c);
+    else if (c.phase === "check") this.fullCheck(c);
+    else if (c.phase === "stopping") this.fullStopping(c);
+    else if (c.phase === "backup") this.fullBackup(c);
+    else if (c.phase === "write") this.fullWrite(c);
+    else if (c.phase === "restore") this.fullRestore(c);
+    else if (c.phase === "verify") this.fullVerify(c);
+    else if (c.phase === "start") this.fullStart(c);
+    else if (c.phase === "compose") this.fullCompose(c);
+    else if (c.phase === "reconcile") this.fullReconcile(c);
+    else if (c.phase === "finish") this.finishing(c);
+    else if (c.phase === "kill") this.killing(c);
+  }
+
+  private pauseFull(c: ServiceChange) {
+    for (const s of this.openSteps(c)) this.closeStep(s, "failed", "The Deployer restarted");
+    const p = c.progress as ChangeProgress;
+    this.dropProbes(p);
+    p.batch = null;
+    this.save(c, { state: "paused", currentMember: null, message: "The Deployer restarted before any file was written: continue, or roll back to start what was stopped." });
+    this.event(c, "change-paused", null, c.message!);
+  }
+
+  private rollbackFull(c: ServiceChange, actor: Actor): ServiceChange {
+    if (c.state !== "stopped" && c.state !== "paused") throw new ChangeError(409, "service-change/state", `This change is ${c.state}: only a stopped or paused change is rolled back.`);
+    const p = c.progress as ChangeProgress;
+    Object.assign(p, { resume: false, stuck: null, intent: "rollback", rollingBack: true, batch: null, composing: null, probes: {}, nextProbe: null, stableSince: null, invalidHigh: false });
+    this.save(c, { state: "running", phase: "reconcile", currentMember: null, message: "Rolling back the whole cluster, by a person's decision" });
+    this.store.audit(actor, "service.change-rollback", `${c.service}/${c.id}`, { member: null });
+    this.advanceSafely(c);
+    return this.store.serviceChange(c.service, c.id)!;
+  }
+
+  /** The one automatic rollback (§16.3): whatever runs stopped, the files back when any was written, everything started. It is not tried again. */
+  private rollBackFull(c: ServiceChange, why: string): void {
+    const p = c.progress as ChangeProgress;
+    Object.assign(p, { rollingBack: true, intent: "rollback", batch: null, composing: null, stableSince: null, invalidHigh: false, nextProbe: null });
+    this.save(c, { phase: "stopping", currentMember: null, message: `Rolling back the whole cluster: ${why}` });
+    this.fullStopping(c);
+  }
+
+  private fullService(c: ServiceChange) {
+    const s = registered(this.store, c.service);
+    if (!s) throw new Error(`${c.service} is no longer registered`);
+    return s;
+  }
+
+  private filesOf(pm: PlanMember) { return pm.files.map((f) => ({ name: f.name, path: f.path, baseSha256: f.baseSha256, sha256: f.sha256 })); }
+
+  /** What this look saw, kept for the page: the views themselves hold start environments and go. */
+  private note(c: ServiceChange, view: View) {
+    const p = c.progress as ChangeProgress;
+    const s = this.fullService(c);
+    const members: Seen["members"] = {};
+    for (const pm of (c.plan as ChangePlan).members) {
+      const a = view.answers.get(pm.member), m = membersOf(s).find((x) => installKey(x) === pm.member);
+      const stand = a && fileStand(pm, a);
+      members[pm.member] = {
+        running: a ? isRunning(a) : null, status: (m && this.nodeOf(view, m)?.status) ?? null,
+        files: !stand ? "unknown" : stand.changed.length ? "changed" : stand.written ? "new" : stand.old ? "old" : "mixed",
+      };
+    }
+    p.seen = { at: this.iso(), members, coordinator: view.nodes.some((n) => n.roles.includes(COORDINATOR)), primary: view.nodes.some((n) => n.roles.includes(PRIMARY)) };
+    this.save(c);
+  }
+
+  /** A step's look over all the members, held open until it is complete. Returns the view when all have answered; past the deadline it says so through `late`. */
+  private look(c: ServiceChange, step: ServiceChangeStep, late: (message: string) => void): View | null {
+    const view = this.probe(c);
+    if (view && !view.problems.size) {
+      this.note(c, view);
+      return view;
+    }
+    if (view) this.note(c, view);
+    if (this.iso() > step.deadline) late(view ? [...view.problems].map(([k, v]) => `${k}: ${v}`).join("; ") : "svc-state was not answered");
+    return null;
+  }
+
+  /** Jobs sent to several members at once, each its own step. Ended when all have ended, since nothing else may run beside them. */
+  private runBatch(c: ServiceChange, seconds: number, request: (pm: PlanMember, m: ServiceMember) => Record<string, unknown>, succeeded?: (key: string, status: ExecutorStatus) => void): Batch | null {
+    const p = c.progress as ChangeProgress;
+    const b = p.batch!;
+    const open = this.openSteps(c);
+    for (const key of b.members) {
+      if (b.ended[key] || open.some((s) => s.member === key)) continue;
+      const m = this.member_(c, key);
+      const body = { ...request(this.planMember(c, key), m), change: c.id, member: key, expiresAt: this.expiry(), requestedBy: c.createdBy };
+      const job = newJobId((body as { kind?: unknown }).kind === "svc-write" ? "svc-write" : "svc-control", new Date(this.clock()));
+      this.addStep(c, b.stage, key, QUEUE_MS + seconds * 1000 + GRACE_MS, job); // written first, as in dispatch
+      this.handoff.submit(job, body, m.host, "service");
+    }
+    for (const step of open) {
+      const key = step.member!;
+      const status = step.job ? this.handoff.status(step.job) : undefined;
+      if (status && FINAL.has(status.state)) {
+        if (status.state === "succeeded") {
+          this.closeStep(step, "succeeded", status.message);
+          b.ended[key] = "ok";
+          succeeded?.(key, status);
+        } else {
+          const message = `${b.stage} on ${key}: ${status.message ?? status.state}`;
+          this.closeStep(step, "failed", message);
+          const result = (status.result ?? {}) as Record<string, unknown>;
+          b.ended[key] = result.notRun === true || status.message === INTERRUPTED ? "unknown" : "failed";
+          b.why.push(message);
+        }
+      } else if (this.iso() > step.deadline) {
+        const message = `${b.stage} on ${key} timed out`;
+        this.closeStep(step, "timed-out", message);
+        b.ended[key] = "unknown";
+        b.why.push(message);
+      }
+    }
+    this.save(c);
+    return b.members.every((k) => b.ended[k]) ? b : null;
+  }
+
+  /** How a batch ended: true when all went well. A clear failure rolls back; an executor gone or a job lost stops, since the hosts are not known; while rolling back, any stops. */
+  private batchWent(c: ServiceChange, b: Batch): boolean {
+    const p = c.progress as ChangeProgress;
+    const states = Object.values(b.ended);
+    p.batch = null;
+    if (states.every((x) => x === "ok")) return true;
+    const why = b.why.join("; ");
+    if (p.rollingBack) this.stopHere(c, `Rolling back failed: ${why}. This needs a person.`);
+    else if (states.includes("unknown")) this.stopHere(c, `${why}: what the hosts did is not known. Look at them, then continue, roll back or close.`);
+    else this.rollBackFull(c, why);
+    return false;
+  }
+
+  private toBatch(c: ServiceChange, phase: string, members: string[]) {
+    const p = c.progress as ChangeProgress;
+    p.batch = { stage: phase, members, ended: {}, why: [] };
+    this.save(c, { phase, currentMember: null });
+  }
+
+  /** §16.3 the check: nothing has been touched, and a failure here ends the change. Going on after a stop has touched things: that stops instead. */
+  private refuseFull(c: ServiceChange, message: string) {
+    const p = c.progress as ChangeProgress;
+    if (p.touched) return this.stopHere(c, message);
+    this.finish(c, "closed", `${message} Nothing was touched.`);
+  }
+
+  private fullGate(c: ServiceChange): void {
+    const p = c.progress as ChangeProgress;
+    const s = this.fullService(c);
+    const step = this.openSteps(c)[0] ?? this.addStep(c, "gate", null, (c.options as ChangeOptions).timeouts.gate * 1000);
+    const refuse = (message: string) => { this.closeStep(step, "failed", message); this.refuseFull(c, message); };
+    const plan = c.plan as ChangePlan;
+    const members = membersOf(s);
+    if (members.length !== plan.members.length || !members.every((m) => plan.members.some((pm) => pm.member === installKey(m)))) return refuse("The cluster's members are not the plan's any more.");
+    const offline = members.map((m) => this.handoff.executor(m.host, "service")).find((e) => !e.online);
+    if (offline) return refuse(`The service executor of ${offline.host} is offline.`);
+    const view = this.look(c, step, (why) => refuse(`Cannot look at every node: ${why}.`));
+    if (!view) return;
+    const warnings: string[] = [];
+    for (const pm of plan.members) {
+      const a = view.answers.get(pm.member)!;
+      const changed = fileStand(pm, a).changed;
+      if (changed.length) return refuse(`${pm.member}: ${changed.join(", ")} changed on the host since the plan: look at the plan again.`);
+      if (a.rest.state === "no-certificate" || a.rest.state === "no-https") return refuse(`${pm.member}: its REST API cannot be watched: ${a.rest.error ?? a.rest.state}.`);
+      this.keepStartSettings(c, pm.member, a);
+      const m = this.member_(c, pm.member);
+      if (!m.startEnvironment) return refuse(`${pm.member}: no start environment is known, and it would not come back the way it runs.`);
+      if (!isRunning(a)) warnings.push(`${pm.member} is not running`);
+      else if (this.nodeOf(view, m)?.status !== "CONNECTED") warnings.push(`${pm.member} is not connected`);
+    }
+    const counts = [...view.answers.values()].map((x) => x.rest.invalidCount).filter((n): n is number => typeof n === "number");
+    if (!p.touched) p.baseline = counts.length ? Math.max(...counts) : null;
+    this.closeStep(step, "succeeded", undefined, { baseline: p.baseline, ...(warnings.length ? { warnings } : {}) });
+    this.toBatch(c, "check", plan.members.map((m) => m.member));
+    this.fullCheck(c);
+  }
+
+  private fullCheck(c: ServiceChange): void {
+    const seconds = (c.options as ChangeOptions).timeouts.write;
+    const b = this.runBatch(c, seconds, (pm) => ({ kind: "svc-write", action: "check", files: this.filesOf(pm), flowFile: true }));
+    if (!b) return;
+    (c.progress as ChangeProgress).batch = null;
+    if (Object.values(b.ended).some((x) => x !== "ok")) return this.refuseFull(c, `${b.why.join("; ")}.`);
+    this.save(c, { phase: "stopping" });
+    this.fullStopping(c);
+  }
+
+  /** One at a time, each confirmed gone; the roles are read afresh for each. Never kills and never starts by itself: a stop that fails stops the change. */
+  private fullStopping(c: ServiceChange): void {
+    const p = c.progress as ChangeProgress;
+    const options = c.options as ChangeOptions;
+    const failing = (message: string) => this.stopHere(c, p.rollingBack ? `Rolling back failed: ${message}. This needs a person.` : message);
+    const open = this.openSteps(c)[0];
+    if (open?.step === "stop") {
+      const key = open.member!;
+      const status = open.job ? this.handoff.status(open.job) : undefined;
+      if (status && FINAL.has(status.state)) {
+        const result = (status.result ?? {}) as Record<string, unknown>;
+        if (status.state !== "succeeded") {
+          const message = `stop on ${key}: ${status.message ?? status.state}`;
+          this.closeStep(open, "failed", message);
+          if (result.stillRunning && result.process) p.stuck = result.process as ProcessPair;
+          return failing(message);
+        }
+        this.closeStep(open, "succeeded", status.message);
+        if (!result.alreadyStopped) this.event(c, "node-stopped", key, `${key} stopped (the whole cluster stops)`);
+        p.nextProbe = null;
+        this.save(c, { currentMember: null });
+        return this.fullStopping(c);
+      }
+      if (this.iso() > open.deadline) {
+        const message = `stop on ${key} timed out`;
+        this.closeStep(open, "timed-out", message);
+        return failing(`${message}: it may still be running there.`);
+      }
+      return;
+    }
+    const s = this.fullService(c);
+    const step = open ?? this.addStep(c, "look", null, options.timeouts.gate * 1000);
+    const view = this.look(c, step, (why) => { this.closeStep(step, "failed", why); failing(`Cannot look at every node: ${why}`); });
+    if (!view) return;
+    const running = (c.plan as ChangePlan).members.map((m) => m.member).filter((k) => isRunning(view.answers.get(k)!));
+    for (const k of running) this.keepStartSettings(c, k, view.answers.get(k)!);
+    this.closeStep(step, "succeeded", undefined, { running });
+    if (!running.length) {
+      if (p.rollingBack) {
+        if (!p.wrote) return this.toVerify(c);
+        this.toBatch(c, "restore", (c.plan as ChangePlan).members.map((m) => m.member));
+        return this.fullRestore(c);
+      }
+      this.toBatch(c, "backup", (c.plan as ChangePlan).members.map((m) => m.member));
+      return this.fullBackup(c);
+    }
+    const key = running.reduce((a, b) => (this.weight(s, view, b) < this.weight(s, view, a) ? b : a));
+    const m = this.member_(c, key);
+    p.touched = true;
+    this.save(c, { currentMember: key });
+    const job = newJobId("svc-control", new Date(this.clock()));
+    this.addStep(c, "stop", key, QUEUE_MS + options.timeouts.stop * 1000 + GRACE_MS, job);
+    this.handoff.submit(job, { kind: "svc-control", action: "stop", change: c.id, member: key, serviceUser: m.serviceUser, env: m.startEnvironment ?? {}, timeoutSeconds: options.timeouts.stop, expiresAt: this.expiry(), requestedBy: c.createdBy }, m.host, "service");
+  }
+
+  /** Every member's, the flow file with them, and none written until all are there. */
+  private fullBackup(c: ServiceChange): void {
+    const seconds = (c.options as ChangeOptions).timeouts.write;
+    const b = this.runBatch(c, seconds, (pm) => ({ kind: "svc-write", action: "backup", files: this.filesOf(pm), flowFile: true }));
+    if (!b || !this.batchWent(c, b)) return;
+    const writers = (c.plan as ChangePlan).members.filter((m) => m.files.length).map((m) => m.member);
+    (c.progress as ChangeProgress).wrote = true;
+    this.toBatch(c, "write", writers);
+    this.fullWrite(c);
+  }
+
+  private fullWrite(c: ServiceChange): void {
+    const seconds = (c.options as ChangeOptions).timeouts.write;
+    const b = this.runBatch(c, seconds, (pm) => ({ kind: "svc-write", action: "apply", files: this.filesOf(pm), content: this.contentOf(c, pm) }));
+    if (!b || !this.batchWent(c, b)) return;
+    this.toVerify(c);
+  }
+
+  private fullRestore(c: ServiceChange): void {
+    const seconds = (c.options as ChangeOptions).timeouts.write;
+    const b = this.runBatch(c, seconds, () => ({ kind: "svc-write", action: "restore" }));
+    if (!b || !this.batchWent(c, b)) return;
+    (c.progress as ChangeProgress).wrote = false;
+    this.toVerify(c);
+  }
+
+  private toVerify(c: ServiceChange) {
+    (c.progress as ChangeProgress).nextProbe = null;
+    this.save(c, { phase: "verify", currentMember: null });
+    this.fullVerify(c);
+  }
+
+  /** The hard rule (§8): no node starts while the nodes' files are a mix. Asked of the hosts, right before starting, on every way here. */
+  private fullVerify(c: ServiceChange): void {
+    const p = c.progress as ChangeProgress;
+    const plan = c.plan as ChangePlan;
+    const step = this.openSteps(c)[0] ?? this.addStep(c, "verify", null, (c.options as ChangeOptions).timeouts.gate * 1000);
+    const failing = (message: string) => {
+      this.closeStep(step, "failed", message);
+      if (p.rollingBack) return this.stopHere(c, `Rolling back failed: ${message}. No node was started. This needs a person.`);
+      this.rollBackFull(c, message);
+    };
+    const view = this.look(c, step, (why) => { this.closeStep(step, "failed", why); this.stopHere(c, `${p.rollingBack ? "Rolling back failed: " : ""}Cannot look at every node before starting them: ${why}. No node was started.`); });
+    if (!view) return;
+    const off = plan.members.filter((pm) => { const stand = fileStand(pm, view.answers.get(pm.member)!); return !(p.rollingBack ? stand.old : stand.written); }).map((pm) => pm.member);
+    if (off.length) return failing(`${off.join(", ")} ${off.length > 1 ? "do" : "does"} not have the ${p.rollingBack ? "old" : "new"} files after all`);
+    const down = plan.members.map((m) => m.member).filter((k) => !isRunning(view.answers.get(k)!));
+    this.closeStep(step, "succeeded", undefined, { start: down });
+    if (!down.length) return this.toCompose(c);
+    this.toBatch(c, "start", down);
+    this.fullStart(c);
+  }
+
+  /** All at once: the flow election waits for enough candidates or for its whole time (§16.3), and one by one only makes it longer. */
+  private fullStart(c: ServiceChange): void {
+    const seconds = (c.options as ChangeOptions).timeouts.start;
+    const b = this.runBatch(c, seconds, (_pm, m) => ({ kind: "svc-control", action: "start", serviceUser: m.serviceUser, env: m.startEnvironment ?? {}, limits: m.startLimits ?? null, timeoutSeconds: seconds }), (key, status) => {
+      if (!(status.result as unknown as { alreadyRunning?: unknown }).alreadyRunning) this.event(c, "node-started", key, `${key} started (the whole cluster starts)`);
+    });
+    if (!b || !this.batchWent(c, b)) return;
+    this.toCompose(c);
+  }
+
+  private toCompose(c: ServiceChange) {
+    const p = c.progress as ChangeProgress;
+    p.stableSince = null;
+    p.nextProbe = null;
+    p.composing = "not looked yet";
+    this.save(c, { phase: "compose", currentMember: null });
+    this.fullCompose(c);
+  }
+
+  /** §16.3: processes up, a coordinator and a primary node, every member in the table and connected, no more invalid components than before, and all of that for a while. Not answering yet is waiting; a process gone is a failed start. */
+  private fullCompose(c: ServiceChange): void {
+    const p = c.progress as ChangeProgress;
+    const options = c.options as ChangeOptions;
+    const s = this.fullService(c);
+    const members = membersOf(s);
+    const step = this.openSteps(c)[0] ?? this.addStep(c, "compose", null, options.timeouts.compose * 1000);
+    const view = this.probe(c);
+    if (view) {
+      this.note(c, view);
+      const gone = [...view.answers].filter(([, a]) => !isRunning(a)).map(([k]) => k);
+      if (gone.length) return this.composeFailed(c, step, `${gone.join(", ")}: NiFi is not running any more`);
+      const blind = [...view.answers].find(([, a]) => a.rest.state === "no-certificate" || a.rest.state === "no-https");
+      if (blind) {
+        const message = `${blind[0]}: its REST API cannot be watched: ${blind[1].rest.error ?? blind[1].rest.state}`;
+        this.closeStep(step, "failed", message);
+        return this.stopHere(c, message);
+      }
+      const invalid = Math.max(-1, ...[...view.answers.values()].map((a) => (typeof a.rest.invalidCount === "number" ? a.rest.invalidCount : -1)));
+      let short: string | null = null;
+      if (view.problems.size) short = `no answer from ${[...view.problems.keys()].join(", ")}`;
+      else if (!view.nodes.some((n) => n.roles.includes(COORDINATOR))) short = "no cluster coordinator";
+      else if (!view.nodes.some((n) => n.roles.includes(PRIMARY))) short = "no primary node";
+      else if (view.nodes.length !== members.length) short = `${view.nodes.length} of ${members.length} nodes in the cluster`;
+      else {
+        const away = members.filter((m) => this.nodeOf(view, m)?.status !== "CONNECTED").map(installKey);
+        if (away.length) short = `${away.join(", ")} not connected`;
+        else if (p.baseline !== null && (invalid < 0 || invalid > p.baseline + options.invalidTolerance)) short = invalid < 0 ? "no count of invalid components" : `${invalid} invalid components, ${p.baseline} before`;
+      }
+      p.invalidHigh = short?.includes("invalid components") ?? false;
+      p.composing = short;
+      p.stableSince = short ? null : p.stableSince ?? this.iso();
+      this.save(c);
+      if (!short && this.clock() - Date.parse(p.stableSince!) >= options.stableSeconds * 1000) {
+        this.closeStep(step, "succeeded");
+        return this.fullComposed(c);
+      }
+    }
+    if (this.iso() > step.deadline) {
+      const message = `The cluster did not come together in time: ${p.composing}`;
+      if (p.composing?.startsWith("no answer from")) {
+        this.closeStep(step, "timed-out", message);
+        return this.stopHere(c, `${p.rollingBack ? "Rolling back failed: " : ""}${message}: the hosts are not known. Nothing more is done by itself.`);
+      }
+      this.composeFailed(c, step, message, "timed-out");
+    }
+  }
+
+  private composeFailed(c: ServiceChange, step: ServiceChangeStep, message: string, state: "failed" | "timed-out" = "failed") {
+    const p = c.progress as ChangeProgress;
+    this.closeStep(step, state, message);
+    if (p.rollingBack) return this.stopHere(c, `Rolling back failed: ${message}. This needs a person.`);
+    this.rollBackFull(c, message);
+  }
+
+  private fullComposed(c: ServiceChange): void {
+    const p = c.progress as ChangeProgress;
+    const plan = c.plan as ChangePlan;
+    p.composing = null;
+    p.stableSince = null;
+    if (p.rollingBack) return this.finish(c, "rolled-back", c.message ?? "The whole cluster rolled back");
+    p.done = plan.members.map((m) => m.member);
+    p.pruning = [...p.done];
+    p.wrote = false;
+    const writers = plan.members.filter((m) => m.files.length);
+    const events = writers.map((pm) => {
+      const names = pm.files.map((f) => f.name);
+      return { service: c.service, member: pm.member, at: this.iso(), kind: "config-applied", detail: { text: c.kind === "overwrite" ? `${names.join(", ")} on ${pm.member} written back` : `Revision ${c.revision} applied to ${pm.member} (${names.join(", ")})`, change: c.id, by: c.createdBy, revision: c.revision, files: names } };
+    });
+    Object.assign(c, { phase: "finish", currentMember: null, message: null });
+    this.store.setFullChangeApplied(c, writers.map((pm) => ({ member: pm.member, files: pm.files.map((f) => ({ file: f.name, path: f.path, sha256: f.sha256, revision: f.revision })) })), events);
+    this.finishing(c);
+  }
+
+  /** Continue and rollback look at all the members first (§16.3) and go from what they have. */
+  private fullReconcile(c: ServiceChange): void {
+    const p = c.progress as ChangeProgress;
+    const plan = c.plan as ChangePlan;
+    const step = this.openSteps(c)[0] ?? this.addStep(c, "reconcile", null, (c.options as ChangeOptions).timeouts.gate * 1000);
+    const refuse = (message: string) => { this.closeStep(step, "failed", message); this.stopHere(c, message); };
+    const view = this.look(c, step, (why) => refuse(`Cannot look at every node: ${why}.`));
+    if (!view) return;
+    const stands = plan.members.map((pm) => ({ pm, a: view.answers.get(pm.member)!, stand: fileStand(pm, view.answers.get(pm.member)!) }));
+    const changed = stands.flatMap((x) => x.stand.changed.map((f) => `${x.pm.member}: ${f}`));
+    if (changed.length) return refuse(`${changed.join(", ")} changed on the host since the plan: this needs a person. Close the change and plan again.`);
+    const allOld = stands.every((x) => x.stand.old), allNew = stands.every((x) => x.stand.written);
+    const up = stands.filter((x) => isRunning(x.a)).map((x) => x.pm.member);
+    if (!allOld && !allNew && up.length) return refuse(`The nodes' files are a mix of old and new and ${up.join(", ")} ${up.length > 1 ? "are" : "is"} running: this needs a person.`);
+    this.closeStep(step, "succeeded", undefined, { files: allNew ? "new" : allOld ? "old" : "mixed", running: up });
+    p.nextProbe = null;
+    if (p.intent === "rollback") {
+      p.wrote = p.wrote || !allOld;
+      if (!p.wrote) return this.toVerify(c);
+      this.save(c, { phase: "stopping" });
+      return this.fullStopping(c);
+    }
+    if (allNew) { p.wrote = true; return this.toVerify(c); }
+    if (allOld) { p.wrote = false; this.save(c, { phase: "gate" }); return this.fullGate(c); }
+    p.wrote = true; // a write cut short: only the rest of it (every backup was there before the first write)
+    this.toBatch(c, "write", stands.filter((x) => x.pm.files.length && !x.stand.written).map((x) => x.pm.member));
+    this.fullWrite(c);
+  }
+
   /** Whether changes hold a host, or any host: what upgrades of an executor or of the Deployer wait for (§16.3). A stopped one holds nothing at work, so it does not count. */
   working(host?: string): ServiceChange[] {
     return this.store.activeServiceChanges().filter((c) => {
@@ -907,6 +1383,19 @@ export class ServiceChanges {
       return Boolean(s) && membersOf(s!).some((m) => m.host === host);
     });
   }
+}
+
+/** Where a member's planned files stand. A new file svc-state does not list yet tells nothing, either way. */
+function fileStand(pm: Pick<PlanMember, "files">, a: StateAnswer) {
+  const out = { old: true, written: true, changed: [] as string[] };
+  for (const f of pm.files) {
+    if (!a.files.some((x) => x.name === f.name) && f.baseSha256 === null) continue;
+    const live = liveHash(a, f);
+    if (live !== f.baseSha256) out.old = false;
+    if (live !== f.sha256) out.written = false;
+    if (live !== f.baseSha256 && live !== f.sha256) out.changed.push(f.name);
+  }
+  return out;
 }
 
 /** The stages that take a member back. Without a restart in the plan, only the files. */
@@ -932,7 +1421,11 @@ export function changeView(c: ServiceChange, steps?: readonly ServiceChangeStep[
   const { planHash: _h, ...shown } = planView(plan as ChangePlan);
   return {
     ...rest, plan: shown,
-    progress: { done: p.done, remaining: p.remaining, rollingBack: p.rollingBack, canForceKill: c.state === "stopped" && Boolean(p.stuck), canRollBack: c.state === "stopped" && Boolean((plan as ChangePlan).members.find((m) => m.member === c.currentMember)?.files.length) },
+    progress: {
+      done: p.done, remaining: p.remaining, rollingBack: p.rollingBack, canForceKill: c.state === "stopped" && Boolean(p.stuck),
+      canRollBack: c.mode === "full" ? c.state === "stopped" || c.state === "paused" : c.state === "stopped" && Boolean((plan as ChangePlan).members.find((m) => m.member === c.currentMember)?.files.length),
+      ...(c.mode === "full" ? { wrote: p.wrote, seen: p.seen ?? null, composing: p.composing ?? null } : {}),
+    },
     ...(steps ? { steps: steps.map(({ change: _c, ...s }) => s) } : {}),
   };
 }
