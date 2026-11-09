@@ -4,22 +4,17 @@
 // Secret values stay hidden: rows carry the redacted "(hidden)", and when the caller can open the sealed copies, nodes
 // are compared on the real values but only labelled "value A" / "value B", never shown (like the takeover findings).
 
-import type { ConfigFileRecord, ServiceConfigBody } from "./config.ts";
+import { sealedText, type ConfigFileRecord, type ServiceConfigBody } from "./config.ts";
+import { parsePropertyEntries } from "./configdoc.ts";
 import { catalogFor, profile as profileById, sectionOf, SECTIONS, type CatalogEntry, type Section } from "./profiles.ts";
 
 const HIDDEN = "(hidden)";
 
 export interface PropertyLine { key: string; value: string; line: number }
 
-/** The key = value lines of a properties file (Java's = or :, comments # and ! skipped), with 1-based line numbers. */
+/** The key = value entries of a properties file, with 1-based line numbers. */
 export function parseProperties(text: string): PropertyLine[] {
-  const out: PropertyLine[] = [];
-  text.split("\n").forEach((raw, i) => {
-    const line = raw.replace(/\r$/, "");
-    const m = /^\s*([^#!\s=:][^=:\s]*)\s*(?:[=:]\s*(.*))?$/.exec(line);
-    if (m) out.push({ key: m[1]!, value: (m[2] ?? "").trimEnd(), line: i + 1 });
-  });
-  return out;
+  return parsePropertyEntries(text).map((e) => ({ key: e.key, value: e.value.trimEnd(), line: e.line }));
 }
 
 /** default: the shipped value; changed: set to something else; hidden: a secret (not compared); unknown: not in the catalog. */
@@ -54,7 +49,7 @@ function compareFile(name: string, files: (ConfigFileRecord | undefined)[], cata
   const identical = files.every((f) => f && f.sha256 === files[0]?.sha256);
   if (format !== "properties") return { name, format, rows: [], differing: identical ? 0 : 1, identical };
   const shown = files.map((f) => new Map((f ? parseProperties(f.redacted) : []).map((l) => [l.key, l.value])));
-  const real = unseal ? files.map((f) => { try { return f ? new Map(parseProperties(unseal(f.sealed)).map((l) => [l.key, l.value])) : undefined; } catch { return undefined; } }) : [];
+  const real = unseal ? files.map((f) => { try { return f ? new Map(parseProperties(sealedText(f, unseal)).map((l) => [l.key, l.value])) : undefined; } catch { return undefined; } }) : [];
   const keys: string[] = [];
   for (const m of shown) for (const k of m.keys()) if (!keys.includes(k)) keys.push(k);
   const rows = keys.map((key): CompareRow => {

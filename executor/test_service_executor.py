@@ -863,6 +863,13 @@ class CollectorTest(Base):
         for text, want in cases["text"]:
             self.assertEqual(sx.redact(text), want, text)
             self.assertEqual(sx.redact(want), want, "redacting twice changes nothing")
+        props = cases["properties"]
+        self.assertEqual(sx.NOT_SECRET_PROPERTY, set(props["exempt"]))
+        for key in props["hidden"]:
+            self.assertEqual(sx.hide_secrets({key: "v"}), {key: sx.HIDDEN}, key)
+        for key in props["shown"] + props["exempt"]:
+            self.assertEqual(sx.hide_secrets({key: "v"}), {key: "v"}, key)
+            self.assertEqual(sx.secret_fingerprints({key: "v"}, "k"), {}, key)
 
     def test_back_pressure_only_every_interval_and_as_a_summary(self):
         c = self.collector()

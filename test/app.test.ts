@@ -42,6 +42,7 @@ import { Drift } from "../src/server/drift.ts";
 import { Briefs, collectFacts, type BriefFacts } from "../src/server/brief.ts";
 import { fakeServices, fakeState, sha256, tarGz, type FakeState } from "./fakes.ts";
 import { NifiOpsGraph } from "../src/server/services/graph-publish.ts";
+import { sealedText } from "../src/server/services/config.ts";
 
 const SESSION = "open_atlas_workbench_session";
 
@@ -947,7 +948,7 @@ test("service ops step 5: a takeover draft from discovery, confirmed with each i
   assert.equal(cfg.view.rows.length, 2);
   assert.ok(cfg.view.rows[0].files["nifi.properties"].some((r: { key: string; status: string }) => r.key === "nifi.sensitive.props.key" && r.status === "hidden"));
   assert.ok(Array.isArray(cfg.view.compare) && cfg.view.catalog.length > 0);
-  assert.equal(t.box.open(t.store.serviceConfig("prod-flow")!.body.members[0]!.files[0]!.sealed), files["/opt/a"]);
+  assert.equal(sealedText(t.store.serviceConfig("prod-flow")!.body.members[0]!.files[0]!, (s) => t.box.open(s)), files["/opt/a"]);
   assert.equal((await post(t, `/api/services/drafts/${draft.id}/confirm`, "admin", {})).status, 409, "confirmed once");
 });
 

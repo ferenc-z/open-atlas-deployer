@@ -7,7 +7,7 @@ import { Handoff } from "../src/server/handoff.ts";
 import type { OmaSessions } from "../src/server/oma.ts";
 import { SecretBox } from "../src/server/secretbox.ts";
 import { assessItems, groupDiscoveries, portConflicts, reviewPrompt, zookeeperServers, type Discovered, type Finding } from "../src/server/services/assess.ts";
-import { importFile, redactProperties, redactXml, withoutSealed } from "../src/server/services/config.ts";
+import { importFile, redactProperties, redactXml, sealedText, withoutSealed } from "../src/server/services/config.ts";
 import type { DraftCluster, DraftItem, DraftStandalone } from "../src/server/services/draft.ts";
 import { catalogEntry, catalogFor, profile } from "../src/server/services/profiles.ts";
 import { FINGERPRINT_KEY, Takeover, TakeoverError } from "../src/server/services/takeover.ts";
@@ -186,7 +186,7 @@ test("configuration files are kept sealed whole, with a redacted copy", () => {
   const box = new SecretBox(randomBytes(32).toString("base64"));
   const raw = Buffer.from(props);
   const f = importFile({ name: "nifi.properties", path: "/x/conf/nifi.properties", sha256: createHash("sha256").update(raw).digest("hex"), size: raw.length, modifiedAt: "t", content: raw.toString("base64") }, box);
-  assert.equal(box.open(f.sealed), props);
+  assert.equal(sealedText(f, (s) => box.open(s)), props);
   assert.ok(!f.redacted.includes("s3cret") && !JSON.stringify(withoutSealed({ members: [{ host: "h", installDir: "/x", files: [f], missing: [] }] })).includes("v1:"));
   assert.throws(() => importFile({ name: "nifi.properties", path: "/x", sha256: "0".repeat(64), size: 1, modifiedAt: "t", content: raw.toString("base64") }, box), /sha256/);
 });
@@ -309,7 +309,7 @@ test("a draft is made from the newest discoveries, and confirming imports the fi
   assert.equal(cfg.revision, 1);
   assert.deepEqual(cfg.body.members.map((m) => [m.installDir.split("/").pop(), m.files.map((f) => f.name), m.missing]), [["c250-1", ["nifi.properties"], ["authorizers.xml"]], ["c250-2", ["nifi.properties"], ["authorizers.xml"]]]);
   const file = cfg.body.members[0]!.files[0]!;
-  assert.match(box!.open(file.sealed), /s3cret/);
+  assert.match(sealedText(file, (s) => box!.open(s)), /s3cret/);
   assert.ok(!file.redacted.includes("s3cret"));
   // The content went over the one-time channel: it is gone from the job afterwards.
   assert.equal(store.takeExecutorEnvContent(done.reads[0]!), undefined);

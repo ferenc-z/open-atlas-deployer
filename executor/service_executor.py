@@ -162,6 +162,8 @@ CONF_FILE_KEYS = {
 }
 # Values never sent to the Deployer: passwords and keys in the properties, and secrets in the start environment.
 SECRET_PROPERTY = re.compile(r"pass(word|wd|phrase)?|secret|token|credential|sensitive\.props\.key|\.key$|private", re.I)
+# Keys that rule catches but the property catalog lists as not sensitive (profiles.ts; testdata/redact/cases.json pins both sides).
+NOT_SECRET_PROPERTY = frozenset({"nifi.web.max.access.token.requests.per.second", "nifi.security.user.oidc.token.refresh.window"})
 SECRET_ENV = re.compile(r"PASS|SECRET|TOKEN|CREDENTIAL|_KEY$|^KEY$|PRIVATE|COOKIE", re.I)
 HIDDEN = "(hidden)"
 MAX_DIRS = 32
@@ -189,16 +191,20 @@ def read_properties(path):
     return out
 
 
+def is_secret(name, pattern=SECRET_PROPERTY):
+    return bool(pattern.search(name)) and name not in NOT_SECRET_PROPERTY
+
+
 def hide_secrets(props, pattern=SECRET_PROPERTY):
     """Secret-looking values replaced by "(hidden)"; an empty one stays empty, so a missing key shows."""
-    return {k: (HIDDEN if v and pattern.search(k) else v) for k, v in props.items()}
+    return {k: (HIDDEN if v and is_secret(k, pattern) else v) for k, v in props.items()}
 
 
 def secret_fingerprints(props, key, pattern=SECRET_PROPERTY):
     """For the values hide_secrets hides: an HMAC under the Deployer's key (the request's fingerprintKey), so the nodes
     of a cluster can be compared (nifi.sensitive.props.key the same everywhere) without the value leaving the host."""
     return {k: hmac.new(key.encode(), f"{k}\0{v}".encode(), hashlib.sha256).hexdigest()[:32]
-            for k, v in props.items() if v and pattern.search(k)}
+            for k, v in props.items() if v and is_secret(k, pattern)}
 
 
 def as_port(value):

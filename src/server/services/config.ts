@@ -6,6 +6,9 @@
 
 import { createHash } from "node:crypto";
 import type { SecretBox } from "../secretbox.ts";
+import { decodeText, redactProperties, redactXml } from "./configdoc.ts";
+
+export { isSecretKey, redactProperties, redactXml, SECRET_NAME } from "./configdoc.ts";
 
 /** One file as the executor sent it over the content channel (svc-read). */
 export interface ReadFile { name: string; path: string; sha256: string; size: number; modifiedAt: string; content: string }
@@ -17,8 +20,10 @@ export interface ConfigFileRecord {
   size: number;
   modifiedAt: string;
   format: "properties" | "xml" | "other";
-  /** The whole file, sealed (SecretBox). */
+  /** The whole file, sealed (SecretBox): its bytes in base64 when sealedAs says so; else, in revisions from before it,
+   *  the bytes read as UTF-8, which is not always the file: see openFile. */
   sealed: string;
+  sealedAs?: "base64";
   /** The file with secret values replaced by "(hidden)", for the pages and the AI. */
   redacted: string;
   /** Keys (properties) or property names (XML) whose values were hidden. */
@@ -30,51 +35,46 @@ export interface ConfigMember { host: string; installDir: string; confDir?: stri
 /** A configuration revision's body: one entry per installation (a standalone's one, each node of a cluster). */
 export interface ServiceConfigBody { members: ConfigMember[] }
 
-/** The names discovery hides too (service_executor.py SECRET_PROPERTY). */
-export const SECRET_NAME = /pass(word|wd|phrase)?|secret|token|credential|sensitive\.props\.key|\.key$|private/i;
-
-const HIDDEN = "(hidden)";
-
-/** A properties file with the values of secret-looking keys hidden (an empty one stays empty). */
-export function redactProperties(text: string): { text: string; secrets: string[] } {
-  const secrets: string[] = [];
-  const out = text.split("\n").map((line) => {
-    const m = /^(\s*)([^#!\s=:][^=:\s]*)(\s*[=:]\s*)(.*?)(\r?)$/.exec(line);
-    if (!m || !SECRET_NAME.test(m[2]!) || m[4] === "") return line;
-    secrets.push(m[2]!);
-    return `${m[1]}${m[2]}${m[3]}${HIDDEN}${m[5]}`;
-  });
-  return { text: out.join("\n"), secrets };
-}
-
-/** An XML file with secret values hidden: <property name="...Password">x</property> and password="x" attributes. */
-export function redactXml(text: string): { text: string; secrets: string[] } {
-  const secrets: string[] = [];
-  let out = text.replace(/(<property\s+name\s*=\s*"([^"]*)"\s*>)([^<]*)(<\/property>)/g, (all, open: string, name: string, value: string, close: string) => {
-    if (!SECRET_NAME.test(name) || value.trim() === "") return all;
-    secrets.push(name);
-    return `${open}${HIDDEN}${close}`;
-  });
-  out = out.replace(/(\s)([\w.-]*(?:[Pp]assword|[Ss]ecret|[Tt]oken)[\w.-]*)(\s*=\s*")([^"]+)(")/g, (_all, sp: string, name: string, eq: string, _v: string, q: string) => {
-    secrets.push(name);
-    return `${sp}${name}${eq}${HIDDEN}${q}`;
-  });
-  return { text: out, secrets };
-}
-
 const formatOf = (name: string): ConfigFileRecord["format"] => (/\.(properties|conf)$/.test(name) ? "properties" : /\.xml$/.test(name) ? "xml" : "other");
 
-/** One read file as it is kept: checked against its hash, sealed whole, and redacted. */
+/** A file's bytes as they are kept: sealed whole, with a redacted copy. */
+export function sealFile(f: Pick<ConfigFileRecord, "name" | "path" | "modifiedAt">, raw: Buffer, box: SecretBox): ConfigFileRecord {
+  const text = decodeText(raw);
+  const format = formatOf(f.name);
+  const { text: redacted, secrets } = format === "properties" ? redactProperties(text) : format === "xml" ? redactXml(text) : { text, secrets: [] };
+  return { name: f.name, path: f.path, sha256: createHash("sha256").update(raw).digest("hex"), size: raw.length, modifiedAt: f.modifiedAt, format, sealed: box.seal(raw.toString("base64")), sealedAs: "base64", redacted, secrets };
+}
+
+/** One read file as it is kept, checked against its hash. */
 export function importFile(f: ReadFile, box: SecretBox): ConfigFileRecord {
   const raw = Buffer.from(f.content, "base64");
   if (createHash("sha256").update(raw).digest("hex") !== f.sha256) throw new Error(`${f.path} does not match its sha256`);
-  const text = raw.toString("utf8");
-  const format = formatOf(f.name);
-  const { text: redacted, secrets } = format === "properties" ? redactProperties(text) : format === "xml" ? redactXml(text) : { text, secrets: [] };
-  return { name: f.name, path: f.path, sha256: f.sha256, size: raw.length, modifiedAt: f.modifiedAt, format, sealed: box.seal(text), redacted, secrets };
+  return sealFile(f, raw, box);
+}
+
+export type OpenedFile = { ok: true; bytes: Buffer } | { ok: false; code: "config/reimport"; message: string };
+
+/** A kept file's bytes, for editing and writing back. A revision from before raw bytes were sealed may have lost some
+ *  (bytes that were not UTF-8): when the hash says so the file cannot be edited or written back, only imported again. */
+export function openFile(f: ConfigFileRecord, box: SecretBox): OpenedFile {
+  const refused = { ok: false as const, code: "config/reimport" as const, message: `${f.name} was imported by an older version and cannot be edited as kept: take the service over again to import it` };
+  let bytes: Buffer;
+  try {
+    const opened = box.open(f.sealed);
+    bytes = f.sealedAs === "base64" ? Buffer.from(opened, "base64") : Buffer.from(opened, "utf8");
+  } catch {
+    return refused;
+  }
+  return createHash("sha256").update(bytes).digest("hex") === f.sha256 ? { ok: true, bytes } : refused;
+}
+
+/** A kept file as text, for comparing on the server; unseal opens the sealed copy (SecretBox.open). */
+export function sealedText(f: Pick<ConfigFileRecord, "sealed" | "sealedAs">, unseal: (sealed: string) => string): string {
+  const opened = unseal(f.sealed);
+  return f.sealedAs === "base64" ? decodeText(Buffer.from(opened, "base64")) : opened;
 }
 
 /** A revision as the pages get it: without the sealed copies. */
-export function withoutSealed(body: ServiceConfigBody): { members: (Omit<ConfigMember, "files"> & { files: Omit<ConfigFileRecord, "sealed">[] })[] } {
-  return { members: body.members.map((m) => ({ ...m, files: m.files.map(({ sealed: _s, ...f }) => f) })) };
+export function withoutSealed(body: ServiceConfigBody): { members: (Omit<ConfigMember, "files"> & { files: Omit<ConfigFileRecord, "sealed" | "sealedAs">[] })[] } {
+  return { members: body.members.map((m) => ({ ...m, files: m.files.map(({ sealed: _s, sealedAs: _a, ...f }) => f) })) };
 }
