@@ -75,6 +75,8 @@ export interface ChangeProgress {
   nudge: string | null; resume: boolean; intent: "forward" | "rollback"; pruning: string[];
   /** The rest is a full change's: whether a node has been touched, the jobs sent at once, what the last look saw (nothing secret, no hash), and what the cluster is still short of. */
   touched?: boolean; batch?: Batch | null; seen?: Seen | null; composing?: string | null;
+  /** The Deployer restarted before any file was written: the jobs executors had taken are let end, then the nodes are looked at, then it pauses (step 14b). */
+  settling?: boolean; settleFailed?: string[];
 }
 interface Batch { stage: string; members: string[]; ended: Record<string, "ok" | "failed" | "unknown">; why: string[] }
 interface Seen { at: string; members: Record<string, { running: boolean | null; files: "old" | "new" | "mixed" | "changed" | "unknown"; status: string | null }>; coordinator: boolean; primary: boolean }
@@ -104,12 +106,17 @@ export function checkContextOf(store: Store, service: Registered) {
   ];
   const members = membersOf(service);
   const memory: Record<string, number> = {};
+  const encrypted: Record<string, number> = {};
   for (const s of store.latestServiceSamples(service.id)) {
-    const total = (s.body as { host?: { memory?: { totalBytes?: unknown } } }).host?.memory?.totalBytes;
+    const body = s.body as { host?: { memory?: { totalBytes?: unknown } }; flow?: { encrypted?: unknown } };
+    const total = body.host?.memory?.totalBytes;
     const m = members.find((x) => installKey(x) === s.member);
     if (m && typeof total === "number") memory[m.host] = total;
+    // P15: how many enc{…} values the flow holds. An older executor's samples have no flow: not known.
+    const n = body.flow?.encrypted;
+    if (m && typeof n === "number" && Number.isInteger(n) && n >= 0) encrypted[s.member] = n;
   }
-  return { profile: profileById(service.profile), version: service.version, kind: service.kind, others, memory };
+  return { profile: profileById(service.profile), version: service.version, kind: service.kind, others, memory, encrypted };
 }
 
 export class ChangeError extends Error {
@@ -406,7 +413,7 @@ export class ServiceChanges {
     if (c.state !== "paused" && c.state !== "stopped") throw new ChangeError(409, "service-change/state", `This change is ${c.state}: there is nothing to continue.`);
     const p = c.progress as ChangeProgress;
     Object.assign(p, { resume: false, rollingBack: false, stuck: null, intent: "forward", probes: {}, nextProbe: null, stableSince: null, nudge: null, invalidHigh: false });
-    if (c.mode === "full") Object.assign(p, { batch: null, composing: null });
+    if (c.mode === "full") Object.assign(p, { batch: null, composing: null, settling: false, settleFailed: [] });
     this.save(c, { state: "running", phase: c.mode === "full" || c.currentMember ? "reconcile" : "gate", ...(c.mode === "full" ? { currentMember: null } : {}), message: null });
     this.store.audit(actor, "service.change-continued", `${id}/${change}`, { member: c.currentMember });
     this.event(c, "change-resumed", c.currentMember, `Change continued by ${actor.id}`);
@@ -983,11 +990,53 @@ export class ServiceChanges {
     else if (c.phase === "kill") this.killing(c);
   }
 
+  /**
+   * The Deployer restarted before any file was written: a person chooses. But a job an executor took before the restart
+   * goes on there (step 14b: a stop did), so first each such job is let end and its step gets what the executor says,
+   * then the nodes are looked at for the page, then it pauses. One not taken yet is called back. A stop that failed or is
+   * past its deadline stops the change, as it would have without the restart.
+   */
   private pauseFull(c: ServiceChange) {
-    for (const s of this.openSteps(c)) this.closeStep(s, "failed", "The Deployer restarted");
     const p = c.progress as ChangeProgress;
-    this.dropProbes(p);
-    p.batch = null;
+    if (!p.settling) {
+      this.dropProbes(p); // asked before the restart: an old story
+      Object.assign(p, { settling: true, nextProbe: null, batch: null });
+      this.save(c);
+    }
+    let waiting = false;
+    const failed = (p.settleFailed ??= []);
+    for (const s of this.openSteps(c)) {
+      const status = s.job ? this.handoff.status(s.job) : undefined;
+      if (!s.job || (!this.handoff.taken(s.job) && !FINAL.has(status?.state ?? ""))) {
+        this.closeStep(s, "failed", s.job ? "The Deployer restarted before an executor took it" : "The Deployer restarted");
+        continue;
+      }
+      const result = (status?.result ?? {}) as Record<string, unknown>;
+      if (status && FINAL.has(status.state)) {
+        if (status.state === "succeeded") {
+          this.closeStep(s, "succeeded", status.message);
+          if (s.step === "stop" && !result.alreadyStopped) this.event(c, "node-stopped", s.member, `${s.member} stopped (the whole cluster stops)`);
+        } else {
+          const message = `${s.step} on ${s.member}: ${status.message ?? status.state}`;
+          this.closeStep(s, "failed", message);
+          if (s.step === "stop") {
+            if (result.stillRunning && result.process) { p.stuck = result.process as ProcessPair; c.currentMember = s.member; } // the kill button's
+            failed.push(message);
+          }
+        }
+      } else if (this.iso() > s.deadline) {
+        const message = `${s.step} on ${s.member} timed out`;
+        this.closeStep(s, "timed-out", message);
+        if (s.step === "stop") failed.push(`${message}: it may still be running there`);
+      } else waiting = true;
+    }
+    this.save(c);
+    if (waiting) return;
+    const view = this.probe(c);
+    if (!view) return;
+    this.note(c, view);
+    Object.assign(p, { settling: false, settleFailed: [], resume: false });
+    if (failed.length) return this.stopHere(c, `The Deployer restarted, and then ${failed.join("; ")}.`);
     this.save(c, { state: "paused", currentMember: null, message: "The Deployer restarted before any file was written: continue, or roll back to start what was stopped." });
     this.event(c, "change-paused", null, c.message!);
   }
@@ -995,7 +1044,7 @@ export class ServiceChanges {
   private rollbackFull(c: ServiceChange, actor: Actor): ServiceChange {
     if (c.state !== "stopped" && c.state !== "paused") throw new ChangeError(409, "service-change/state", `This change is ${c.state}: only a stopped or paused change is rolled back.`);
     const p = c.progress as ChangeProgress;
-    Object.assign(p, { resume: false, stuck: null, intent: "rollback", rollingBack: true, batch: null, composing: null, probes: {}, nextProbe: null, stableSince: null, invalidHigh: false });
+    Object.assign(p, { resume: false, settling: false, settleFailed: [], stuck: null, intent: "rollback", rollingBack: true, batch: null, composing: null, probes: {}, nextProbe: null, stableSince: null, invalidHigh: false });
     this.save(c, { state: "running", phase: "reconcile", currentMember: null, message: "Rolling back the whole cluster, by a person's decision" });
     this.store.audit(actor, "service.change-rollback", `${c.service}/${c.id}`, { member: null });
     this.advanceSafely(c);

@@ -50,6 +50,8 @@ export interface CheckInput {
   memory?: Record<string, number | null | undefined>;
   /** How much of the machine's memory a heap may take (default 80). */
   heapMaxPct?: number;
+  /** P15: by member (installation), how many encrypted values (enc{…}) its flow holds, from its latest sample; absent: not known. */
+  encrypted?: Record<string, number | null | undefined>;
 }
 
 const HEAP_MAX_PCT = 80;
@@ -318,6 +320,27 @@ export function assessChange(input: Pick<CheckInput, "profile" | "kind" | "membe
   return { mode: cluster && full.length ? "full" : "rolling", fullBecause: cluster ? full : [], restart: members.some((m) => m.files.some((f) => f.restart)), members };
 }
 
+/**
+ * P15 (owner 2026-11-10): the flow's secrets are not migrated. The executor counts the flow's encrypted values (enc{…},
+ * never the values) in its samples: none on every member changing the key, and nothing is said; some, and the warning
+ * says what will happen and how it is done by hand; not known (no sample yet, an older executor), and it says "may".
+ */
+function migrationFinding(input: CheckInput, change: ChangeAssessment, file: string, key: string): Found | null {
+  const members = change.members.filter((m) => m.files.some((f) => f.name === file && f.keys.includes(key))).map((m) => m.member);
+  const counts = members.map((m) => input.encrypted?.[m]);
+  const known = counts.filter((n): n is number => typeof n === "number");
+  if (known.length === counts.length && known.every((n) => n === 0)) return null;
+  const command = key === "nifi.sensitive.props.key" ? "set-sensitive-properties-key" : "set-sensitive-properties-algorithm";
+  const how = input.version.startsWith("1.")
+    ? `with every node stopped, migrate the flow with the NiFi toolkit's encrypt-config.sh outside the Deployer (this version's nifi.sh may have no ${command}: 1.12.1 has none; not tried here), then adopt the files here as drift`
+    : `with every node stopped, run bin/nifi.sh ${command} on each node outside the Deployer (it re-encrypts the flow and writes nifi.properties), start them, then adopt the files here as drift`;
+  const most = known.length ? Math.max(...known) : 0;
+  const message = most > 0
+    ? `${key}: the flow holds ${most} encrypted value${most > 1 ? "s" : ""} (enc{…}), which stay encrypted the old way: they are not migrated. NiFi will not start with the new setting, and the change rolls back by itself. To change it: ${how}.`
+    : `${key}: whether the flow holds encrypted values is not known (${known.length ? "not every member's" : "no member's"} service executor has said yet; an older one never does). If it holds any, they stay encrypted the old way: NiFi will not start with the new setting, and the change rolls back by itself. To change it then: ${how}.`;
+  return { severity: "warning", code: "config/sensitive-key-migration", file, key, message };
+}
+
 function changeFindings(input: CheckInput & { base: CheckMember[] }, change: ChangeAssessment): Found[] {
   const out: Found[] = [];
   const once = new Set<string>();
@@ -334,7 +357,10 @@ function changeFindings(input: CheckInput & { base: CheckMember[] }, change: Cha
   }
   for (const { file, key, member } of change.members.flatMap((m) => m.files.flatMap((f) => f.keys.map((key) => ({ file: f.name, key, member: m.member }))))) {
     const e = entryOf(input.profile, key, file);
-    if (FLOW_ENCRYPTION.has(key) && first("config/sensitive-key-migration", file, key)) out.push({ severity: "warning", code: "config/sensitive-key-migration", file, key, message: `${key}: the flow's secrets stay encrypted the old way and are not migrated. If the flow has any, NiFi will not start with the new setting and the change rolls back by itself.` });
+    if (FLOW_ENCRYPTION.has(key) && first("config/sensitive-key-migration", file, key)) {
+      const migration = migrationFinding(input, change, file, key);
+      if (migration) out.push(migration);
+    }
     if (input.kind === "cluster" && ZOOKEEPER.has(key) && first("config/zookeeper-state", file, key)) out.push({ severity: "warning", code: "config/zookeeper-state", file, key, message: `${key} (${file}): component state kept in ZooKeeper may not be found at the new place.` });
     if (!e && isProperties(file) && first("config/unknown-key", file, key)) out.push({ severity: "info", code: "config/unknown-key", file, key, message: `${key} (${file}) is not in the ${input.profile.id} catalog: it cannot be checked, and changing it counts as needing a restart.` });
     if (key === "nifi.cluster.is.node") {

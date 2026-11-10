@@ -60,8 +60,15 @@ const DOWN = new Set(["DISCONNECTED", "DISCONNECTING", "OFFLOADED", "OFFLOADING"
 const ZK = /zookeeper|curator|connectionloss|keeperexception/i;
 /** In the log summary NiFi abbreviates the logger (o.a.z.ClientCnxn is ZooKeeper's client). */
 const ZK_LOG = /zookeeper|curator|connectionloss|keeperexception|\bo\.a\.z\.|ClientCnxn/i;
-const MIN = 60_000, DAY = 86_400_000;
+const MIN = 60_000, DAY = 86_400_000, BUCKET_MS = 5 * MIN;
 const keyOf = (rule: string, member: string) => `${rule}\0${member}`;
+
+/** The times a service's changes took, from their start to their end (one not closed yet: to now), that reach into [from, to] (ms). */
+export function changeWindows(store: Store, service: string, from: number, to: number): [number, number][] {
+  return store.serviceChanges(service, 50)
+    .map((c) => [Date.parse(c.createdAt), c.finishedAt ? Date.parse(c.finishedAt) : to] as [number, number])
+    .filter(([a, b]) => a <= to && b >= from);
+}
 
 /** How a member is named in alerts and on the timeline: a node by address and port, a standalone by host. */
 export const memberName = (s: Pick<ServiceStatus, "kind">, m: Pick<MemberStatus, "host" | "nodeAddress" | "ports">) =>
@@ -88,12 +95,12 @@ export function evaluate(store: Store, s: ServiceStatus, t: Thresholds, now: Dat
   const hold = (rule: RuleId, member: string) => held.add(keyOf(rule, member));
   const cluster = s.kind === "cluster";
   const memberFiles = store.serviceMemberFiles(s.id);
-  // §16.3 no. 8: the member a running change is working on is expected to look down, and in a full change (S31) every member
-  // and the cluster as a whole; a stopped change is judged again.
-  const change = store.activeServiceChange(s.id);
-  const running = change?.state === "running" ? change : null;
-  const whole = running?.mode === "full";
-  const working = new Set<string | null>(whole ? s.members.map((m) => m.key) : [running?.currentMember ?? null]);
+  // §16.3 no. 8: the member a change is working on is expected to look down, and in a full change (S31) every member and
+  // the cluster as a whole. Until the change is closed (step 14b: paused and stopped too), not only while it runs: a person
+  // is already on it, and closing it judges them again.
+  const change = store.activeServiceChange(s.id) ?? null;
+  const whole = change?.mode === "full";
+  const working = new Set<string | null>(whole ? s.members.map((m) => m.key) : [change?.currentMember ?? null]);
 
   for (const m of s.members) {
     const name = memberName(s, m);
@@ -186,10 +193,16 @@ export function evaluate(store: Store, s: ServiceStatus, t: Thresholds, now: Dat
   }
   const errors = store.serviceBulletins(s.id, { from: iso(nowMs - t.errorBulletinMinutes * MIN), level: "ERROR", limit: 1000 });
   if (errors.length >= t.errorBulletins) add("error-bulletins", "*", "WARN", `${errors.length} ERROR bulletins in ${t.errorBulletinMinutes} min (newest: ${errors[0]?.source ?? "?"}: ${(errors[0]?.message ?? "").slice(0, 200)})`, { count: errors.length, minutes: t.errorBulletinMinutes });
-  const zk = store.serviceBulletins(s.id, { from: iso(nowMs - t.zkMinutes * MIN), limit: 1000 }).filter((b) => b.level !== "INFO" && b.level !== "DEBUG" && ZK.test(b.message ?? ""));
+  // Step 14b: what a change's own stops and starts make NiFi log about ZooKeeper (forming and the stable time included) is
+  // not counted; a 5-minute bucket that touches a change's time counts as the change's.
+  const zkFrom = iso(nowMs - t.zkMinutes * MIN);
+  const windows = changeWindows(store, s.id, Date.parse(bucketOf(zkFrom)), nowMs);
+  const inChange = (from: number, to: number) => windows.some(([a, b]) => from <= b && to >= a);
+  const zk = store.serviceBulletins(s.id, { from: zkFrom, limit: 1000 }).filter((b) => b.level !== "INFO" && b.level !== "DEBUG" && ZK.test(b.message ?? "") && !inChange(Date.parse(b.at), Date.parse(b.at)));
   // Step 4: and nifi-app.log's WARN/ERROR summary (5-minute counts: the window is widened to whole buckets).
-  const logs = store.serviceLogCounts(s.id, bucketOf(iso(nowMs - t.zkMinutes * MIN)))
-    .filter((c) => c.level !== "INFO" && c.level !== "DEBUG" && ZK_LOG.test(`${c.logger ?? ""} ${c.template} ${c.exception ?? ""}`));
+  const logs = store.serviceLogCounts(s.id, bucketOf(zkFrom))
+    .filter((c) => c.level !== "INFO" && c.level !== "DEBUG" && ZK_LOG.test(`${c.logger ?? ""} ${c.template} ${c.exception ?? ""}`))
+    .filter((c) => !inChange(Date.parse(c.bucket), Date.parse(c.bucket) + BUCKET_MS - 1));
   const fromLogs = logs.reduce((n, c) => n + c.count, 0);
   if (whole) hold("zk-errors", "*");
   else if (zk.length + fromLogs >= t.zkErrors) {

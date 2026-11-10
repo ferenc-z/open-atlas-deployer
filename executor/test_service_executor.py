@@ -3,6 +3,7 @@
     python3 -m unittest test_service_executor        (from executor/)
 """
 import calendar
+import gzip
 import hashlib
 import json
 import os
@@ -1331,6 +1332,32 @@ class CollectorTest(Base):
             props.write_bytes(data[:-1] + (b"x" if data[-1:] != b"x" else b"y"))
             os.utime(props, ns=(st.st_atime_ns, st.st_mtime_ns))
             self.assertNotEqual(c.fingerprint(f)["sha256"], first["sha256"])
+
+    def test_the_sample_counts_the_flows_encrypted_values_never_their_text(self):
+        """P15: how many enc{ the flow holds, one split across two chunks counted once; cached by stat; never a value."""
+        c = self.collector()
+        d = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        flow = d / "flow.json.gz"
+        head = b'{"a":"enc{AAAA-secret}","b":"'
+        body = head + b"x" * ((1 << 20) - 2 - len(head)) + b'enc{BBBB-secret}"}'
+        flow.write_bytes(gzip.compress(body))
+        props, where = {"nifi.flow.configuration.file": "./flow.json.gz"}, {"installDir": str(d)}
+        out = c.flow_secrets(where, props)
+        self.assertEqual(out, {"encrypted": 2})
+        self.assertNotIn("secret", json.dumps(out))
+        with mock.patch.object(sx, "count_encrypted", side_effect=AssertionError("read again")):
+            self.assertEqual(c.flow_secrets(where, props), {"encrypted": 2}, "the same stat: not read again")
+        # 1.16 to 1.28: the xml and the json flow, the most of either; a plain (not gzip) file as it is.
+        (d / "flow.xml.gz").write_bytes(b"<x>enc{1}enc{2}enc{3}</x>")
+        self.assertEqual(c.flow_secrets(where, {**props, "nifi.flow.configuration.json.file": "./flow.json.gz", "nifi.flow.configuration.file": "./flow.xml.gz"}), {"encrypted": 3})
+        self.assertEqual(c.flow_secrets(where, {"nifi.flow.configuration.file": "./none.json.gz"}), {"encrypted": 0, "missing": True})
+        self.assertIsNone(c.flow_secrets(where, {})["encrypted"], "no flow named: not known")
+        (d / "bad.json.gz").write_bytes(b"\x1f\x8bnot gzip at all")
+        bad = c.flow_secrets(where, {"nifi.flow.configuration.file": "./bad.json.gz"})
+        self.assertIsNone(bad["encrypted"])
+        self.assertIn("bad.json.gz", bad["error"])
+        self.assertIn("flow", c.round(sx.watch_entries(self.watch[:1]))[0], "every sample says it")
 
     def test_an_unreadable_file_says_so_and_the_sample_goes_on(self):
         props = self.n200 / "conf" / "nifi.properties"

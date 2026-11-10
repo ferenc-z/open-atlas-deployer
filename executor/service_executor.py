@@ -76,6 +76,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import zlib
 
 # >>> executor_core
 # The protocol, registration and self-upgrade every executor shares (executor_core.py, S18). package.sh (bundle.py) puts
@@ -1243,7 +1244,36 @@ class Collector:
             out["logs"] = {"error": f"the log summary failed: {e}"[:300]}
         # §16.3: what the Deployer compares with what each file should be. Only hashes, the content stays here.
         out["files"] = [self.fingerprint(f) for f in w.get("files") or []]
+        out["flow"] = self.flow_secrets(where, props)
         return out
+
+    def flow_secrets(self, where, props):
+        """P15: how many encrypted values (enc{...}) the flow holds, so that a plan changing the sensitive properties key
+        can say whether NiFi will start: a count, never a value. Counted again only when the file's stat changes. NiFi
+        1.16 to 1.28 keep the flow twice (xml and json): the most of either."""
+        names = [(props.get(k) or "").strip() for k in (FLOW_PROPERTY, FLOW_JSON_PROPERTY)]
+        paths = list(dict.fromkeys(str(Discovery.resolve(where["installDir"], v)) for v in names if v))
+        if not paths:
+            return {"encrypted": None, "error": f"nifi.properties does not name a flow file ({FLOW_PROPERTY})"}
+        counts, errors = [], []
+        cache = self.__dict__.setdefault("flow_counts", {})
+        for path in paths:
+            try:
+                st = os.stat(path)
+                stamp = (st.st_mtime_ns, st.st_ctime_ns, st.st_size)
+                known = cache.get(path)
+                if not known or known[0] != stamp:
+                    known = cache[path] = (stamp, count_encrypted(path))
+                counts.append(known[1])
+            except FileNotFoundError:
+                continue
+            except (OSError, EOFError, zlib.error) as e:
+                errors.append(f"{os.path.basename(path)}: {getattr(e, 'strerror', None) or e}"[:200])
+        if errors:
+            return {"encrypted": None, "error": "; ".join(errors)}
+        if not counts:  # no flow yet: NiFi starts with an empty one, nothing to decrypt
+            return {"encrypted": 0, "missing": True}
+        return {"encrypted": max(counts)}
 
     def fingerprint(self, f):
         """A file's name, path and sha256 (or missing, or error). Hashed again only when its stat changes: ctime as well,
@@ -1937,10 +1967,26 @@ XATTR_LABEL = "security.selinux"
 XATTR_ACL = "system.posix_acl_access"
 WRITE_TEMP = ".oa-svc-write.tmp"
 FLOW_PROPERTY = "nifi.flow.configuration.file"
+FLOW_JSON_PROPERTY = "nifi.flow.configuration.json.file"
+FLOW_ENCRYPTED = b"enc{"
 FLOW_ENTRY = "flow"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 CHANGE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 WriteTarget = collections.namedtuple("WriteTarget", "name path directory leaf base sha256")
+
+
+def count_encrypted(path):
+    """How many times enc{ is in a flow file (gzip, as NiFi writes it; a plain file read as it is), in chunks, a marker
+    split across two of them counted once."""
+    with open(path, "rb") as raw:
+        gz = raw.read(2) == b"\x1f\x8b"
+    n, tail, keep = 0, b"", len(FLOW_ENCRYPTED) - 1
+    with (gzip.open if gz else open)(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            data = tail + chunk
+            n += data.count(FLOW_ENCRYPTED)
+            tail = data[-keep:]
+    return n
 
 
 def selinux_on():

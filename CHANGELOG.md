@@ -19,6 +19,9 @@ logs, the AI's read-only tools, Studio's `nifi-ops` graph, the FlowFile trace). 
   limits (`env -i`, `prlimit`), and confirms by pid and start time that a stop really ended; a timeout never kills, a
   `kill` is its own request. Disconnects, offloads and connects nodes with the operator certificate
   (`EXECUTOR_NIFI_OPERATOR_CERT`, `EXECUTOR_NIFI_OPERATOR_KEY`), which reads and samples never get.
+- Samples say how many encrypted values (`enc{`) the flow holds (`flow.encrypted`, a count, never a value), so a plan
+  changing `nifi.sensitive.props.key` or `.algorithm` can say whether NiFi will start; without it (an older executor)
+  the plan says it may not.
 - A second executor, installed only where services are managed: `open-atlas-service-executor-<version>.tar.gz` in
   the same `executor-v<version>` release, its own `install.sh` (no Docker check; runs as root or as a plain user, who
   then sees only their own processes). The deploy executor and the service executor share `executor_core.py`, and

@@ -315,6 +315,25 @@ test("changing the flow's key or algorithm warns, without showing either value; 
   assert.ok(!all.includes(OLD) && !all.includes(NEW));
 });
 
+test("P15: the flow's encrypted values as the executor counts them: none and nothing is said, some and it says what happens and how by hand, not known and it says may", () => {
+  const base = [member("a", { "nifi.properties": props("nifi.sensitive.props.key=old-one") }), member("b", { "nifi.properties": props("nifi.sensitive.props.key=old-one") })];
+  const members = base.map((m) => editNifi(m, { key: "nifi.sensitive.props.key", value: "new-one" }));
+  const warn = (encrypted?: CheckInput["encrypted"], version = "2.5.0") => one(checkConfig(input({ base, members, encrypted, version })), "config/sensitive-key-migration");
+  assert.deepEqual(warn({ "h:/opt/a": 0, "h:/opt/b": 0 }), [], "no enc{ in either flow: it just works");
+  const some = warn({ "h:/opt/a": 3, "h:/opt/b": 3 });
+  assert.equal(some.length, 1);
+  assert.match(some[0]!.message, /holds 3 encrypted values/);
+  assert.match(some[0]!.message, /will not start/);
+  assert.match(some[0]!.message, /nifi\.sh set-sensitive-properties-key/);
+  for (const unknown of [undefined, { "h:/opt/a": 0 }, { "h:/opt/a": 0, "h:/opt/b": null }]) {
+    const may = warn(unknown);
+    assert.equal(may.length, 1, "an older executor, or no sample yet: may have");
+    assert.match(may[0]!.message, /not known/);
+  }
+  assert.match(warn(undefined, "1.12.1")[0]!.message, /encrypt-config\.sh/, "1.x: the toolkit");
+  assert.equal(warn({ "h:/opt/a": 1, "h:/opt/b": 0 })[0]!.severity, "warning", "never an error: it rolls back by itself");
+});
+
 test("nifi.cluster.is.node changing is an error; left to the default is not a change of meaning", () => {
   const base = [member("a", { "nifi.properties": props("nifi.cluster.is.node=true") })];
   const r = checkConfig(input({ base, members: [member("a", { "nifi.properties": props("nifi.cluster.is.node=false") })] }));

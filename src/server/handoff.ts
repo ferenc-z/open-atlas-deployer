@@ -234,6 +234,11 @@ export class Handoff {
   }
 
   /** Takes a job back while it waits in the queue, its content with it; one an executor already has goes on regardless. */
+  /** Whether an executor has taken the job (it may still be running there). */
+  taken(id: string): boolean {
+    return Boolean(this.store.executorJob(id)?.pickedAt);
+  }
+
   cancelQueued(id: string, message: string) {
     const job = this.store.executorJob(id);
     if (!job || job.pickedAt) return;

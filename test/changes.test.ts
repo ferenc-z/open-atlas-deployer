@@ -649,18 +649,18 @@ test("permissions (§13, D7): viewers see plans and changes; UAT takes its group
   assert.equal((await act(prod, "solo", id, "stop", { as: "prod" })).status, 200);
 });
 
-async function sampled(t: T, member: string, running: boolean, hash?: string) {
+async function sampled(t: T, member: string, running: boolean, hash?: string, more: Record<string, unknown> = {}) {
   const at = new Date(t.now.t - 1000).toISOString();
   const files = t.store.serviceMemberFiles("flow").filter((f) => f.member === member).map((f) => ({ name: f.file, sha256: hash ?? f.expectedSha256 }));
   ingest(t.store, [{
     service: "flow", member, at,
     process: running ? { running: true, pid: 1, startedAt: "2026-11-01T00:00:00Z" } : { running: false },
     nifi: running ? { state: "ok", about: { version: "2.5.0", timezone: "UTC" }, cluster: { nodes: [{ address: "localhost", apiPort: member === A ? 8443 : member === B ? 9443 : 10443, status: "CONNECTED", roles: member === A ? [COORD] : [] }] }, backpressure: { connections: 0, full: 0, maxPercent: 0 } } : { state: "not-running" },
-    files,
+    files, ...more,
   } as unknown as ServiceSample]);
 }
 
-test("the rules leave the member at work alone while the change runs, and judge it again once it has stopped", async () => {
+test("the rules leave the member at work alone while the change runs, and while it is stopped (step 14b), and judge it again once it is closed", async () => {
   const t = setup();
   takenOver(t);
   t.w.held.add("start");
@@ -690,7 +690,12 @@ test("the rules leave the member at work alone while the change runs, and judge 
   t.now.t += 3000;
   await sampled(t, B, false);
   check(t.store, () => online, "flow", new Date(t.now.t));
-  assert.ok(rule().includes(`process-down ${B}`), "stopped: judged again");
+  assert.ok(!rule().includes(`process-down ${B}`), "stopped: still the change's, a person is on it");
+  assert.equal((await act(t, "flow", id, "close")).status, 200);
+  t.now.t += 3000;
+  await sampled(t, B, false);
+  check(t.store, () => online, "flow", new Date(t.now.t));
+  assert.ok(rule().includes(`process-down ${B}`), "closed: judged again");
   assert.ok(!t.store.serviceEvents("flow", { from: before }).some((e) => e.kind === "process-restarted"), "the timeline has the change's steps");
 });
 
@@ -1562,6 +1567,78 @@ test("full: the Deployer restarting before any file is written: paused, and a pe
   assert.equal((await drive(t5, "flow", id5)).state, "succeeded");
 });
 
+test("full, step 14b: a stop an executor took before the Deployer restarted is waited for and recorded as it ended; the nodes are looked at before pausing", async () => {
+  const fresh = (t: T) => {
+    t.engine.changes = new ServiceChanges({ store: t.store, handoff: t.handoff, box, now: () => t.now.t });
+    t.engine.changes.recover();
+  };
+  const t = setup();
+  await fullChange(t);
+  guard(t);
+  t.w.held.add(`stop ${B}`); // B, the ordinary node, goes first: taken, and still running on the host
+  const id = await begin(t, "flow", { kind: "apply" });
+  await drive(t, "flow", id, () => calls(t, "stop").length === 1);
+  const stop = t.store.serviceChangeSteps(id).find((s) => s.step === "stop")!;
+  type Seen = { seen: { members: Record<string, { running: boolean }> } };
+  assert.equal((changeOf(t, "flow", id).progress as Seen).seen.members[B]!.running, true, "as seen before the stop");
+  fresh(t);
+  for (let i = 0; i < 4; i++) { await t.w.run(); t.engine.changes.tick(); t.now.t += 3000; }
+  assert.equal(changeOf(t, "flow", id).state, "running", "waits for the job the executor has");
+  assert.equal(t.store.serviceChangeSteps(id).find((s) => s.seq === stop.seq)!.state, "running");
+  // The executor finishes it, as it did on c250-2.
+  const n = t.w.nodes.get(B)!;
+  n.running = false;
+  n.status = "DISCONNECTED";
+  t.handoff.putStatus(stop.job!, { state: "succeeded", steps: [], result: { stopped: { pid: n.pid } } as never });
+  const c = await drive(t, "flow", id);
+  assert.equal(c.state, "paused", c.message ?? "");
+  assert.equal(t.store.serviceChangeSteps(id).find((s) => s.seq === stop.seq)!.state, "succeeded", "what the executor said, not 'the Deployer restarted'");
+  assert.ok(t.store.serviceEvents("flow").some((e) => e.kind === "node-stopped" && e.member === B));
+  const seen = (c.progress as Seen).seen;
+  assert.equal(seen.members[B]!.running, false, "the page sees the node as it is now");
+  assert.equal(seen.members[A]!.running, true);
+  assert.equal((await act(t, "flow", id, "continue")).status, 200);
+  assert.equal((await drive(t, "flow", id)).state, "succeeded");
+  assert.equal(calls(t, `stop`).filter((x) => x === `stop ${B}`).length, 1, "not stopped twice");
+
+  // A stop that ends badly after the restart stops the change there, as it would have; one past its deadline too.
+  for (const ending of ["failed", "late"] as const) {
+    const t2 = setup();
+    await fullChange(t2);
+    t2.w.held.add(`stop ${B}`);
+    const id2 = await begin(t2, "flow", { kind: "apply" });
+    await drive(t2, "flow", id2, () => calls(t2, "stop").length === 1);
+    const job = t2.store.serviceChangeSteps(id2).find((s) => s.step === "stop")!.job!;
+    fresh(t2);
+    if (ending === "failed") t2.handoff.putStatus(job, { state: "failed", steps: [], message: "still running", result: { stillRunning: true, process: { pid: 7, startedAt: "x" } } as never });
+    else t2.now.t += 3600_000;
+    const c2 = await drive(t2, "flow", id2);
+    assert.equal(c2.state, "stopped", `${ending}: ${c2.message}`);
+    assert.match(c2.message!, ending === "failed" ? /restarted, and then stop on .*still running/ : /timed out/);
+    if (ending === "failed") {
+      assert.equal(c2.currentMember, B, "the kill button knows whom");
+      const view = await (await t2.call("GET", `/api/services/flow/changes/${id2}`, { as: "viewer" })).json();
+      assert.equal(view.progress.canForceKill, true);
+    }
+  }
+});
+
+test("P15: the plan takes the flow's encrypted count from the newest samples; one member without it is not known", async () => {
+  const t = setup();
+  takenOver(t);
+  await revision(t, "flow", [{ file: "nifi.properties", key: "nifi.sensitive.props.key", secret: "new-props-key" }]);
+  const migration = async () => (await planOf(t, "flow", { kind: "apply" })).findings.filter((f: { code: string }) => f.code === "config/sensitive-key-migration");
+  assert.match((await migration())[0].message, /not known/, "no samples yet");
+  for (const m of NODES) await sampled(t, m, true, undefined, { flow: { encrypted: 0 } });
+  assert.deepEqual(await migration(), [], "no enc{ in any flow");
+  t.now.t += 5000;
+  await sampled(t, C, true, undefined, { flow: { encrypted: 2 } });
+  assert.match((await migration())[0].message, /holds 2 encrypted values/);
+  t.now.t += 5000;
+  await sampled(t, C, true); // an older executor's sample: no flow
+  assert.match((await migration())[0].message, /not known/);
+});
+
 test("full: stopping by hand takes back everything queued; closing after the first write takes saying so, and the timeline has it", async () => {
   const t = setup();
   await fullChange(t);
@@ -1653,8 +1730,17 @@ test("full: the rules leave every member and the cluster alone while it runs, an
   for (const m of NODES) await sampled(t, m, false);
   zkMessages(t);
   check(t.store, () => online, "flow", new Date(t.now.t));
+  assert.deepEqual(rule().filter((r) => /process-down|node-disconnected|no-samples|no-coordinator|zk-errors|config-drift/.test(r)), [], "stopped: still the change's (step 14b)");
+  assert.equal((await t.call("POST", `/api/services/flow/changes/${id}/close`, { as: "uat" }, { filesMayBeMixed: true })).status, 200);
+  t.now.t += 3000;
+  for (const m of NODES) await sampled(t, m, false);
+  check(t.store, () => online, "flow", new Date(t.now.t));
   for (const m of NODES) assert.ok(rule().includes(`process-down ${m}`), `${m} is judged again`);
-  assert.ok(rule().includes("zk-errors *"), "and the cluster");
+  assert.ok(!rule().includes("zk-errors *"), "what NiFi said of ZooKeeper while the change ran does not count afterwards (step 14b)");
+  t.now.t += 3000;
+  zkMessages(t);
+  check(t.store, () => online, "flow", new Date(t.now.t));
+  assert.ok(rule().includes("zk-errors *"), "what it says after the change does");
   await sampled(t, B, true);
   check(t.store, () => online, "flow", new Date(t.now.t));
   assert.ok(rule().includes("no-coordinator *"));

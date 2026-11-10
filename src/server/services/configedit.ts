@@ -228,7 +228,7 @@ export function sameFiles(a: readonly ConfigMember[], b: readonly ConfigMember[]
   return hashes(a) === hashes(b);
 }
 
-export type CheckContext = Pick<CheckInput, "profile" | "version" | "kind" | "others" | "memory">;
+export type CheckContext = Pick<CheckInput, "profile" | "version" | "kind" | "others" | "memory" | "encrypted">;
 
 /** A draft's outcome on its base revision: the bodies to keep, its findings and what it means. No profile: nothing to check against. */
 export function outcomeOf(base: ServiceConfigBody, changes: readonly DraftChange[], box: SecretBox, context: Omit<CheckContext, "profile"> & { profile: CheckContext["profile"] | undefined }): { split: ServiceConfigBody | null; body: ServiceConfigBody; findings: ConfigFinding[]; change: ChangeAssessment | null } {

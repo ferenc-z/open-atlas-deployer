@@ -59,6 +59,25 @@ test("the ZooKeeper rule counts nifi-app.log's summary as well as the bulletins"
   assert.deepEqual([open.detail.count, open.detail.log, open.detail.bulletins], [3, 3, 0]);
 });
 
+test("step 14b: what NiFi logs of ZooKeeper while a change runs (forming and the stable time too) does not count; a bucket that touches the change is the change's", () => {
+  const now = { t: new Date("2026-11-06T12:01:00Z") };
+  const store = lab(now);
+  const online: ExecutorInfo = { online: true, host: "local", ageSeconds: 5, heartbeat: { collector: { seconds: 30 } } as never };
+  const zk = (key: string, at: string, count: number) => pattern(key, at, { level: "ERROR", logger: "o.a.z.ClientCnxn", template: "Session <hex> for server localhost/<ip>:<n>, Closing socket connection", count });
+  const open = () => store.serviceAlerts({ service: "c250", state: "open" }).find((a) => a.rule === "zk-errors");
+  store.createServiceChange({ id: "chg-1", service: "c250", kind: "apply", revision: 1, mode: "full", phase: "gate", plan: {}, options: {}, reason: null, progress: {}, text: "x" }, admin);
+  now.t = new Date("2026-11-06T12:04:00Z");
+  store.updateServiceChange("chg-1", { state: "succeeded", phase: "done", currentMember: null, message: null, finishedAt: now.t.toISOString(), progress: {} });
+  now.t = new Date("2026-11-06T12:06:10Z");
+  ingest(store, [sample(KEY1, "2026-11-06T12:04:30Z", [zk("bbbbbbbbbbbbbbbb", "2026-11-06T12:04:20Z", 5)])]);
+  ingest(store, [sample(KEY2, "2026-11-06T12:04:30Z", [zk("cccccccccccccccc", "2026-11-06T12:03:50Z", 5)])]);
+  check(store, () => online, "c250", now.t);
+  assert.equal(open(), undefined, "the 12:00 bucket touches the change: none of it counts, even after its end");
+  ingest(store, [sample(KEY1, "2026-11-06T12:06:00Z", [zk("bbbbbbbbbbbbbbbb", "2026-11-06T12:05:50Z", 3)])]);
+  check(store, () => online, "c250", now.t);
+  assert.equal(open()?.detail.log, 3, "the next bucket does");
+});
+
 test("a search request is checked and has its defaults", () => {
   const now = new Date("2026-11-06T12:00:00Z");
   assert.deepEqual(parseSearch({}, now), { from: "2026-11-06T11:00:00.000Z", to: "2026-11-06T12:00:00.000Z", limit: 1000 });
