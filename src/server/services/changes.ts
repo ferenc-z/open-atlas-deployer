@@ -734,9 +734,18 @@ export class ServiceChanges {
     const control = { ...base, kind: "svc-control", timeoutSeconds: seconds };
     const who = { serviceUser: m.serviceUser, env: m.startEnvironment ?? {} };
     let request: Record<string, unknown>;
-    if (stage === "disconnect") request = { ...control, action: "node-disconnect", nodeId: p.nodeId };
-    else if (stage === "offload") request = { ...control, action: "node-offload", nodeId: p.nodeId };
-    else if (stage === "stop") request = { ...control, action: "stop", ...who };
+    if (stage === "disconnect" || stage === "offload") {
+      // Step 14 on 2.5.0: once disconnected, a node answers its own cluster endpoints with 404 ("Only a node connected to a
+      // cluster can process the request"), so it cannot confirm its own disconnect. Another member asks and watches; the
+      // gate has just seen every other member CONNECTED. A one-node cluster has nobody else and goes through itself.
+      const through = membersOf(registered(this.store, c.service)!).find((n) => installKey(n) !== key) ?? m;
+      const job = newJobId("svc-control", new Date(this.clock()));
+      const step = this.addStep(c, stage, key, QUEUE_MS + seconds * 1000 + GRACE_MS, job);
+      this.store.updateServiceChangeStep(step.change, step.seq, { detail: { ...step.detail, through: installKey(through) } });
+      this.handoff.submit(job, { ...control, member: installKey(through), action: stage === "disconnect" ? "node-disconnect" : "node-offload", nodeId: p.nodeId }, through.host, "service");
+      return;
+    }
+    if (stage === "stop") request = { ...control, action: "stop", ...who };
     else if (stage === "start") request = { ...control, action: "start", ...who, limits: m.startLimits ?? null };
     else if (stage === "restore") request = { ...base, kind: "svc-write", action: "restore" };
     else request = { ...base, kind: "svc-write", action: "apply", files: pm.files.map((f) => ({ name: f.name, path: f.path, baseSha256: f.baseSha256, sha256: f.sha256 })), content: this.contentOf(c, pm) };

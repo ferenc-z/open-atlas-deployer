@@ -48,6 +48,7 @@ function world(t: { store: Store; handoff: Handoff; now: { t: number } }) {
   const w = {
     nodes: new Map<string, Node>(),
     calls: [] as string[],
+    via: [] as string[],
     held: new Set<string>(),
     /** After doing the thing, or instead of it: "<action> <member>" → how it ends. */
     failing: new Map<string, Answer & { didIt?: boolean }>(),
@@ -96,15 +97,18 @@ function world(t: { store: Store; handoff: Handoff; now: { t: number } }) {
         return finish({ state: "succeeded", result: { files: [] } });
       }
       const action = String(job.action);
-      const name = `${action} ${member}`;
+      // A node-* job names the node it is about; the executor asked (member) may be another one's (step 14).
+      const about = action.startsWith("node-") ? [...w.nodes.entries()].find(([, x]) => x.nodeId === job.nodeId)?.[0] ?? member : member;
+      const name = `${action} ${about}`;
       w.calls.push(name);
-      w.onJob?.(action, member);
+      if (about !== member) w.via.push(`${action} ${about} via ${member}`);
+      w.onJob?.(action, about);
       if (w.held.has(name) || w.held.has(action)) return;
       const failure = w.failing.get(name);
       if (failure) w.failing.delete(name);
       if (failure && !failure.didIt) return finish(failure);
-      if (action === "node-disconnect") { n.status = "DISCONNECTED"; finish({ state: "succeeded" }); }
-      else if (action === "node-offload") { n.status = "OFFLOADED"; finish({ state: "succeeded" }); }
+      if (action === "node-disconnect") { w.nodes.get(about)!.status = "DISCONNECTED"; finish({ state: "succeeded" }); }
+      else if (action === "node-offload") { w.nodes.get(about)!.status = "OFFLOADED"; finish({ state: "succeeded" }); }
       else if (action === "node-connect") { const to = [...w.nodes.values()].find((x) => x.nodeId === job.nodeId)!; to.connects = true; to.status = "CONNECTED"; finish({ state: "succeeded" }); }
       else if (action === "stop") {
         const had = n.running;
@@ -248,6 +252,8 @@ test("a rolling apply: one node at a time, ordinary first, the primary node and 
   assert.equal(c.state, "succeeded", c.message ?? "");
   assert.deepEqual(touched(t), [B, C, A].flatMap((m) => ["node-disconnect", "stop", "apply", "start"].map((a) => `${a} ${m}`)));
   assert.equal(t.w.calls.filter((x) => x.startsWith("prune")).length, 3, "the old backups go after it succeeded, each member's");
+  assert.equal(t.w.via.filter((x) => x.startsWith("node-disconnect")).length, 3, "a disconnected node cannot confirm it itself: another member asks (step 14)");
+  assert.ok(t.w.via.every((x) => !x.match(/^node-disconnect (\S+) via \1$/)));
   const steps = stepsOf(t, id);
   assert.deepEqual(steps.slice(0, 9), ["gate succeeded", `disconnect ${B} succeeded`, `stop ${B} succeeded`, `write ${B} succeeded`, `start ${B} succeeded`, `wait-rest ${B} succeeded`, `wait-connected ${B} succeeded`, `wait-stable ${B} succeeded`, "gate succeeded"]);
   for (const f of t.store.serviceMemberFiles("flow").filter((x) => x.file === "nifi.properties")) {
@@ -346,7 +352,7 @@ test("each step has its deadline: past it the change stops where it is, nothing 
   const c2 = await drive(t2, "flow", id2);
   assert.equal(c2.state, "stopped");
   assert.match(c2.message!, /wait-connected on local:\/opt\/b timed out/);
-  assert.ok(t2.w.calls.includes(`node-connect ${A}`) || t2.w.calls.includes(`node-connect ${C}`), "another node was asked to connect it, once");
+  assert.ok(t2.w.via.includes(`node-connect ${B} via ${A}`) || t2.w.via.includes(`node-connect ${B} via ${C}`), "another node was asked to connect it, once");
   assert.equal(t2.w.calls.filter((x) => x.startsWith("node-connect")).length, 1);
 });
 
@@ -357,8 +363,8 @@ test("a node staying away is connected through another node, and the roll goes o
   t.w.handle = (job) => { original(job); if (job.action === "start" && job.member === B) t.w.nodes.get(B)!.connects = false; };
   const id = await begin(t, "flow", { kind: "rolling-restart" });
   assert.equal((await drive(t, "flow", id)).state, "succeeded");
-  const asked = t.w.calls.find((x) => x.startsWith("node-connect"))!;
-  assert.notEqual(asked, `node-connect ${B}`, "through another node's executor");
+  const asked = t.w.via.find((x) => x.startsWith("node-connect"))!;
+  assert.match(asked, new RegExp(`^node-connect ${B} via (?!${B}$)`), "through another node's executor");
 });
 
 test("a failing start rolls that node back, starts it and stops the change; the others stay as they were", async () => {
