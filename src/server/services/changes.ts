@@ -1414,6 +1414,16 @@ function bestTable(answers: Map<string, StateAnswer>): ClusterNode[] {
   return best?.nodes ?? [];
 }
 
+/**
+ * How long a plan can take at most, each step at its timeout, in seconds; a job's time in the queue is not counted, nor is
+ * rolling back. mode full: from the first stop to the cluster formed (§16.3), which is how long the service can be down.
+ */
+export function longestSeconds(plan: Pick<ChangePlan, "mode" | "members" | "options">): number {
+  const t = plan.options.timeouts;
+  if (plan.mode === "full") return plan.members.length * t.stop + 2 * t.write + t.gate + t.start + t.compose; // stopped one by one; backup and write; verify; started at once
+  return plan.members.reduce((total, m) => total + m.stages.reduce((n, stage) => n + t[STAGE_TIMEOUT[stage]], 0), 0);
+}
+
 /** A change as pages and tools get it: no file hashes, no working state, no start environment. */
 export function changeView(c: ServiceChange, steps?: readonly ServiceChangeStep[]) {
   const { plan, progress, ...rest } = c;
@@ -1422,7 +1432,7 @@ export function changeView(c: ServiceChange, steps?: readonly ServiceChangeStep[
   return {
     ...rest, plan: shown,
     progress: {
-      done: p.done, remaining: p.remaining, rollingBack: p.rollingBack, canForceKill: c.state === "stopped" && Boolean(p.stuck),
+      done: p.done, remaining: p.remaining, rollingBack: p.rollingBack, canForceKill: c.state === "stopped" && Boolean(p.stuck), stuck: c.state === "stopped" ? p.stuck : null,
       canRollBack: c.mode === "full" ? c.state === "stopped" || c.state === "paused" : c.state === "stopped" && Boolean((plan as ChangePlan).members.find((m) => m.member === c.currentMember)?.files.length),
       ...(c.mode === "full" ? { wrote: p.wrote, seen: p.seen ?? null, composing: p.composing ?? null } : {}),
     },
@@ -1432,5 +1442,5 @@ export function changeView(c: ServiceChange, steps?: readonly ServiceChangeStep[
 
 /** A plan as pages and tools get it: without the files' hashes (§16.3: the AI gets none, and no page needs them). */
 export function planView(plan: ChangePlan) {
-  return { ...plan, members: plan.members.map((m) => ({ ...m, files: m.files.map(({ baseSha256: _b, sha256: _s, ...f }) => f) })) };
+  return { ...plan, longestSeconds: longestSeconds(plan), members: plan.members.map((m) => ({ ...m, files: m.files.map(({ baseSha256: _b, sha256: _s, ...f }) => f) })) };
 }

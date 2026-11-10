@@ -281,6 +281,22 @@ export type DiscoveryView = { id: string; host: string; dirs: DiscoverDir[]; sta
   result: { scannedAt?: string; user?: string; isRoot?: boolean; instances: Record<string, any>[]; dirs: { dir: string; conf?: string; found: boolean; running?: boolean; error?: string }[]; skipped: { pid: number; user: string }[] } | null; log: string };
 export const discover = (host: string, dirs: DiscoverDir[] = []) => call<{ id: string; host: string; dirs: DiscoverDir[]; state: string }>("POST", `hosts/${encodeURIComponent(host)}/discover`, { dirs });
 export const discovery = (host: string) => call<DiscoveryView>("GET", `hosts/${encodeURIComponent(host)}/discover`);
+// §16.3: changes. A plan is only worked out; a change starts with the plan's hash, and the buttons steer it.
+import type { changeView, ChangeKind, planView } from "../server/services/changes.ts";
+export type { ChangeKind };
+export type ChangePlan = ReturnType<typeof planView>;
+export type ServiceChangeView = ReturnType<typeof changeView>;
+export type ChangeOptionsInput = { offload?: boolean; invalidTolerance?: number; stableSeconds?: number; timeouts?: Record<string, number> };
+export type ChangeRequest = { kind: ChangeKind; revision?: number; members?: string[]; options?: ChangeOptionsInput };
+const changesPath = (id: string, rest = "") => `services/${encodeURIComponent(id)}/changes${rest}`;
+export const serviceChanges = (id: string) => call<{ changes: ServiceChangeView[]; active: string | null }>("GET", changesPath(id));
+export const serviceChange = (id: string, change: string) => call<ServiceChangeView>("GET", changesPath(id, `/${encodeURIComponent(change)}`));
+export const planChange = (id: string, request: ChangeRequest) => call<ChangePlan>("POST", changesPath(id, "/plan"), request);
+export const startChange = (id: string, request: ChangeRequest, planHash: string, reason: string) => call<ServiceChangeView>("POST", changesPath(id), { ...request, planHash, ...(reason ? { reason } : {}) });
+export const steerChange = (id: string, change: string, action: "continue" | "stop" | "rollback" | "force-kill" | "close", body: Record<string, unknown> = {}) =>
+  call<ServiceChangeView>("POST", changesPath(id, `/${encodeURIComponent(change)}/${action}`), body);
+export const rollBackConfig = (id: string, revision: number, note?: string) => call<{ revision: number; saved: boolean; findings: ConfigFinding[] }>("POST", `services/${encodeURIComponent(id)}/config/rollback`, { revision, ...(note ? { note } : {}) });
+export const setMemberStart = (id: string, member: string, environment: Record<string, string>) => call<{ kept: string[]; dropped: string[] }>("PUT", `services/${encodeURIComponent(id)}/members/${encodeURIComponent(member)}/start`, { environment });
 export type DraftSummary = Omit<ServiceDraft, "items" | "review">;
 const drafts = (rest = "") => `services/drafts${rest}`;
 export const serviceDrafts = (state?: "open" | "confirmed" | "discarded") => call<{ drafts: DraftSummary[] }>("GET", drafts(state ? `?state=${state}` : ""));

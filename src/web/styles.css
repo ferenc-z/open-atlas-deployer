@@ -453,3 +453,57 @@ table.props tr.selected td { background: var(--info-bg); }
 .diffs summary { color: var(--text); }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 .drift-adopt { margin-left: 12px; }
+
+/* ServiceChanges.tsx: a plan and a change. What it does to the service comes first and looks different for each way it can go. */
+.change-plan, .change-run { margin-bottom: 14px; }
+.change-plan { scroll-margin-top: 12px; }
+.change-plan.is-full, .change-run.is-full { border-color: var(--bad); }
+.change-run.state-stopped { border-color: var(--bad); }
+.change-run.state-paused { border-color: var(--warn); }
+.plan-close { margin-left: auto; }
+.impact { border-left: 4px solid var(--border); border-radius: 6px; padding: 10px 14px; background: var(--bg); }
+.impact h4 { margin: 0 0 4px; font-size: 15px; }
+.impact p { margin: 0; }
+.impact ul { margin: 8px 0 0; padding-left: 18px; display: grid; gap: 4px; }
+.impact-full { border-left-color: var(--bad); background: var(--bad-bg); }
+.impact-full h4 { color: var(--bad); font-size: 17px; }
+.impact-rolling { border-left-color: var(--info); background: var(--info-bg); }
+.impact-warn { border-left-color: var(--warn); background: var(--warn-bg); }
+.impact-ok { border-left-color: var(--ok); background: var(--ok-bg); }
+.stage-rows { display: grid; gap: 8px; }
+.stage-row { display: grid; grid-template-columns: minmax(170px, 240px) minmax(0, 1fr); gap: 8px; align-items: center; padding: 4px 6px; border-radius: 6px; }
+.stage-row.current { background: var(--bg); }
+.stage-node { overflow-wrap: anywhere; }
+.stage-flow { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.stage-flow li { display: flex; align-items: center; gap: 4px; }
+.stage-flow li + li::before { content: "→"; color: var(--muted); }
+.stage { display: inline-block; padding: 2px 8px; border: 1px solid var(--border); border-radius: 12px; font-size: 12px; color: var(--muted); background: var(--surface); }
+.stage.done { color: var(--ok); border-color: var(--ok); background: var(--ok-bg); }
+.stage.now { color: var(--info); border-color: var(--info); background: var(--info-bg); font-weight: 600; }
+.stage.failed { color: var(--bad); border-color: var(--bad); background: var(--bad-bg); font-weight: 600; }
+.stage.skipped { border-style: dashed; }
+.plan-differences summary, .plan-options summary, .change-run details summary { cursor: pointer; font-weight: 600; }
+.plan-numbers { grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); align-items: end; }
+.plan-numbers label.check { grid-column: 1 / -1; }
+.plan-entry { align-items: center; margin-top: 8px; }
+.pending-bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between; }
+button.danger:not(.primary) { color: var(--bad); border-color: var(--bad); }
+.change-actions { display: grid; gap: 8px; padding: 10px 12px; background: var(--bg); border-radius: 8px; }
+.change-actions > div { display: grid; grid-template-columns: minmax(150px, max-content) minmax(0, 1fr); gap: 10px; align-items: center; }
+.change-actions > div > button { justify-self: stretch; }
+button.change-now { font-weight: 600; color: var(--info); border-color: var(--info); }
+button.change-now.state-stopped { color: var(--bad); border-color: var(--bad); }
+button.change-now.state-paused { color: var(--warn); border-color: var(--warn); }
+.node-controls { margin-bottom: 14px; }
+.node-control { padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); display: grid; gap: 6px; }
+.node-control-main { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.node-control-buttons { margin-left: auto; }
+@media (max-width: 760px) {
+  .stage-row { grid-template-columns: minmax(0, 1fr); }
+  .change-actions > div { grid-template-columns: minmax(0, 1fr); gap: 4px; }
+  .plan-close { margin-left: 0; }
+  .node-control-buttons { margin-left: 0; }
+  .svc-summary { flex-wrap: wrap; }
+  .svc-summary-main { flex: 1 1 100%; }
+  .svc-summary-actions { flex-wrap: wrap; }
+}

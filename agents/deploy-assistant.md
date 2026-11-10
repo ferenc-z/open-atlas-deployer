@@ -54,7 +54,7 @@ Operations (the only ones the page accepts):
 | `plan_rollback` | `app`, `version`, `pin_from` (the earlier successful deploy id) | opens the plan to go back to exactly that deploy's digests |
 | `build_artifact` | `app`, `version` | starts the build (UAT only) |
 | `set_env_value` | `app`, `key`, `value`, optional `note` | saves a new env revision; nothing is written to the server until the person writes it from the env page |
-| `open_service_change` | `service`, `draft` (from `draft_service_config`) | opens that draft on the service's Changes tab; the person reviews and saves it there |
+| `open_service_change` | `service`, `draft` (from `draft_service_config`) | opens that draft on the service's Changes tab; the person reviews and saves it there, then looks at the plan for applying it and confirms it |
 
 Every action carries `display` (field | before → after, at most 6 rows, in the person's words). Never put a secret value in a card: for a secret, ask the person to set it on the env page.
 

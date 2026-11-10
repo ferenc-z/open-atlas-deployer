@@ -36,6 +36,7 @@ import { configView } from "./services/configview.ts";
 import { catalogFor, profile as profileById, profileFor, PROFILES } from "./services/profiles.ts";
 import type { ConfigReviewer } from "./services/configreview.ts";
 import { checkConfig, openMembers } from "./services/configcheck.ts";
+import { filterStartEnvironment } from "./services/draft.ts";
 import { ChangeError, changeView as serviceChangeView, checkContextOf, planView, ServiceChanges } from "./services/changes.ts";
 import { adoptedBody, DriftError, hasDrifted, liveDifferences, readLive, serviceDrift, type LiveReadOptions } from "./services/configdrift.ts";
 import { installKey, type DraftItem } from "./services/draft.ts";
@@ -848,6 +849,50 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     const member = c.req.query("member") || undefined;
     if (member && ![...to.body.members, ...(from?.body.members ?? [])].some((m) => installKey(m) === member)) return reject(c, 404, "config/unknown-member", `${member} is not a member of ${cfg.id}.`);
     return c.json({ service: cfg.id, from: from?.revision ?? null, to: to.revision, members: fileDiffs(from?.body.members ?? [], to.body.members, cfg.box, member) });
+  });
+  // §16.3: "back to revision N": its files saved as the newest revision, then applied like any other. Nothing on the hosts
+  // changes here. Files the newest already has make no new revision. Not reviewed by the AI: these files have been kept before.
+  api.post("/api/services/:id/config/rollback", async (c) => {
+    const p = await configEditor(c);
+    if (p instanceof Response) return p;
+    const cfg = configOf(c);
+    if (cfg instanceof Response) return cfg;
+    const body = await c.req.json().catch(() => ({})) as { revision?: unknown; note?: unknown };
+    if (!Number.isInteger(body.revision)) return reject(c, 400, "config-rollback/invalid", "Give the revision to go back to.");
+    const target = store.serviceConfig(cfg.id, body.revision as number);
+    if (!target) return reject(c, 404, "service-config/none", `No revision ${String(body.revision)} of ${cfg.id}.`);
+    if (sameFiles(target.body.members, cfg.latest.body.members)) return c.json({ revision: cfg.latest.revision, saved: false, findings: [] });
+    const context = checkContext(cfg.service);
+    const findings = context.profile ? checkConfig({ ...context, profile: context.profile, members: openMembers(target.body.members, cfg.box), base: openMembers(cfg.latest.body.members, cfg.box) }).findings : [];
+    try {
+      const revision = store.saveServiceConfigRollback(cfg.id, { from: target.revision, base: cfg.latest.revision, body: target.body, findings, note: noteOf(body.note) }, actorOf(p));
+      return c.json({ revision, saved: true, findings }, 201);
+    } catch (error) {
+      if (error instanceof StoreError) return reject(c, 409, error.code, error.message);
+      throw error;
+    }
+  });
+  // §16.3: how a member is started when it has not been seen running: what `stop` would otherwise have read from the process.
+  // An admin's browser session only: it runs as the service user. The same filter as at takeover; values do not come back.
+  api.put("/api/services/:id/members/:member/start", async (c) => {
+    const p = await authenticate(c, "admin");
+    if (p instanceof Response) return p;
+    if (isKey(p)) return reject(c, 403, "auth/browser-only", "A start environment is set only from a browser session, not with API keys.");
+    const id = c.req.param("id")!, member = c.req.param("member")!;
+    const service = registeredService(id);
+    if (!service) return reject(c, 404, "service/unknown", `No standalone instance or cluster ${id}.`);
+    const m = serviceMembers(service).find((x) => installKey(x) === member);
+    if (!m) return reject(c, 404, "config/unknown-member", `${member} is not a member of ${id}.`);
+    const holding = store.activeServiceChange(id);
+    if (holding) return reject(c, 409, "service-change/active", `Change ${holding.id} is ${holding.state}: set this when it has ended.`);
+    const body = await c.req.json().catch(() => ({})) as { environment?: unknown };
+    const given = body.environment;
+    if (!given || typeof given !== "object" || Array.isArray(given) || Object.values(given).some((v) => typeof v !== "string")) return reject(c, 400, "member-start/invalid", "environment is names to strings; {} forgets what is kept.");
+    const { kept, dropped } = filterStartEnvironment(given as Record<string, unknown>);
+    const names = Object.keys(kept ?? {}).sort();
+    store.setServiceMemberStart(id, member, names.length ? kept : null, m.startLimits ?? null);
+    store.audit(actorOf(p), "service.member-start", `${id}/${member}`, { names, dropped });
+    return c.json({ kept: names, dropped });
   });
   api.post("/api/services/:id/config/reveal", async (c) => {
     const p = await authenticate(c, "admin");

@@ -20,7 +20,7 @@ import { Handoff, hostIds, type ExecutorInfo } from "../src/server/handoff.ts";
 import type { Keys } from "../src/server/keys.ts";
 import { Observer } from "../src/server/observe.ts";
 import { SecretBox } from "../src/server/secretbox.ts";
-import { INTERRUPTED, nowStages, ServiceChanges, stagesFor } from "../src/server/services/changes.ts";
+import { INTERRUPTED, longestSeconds, nowStages, ServiceChanges, stagesFor } from "../src/server/services/changes.ts";
 import { sealFile, type ConfigMember, type ServiceConfigBody } from "../src/server/services/config.ts";
 import type { DraftCluster, DraftStandalone } from "../src/server/services/draft.ts";
 import { ingest } from "../src/server/services/metrics.ts";
@@ -1652,4 +1652,91 @@ test("full: the rules leave every member and the cluster alone while it runs, an
   check(t.store, () => online, "flow", new Date(t.now.t));
   assert.ok(rule().includes("no-coordinator *"));
   assert.ok(!t.store.serviceEvents("flow", { from: before }).some((e) => e.kind === "process-restarted" || e.kind === "node-disconnected"), "the timeline has the change's steps");
+});
+
+test("back to a revision: its files saved as the newest with source rollback, changing nothing on the hosts, and applied like any other", async () => {
+  const t = setup();
+  takenOver(t);
+  const rev = await revision(t, "solo");
+  const before = t.store.serviceConfig("solo", 1)!.body.members[0]!.files.map((f) => f.sha256);
+  const post = (who: { as?: string; key?: string }, body: unknown) => t.call("POST", "/api/services/solo/config/rollback", who, body);
+  assert.equal((await post({ as: "viewer" }, { revision: 1 })).status, 403);
+  assert.equal((await post({ as: "uat" }, {})).status, 400);
+  assert.equal((await post({ as: "uat" }, { revision: 99 })).status, 404);
+  const applied = await begin(t, "solo", { kind: "apply", revision: rev });
+  assert.equal((await drive(t, "solo", applied)).state, "succeeded");
+  const hostHad = t.w.nodes.get(SOLO)!.files.get("nifi.properties");
+
+  const out = await post({ as: "uat" }, { revision: 1, note: "that banner was wrong" });
+  assert.equal(out.status, 201, await out.clone().text());
+  const back = await out.json();
+  assert.equal(back.revision, rev + 1);
+  assert.equal(back.saved, true);
+  const kept = t.store.serviceConfig("solo")!;
+  assert.equal(kept.source, "rollback");
+  assert.equal(kept.note, "that banner was wrong");
+  assert.deepEqual(kept.body.members[0]!.files.map((f) => f.sha256), before, "the very files of revision 1");
+  assert.ok(t.store.serviceEvents("solo").some((e) => e.kind === "config-saved" && String((e.detail as { text?: unknown }).text).includes("back to revision 1")));
+  assert.equal(t.w.nodes.get(SOLO)!.files.get("nifi.properties"), hostHad, "nothing changes on the host");
+
+  const again = await post({ as: "uat" }, { revision: 1 });
+  assert.deepEqual([again.status, (await again.json()).saved], [200, false], "the newest already has those files");
+  assert.equal(t.store.serviceConfig("solo")!.revision, rev + 1);
+
+  const id = await begin(t, "solo", { kind: "apply" });
+  const c = await drive(t, "solo", id);
+  assert.equal(c.state, "succeeded");
+  assert.equal(c.revision, rev + 1);
+  assert.equal(t.w.nodes.get(SOLO)!.files.get("nifi.properties"), before[0], "and applying puts them back");
+});
+
+test("a member's start environment: an admin in a browser, through the takeover's filter, and only the names come back", async () => {
+  const t = setup();
+  takenOver(t);
+  const path = (m: string) => `/api/services/flow/members/${encodeURIComponent(m)}/start`;
+  const given = { environment: { JAVA_HOME: "/new", NIFI_DB_PASSWORD: "s3cret-value" } };
+  assert.equal((await t.call("PUT", path(A), { as: "uat" }, given)).status, 403);
+  assert.equal((await t.call("PUT", path(A), { key: "dpk_uat" }, given)).status, 403);
+  assert.equal((await t.call("PUT", path("local:/nowhere"), { as: "admin" }, given)).status, 404);
+  assert.equal((await t.call("PUT", path(A), { as: "admin" }, { environment: { JAVA_HOME: 1 } })).status, 400);
+  const out = await t.call("PUT", path(A), { as: "admin" }, given);
+  assert.equal(out.status, 200, await out.clone().text());
+  assert.deepEqual(await out.json(), { kept: ["JAVA_HOME"], dropped: ["NIFI_DB_PASSWORD"] });
+  const status = await (await t.call("GET", "/api/services/flow/status", { as: "viewer" })).text();
+  assert.ok(!status.includes("/new") && !status.includes("s3cret-value"), "no value in the status");
+  assert.deepEqual(JSON.parse(status).members.find((m: { key: string }) => m.key === A).startEnvironment, ["JAVA_HOME"]);
+  assert.equal(t.store.clusters().find((c) => c.id === "flow")!.nodes.find((n) => n.installDir === "/opt/a")!.startEnvironment!.JAVA_HOME, "/new");
+
+  t.w.held.add("stop");
+  const id = await begin(t, "flow", { kind: "stop", members: [B] });
+  assert.ok(id);
+  assert.equal((await t.call("PUT", path(A), { as: "admin" }, given)).status, 409, "not while a change holds the service");
+  t.w.held.clear();
+  assert.equal((await act(t, "flow", id, "stop")).status, 200);
+  assert.equal((await act(t, "flow", id, "close")).status, 200);
+  const forgot = await t.call("PUT", path(A), { as: "admin" }, { environment: {} });
+  assert.deepEqual(await forgot.json(), { kept: [], dropped: [] });
+  assert.equal(t.store.clusters().find((c) => c.id === "flow")!.nodes.find((n) => n.installDir === "/opt/a")!.startEnvironment, null);
+});
+
+test("how long a plan can take is shown with it: a whole cluster's outage, or a rolling change's steps added up; a change that stopped names the process it would kill", async () => {
+  const t = setup();
+  const { rev } = await fullChange(t);
+  const full = await planOf(t, "flow", { kind: "apply", revision: rev });
+  const o = full.options.timeouts;
+  assert.equal(full.mode, "full");
+  assert.equal(full.longestSeconds, 3 * o.stop + 2 * o.write + o.gate + o.start + o.compose);
+  const rolling = await planOf(t, "flow", { kind: "rolling-restart" });
+  const d = rolling.options.timeouts;
+  assert.equal(rolling.longestSeconds, 3 * (d.disconnect + d.stop + d.start + d.rest + d.connect + d.stable));
+  assert.equal(longestSeconds({ mode: "rolling", members: [], options: rolling.options }), 0);
+
+  const n = t.w.nodes.get(B)!;
+  t.w.failing.set(`stop ${B}`, { state: "failed", message: "still running", result: { stillRunning: true, process: { pid: n.pid, startedAt: n.startedAt } } });
+  const id = await begin(t, "flow", { kind: "stop", members: [B] });
+  await drive(t, "flow", id);
+  const seen = await (await t.call("GET", `/api/services/flow/changes/${id}`, { as: "viewer" })).json();
+  assert.equal(seen.state, "stopped");
+  assert.equal(seen.progress.canForceKill, true);
+  assert.deepEqual(seen.progress.stuck, { pid: n.pid, startedAt: n.startedAt });
 });

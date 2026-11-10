@@ -8,7 +8,7 @@ import { useCallback, useEffect, useState, type ReactNode } from "react";
 import * as api from "./api.ts";
 import type { Field, MemberStatus, MetricsView, Range, ServiceBulletin, ServiceConfigView, ServiceStatus } from "./api.ts";
 import { LineChart, type Series } from "./Charts.tsx";
-import { ServiceChanges, useDrafts, type Drafts } from "./ServiceChanges.tsx";
+import { memberName, ServiceChanges, useChanges, useDrafts, type ChangeDesk, type Drafts } from "./ServiceChanges.tsx";
 import { ServiceConfig } from "./ServiceConfig.tsx";
 import { Logs } from "./Logs.tsx";
 import { FlowFileTrace } from "./Trace.tsx";
@@ -16,7 +16,7 @@ import { NginxAddress } from "./Nginx.tsx";
 import { AlertBadge, EventsAndAlerts, OpenAlerts, Timeline } from "./Alerts.tsx";
 import { ago, CertBadge, certTone, ConfCell, daysLeft, daysText, fmtBytes, fmtNumber, memberKey, serviceName, SEVERITY, STATE, StatusNotes, UpBadge, webPort, when } from "./svc.tsx";
 
-type Loaded = { s: ServiceStatus; cfg: ServiceConfigView | null | undefined; reload: () => void; drafts: Drafts; saved: () => void; open: (tab: string) => void };
+type Loaded = { s: ServiceStatus; cfg: ServiceConfigView | null | undefined; reload: () => void; drafts: Drafts; desk: ChangeDesk; saved: () => void; open: (tab: string) => void };
 type Tab = { id: string; label: string; shown: (l: Loaded) => boolean; render: (l: Loaded) => ReactNode };
 
 const TABS: Tab[] = [
@@ -25,9 +25,9 @@ const TABS: Tab[] = [
   { id: "logs", label: "Logs", shown: (l) => l.s.members.length > 0, render: (l) => <Logs s={l.s} /> },
   { id: "trace", label: "FlowFile trace", shown: (l) => l.s.members.length > 0, render: (l) => <FlowFileTrace s={l.s} /> },
   { id: "events", label: "Events and alerts", shown: () => true, render: (l) => <EventsAndAlerts s={l.s} /> },
-  { id: "nodes", label: "Nodes", shown: () => true, render: (l) => <Nodes s={l.s} /> },
+  { id: "nodes", label: "Nodes", shown: () => true, render: (l) => <Nodes {...l} /> },
   { id: "configuration", label: "Configuration", shown: () => true, render: (l) => <ServiceConfig cfg={l.cfg} status={l.s} drafts={l.drafts} onReview={() => l.open("changes")} /> },
-  { id: "changes", label: "Changes", shown: (l) => Boolean(l.cfg), render: (l) => <ServiceChanges s={l.s} cfg={l.cfg!} drafts={l.drafts} onSaved={l.saved} onEdit={() => l.open("configuration")} /> },
+  { id: "changes", label: "Changes", shown: (l) => Boolean(l.cfg), render: (l) => <ServiceChanges s={l.s} cfg={l.cfg!} drafts={l.drafts} desk={l.desk} onSaved={l.saved} onEdit={() => l.open("configuration")} onLogs={() => l.open("logs")} /> },
 ];
 
 /** How a member is named on the charts: a node by address and port, a standalone by host. */
@@ -43,10 +43,13 @@ export function ServiceDetail({ id, initialDraft, onBack }: { id: string; initia
   const loadCfg = useCallback(() => { api.serviceConfig(id).then(setCfg, () => setCfg(null)); }, [id]);
   useEffect(loadCfg, [loadCfg]);
   const drafts = useDrafts(id, initialDraft);
+  const desk0 = useChanges(id, () => { loadCfg(); load(); });
+  // Asking for a plan shows it, from wherever it was asked.
+  const desk: ChangeDesk = { ...desk0, plan: (request) => { desk0.plan(request); setTab("changes"); } };
   const back = <button className="link" onClick={onBack}>← Services</button>;
   if (!s) return <>{back}{error ? <p className="error">{error}</p> : <p className="muted">Loading…</p>}</>;
   const cluster = s.kind === "cluster";
-  const loaded = { s, cfg, reload: load, drafts, open: setTab, saved: () => { loadCfg(); load(); drafts.refresh(); } };
+  const loaded = { s, cfg, reload: load, drafts, desk, open: setTab, saved: () => { loadCfg(); load(); drafts.refresh(); } };
   const tabs = TABS.filter((t) => t.shown(loaded));
   const driftCount = s.members.reduce((n, m) => n + m.configDrift.length, 0);
   const current = tabs.find((t) => t.id === tab) ?? tabs[0]!;
@@ -76,11 +79,13 @@ export function ServiceDetail({ id, initialDraft, onBack }: { id: string; initia
           </div>
         </div>
         <div className="svc-summary-actions">
+          {desk.active ? <button className={`change-now state-${desk.active.state}`} onClick={() => setTab("changes")} title="Open the change on the Changes tab">Change {desk.active.state}{desk.active.mode !== "full" && desk.active.plan.members.length > 1 ? ` · ${desk.active.progress.done.length}/${desk.active.plan.members.length} nodes` : ""}</button>
+            : cfg?.canDraft && <button onClick={() => desk.plan({ kind: cluster ? "rolling-restart" : "restart" })} title={cluster ? "Restart every node, one at a time. Shows the plan first." : "Stop and start NiFi. Shows the plan first."}>{cluster ? "Rolling restart" : "Restart"}</button>}
           {s.webUrl && <a className="button" href={s.webUrl} target="_blank" rel="noreferrer" title={s.webUrl}>NiFi UI ↗</a>}
         </div>
       </section>
       <div className="subtabs" role="tablist">
-        {tabs.map((t) => <button key={t.id} role="tab" aria-selected={t.id === current.id} className={t.id === current.id ? "active" : ""} onClick={() => setTab(t.id)}>{t.label}{t.id === "changes" && driftCount > 0 && <span className="badge warn" title="Files on the hosts are not what is kept">{driftCount}</span>}</button>)}
+        {tabs.map((t) => <button key={t.id} role="tab" aria-selected={t.id === current.id} className={t.id === current.id ? "active" : ""} onClick={() => setTab(t.id)}>{t.label}{t.id === "changes" && driftCount > 0 && <span className="badge warn" title="Files on the hosts are not what is kept">{driftCount}</span>}{t.id === "changes" && desk.active && <span className={`badge ${desk.active.state === "running" ? "info" : "bad"}`}>{desk.active.state}</span>}</button>)}
       </div>
       {current.render(loaded)}
     </>
@@ -291,11 +296,74 @@ function Metrics({ s }: { s: ServiceStatus }) {
   );
 }
 
-function Nodes({ s }: { s: ServiceStatus }) {
+/** Starting and stopping one node or installation (§8): each button shows a plan first. An admin says what it starts with if that is not known. */
+function NodeControls({ s, cfg, desk, reload }: Pick<Loaded, "s" | "cfg" | "desk" | "reload">) {
+  const [editing, setEditing] = useState<string | null>(null);
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState<{ member: string; ok: string; dropped: string[] } | null>(null);
+  const [error, setError] = useState("");
+  const cluster = s.kind === "cluster";
+  const canAct = Boolean(cfg?.canDraft) && !desk.active;
+  const save = async (member: string) => {
+    const environment: Record<string, string> = {};
+    for (const line of text.split("\n").map((x) => x.trim()).filter(Boolean)) {
+      const at = line.indexOf("=");
+      if (at < 1) { setError(`Not NAME=value: ${line.slice(0, 40)}`); return; }
+      environment[line.slice(0, at).trim()] = line.slice(at + 1);
+    }
+    setBusy(true); setError("");
+    try {
+      const out = await api.setMemberStart(s.id, member, environment);
+      setNote({ member, ok: out.kept.join(", "), dropped: out.dropped });
+      setEditing(null); setText("");
+      reload();
+    } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
+  };
+  return (
+    <div className="panel node-controls">
+      <h3>Start and stop</h3>
+      <p className="muted small">Each button shows a plan first; nothing happens until you confirm it. {cluster ? "One node at a time: the others keep running. To restart them all, use Rolling restart at the top of the page." : ""}{desk.active ? ` Change ${desk.active.id} holds this service for now.` : ""}</p>
+      {s.members.map((m) => {
+        const request = { members: [m.key] };
+        return (
+          <div key={m.key} className="node-control">
+            <div className="node-control-main">
+              <span className="mono">{cluster ? memberName(s, m.key) : m.host}</span>
+              <StateBadge m={m} />
+              {m.live?.pid ? <span className="muted small">pid {m.live.pid}</span> : null}
+              {canAct && <div className="row node-control-buttons">
+                {m.state !== "running" && <button onClick={() => desk.plan({ kind: "start", ...request })}>Start</button>}
+                {m.state !== "stopped" && <button onClick={() => desk.plan({ kind: "restart", ...request })}>Restart</button>}
+                {m.state !== "stopped" && <button onClick={() => desk.plan({ kind: "stop", ...request })}>Stop</button>}
+              </div>}
+            </div>
+            <div className="small">
+              <span className="muted">Starts with: </span>
+              {m.startEnvironment?.length ? <span className="mono">{m.startEnvironment.join(", ")}</span> : <span className="muted">no known environment, only what NiFi's own scripts set</span>}
+              {cfg?.canReveal && !desk.active && editing !== m.key && <> · <button className="link" onClick={() => { setEditing(m.key); setText(""); setError(""); setNote(null); }}>{m.startEnvironment?.length ? "Replace" : "Set"}</button></>}
+            </div>
+            {note?.member === m.key && <p className="small ok">Kept: {note.ok || "nothing"}.{note.dropped.length > 0 && <span className="error"> Left out: {note.dropped.join(", ")}.</span>}</p>}
+            {editing === m.key && <div className="plan">
+              <label className="field">Start environment<textarea rows={4} className="mono" value={text} onChange={(e) => setText(e.target.value)} placeholder={"JAVA_HOME=/usr/lib/jvm/java-21\nNIFI_HOME=/opt/nifi"} />
+                <span className="muted small">One NAME=value a line. Needed only for a NiFi the Deployer has never seen running: each time it stops a running NiFi, it reads this from the process instead and replaces what you enter. Only the names NiFi needs are kept and anything that looks like a secret is left out; the values are not shown again. Empty forgets what is kept.</span></label>
+              <div className="row"><button className="primary" onClick={() => void save(m.key)} disabled={busy}>Save</button><button onClick={() => setEditing(null)}>Cancel</button></div>
+            </div>}
+          </div>
+        );
+      })}
+      {error && <p className="error">{error}</p>}
+    </div>
+  );
+}
+
+function Nodes({ s, cfg, desk, reload }: Loaded) {
   const cluster = s.kind === "cluster";
   const soonest = (m: MemberStatus) => s.certs.filter((c) => c.member === m.key && c.notAfter).sort((a, b) => (a.notAfter! < b.notAfter! ? -1 : 1))[0];
   const unread = (m: MemberStatus) => s.certs.filter((c) => c.member === m.key && c.error).length;
   return (
+    <>
+    <NodeControls s={s} cfg={cfg} desk={desk} reload={reload} />
     <table>
       <thead><tr><th>Host</th><th>Install directory</th><th>Conf directory</th>{cluster && <th>Node address</th>}<th>User</th><th>Ports</th><th>Service executor</th><th>State</th><th>Certificate</th><th>As of</th></tr></thead>
       <tbody>
@@ -319,5 +387,6 @@ function Nodes({ s }: { s: ServiceStatus }) {
         })}
       </tbody>
     </table>
+    </>
   );
 }

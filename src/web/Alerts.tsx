@@ -43,6 +43,10 @@ const KIND: Record<string, { label: string; tone: string }> = {
   "process-restarted": { label: "Restarted", tone: "info" }, "version-changed": { label: "Version", tone: "warn" },
   "drift-detected": { label: "Drift", tone: "warn" }, "drift-resolved": { label: "Drift gone", tone: "ok" },
   "taken-over": { label: "Taken over", tone: "info" }, "config-imported": { label: "Configuration", tone: "info" }, thresholds: { label: "Thresholds", tone: "muted" },
+  "config-saved": { label: "Revision saved", tone: "info" }, "config-applied": { label: "Applied", tone: "ok" }, "config-rolled-back": { label: "Rolled back", tone: "warn" },
+  "node-stopped": { label: "Stopped", tone: "warn" }, "node-started": { label: "Started", tone: "info" },
+  "change-started": { label: "Change", tone: "info" }, "change-finished": { label: "Change ended", tone: "info" }, "change-stopped": { label: "Change stopped", tone: "bad" },
+  "change-paused": { label: "Change paused", tone: "warn" }, "change-resumed": { label: "Change continued", tone: "info" },
 };
 
 /** The timeline, newest first: alerts opening and closing next to restarts, connections, configuration and takeover. */

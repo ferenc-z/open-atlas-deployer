@@ -53,6 +53,8 @@ export interface MemberStatus {
   confDir: string;
   nodeAddress?: string | null;
   serviceUser: string | null;
+  /** The names in the start environment (§16.3), null when none is known. The values stay out of here: only `svc-control` gets them. */
+  startEnvironment: string[] | null;
   ports: ServicePorts;
   executor: { online: boolean; reason?: string; version?: string; ageSeconds?: number };
   /** Files whose newest revision is not what this member should have now (§16.3 "pending"): saved, not applied yet. */
@@ -221,7 +223,7 @@ export function serviceStatus(store: Store, executor: (host: string) => Executor
     } else if (d) { state = !found ? "not-found" : found.running ? "running" : "stopped"; source = "discovery"; asOf = d.at; }
     else { state = "unknown"; source = "none"; asOf = null; }
     return {
-      key: installKey(m), host: m.host, installDir: m.installDir, confDir: confDirOf(m), ...(m.nodeAddress !== undefined ? { nodeAddress: m.nodeAddress } : {}), serviceUser: m.serviceUser, ports: m.ports,
+      key: installKey(m), host: m.host, installDir: m.installDir, confDir: confDirOf(m), ...(m.nodeAddress !== undefined ? { nodeAddress: m.nodeAddress } : {}), serviceUser: m.serviceUser, startEnvironment: m.startEnvironment ? Object.keys(m.startEnvironment).sort() : null, ports: m.ports,
       executor: { online: e.online, ...(e.reason ? { reason: e.reason } : {}), ...(e.heartbeat?.version ? { version: e.heartbeat.version } : {}), ...(e.ageSeconds !== undefined ? { ageSeconds: e.ageSeconds } : {}) },
       configPending: pendingOf(installKey(m)),
       configDrift: memberFiles.filter((f) => f.member === installKey(m) && hasDrifted(f)).map((f) => f.file),

@@ -1297,6 +1297,20 @@ export class Store {
     });
   }
 
+  /** §16.3: an earlier revision's files saved again as the newest ("back to revision N"). Nothing on the hosts changes: it is applied like any other. */
+  saveServiceConfigRollback(service: string, r: { from: number; base: number; body: ServiceConfigBody; findings: ConfigFinding[]; note: string | null }, actor: Actor): number {
+    return this.inTransaction(() => {
+      const latest = (this.db.prepare("SELECT MAX(revision) AS n FROM service_configs WHERE service = ?").get(service) as Row).n as number | null;
+      if (latest !== r.base) throw new StoreError("config-rollback/stale", `The configuration of ${service} is at revision ${latest} now: look again.`);
+      const at = this.stamp(), revision = latest + 1;
+      this.db.prepare("INSERT INTO service_configs (service, revision, body, source, saved_at, saved_by, via, note, base, findings) VALUES (?, ?, ?, 'rollback', ?, ?, ?, ?, ?, ?)")
+        .run(service, revision, JSON.stringify(r.body), at, actor.id, actor.via, r.note, latest, JSON.stringify(r.findings));
+      this.insertServiceEvent({ service, member: null, at, kind: "config-saved", detail: { text: `Configuration revision ${revision} saved: back to revision ${r.from}${r.note ? `: ${r.note}` : ""}`, by: actor.id, revision } });
+      this.insertAudit(actor, "service.config-rollback", `${service}#${revision}`, { from: r.from, base: latest });
+      return revision;
+    });
+  }
+
   /** The AI review of a revision (§16.3): written when it starts and when its session ends, not an edit of the revision. */
   setServiceConfigReview(service: string, revision: number, review: ConfigReview) {
     this.db.prepare("UPDATE service_configs SET review = ? WHERE service = ? AND revision = ?").run(JSON.stringify(review), service, revision);

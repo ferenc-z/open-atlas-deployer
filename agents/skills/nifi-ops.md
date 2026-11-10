@@ -22,7 +22,7 @@ How to look into the NiFi clusters and standalone instances the Deployer manages
 | Configuration | `get_service_config {id, member?, file?}` | the files as kept; secrets read `(hidden)` |
 | Nodes disagree? | `diff_service_config {id}` | only differences; error = must agree, warning = should, info = per node by design |
 | What changed between two revisions | `diff_service_config {id, from?, to?, member?}` | either one is enough: `to` alone compares it with the revision it came from; a changed secret is only named |
-| Does the server still have what is kept? | `get_service_drift {id}`, then `{id, member}` for the changed lines | `known: false`: some member cannot tell (its `reason` says why); never read that as "no drift". A person adopts a drifted file on the Changes tab; overwriting the host is not there yet |
+| Does the server still have what is kept? | `get_service_drift {id}`, then `{id, member}` for the changed lines | `known: false`: some member cannot tell (its `reason` says why); never read that as "no drift". A person adopts a drifted file, or writes back what is kept, on the Changes tab |
 | Was it applied or restarted from here? | `list_service_changes {id}`, `get_service_change {id, change}` | `active` holds the service while it runs or waits for a person (`stopped`: read `message`). Changes made by hand on the host are not listed: say you do not know about those |
 | Where did a FlowFile go, where did it stop? | `search_provenance {id, uuid or field+value, from, to}` → `get_lineage {id, uuid, node?}` → `get_provenance_event {id, eventId, node?}` | NiFi provenance (the FlowFile trace); a time range is required, keep it tight; on a cluster pass the event's `clusterNodeId` as `node` for lineage and event |
 | What a property means, its default, restart needed? | `lookup_property {service, key}` or `{version, q}` | answer by the service's version; `otherVersions` = the key exists in another version only |
@@ -62,7 +62,7 @@ How to look into the NiFi clusters and standalone instances the Deployer manages
 ```
 ````
 
-`draft_service_config` refuses secrets (`config/secret-by-person`) and drafts nothing, so leave them out and draft the rest. Tell the person which key to enter themselves on the Configuration tab. Saving and applying are only on the page; applying a revision is not there yet, so do not promise it.
+`draft_service_config` refuses secrets (`config/secret-by-person`) and drafts nothing, so leave them out and draft the rest. Tell the person which key to enter themselves on the Configuration tab. Saving and applying are only on the page: the person saves the draft as a revision on the Changes tab, then looks at the plan for applying it and confirms it there. You do neither.
 
 ## Rules
 

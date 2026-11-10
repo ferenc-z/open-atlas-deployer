@@ -34,7 +34,7 @@ export async function runHostOperation(operation: string, payload: Payload, acti
       return { ok: false, outcome: (error as Error).message };
     }
     actions.openServiceChange(service, draft);
-    return { ok: true, outcome: `Opened draft ${draft} of ${service} on its Changes tab: nothing is saved or applied until it is reviewed and saved there` };
+    return { ok: true, outcome: `Opened draft ${draft} of ${service} on its Changes tab: nothing is saved until it is reviewed there, and nothing reaches a host until a plan for applying it is confirmed` };
   }
   if (!app) return { ok: false, outcome: "The card has no app" };
   try {
