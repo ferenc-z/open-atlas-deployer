@@ -2593,12 +2593,17 @@ FAKE_NIFI_PROCESS = """import os, pathlib, subprocess, sys, time
 main = "org.apache.nifi.NiFi" in sys.argv
 config = next(a.split("=", 1)[1] for a in sys.argv if a.startswith(("-Dnifi.properties.file.path=", "-Dorg.apache.nifi.bootstrap.config.file=")))
 home = pathlib.Path(config).parent.parent
-(home / ("main.pid" if main else "boot.pid")).write_text(str(os.getpid()))
 if main:
     time.sleep(120)
 else:
-    p = subprocess.Popen([sys.executable, __file__, "-classpath", f"{home}/lib/nifi-runtime.jar", f"-Dnifi.properties.file.path={home}/conf/nifi.properties", "org.apache.nifi.NiFi"])
-    p.wait()
+    (home / "boot.pid").write_text(str(os.getpid()))
+    # main.pid is written before the exec: svc-control sees the "JVM" by its command line, so the file has to be there by
+    # then (a cold Python wrote it too late: the test read no pid, and kill_all left the process in the temporary dir).
+    pid = os.fork()
+    if pid == 0:
+        (home / "main.pid").write_text(str(os.getpid()))
+        os.execv(sys.executable, [sys.executable, __file__, "-classpath", f"{home}/lib/nifi-runtime.jar", f"-Dnifi.properties.file.path={home}/conf/nifi.properties", "org.apache.nifi.NiFi"])
+    os.waitpid(pid, 0)
 """
 
 FAKE_NIFI_SH = """#!/bin/sh
