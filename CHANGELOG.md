@@ -26,6 +26,13 @@ logs, the AI's read-only tools, Studio's `nifi-ops` graph, the FlowFile trace). 
   the same `executor-v<version>` release, its own `install.sh` (no Docker check; runs as root or as a plain user, who
   then sees only their own processes). The deploy executor and the service executor share `executor_core.py`, and
   each release file is still one script (`bundle.py`), so a 0.7.x deploy executor upgrades as before.
+- Self-upgrade of the service executor: Hosts (next to the service executor) and Overview (a row for it beside the
+  deploy executor's, and "Upgrade outdated" takes it in) start it, `POST /api/hosts/:id/upgrade-executor` takes
+  `{executor: "deploy" | "service"}`. It goes through the service executor's own queue and release (its own
+  `EXECUTOR_UPGRADE_FROM`). It waits while a change on that host is running, paused or stopped; the deploy executor
+  is not held by changes. A self-upgrade does not update the systemd unit (see the `KillMode=process` note above).
+- The setup archive `open-atlas-deployer-setup-<version>.tar.gz` also holds the service executor
+  (`service-executor/`, its `install.sh`); `bootstrap.sh --service-executor` installs it, it is not installed by default.
 - A token belongs to one executor of a host; the heartbeat says which (`executor: deploy|service`) and a mismatch is
   refused. Deploy jobs never go to a service executor. The Hosts page shows the service executor, its version and
   whether it runs as root.

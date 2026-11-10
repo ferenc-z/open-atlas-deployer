@@ -908,29 +908,39 @@ test("the sealed queue: a write waiting has its content sealed, and it is droppe
   assert.equal(after, null);
 });
 
-test("while a change holds a service: no adopting, no upgrade of its host's executor or of the Deployer; stopped lets upgrades through", async () => {
+test("while a change holds a service: no adopting, no upgrade of its host's service executor (a stopped one too) or of the Deployer; the deploy executor is never held", async () => {
   const t = setup();
   takenOver(t);
-  const beat = () => t.handoff.heartbeat("local", { version: "0.1.0", protocols: [2], at: "", project: "", registries: [], databaseBackup: {}, busy: null, kinds: ["executor-upgrade", "deployer-upgrade"], upgradeFrom: "directory", deployer: { image: "x/deployer" } } as never);
+  const base = { version: "0.1.0", protocols: [2], at: "", project: "", registries: [], databaseBackup: {}, busy: null, upgradeFrom: "directory" };
+  const beat = () => {
+    t.handoff.heartbeat("local", { ...base, kinds: ["executor-upgrade", "deployer-upgrade"], deployer: { image: "x/deployer" } } as never);
+    t.handoff.heartbeat("local", { ...base, executor: "service", kinds: ["svc-discover", "executor-upgrade"] } as never, "service");
+  };
   const blocked = async () => {
     beat();
     const hosts = await (await t.call("GET", "/api/hosts", { as: "admin" })).json();
     const self = await (await t.call("GET", "/api/deployer", { as: "admin" })).json();
-    return { host: hosts.hosts[0].upgrade.blocked as string | undefined, self: self.blocked as string | undefined };
+    const h = hosts.hosts[0];
+    return { host: h.upgrade.blocked as string | undefined, service: h.serviceUpgrade.blocked as string | undefined, self: self.blocked as string | undefined };
   };
-  assert.deepEqual(await blocked(), { host: undefined, self: undefined });
+  assert.deepEqual(await blocked(), { host: undefined, service: undefined, self: undefined });
   t.w.held.add("start");
   const id = await begin(t, "flow", { kind: "rolling-restart" });
   await drive(t, "flow", id, () => t.w.calls.includes(`start ${B}`));
   const during = await blocked();
-  assert.match(during.host!, /in the middle of change/);
+  assert.equal(during.host, undefined, "the deploy executor touches no NiFi");
+  assert.match(during.service!, /in the middle of change \S+; upgrade when it ends/);
   assert.match(during.self!, /in progress/);
+  const refusedUpgrade = await t.call("POST", "/api/hosts/local/upgrade-executor", { as: "admin" }, { executor: "service" });
+  assert.deepEqual([refusedUpgrade.status, (await refusedUpgrade.json()).error], [409, "executor/upgrade-blocked"]);
   const adopt = await t.call("POST", "/api/services/flow/drift/adopt", { as: "uat" }, { member: B, file: "nifi.properties", sha256: "a".repeat(64) });
   assert.equal(adopt.status, 409);
   assert.equal((await adopt.json()).error, "drift/change-active");
 
   assert.equal((await drive(t, "flow", id)).state, "stopped");
-  assert.deepEqual(await blocked(), { host: undefined, self: undefined });
+  const stopped = await blocked();
+  assert.match(stopped.service!, /in the middle of change \S+ \(stopped\)/, "a stopped change still holds the service executor");
+  assert.deepEqual([stopped.host, stopped.self], [undefined, undefined], "the Deployer's own upgrade and the deploy executor are not held by it");
   assert.equal((await t.call("POST", "/api/services/flow/drift/adopt", { as: "uat" }, { member: B, file: "nifi.properties", sha256: "a".repeat(64) })).status, 409, "the files may be half way");
 });
 

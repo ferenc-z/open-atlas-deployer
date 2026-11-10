@@ -4,12 +4,14 @@
 
 import { useCallback, useEffect, useState } from "react";
 import * as api from "./api.ts";
-import type { DeployerPlan, PlatformView } from "./api.ts";
+import type { DeployerPlan, ExecutorKind, PlatformView } from "./api.ts";
 import { JobState } from "./Deploy.tsx";
 import { ask } from "./Confirm.tsx";
 
 const RELATION: Record<string, string> = { newer: "newer", older: "older (go back)", running: "running", unknown: "" };
 const active = (state?: string) => state === "queued" || state === "running";
+/** A batch names a host's deploy executor as "<host>" and its service executor as "<host>/service" (a stop message follows a colon). */
+const entryName = (s: string) => s.replace(/^([^\s:/]+)\/service\b/, "$1 (service executor)");
 
 export function Platform() {
   const [data, setData] = useState<PlatformView | undefined>();
@@ -113,10 +115,12 @@ function ExecutorRows({ data, onChanged }: { data: PlatformView; onChanged: () =
   const startable = data.executors.filter((e) => e.upgrade.available && !e.upgrade.blocked);
   const batch = data.batch;
   const batchRunning = Boolean(batch?.current);
-  const one = async (host: string, from: string | null) => {
-    if (!(await ask(`Upgrade the executor on ${host} from ${from} to ${data.shipped}? It takes the release from the host's own source and restarts; if the new version does not start, it goes back by itself.`, { confirm: "Upgrade" }))) return;
+  const one = async (host: string, from: string | null, kind: ExecutorKind) => {
+    const name = kind === "service" ? "service executor" : "executor";
+    const tail = kind === "service" ? " Services it started keep running." : "";
+    if (!(await ask(`Upgrade the ${name} on ${host} from ${from} to ${data.shipped}? It takes the release from the host's own source and restarts; if the new version does not start, it goes back by itself.${tail}`, { confirm: "Upgrade" }))) return;
     setError("");
-    api.upgradeExecutor(host).then(onChanged, (e: Error) => setError(e.message));
+    api.upgradeExecutor(host, kind).then(onChanged, (e: Error) => setError(e.message));
   };
   const all = async () => {
     if (!(await ask(`Upgrade ${startable.length} executors to ${data.shipped}, one host after the other? A failed host stops the rest.`, { confirm: "Upgrade all" }))) return;
@@ -132,7 +136,7 @@ function ExecutorRows({ data, onChanged }: { data: PlatformView; onChanged: () =
       </div>
       {batch && (batchRunning || batch.stopped) && !batch.finishedAt && (
         <p className={batch.stopped ? "banner warn" : "small muted"}>
-          {batchRunning ? `Upgrading one host after the other: ${batch.current!.host} now${batch.remaining.length ? `, then ${batch.remaining.join(", ")}` : ""}.` : `Stopped at ${batch.stopped}${batch.remaining.length ? `; not upgraded: ${batch.remaining.join(", ")}` : ""}.`}
+          {batchRunning ? `Upgrading one executor after the other: ${entryName(batch.current!.host)} now${batch.remaining.length ? `, then ${batch.remaining.map(entryName).join(", ")}` : ""}.` : `Stopped at ${entryName(batch.stopped!)}${batch.remaining.length ? `; not upgraded: ${batch.remaining.map(entryName).join(", ")}` : ""}.`}
         </p>
       )}
       <table className="executors">
@@ -141,18 +145,18 @@ function ExecutorRows({ data, onChanged }: { data: PlatformView; onChanged: () =
             const u = e.upgrade;
             const running = active(u.job?.state);
             return (
-              <tr key={e.host}>
-                <td className="mono">{e.host}</td>
+              <tr key={`${e.host}/${e.executor}`}>
+                <td className="mono">{e.host}{e.executor === "service" && <> <span className="badge info">Service executor</span></>}</td>
                 <td className="mono">{e.version ?? "—"}</td>
                 <td>
-                  {!e.online && <span className="badge bad">Offline</span>}
+                  {!e.online && !running && <span className="badge bad">Offline</span>}
                   {running && <><JobState state={u.job!.state} /> <span className="muted">upgrading to {u.job!.version}</span></>}
                   {!running && u.available && <span className="badge warn">{data.shipped} available</span>}
                   {!running && !u.available && e.online && <span className="badge ok">Up to date</span>}
                   {!running && u.job && u.job.state !== "succeeded" && u.job.version === data.shipped && <span className="small muted"> Last try: {u.job.message}</span>}
                   {!running && u.available && u.blocked && <div className="small muted">{u.blocked}</div>}
                 </td>
-                <td className="actions">{data.canUpgrade && !running && !batchRunning && u.available && !u.blocked && <button className="link" onClick={() => one(e.host, e.version)}>Upgrade</button>}</td>
+                <td className="actions">{data.canUpgrade && !running && !batchRunning && u.available && !u.blocked && <button className="link" onClick={() => one(e.host, e.version, e.executor)}>Upgrade</button>}</td>
               </tr>
             );
           })}

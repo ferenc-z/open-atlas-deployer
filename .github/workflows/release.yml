@@ -4,7 +4,8 @@
 #     "-", such as 0.1.0-rc.1, becomes a pre-release: shown there, never announced);
 #   - the executor's release executor-v<executor version> with its archive and SHA256SUMS, unless it already exists
 #     (executors upgrade from it; its version moves only when the executor changes);
-#   - the setup archive for a new host (bin/package-setup.sh), attached to the Deployer's release.
+#   - the setup archive for a new host (bin/package-setup.sh: bootstrap.sh, the Deployer's compose files and both
+#     executors), attached to the Deployer's release.
 # The tag must match package.json, and the executor version the Deployer offers (handoff.ts) must match the executor.
 name: release
 on:
@@ -103,4 +104,7 @@ jobs:
           [ "${{ steps.v.outputs.pre }}" = true ] && flags="--prerelease"
           # §15.6 ⑦: the setup archive for a new host (bootstrap.sh, the Deployer's compose files, the executor).
           sh bin/package-setup.sh dist/setup
+          # Both executors must be in it (the service executor's install.sh and its bundled script).
+          tar -tzf dist/setup/open-atlas-deployer-setup-*.tar.gz | grep -q '/service-executor/service_executor.py$' || { echo "::error::the setup archive has no service executor"; exit 1; }
+          tar -tzf dist/setup/open-atlas-deployer-setup-*.tar.gz | grep -q '/executor/deployer_executor.py$' || { echo "::error::the setup archive has no deploy executor"; exit 1; }
           gh release create "$GITHUB_REF_NAME" dist/setup/*.tar.gz dist/setup/SHA256SUMS --title "Open Atlas Deployer ${{ steps.v.outputs.version }}" --notes-file notes.md --verify-tag $flags

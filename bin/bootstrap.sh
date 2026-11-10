@@ -2,7 +2,7 @@
 # L0 of the first setup (design §15.4 step 0, §15.6 ⑦), run once as root on the host that runs the Deployer, from the
 # unpacked setup archive of a release (open-atlas-deployer-setup-<version>.tar.gz):
 #   sudo ./bootstrap.sh [--dir /webapp/data/open-atlas/deployer] [--workbench-public-url https://uat.example.internal:8443/]
-#                       [--compare-key-file <file>] [--project open-atlas] [--no-executor] [--no-start]
+#                       [--compare-key-file <file>] [--project open-atlas] [--no-executor] [--service-executor] [--no-start]
 # It installs the executor when the host has none, lays out the Deployer's directory (compose.yaml, .env, deployer.env,
 # data/, secrets/) and starts it. The secrets in deployer.env are generated straight into the file and never printed:
 # the credential key, the compare key (PROD: pass UAT's with --compare-key-file, they must be equal) and the emergency
@@ -18,6 +18,7 @@ public_url=
 compare_file=
 project=open-atlas
 executor=yes
+service_executor=no
 start=yes
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -26,6 +27,7 @@ while [ $# -gt 0 ]; do
     --compare-key-file) compare_file=$2; shift 2 ;;
     --project) project=$2; shift 2 ;;
     --no-executor) executor=no; shift ;;
+    --service-executor) service_executor=yes; shift ;;
     --no-start) start=no; shift ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
@@ -40,6 +42,16 @@ if [ "$executor" = yes ]; then
     echo "executor: already installed ($(readlink /opt/open-atlas-deployer/executor/current))"
   else
     sh "$here/executor/install.sh"
+  fi
+fi
+
+# The service executor (managed services such as NiFi; no Docker) is only installed where asked: it needs its own token
+# from the Hosts page, and a host that runs no NiFi does not need it. Run service-executor/install.sh later if wanted.
+if [ "$service_executor" = yes ]; then
+  if [ -e /opt/open-atlas-deployer/service-executor/current ]; then
+    echo "service executor: already installed ($(readlink /opt/open-atlas-deployer/service-executor/current))"
+  else
+    sh "$here/service-executor/install.sh"
   fi
 fi
 
@@ -98,5 +110,7 @@ Next:
   1. nginx: forward https://<domain>/deploy/ to 127.0.0.1:8095 (the Deployer's Ingress page writes the full configuration later).
   2. Executor: edit /etc/open-atlas-deployer/executor.env (EXECUTOR_ROOT, EXECUTOR_REGISTRIES, EXECUTOR_TOKEN_FILE; on this host
      also EXECUTOR_DEPLOYER_DIR=$dir and EXECUTOR_DEPLOYER_IMAGE=$image). The token comes from the Setup page.
-  3. Open the Deployer, sign in with the emergency account (password in $dir/emergency-password) and follow Setup.
+  3. Managed services (NiFi): sudo ./service-executor/install.sh on each host that runs one (or rerun this with
+     --service-executor), then set /etc/open-atlas-deployer/service-executor.env; its token comes from the Hosts page.
+  4. Open the Deployer, sign in with the emergency account (password in $dir/emergency-password) and follow Setup.
 EOF

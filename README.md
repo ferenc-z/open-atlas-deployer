@@ -689,7 +689,7 @@ npm test
 
 ### 服务器上：`bootstrap.sh`（L0）
 
-每个版本的 release 附一个 `open-atlas-deployer-setup-<版本>.tar.gz`（[bin/package-setup.sh](bin/package-setup.sh) 打包），里面有 [bootstrap.sh](bin/bootstrap.sh)、Deployer 的 `compose.yaml` 和 `deployer.env.example`、执行器的全部文件。解压后以 root 运行：
+每个版本的 release 附一个 `open-atlas-deployer-setup-<版本>.tar.gz`（[bin/package-setup.sh](bin/package-setup.sh) 打包），里面有 [bootstrap.sh](bin/bootstrap.sh)、Deployer 的 `compose.yaml` 和 `deployer.env.example`、两种执行器的全部文件（`executor/` 部署执行器，`service-executor/` 服务执行器，后者要加 `--service-executor` 才由 `bootstrap.sh` 安装）。解压后以 root 运行：
 
 ```sh
 sudo ./bootstrap.sh --workbench-public-url https://uat.example.internal:8443/

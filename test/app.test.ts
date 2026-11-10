@@ -1015,6 +1015,60 @@ test("§8.6: an administrator upgrades a host's executor to the version the Depl
   assert.ok(t.store.listAudit().some((e) => e.action === "executor-upgrade.request" && e.target === `executor@app1@${EXECUTOR_VERSION}`));
 });
 
+test("§16.4 step 16: a host's service executor upgrades itself through its own queue, apart from the deploy executor's", async () => {
+  assert.equal(readFileSync(join(import.meta.dirname, "../executor/service_executor.py"), "utf8").match(/^VERSION = "(.+)"$/m)?.[1], EXECUTOR_VERSION, "both executors ship in one version");
+  const t = withBuiltApp();
+  setEnvironment(t, ({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", hosts, registries: { ghcr: "ghcr.io/acme" }, apps: { shop: { version: "1.2.0", host: "app2" } } }));
+  const service = (await (await post(t, "/api/hosts/app1/token", "admin", { executor: "service" })).json()).token as string;
+  const deploy = (await (await post(t, "/api/hosts/app1/token", "admin", {})).json()).token as string;
+  const call = (path: string, token: string, init: RequestInit = {}) => t.app.request(`/deploy${path}`, { ...init, headers: { authorization: `Bearer ${token}`, ...(typeof init.body === "string" && init.body.startsWith("{") ? { "content-type": "application/json" } : {}) } });
+  const beatS = (body: Record<string, unknown>) => call("/executor/v1/heartbeat", service, { method: "POST", body: JSON.stringify({ executor: "service", version: "0.8.0", protocols: [2], kinds: ["svc-discover", "svc-read", "executor-upgrade"], busy: null, upgradeFrom: "directory", ...body }) });
+  const beatD = (body: Record<string, unknown>) => call("/executor/v1/heartbeat", deploy, { method: "POST", body: JSON.stringify({ version: EXECUTOR_VERSION, protocols: [2], project: "open-atlas", registries: [], databaseBackup: {}, busy: null, kinds: ["build", "deploy", "executor-upgrade"], upgradeFrom: "directory", ...body }) });
+  const host = async () => (await (await t.request("/api/hosts", { as: "viewer" })).json()).hosts.find((h: { id: string }) => h.id === "app1");
+
+  // With a token but no heartbeat yet from the service executor there is nothing to upgrade.
+  assert.deepEqual((await host()).serviceUpgrade, { available: false, job: null, from: null });
+  assert.equal((await (await t.request("/api/hosts", { as: "viewer" })).json()).hosts.find((h: { id: string }) => h.id === "app2").serviceUpgrade, null, "no service executor on app2");
+  await beatD({});
+  // An older service executor that cannot upgrade itself is told to be installed by hand; one without a source is told to set it.
+  await beatS({ kinds: ["svc-discover", "svc-read"] });
+  assert.match((await host()).serviceUpgrade.blocked, /^Service executor 0\.8\.0 on app1 cannot upgrade itself: install .* by hand once/);
+  assert.equal((await post(t, "/api/hosts/app1/upgrade-executor", "admin", { executor: "service" })).status, 409);
+  await beatS({ upgradeFrom: null });
+  assert.match((await host()).serviceUpgrade.blocked, /EXECUTOR_UPGRADE_FROM is not set on app1: set it in service-executor\.env/);
+  await beatS({});
+  assert.deepEqual((await host()).serviceUpgrade, { available: true, job: null, from: "directory" });
+  assert.equal((await host()).upgrade.available, false, "the deploy executor is current: its own upgrade state");
+
+  assert.equal((await post(t, "/api/hosts/app1/upgrade-executor", "uat", { executor: "service" })).status, 403, "administrators only");
+  assert.equal((await post(t, "/api/hosts/app1/upgrade-executor", "admin", { executor: "docker" })).status, 400);
+  assert.equal((await post(t, "/api/hosts/app1/upgrade-executor", "admin", {})).status, 409, "no executor named means the deploy executor, which is current");
+  const started = await post(t, "/api/hosts/app1/upgrade-executor", "admin", { executor: "service" });
+  assert.equal(started.status, 201);
+  const { job } = await started.json();
+  assert.deepEqual([job.kind, job.app, job.fromVersion, job.version], ["executor-upgrade", "service-executor@app1", "0.8.0", EXECUTOR_VERSION]);
+  assert.match((await host()).serviceUpgrade.blocked, /app1 is running executor-upgrade-/, "one at a time");
+  assert.equal((await host()).upgrade.job, null, "the deploy executor's last upgrade is not this one");
+
+  assert.equal((await call("/executor/v1/jobs/next", deploy)).status, 204, "it is not for the deploy executor");
+  const got = await (await call("/executor/v1/jobs/next", service)).json();
+  assert.deepEqual([got.job.id, got.job.kind, got.job.version], [job.id, "executor-upgrade", EXECUTOR_VERSION]);
+  await call(`/executor/v1/jobs/${job.id}/status`, service, { method: "PUT", body: JSON.stringify({ state: "succeeded", steps: [], result: { from: "0.8.0", to: EXECUTOR_VERSION }, message: "done", finishedAt: "2026-11-01T10:00:00Z" }) });
+  assert.equal((await (await t.request(`/api/jobs/${job.id}`, { as: "viewer" })).json()).job.state, "succeeded");
+  await beatS({ version: EXECUTOR_VERSION });
+  const after = (await host()).serviceUpgrade;
+  assert.deepEqual([after.available, after.job.state], [false, "succeeded"]);
+  assert.ok(t.store.listAudit().some((e) => e.action === "executor-upgrade.request" && e.target === `service-executor@app1@${EXECUTOR_VERSION}`));
+
+  // The Overview lists a row for each executor, and "upgrade outdated" takes the service executors in too.
+  const row = async () => (await (await t.request("/api/platform", { as: "viewer" })).json()).executors.filter((e: { host: string }) => e.host === "app1");
+  assert.deepEqual((await row()).map((e: { executor: string }) => e.executor), ["deploy", "service"]);
+  await beatS({ version: "0.8.0" });
+  await beatD({ version: "0.8.0" });
+  const batch = await (await post(t, "/api/hosts/upgrade-outdated", "admin", {})).json();
+  assert.deepEqual([batch.batch.current.host, batch.batch.remaining], ["app1", ["app1/service"]]);
+});
+
 test("D16: an administrator upgrades the Deployer through the executor of the host that runs it", async () => {
   assert.equal(DEPLOYER_VERSION, JSON.parse(readFileSync(join(import.meta.dirname, "../package.json"), "utf8")).version);
   assert.match(readFileSync(join(import.meta.dirname, "../Dockerfile"), "utf8"), new RegExp(`org\\.open-atlas\\.executor-protocols="${PROTOCOL}"`), "the image says which executor protocol it speaks");

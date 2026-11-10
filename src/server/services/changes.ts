@@ -1432,10 +1432,19 @@ export class ServiceChanges {
     this.fullWrite(c);
   }
 
-  /** Whether changes hold a host, or any host: what upgrades of an executor or of the Deployer wait for (§16.3). A stopped one holds nothing at work, so it does not count. */
+  /** Whether changes hold a host, or any host: what the Deployer's own upgrade waits for (§16.3). A stopped one holds nothing at work, so it does not count. */
   working(host?: string): ServiceChange[] {
+    return this.onHost(host).filter((c) => c.state !== "stopped");
+  }
+
+  /** §16.3 (step 16): the changes that keep a host's service executor from upgrading itself: every one not closed, a
+   *  stopped one too (it waits for a person to continue, roll back or kill, and all of those go through that executor). */
+  holding(host: string): ServiceChange[] {
+    return this.onHost(host);
+  }
+
+  private onHost(host?: string): ServiceChange[] {
     return this.store.activeServiceChanges().filter((c) => {
-      if (c.state === "stopped") return false;
       if (!host) return true;
       const s = registered(this.store, c.service);
       return Boolean(s) && membersOf(s!).some((m) => m.host === host);

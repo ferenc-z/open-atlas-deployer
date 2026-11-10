@@ -234,20 +234,27 @@ export function createApp({ config, store, sessions, observer, deployments, vers
   }));
 
   // §8.6: a host's executor is upgraded to the version this Deployer ships. The Deployer only names the version; the
-  // host takes the release from its own EXECUTOR_UPGRADE_FROM. An executor job's app is executor@<host>.
-  const upgradeOf = (env: Environment, host: string) => {
-    const info = handoff.executor(host);
-    const last = store.listJobs({ app: `executor@${host}`, kind: "executor-upgrade", limit: 1 })[0];
+  // host takes the release from its own EXECUTOR_UPGRADE_FROM. An executor job's app is executor@<host>; a service
+  // executor's (§16.3, S18: its own queue, release archive and EXECUTOR_UPGRADE_FROM) is service-executor@<host>.
+  const upgradeApp = (host: string, kind: ExecutorKind) => kind === "service" ? `service-executor@${host}` : `executor@${host}`;
+  const upgradeOf = (env: Environment, host: string, kind: ExecutorKind = "deploy") => {
+    const info = handoff.executor(host, kind);
+    const name = kind === "service" ? "Service executor" : "Executor";
+    const last = store.listJobs({ app: upgradeApp(host, kind), kind: "executor-upgrade", limit: 1 })[0];
     const job = last ? { id: last.id, state: last.state, version: last.version, message: last.message, finishedAt: last.finishedAt } : null;
     const version = info.heartbeat?.version;
     const available = Boolean(version && /^\d+\.\d+\.\d+(-.+)?$/.test(version) && compareVersions(version, EXECUTOR_VERSION) < 0);
-    const busy = store.activeJobs().find((j) => (j.kind === "executor-upgrade" ? j.app === `executor@${host}` : env.apps[j.app] !== undefined && hostOf(env, j.app) === host));
+    // A deploy executor waits for the deploys of its host; a service executor takes no deploy jobs, only its own upgrade counts.
+    const busy = store.activeJobs().find((j) => (j.kind === "executor-upgrade" ? j.app === upgradeApp(host, kind) : kind === "deploy" && env.apps[j.app] !== undefined && hostOf(env, j.app) === host));
+    // §16.3: only the service executor is held by changes (it restarts, and a running change's steps go through it); a
+    // stopped change holds it too. The deploy executor touches no NiFi.
+    const holding = kind === "service" ? changes.holding(host) : [];
     const blocked = !available ? undefined
       : !info.online ? info.reason
-      : !info.heartbeat?.kinds?.includes("executor-upgrade") ? `Executor ${version} on ${host} cannot upgrade itself: install ${EXECUTOR_VERSION} there by hand once (install.sh)`
-      : !info.heartbeat.upgradeFrom ? `EXECUTOR_UPGRADE_FROM is not set on ${host}: set it in executor.env and restart the executor`
+      : !info.heartbeat?.kinds?.includes("executor-upgrade") ? `${name} ${version} on ${host} cannot upgrade itself: install ${EXECUTOR_VERSION} there by hand once (install.sh)`
+      : !info.heartbeat.upgradeFrom ? `EXECUTOR_UPGRADE_FROM is not set on ${host}: set it in ${kind === "service" ? "service-executor.env" : "executor.env"} and restart the ${kind === "service" ? "service " : ""}executor`
       : busy ? `${host} is running ${busy.id}; upgrade when it ends`
-      : changes.working(host).length ? `${host} is in the middle of change ${changes.working(host)[0]!.id}; upgrade when it ends`
+      : holding.length ? `${host} is in the middle of change ${holding[0]!.id}${holding[0]!.state === "stopped" ? " (stopped)" : ""}; upgrade when it ends`
       : undefined;
     return { available, ...(blocked ? { blocked } : {}), job, from: info.heartbeat?.upgradeFrom ?? null };
   };
@@ -567,37 +574,49 @@ export function createApp({ config, store, sessions, observer, deployments, vers
         tokens: tokens.filter((t) => t.host === id).map(({ executor, prefix, createdAt, createdBy, revokedAt }) => ({ executor, prefix, createdAt, createdBy, revokedAt })),
         upgrade: upgradeOf(env, id),
         // S18: the host's service executor, once it has a token or has called in; it takes no deploy jobs.
-        service: tokens.some((t) => t.host === id && t.executor === "service") || store.executorBeat(id, "service") ? handoff.executor(id, "service") : null,
+        service: hasServiceExecutor(id) ? handoff.executor(id, "service") : null,
+        serviceUpgrade: hasServiceExecutor(id) ? upgradeOf(env, id, "service") : null,
       })),
     });
   });
-  const startExecutorUpgrade = (actor: Actor, host: string) => {
+  // S18: a host has a service executor once it has a token or has called in.
+  const hasServiceExecutor = (host: string) => store.executorTokens().some((t) => t.host === host && t.executor === "service") || Boolean(store.executorBeat(host, "service"));
+  const executorRow = (env: Environment, host: string, kind: ExecutorKind) => {
+    const e = handoff.executor(host, kind);
+    return { host, online: e.online, ...(e.reason ? { reason: e.reason } : {}), version: e.heartbeat?.version ?? null, upgrade: upgradeOf(env, host, kind) };
+  };
+  const startExecutorUpgrade = (actor: Actor, host: string, kind: ExecutorKind = "deploy") => {
     const { env } = deployments.environment();
     if (!hostIds(env).includes(host)) throw new DeployError(404, "host/unknown", `${host} is not a host of this environment (environment settings hosts).`);
-    const upgrade = upgradeOf(env, host);
-    if (!upgrade.available) throw new DeployError(409, "executor/up-to-date", `The executor on ${host} is not older than ${EXECUTOR_VERSION}.`);
+    const upgrade = upgradeOf(env, host, kind);
+    const name = kind === "service" ? "service executor" : "executor";
+    if (!upgrade.available) throw new DeployError(409, "executor/up-to-date", `The ${name} on ${host} is not older than ${EXECUTOR_VERSION}.`);
     if (upgrade.blocked) throw new DeployError(409, "executor/upgrade-blocked", upgrade.blocked);
     const id = newJobId("executor-upgrade");
     const request = { kind: "executor-upgrade", version: EXECUTOR_VERSION };
-    store.addJob({ id, kind: "executor-upgrade", app: `executor@${host}`, version: EXECUTOR_VERSION, environment: env.name, fromVersion: handoff.executor(host).heartbeat?.version ?? null, manifest: null, pinFrom: null, request }, actor);
-    handoff.submit(id, { ...request, requestedBy: actor.id }, host);
+    store.addJob({ id, kind: "executor-upgrade", app: upgradeApp(host, kind), version: EXECUTOR_VERSION, environment: env.name, fromVersion: handoff.executor(host, kind).heartbeat?.version ?? null, manifest: null, pinFrom: null, request }, actor);
+    handoff.submit(id, { ...request, requestedBy: actor.id }, host, kind);
     return store.job(id)!;
   };
   api.post("/api/hosts/:id/upgrade-executor", async (c) => {
     const p = await authenticate(c, "admin");
     if (p instanceof Response) return p;
     if (isKey(p)) return reject(c, 403, "auth/browser-only", "Executor upgrades are started only from a browser session, not API keys.");
-    try { return c.json({ job: startExecutorUpgrade(actorOf(p), c.req.param("id")) }, 201); } catch (error) { return deployError(c, error); }
+    const which = ((await c.req.json().catch(() => ({}))) as { executor?: unknown }).executor ?? "deploy";
+    if (which !== "deploy" && which !== "service") return reject(c, 400, "executor/kind", "executor is deploy or service.");
+    try { return c.json({ job: startExecutorUpgrade(actorOf(p), c.req.param("id"), which) }, 201); } catch (error) { return deployError(c, error); }
   });
 
   // D39: every outdated executor, one host after the other; a failed or rolled-back one stops the rest.
   type Batch = { by: Actor; startedAt: string; current: { host: string; job: string } | null; remaining: string[]; done: string[]; stopped?: string; finishedAt?: string };
   const batchOf = (): Batch | null => { const raw = store.setting("executor-upgrade-batch"); return raw ? JSON.parse(raw) as Batch : null; };
   const saveBatch = (b: Batch) => store.setSetting("executor-upgrade-batch", JSON.stringify(b), { id: "deployer", via: "cli" });
+  // A batch entry is a host (its deploy executor) or "<host>/service" (its service executor).
+  const startBatchEntry = (by: Actor, entry: string) => entry.endsWith("/service") ? startExecutorUpgrade(by, entry.slice(0, -"/service".length), "service") : startExecutorUpgrade(by, entry);
   const nextInBatch = (b: Batch) => {
     while (b.remaining.length) {
       const host = b.remaining.shift()!;
-      try { b.current = { host, job: startExecutorUpgrade(b.by, host).id }; return; } catch (error) { b.current = null; b.stopped = `${host}: ${(error as Error).message}`; return; }
+      try { b.current = { host, job: startBatchEntry(b.by, host).id }; return; } catch (error) { b.current = null; b.stopped = `${host}: ${(error as Error).message}`; return; }
     }
     b.current = null;
     b.finishedAt = new Date().toISOString();
@@ -616,10 +635,13 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     const running = batchOf();
     if (running?.current) return reject(c, 409, "executor/batch-running", `An upgrade of the executors is running (${running.current.host}).`);
     const { env } = deployments.environment();
-    const hosts = hostIds(env).filter((h) => { const u = upgradeOf(env, h); return u.available && !u.blocked; });
+    const hosts = hostIds(env).flatMap((h) => [
+      ...(() => { const u = upgradeOf(env, h); return u.available && !u.blocked ? [h] : []; })(),
+      ...(hasServiceExecutor(h) ? (() => { const u = upgradeOf(env, h, "service"); return u.available && !u.blocked ? [`${h}/service`] : []; })() : []),
+    ]);
     if (!hosts.length) return reject(c, 409, "executor/none-outdated", "No executor can be upgraded now.");
     const b: Batch = { by: actorOf(p), startedAt: new Date().toISOString(), current: null, remaining: hosts, done: [] };
-    try { b.current = { host: hosts[0]!, job: startExecutorUpgrade(b.by, hosts[0]!).id }; b.remaining.shift(); } catch (error) { return deployError(c, error); }
+    try { b.current = { host: hosts[0]!, job: startBatchEntry(b.by, hosts[0]!).id }; b.remaining.shift(); } catch (error) { return deployError(c, error); }
     saveBatch(b);
     return c.json({ batch: b }, 201);
   });
@@ -644,7 +666,10 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     const { env } = deployments.environment();
     return c.json({
       deployer: { ...selfOf(env), ...(await deployerVersions()), repo: config.deployerRelease && "repo" in config.deployerRelease ? config.deployerRelease.repo : null },
-      executors: hostIds(env).map((id) => { const e = handoff.executor(id); return { host: id, online: e.online, ...(e.reason ? { reason: e.reason } : {}), version: e.heartbeat?.version ?? null, upgrade: upgradeOf(env, id) }; }),
+      executors: hostIds(env).flatMap((id) => [
+        { executor: "deploy" as ExecutorKind, ...executorRow(env, id, "deploy") },
+        ...(hasServiceExecutor(id) ? [{ executor: "service" as ExecutorKind, ...executorRow(env, id, "service") }] : []),
+      ]),
       shipped: EXECUTOR_VERSION, batch: batchOf(), canUpgrade: p.permissions.includes("admin") && !isKey(p),
     });
   });

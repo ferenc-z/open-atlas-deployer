@@ -112,15 +112,16 @@ export const statusView = () => call<StatusView>("GET", "status");
 export type ExecutorUpgrade = { available: boolean; blocked?: string; from: "github" | "directory" | null; job: { id: string; state: Job["state"]; version: string; message: string | null; finishedAt: string | null } | null };
 /** S18: a host runs a deploy executor, a service executor, or both, each with its own tokens. */
 export type ExecutorKind = "deploy" | "service";
-export type HostView = { id: string; address: string | null; executor: ExecutorInfo; apps: string[]; report: { at: string; stale: boolean; containers: number } | null; tokens: { executor: ExecutorKind; prefix: string; createdAt: string; createdBy: string; revokedAt: string | null }[]; upgrade: ExecutorUpgrade; service: ExecutorInfo | null };
+export type HostView = { id: string; address: string | null; executor: ExecutorInfo; apps: string[]; report: { at: string; stale: boolean; containers: number } | null; tokens: { executor: ExecutorKind; prefix: string; createdAt: string; createdBy: string; revokedAt: string | null }[]; upgrade: ExecutorUpgrade; serviceUpgrade: ExecutorUpgrade | null; service: ExecutorInfo | null };
 export const hosts = () => call<{ executorVersion: string; hosts: HostView[] }>("GET", "hosts");
-export const upgradeExecutor = (id: string) => call<{ job: Job }>("POST", `hosts/${encodeURIComponent(id)}/upgrade-executor`, {});
+export const upgradeExecutor = (id: string, executor: ExecutorKind = "deploy") => call<{ job: Job }>("POST", `hosts/${encodeURIComponent(id)}/upgrade-executor`, { executor });
 /** D39: the Overview's Platform area. */
 export type UpgradeJob = { id: string; state: Job["state"]; version: string; fromVersion?: string | null; message: string | null; finishedAt: string | null };
 export type PlatformView = {
   deployer: { version: string; host: string | null; image: string | null; blocked?: string; job: UpgradeJob | null; repo: string | null; latest?: string | null; error?: string;
     versions: { version: string; prerelease: boolean; relation: "newer" | "older" | "running" | "unknown" }[] };
-  executors: { host: string; online: boolean; reason?: string; version: string | null; upgrade: ExecutorUpgrade }[];
+  /** One row per executor: a host's deploy executor, and its service executor when it has one. */
+  executors: { executor: ExecutorKind; host: string; online: boolean; reason?: string; version: string | null; upgrade: ExecutorUpgrade }[];
   shipped: string; canUpgrade: boolean;
   batch: { startedAt: string; current: { host: string; job: string } | null; remaining: string[]; done: string[]; stopped?: string; finishedAt?: string } | null;
 };
