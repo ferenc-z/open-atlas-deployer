@@ -59,6 +59,8 @@ export function HostsPage({ isAdmin, compact = false }: { isAdmin: boolean; comp
   };
   const upgradeService = async (h: HostView) => {
     const from = h.service?.heartbeat?.version ?? "?";
+    const unsafe = h.serviceUpgrade?.killModeUnsafe;
+    if (unsafe) { await ask(api.killModeNote(h.id, unsafe), { confirm: "Upgrade", disabled: true }); return; }
     if (!(await ask(`Upgrade the service executor on ${h.id} from ${from} to ${shipped}? It takes the release from the host's own source and restarts; if the new version does not start, it goes back by itself. Services it started keep running.`, { confirm: "Upgrade" }))) return;
     setError("");
     api.upgradeExecutor(h.id, "service").then(refresh, (e: Error) => setError(e.message));

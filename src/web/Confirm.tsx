@@ -4,13 +4,13 @@
 // question while one is open answers the first with false.
 import { useEffect, useRef, useState } from "react";
 
-type Question = { message: string; confirm: string; danger: boolean; resolve: (ok: boolean) => void };
+type Question = { message: string; confirm: string; danger: boolean; disabled: boolean; resolve: (ok: boolean) => void };
 let open: ((q: Question) => void) | null = null;
 
-export function ask(message: string, options: { confirm?: string; danger?: boolean } = {}): Promise<boolean> {
+export function ask(message: string, options: { confirm?: string; danger?: boolean; disabled?: boolean } = {}): Promise<boolean> {
   return new Promise((resolve) => {
     if (!open) return resolve(false);
-    open({ message, confirm: options.confirm ?? "Confirm", danger: options.danger ?? false, resolve });
+    open({ message, confirm: options.confirm ?? "Confirm", danger: options.danger ?? false, disabled: options.disabled ?? false, resolve });
   });
 }
 
@@ -33,7 +33,7 @@ export function ConfirmHost() {
     if (question && !d.open) d.showModal();
     if (!question && d.open) d.close();
     // Enter takes the default: Cancel for a destructive action, the confirm button otherwise.
-    if (question) d.querySelector<HTMLButtonElement>(question.danger ? "button" : "button.primary")?.focus();
+    if (question) d.querySelector<HTMLButtonElement>(question.danger ? "button" : "button.primary:not(:disabled)")?.focus();
   }, [question]);
   return (
     <dialog ref={dialog} className="confirm" onCancel={(e) => { e.preventDefault(); answer(false); }} onClick={(e) => { if (e.target === e.currentTarget) answer(false); }}>
@@ -41,7 +41,7 @@ export function ConfirmHost() {
         <p>{question.message}</p>
         <div className="confirm-actions">
           <button type="button" onClick={() => answer(false)}>Cancel</button>
-          <button type="button" className={question.danger ? "primary danger" : "primary"} onClick={() => answer(true)}>{question.confirm}</button>
+          <button type="button" disabled={question.disabled} className={question.danger ? "primary danger" : "primary"} onClick={() => answer(true)}>{question.confirm}</button>
         </div>
       </div>}
     </dialog>

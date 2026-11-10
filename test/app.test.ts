@@ -1043,6 +1043,20 @@ test("§16.4 step 16: a host's service executor upgrades itself through its own 
   assert.equal((await post(t, "/api/hosts/app1/upgrade-executor", "uat", { executor: "service" })).status, 403, "administrators only");
   assert.equal((await post(t, "/api/hosts/app1/upgrade-executor", "admin", { executor: "docker" })).status, 400);
   assert.equal((await post(t, "/api/hosts/app1/upgrade-executor", "admin", {})).status, 409, "no executor named means the deploy executor, which is current");
+  // KillMode: reported and not process: held back (the unit is not updated by the upgrade); process or not reported: through.
+  await beatS({ control: { operatorCert: true, killMode: "control-group", runuser: true } });
+  assert.equal((await host()).serviceUpgrade.killModeUnsafe, "control-group");
+  const unsafe = await post(t, "/api/hosts/app1/upgrade-executor", "admin", { executor: "service" });
+  assert.equal(unsafe.status, 409);
+  const unsafeBody = await unsafe.json();
+  assert.equal(unsafeBody.error, "upgrade/killmode-unsafe");
+  assert.match(unsafeBody.message, /KillMode=control-group.*KillMode=process.*daemon-reload/);
+  assert.equal(t.store.activeJobs().length, 0, "no job was queued");
+  await beatS({ control: { operatorCert: true, killMode: "process", runuser: true } });
+  assert.equal((await host()).serviceUpgrade.killModeUnsafe, undefined);
+  await beatS({ control: { operatorCert: true, killMode: null, runuser: true } });
+  assert.equal((await host()).serviceUpgrade.killModeUnsafe, undefined, "not under systemd: nothing to say");
+  await beatS({});
   const started = await post(t, "/api/hosts/app1/upgrade-executor", "admin", { executor: "service" });
   assert.equal(started.status, 201);
   const { job } = await started.json();

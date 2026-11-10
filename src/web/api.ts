@@ -109,10 +109,12 @@ export interface JobView { job: Omit<Job, "request">; request: Record<string, un
 export const statusView = () => call<StatusView>("GET", "status");
 
 // D35: the hosts of this environment and their executors' tokens.
-export type ExecutorUpgrade = { available: boolean; blocked?: string; from: "github" | "directory" | null; job: { id: string; state: Job["state"]; version: string; message: string | null; finishedAt: string | null } | null };
+export type ExecutorUpgrade = { available: boolean; blocked?: string; killModeUnsafe?: string; from: "github" | "directory" | null; job: { id: string; state: Job["state"]; version: string; message: string | null; finishedAt: string | null } | null };
 /** S18: a host runs a deploy executor, a service executor, or both, each with its own tokens. */
 export type ExecutorKind = "deploy" | "service";
 export type HostView = { id: string; address: string | null; executor: ExecutorInfo; apps: string[]; report: { at: string; stale: boolean; containers: number } | null; tokens: { executor: ExecutorKind; prefix: string; createdAt: string; createdBy: string; revokedAt: string | null }[]; upgrade: ExecutorUpgrade; serviceUpgrade: ExecutorUpgrade | null; service: ExecutorInfo | null };
+/** The service executor's unit has a KillMode other than process: an upgrade restart would stop its NiFi too. */
+export const killModeNote = (host: string, mode: string) => `The service executor's unit on ${host} has KillMode=${mode}: restarting it for the upgrade would stop the NiFi it started. Add KillMode=process to the unit, run systemctl daemon-reload, then upgrade.`;
 export const hosts = () => call<{ executorVersion: string; hosts: HostView[] }>("GET", "hosts");
 export const upgradeExecutor = (id: string, executor: ExecutorKind = "deploy") => call<{ job: Job }>("POST", `hosts/${encodeURIComponent(id)}/upgrade-executor`, { executor });
 /** D39: the Overview's Platform area. */

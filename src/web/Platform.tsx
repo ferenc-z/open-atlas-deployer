@@ -112,10 +112,11 @@ function DeployerRow({ data, onChanged }: { data: PlatformView; onChanged: () =>
 
 function ExecutorRows({ data, onChanged }: { data: PlatformView; onChanged: () => void }) {
   const [error, setError] = useState("");
-  const startable = data.executors.filter((e) => e.upgrade.available && !e.upgrade.blocked);
+  const startable = data.executors.filter((e) => e.upgrade.available && !e.upgrade.blocked && !e.upgrade.killModeUnsafe);
   const batch = data.batch;
   const batchRunning = Boolean(batch?.current);
-  const one = async (host: string, from: string | null, kind: ExecutorKind) => {
+  const one = async (host: string, from: string | null, kind: ExecutorKind, unsafe?: string) => {
+    if (unsafe) { await ask(api.killModeNote(host, unsafe), { confirm: "Upgrade", disabled: true }); return; }
     const name = kind === "service" ? "service executor" : "executor";
     const tail = kind === "service" ? " Services it started keep running." : "";
     if (!(await ask(`Upgrade the ${name} on ${host} from ${from} to ${data.shipped}? It takes the release from the host's own source and restarts; if the new version does not start, it goes back by itself.${tail}`, { confirm: "Upgrade" }))) return;
@@ -156,7 +157,7 @@ function ExecutorRows({ data, onChanged }: { data: PlatformView; onChanged: () =
                   {!running && u.job && u.job.state !== "succeeded" && u.job.version === data.shipped && <span className="small muted"> Last try: {u.job.message}</span>}
                   {!running && u.available && u.blocked && <div className="small muted">{u.blocked}</div>}
                 </td>
-                <td className="actions">{data.canUpgrade && !running && !batchRunning && u.available && !u.blocked && <button className="link" onClick={() => one(e.host, e.version, e.executor)}>Upgrade</button>}</td>
+                <td className="actions">{data.canUpgrade && !running && !batchRunning && u.available && !u.blocked && <button className="link" onClick={() => one(e.host, e.version, e.executor, u.killModeUnsafe)}>Upgrade</button>}</td>
               </tr>
             );
           })}

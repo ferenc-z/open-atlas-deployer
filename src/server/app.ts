@@ -256,7 +256,11 @@ export function createApp({ config, store, sessions, observer, deployments, vers
       : busy ? `${host} is running ${busy.id}; upgrade when it ends`
       : holding.length ? `${host} is in the middle of change ${holding[0]!.id}${holding[0]!.state === "stopped" ? " (stopped)" : ""}; upgrade when it ends`
       : undefined;
-    return { available, ...(blocked ? { blocked } : {}), job, from: info.heartbeat?.upgradeFrom ?? null };
+    // The upgrade does not touch the unit: with a KillMode other than process the restart would take NiFi along. Not
+    // reported (0.8.0 and older, which cannot start or stop NiFi): nothing to protect, let it through.
+    const km = kind === "service" ? info.heartbeat?.control?.killMode : undefined;
+    const killModeUnsafe = available && km && km !== "process" ? km : undefined;
+    return { available, ...(blocked ? { blocked } : {}), ...(killModeUnsafe ? { killModeUnsafe } : {}), job, from: info.heartbeat?.upgradeFrom ?? null };
   };
 
   // D16: the Deployer's own upgrade. The executor of the host that runs it (its heartbeat names the image repository)
@@ -592,6 +596,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     const name = kind === "service" ? "service executor" : "executor";
     if (!upgrade.available) throw new DeployError(409, "executor/up-to-date", `The ${name} on ${host} is not older than ${EXECUTOR_VERSION}.`);
     if (upgrade.blocked) throw new DeployError(409, "executor/upgrade-blocked", upgrade.blocked);
+    if (upgrade.killModeUnsafe) throw new DeployError(409, "upgrade/killmode-unsafe", `The service executor's unit on ${host} has KillMode=${upgrade.killModeUnsafe}: restarting it would stop the NiFi it started. Add KillMode=process to the unit, run systemctl daemon-reload, then upgrade.`);
     const id = newJobId("executor-upgrade");
     const request = { kind: "executor-upgrade", version: EXECUTOR_VERSION };
     store.addJob({ id, kind: "executor-upgrade", app: upgradeApp(host, kind), version: EXECUTOR_VERSION, environment: env.name, fromVersion: handoff.executor(host, kind).heartbeat?.version ?? null, manifest: null, pinFrom: null, request }, actor);
@@ -637,7 +642,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     const { env } = deployments.environment();
     const hosts = hostIds(env).flatMap((h) => [
       ...(() => { const u = upgradeOf(env, h); return u.available && !u.blocked ? [h] : []; })(),
-      ...(hasServiceExecutor(h) ? (() => { const u = upgradeOf(env, h, "service"); return u.available && !u.blocked ? [`${h}/service`] : []; })() : []),
+      ...(hasServiceExecutor(h) ? (() => { const u = upgradeOf(env, h, "service"); return u.available && !u.blocked && !u.killModeUnsafe ? [`${h}/service`] : []; })() : []),
     ]);
     if (!hosts.length) return reject(c, 409, "executor/none-outdated", "No executor can be upgraded now.");
     const b: Batch = { by: actorOf(p), startedAt: new Date().toISOString(), current: null, remaining: hosts, done: [] };

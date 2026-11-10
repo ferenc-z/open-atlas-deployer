@@ -30,7 +30,7 @@ logs, the AI's read-only tools, Studio's `nifi-ops` graph, the FlowFile trace). 
   deploy executor's, and "Upgrade outdated" takes it in) start it, `POST /api/hosts/:id/upgrade-executor` takes
   `{executor: "deploy" | "service"}`. It goes through the service executor's own queue and release (its own
   `EXECUTOR_UPGRADE_FROM`). It waits while a change on that host is running, paused or stopped; the deploy executor
-  is not held by changes. A self-upgrade does not update the systemd unit (see the `KillMode=process` note above).
+  is not held by changes. A self-upgrade does not update the systemd unit (see the `KillMode=process` note above). When the service executor's heartbeat reports a `KillMode` other than `process`, the upgrade is refused (`upgrade/killmode-unsafe`; the Hosts and Overview confirm dialog explains and has its button disabled): add `KillMode=process` to the unit and `systemctl daemon-reload` first. A heartbeat without `control.killMode` (0.8.0 and older) is let through.
 - The setup archive `open-atlas-deployer-setup-<version>.tar.gz` also holds the service executor
   (`service-executor/`, its `install.sh`); `bootstrap.sh --service-executor` installs it, it is not installed by default.
 - A token belongs to one executor of a host; the heartbeat says which (`executor: deploy|service`) and a mismatch is
