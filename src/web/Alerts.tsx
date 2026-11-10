@@ -42,7 +42,7 @@ const KIND: Record<string, { label: string; tone: string }> = {
   "node-disconnected": { label: "Disconnected", tone: "bad" }, "node-reconnected": { label: "Reconnected", tone: "ok" },
   "process-restarted": { label: "Restarted", tone: "info" }, "version-changed": { label: "Version", tone: "warn" },
   "drift-detected": { label: "Drift", tone: "warn" }, "drift-resolved": { label: "Drift gone", tone: "ok" },
-  "taken-over": { label: "Taken over", tone: "info" }, "config-imported": { label: "Configuration", tone: "info" }, thresholds: { label: "Thresholds", tone: "muted" },
+  "taken-over": { label: "Taken over", tone: "info" }, removed: { label: "Removed", tone: "warn" }, "config-imported": { label: "Configuration", tone: "info" }, thresholds: { label: "Thresholds", tone: "muted" },
   "config-saved": { label: "Revision saved", tone: "info" }, "config-applied": { label: "Applied", tone: "ok" }, "config-rolled-back": { label: "Rolled back", tone: "warn" },
   "node-stopped": { label: "Stopped", tone: "warn" }, "node-started": { label: "Started", tone: "info" },
   "change-started": { label: "Change", tone: "info" }, "change-finished": { label: "Change ended", tone: "info" }, "change-stopped": { label: "Change stopped", tone: "bad" },

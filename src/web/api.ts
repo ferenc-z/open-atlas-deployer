@@ -237,6 +237,7 @@ type Registered = { environment: string; draft: string | null; createdAt: string
   trend: { heapPct: (number | null)[]; queuedCount: (number | null)[] } };
 export type RegisteredService = (Extract<DraftItem, { kind: "standalone" }> | Extract<DraftItem, { kind: "cluster" }>) & Registered;
 export const services = () => call<{ standalones: RegisteredService[]; clusters: RegisteredService[] }>("GET", "services");
+export const removeService = (id: string) => call<{ removed: string; kind: string; members: string[] }>("DELETE", `services/${encodeURIComponent(id)}`);
 export const serviceStatus = (id: string) => call<ServiceStatus>("GET", `services/${encodeURIComponent(id)}/status`);
 export type ServiceConfigView = { service: string; revision: number; source: string; savedAt: string; savedBy: string; via: string; note: string | null;
   body: { members: { host: string; installDir: string; confDir?: string; files: Omit<ConfigFileRecord, "sealed">[]; missing: string[] }[]; layers?: unknown };

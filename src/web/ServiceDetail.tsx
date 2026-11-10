@@ -10,6 +10,7 @@ import type { Field, MemberStatus, MetricsView, Range, ServiceBulletin, ServiceC
 import { LineChart, type Series } from "./Charts.tsx";
 import { memberName, ServiceChanges, useChanges, useDrafts, type ChangeDesk, type Drafts } from "./ServiceChanges.tsx";
 import { ServiceConfig } from "./ServiceConfig.tsx";
+import { ask } from "./Confirm.tsx";
 import { Logs } from "./Logs.tsx";
 import { FlowFileTrace } from "./Trace.tsx";
 import { NginxAddress } from "./Nginx.tsx";
@@ -33,7 +34,7 @@ const TABS: Tab[] = [
 /** How a member is named on the charts: a node by address and port, a standalone by host. */
 export const memberLabel = (s: ServiceStatus, m: MemberStatus) => (s.kind === "cluster" ? `${m.nodeAddress ?? m.host}:${webPort(m.ports) ?? "?"}` : m.host);
 
-export function ServiceDetail({ id, initialDraft, onBack }: { id: string; initialDraft?: string; onBack: () => void }) {
+export function ServiceDetail({ id, isAdmin, initialDraft, onBack }: { id: string; isAdmin: boolean; initialDraft?: string; onBack: () => void }) {
   const [s, setS] = useState<ServiceStatus | undefined>();
   const [cfg, setCfg] = useState<ServiceConfigView | null | undefined>();
   const [tab, setTab] = useState(initialDraft ? "changes" : "overview");
@@ -47,6 +48,10 @@ export function ServiceDetail({ id, initialDraft, onBack }: { id: string; initia
   // Asking for a plan shows it, from wherever it was asked.
   const desk: ChangeDesk = { ...desk0, plan: (request) => { desk0.plan(request); setTab("changes"); } };
   const back = <button className="link" onClick={onBack}>← Services</button>;
+  const remove = async () => {
+    if (!(await ask(`Remove ${id} from operations? Deployer stops watching it and its alerts close. NiFi keeps running and no file on the hosts is touched. The history stays, but the name ${id} is not used again: to manage it again, take it over under a new name.`, { confirm: "Remove", danger: true }))) return;
+    try { await api.removeService(id); onBack(); } catch (e) { setError((e as Error).message); }
+  };
   if (!s) return <>{back}{error ? <p className="error">{error}</p> : <p className="muted">Loading…</p>}</>;
   const cluster = s.kind === "cluster";
   const loaded = { s, cfg, reload: load, drafts, desk, open: setTab, saved: () => { loadCfg(); load(); drafts.refresh(); } };
@@ -57,6 +62,7 @@ export function ServiceDetail({ id, initialDraft, onBack }: { id: string; initia
   return (
     <>
       {back}
+      {error && <p className="error">{error}</p>}
       <section className="card svc-summary">
         <div className="svc-summary-main">
           <div className="svc-summary-line">
@@ -81,6 +87,7 @@ export function ServiceDetail({ id, initialDraft, onBack }: { id: string; initia
         <div className="svc-summary-actions">
           {desk.active ? <button className={`change-now state-${desk.active.state}`} onClick={() => setTab("changes")} title="Open the change on the Changes tab">Change {desk.active.state}{desk.active.mode !== "full" && desk.active.plan.members.length > 1 ? ` · ${desk.active.progress.done.length}/${desk.active.plan.members.length} nodes` : ""}</button>
             : cfg?.canDraft && <button onClick={() => desk.plan({ kind: cluster ? "rolling-restart" : "restart" })} title={cluster ? "Restart every node, one at a time. Shows the plan first." : "Stop and start NiFi. Shows the plan first."}>{cluster ? "Rolling restart" : "Restart"}</button>}
+          {isAdmin && <button className="danger" onClick={remove} disabled={Boolean(desk.active)} title={desk.active ? "A change holds this service: finish or close it first" : "Stop managing this service (NiFi is not touched)"}>Remove</button>}
           {s.webUrl && <a className="button" href={s.webUrl} target="_blank" rel="noreferrer" title={s.webUrl}>NiFi UI ↗</a>}
         </div>
       </section>

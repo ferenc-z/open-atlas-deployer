@@ -1379,6 +1379,22 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     if (p instanceof Response) return p;
     return c.json({ graph: graph.graph, configured: graph.configured, services: graphServices(store), runs: store.graphRuns(Number(c.req.query("limit") ?? 10) || 10), canPublish: p.permissions.includes("admin") });
   });
+  // §16.2: removing a service only stops managing it (NiFi and its files are not touched). An admin's browser session; refused while a change holds it.
+  api.delete("/api/services/:id", async (c) => {
+    const p = await authenticate(c, "admin");
+    if (p instanceof Response) return p;
+    if (isKey(p)) return reject(c, 403, "auth/browser-only", "A service is removed only from a browser session, not with API keys.");
+    const id = c.req.param("id")!;
+    try {
+      const was = registeredService(id);
+      const done = store.removeService(id, actorOf(p));
+      if (was?.nginxUrl) graph.schedule(`service ${id} removed`, actorOf(p));
+      return c.json({ removed: done.id, kind: done.kind, members: done.members });
+    } catch (error) {
+      if (error instanceof StoreError) return reject(c, error.code === "service/unknown" ? 404 : 409, error.code, error.message);
+      throw error;
+    }
+  });
   api.post("/api/services/graph/publish", async (c) => {
     const p = await authenticate(c, "admin");
     if (p instanceof Response) return p;

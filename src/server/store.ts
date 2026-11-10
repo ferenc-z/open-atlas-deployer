@@ -1320,6 +1320,42 @@ export class Store {
     return (this.db.prepare("SELECT service, revision, review FROM service_configs WHERE review LIKE '%\"state\":\"running\"%'").all() as Row[]).map((r) => ({ service: r.service, revision: r.revision, review: JSON.parse(r.review) }));
   }
 
+  /**
+   * §16.2 "removing a service only stops managing it": soft delete (the row stays, so the id is never taken again: service_configs
+   * is keyed by service + revision). Refused while a change holds the service (running, paused or stopped). The hosts' files and
+   * NiFi are not touched; the watch list loses it at once (standalones() and clusters() skip removed rows). What is kept is
+   * history (revisions, events, samples: the retention prunes them); what is dropped is what could still act or leak: the
+   * start environments, the open configuration drafts' changes, and the open alerts (closed, with an event).
+   */
+  removeService(id: string, actor: Actor): { id: string; kind: "standalone" | "cluster"; members: string[] } {
+    return this.inTransaction(() => {
+      const at = this.stamp();
+      const standalone = this.db.prepare("SELECT * FROM service_standalones WHERE id = ? AND removed_at IS NULL").get(id) as Row | undefined;
+      const cluster = standalone ? undefined : this.db.prepare("SELECT * FROM service_clusters WHERE id = ? AND removed_at IS NULL").get(id) as Row | undefined;
+      if (!standalone && !cluster) throw new StoreError("service/unknown", `No standalone instance or cluster ${id}.`);
+      const holding = this.activeServiceChange(id);
+      if (holding) throw new StoreError("service-change/active", `Change ${holding.id} is ${holding.state}: finish or close it before removing ${id}.`);
+      let members: string[];
+      if (standalone) {
+        members = [installKey({ host: standalone.host, installDir: standalone.install_dir })];
+        this.db.prepare("UPDATE service_standalones SET removed_at = ?, removed_by = ?, start_env = NULL WHERE id = ?").run(at, actor.id, id);
+      } else {
+        members = (this.db.prepare("SELECT host, install_dir FROM service_nodes WHERE cluster = ? AND removed_at IS NULL ORDER BY host, install_dir").all(id) as Row[]).map((n) => installKey({ host: n.host, installDir: n.install_dir }));
+        this.db.prepare("UPDATE service_nodes SET removed_at = ?, start_env = NULL WHERE cluster = ? AND removed_at IS NULL").run(at, id);
+        this.db.prepare("UPDATE service_clusters SET removed_at = ?, removed_by = ? WHERE id = ?").run(at, actor.id, id);
+      }
+      // (resolveServiceAlert has its own transaction, and they do not nest.)
+      for (const a of this.db.prepare("SELECT id, member, rule, level FROM service_alerts WHERE service = ? AND state = 'open'").all(id) as Row[]) {
+        this.db.prepare("UPDATE service_alerts SET state = 'resolved', resolved_at = ?, updated_at = ? WHERE id = ?").run(at, at, a.id);
+        this.insertServiceEvent({ service: id, member: a.member === "*" ? null : a.member, at, kind: "alert-resolved", detail: { text: "The service was removed from operations", by: actor.id, alert: a.id, rule: a.rule, level: a.level } });
+      }
+      this.db.prepare("UPDATE service_config_drafts SET state = 'discarded', changes = '[]', updated_at = ?, updated_by = ? WHERE service = ? AND state = 'open'").run(at, actor.id, id);
+      this.insertServiceEvent({ service: id, member: null, at, kind: "removed", detail: { text: "Removed from operations: NiFi and its files are untouched", by: actor.id, members } });
+      this.insertAudit(actor, "service.removed", id, { kind: standalone ? "standalone" : "cluster", members });
+      return { id, kind: standalone ? "standalone" : "cluster", members };
+    });
+  }
+
   /** Closes an open draft without registering anything; its items stay for the record. */
   discardServiceDraft(draft: string, actor: Actor) {
     this.inTransaction(() => {

@@ -32,7 +32,7 @@ const savedLayout = (): Layout => { try { return localStorage.getItem(LAYOUT_KEY
 const kindLabel = (s: RegisteredService) => (s.kind === "cluster" ? `Cluster · ${s.nodes.length} nodes` : "Standalone");
 const where = (m: { host: string; ports: { https?: number | null; http?: number | null } }) => `${m.host}${webPort(m.ports) ? `:${webPort(m.ports)}` : ""}`;
 
-export function ServicesPage({ onTakeover, initialOpen, initialDraft }: { onTakeover: () => void; initialOpen?: string; initialDraft?: string }) {
+export function ServicesPage({ onTakeover, isAdmin, initialOpen, initialDraft }: { onTakeover: () => void; isAdmin: boolean; initialOpen?: string; initialDraft?: string }) {
   const [list, setList] = useState<{ standalones: RegisteredService[]; clusters: RegisteredService[] } | undefined>();
   const [open, setOpen] = useState<string | undefined>(initialOpen);
   const [layout, setLayoutState] = useState<Layout>(savedLayout);
@@ -40,7 +40,7 @@ export function ServicesPage({ onTakeover, initialOpen, initialDraft }: { onTake
   const refresh = useCallback(() => { api.services().then(setList, (e: Error) => setError(e.message)); }, []);
   useEffect(() => { refresh(); const t = setInterval(refresh, 15_000); return () => clearInterval(t); }, [refresh]);
   const setLayout = (l: Layout) => { setLayoutState(l); try { localStorage.setItem(LAYOUT_KEY, l); } catch { /* per-viewer convenience only */ } };
-  if (open) return <ServiceDetail key={open} id={open} {...(initialDraft && open === initialOpen ? { initialDraft } : {})} onBack={() => { setOpen(undefined); refresh(); }} />;
+  if (open) return <ServiceDetail key={open} id={open} isAdmin={isAdmin} {...(initialDraft && open === initialOpen ? { initialDraft } : {})} onBack={() => { setOpen(undefined); refresh(); }} />;
   if (!list) return error ? <p className="error">{error}</p> : <p className="muted">Loading…</p>;
   const all = [...list.clusters, ...list.standalones];
   const envs = [...ENVIRONMENTS, ...new Set(all.map((s) => s.environment.toUpperCase()).filter((e) => !ENVIRONMENTS.includes(e)))];
@@ -166,6 +166,7 @@ function MonitorPolicies() {
         <tbody>{MONITOR_POLICIES.map(([resource, policy, why]) => <tr key={resource}><td className="mono small">{resource}</td><td>{policy}</td><td className="muted small">{why}</td></tr>)}</tbody>
       </table>
       <p className="muted small">On a cluster, also give every node's own identity (its certificate's, e.g. CN=node1, OU=NIFI) <strong>view the data</strong> on the root group: a node passes the request on to the node that holds the event as a proxy, and NiFi checks that policy for every identity on the way; without it the attributes stay hidden.</p>
+      <p className="muted small">Changes that restart a cluster (Changes tab) also use an <strong>operator</strong> identity: the certificate in EXECUTOR_NIFI_OPERATOR_CERT on each host. In NiFi give it, besides the policies above, <strong>modify the controller</strong> (<span className="mono">/controller</span>, write): it is the only thing that disconnects, offloads and reconnects a node. A standalone instance does not need it. The monitor certificate never writes.</p>
     </details>
   );
 }

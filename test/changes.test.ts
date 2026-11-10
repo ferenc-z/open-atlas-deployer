@@ -24,6 +24,7 @@ import { INTERRUPTED, longestSeconds, nowStages, ServiceChanges, stagesFor } fro
 import { sealFile, type ConfigMember, type ServiceConfigBody } from "../src/server/services/config.ts";
 import type { DraftCluster, DraftStandalone } from "../src/server/services/draft.ts";
 import { ingest } from "../src/server/services/metrics.ts";
+import { watchList } from "../src/server/services/watch.ts";
 import { check } from "../src/server/services/rules.ts";
 import { Takeover } from "../src/server/services/takeover.ts";
 import type { ServiceSample } from "../src/server/services/watch.ts";
@@ -38,7 +39,7 @@ const COORD = "Cluster Coordinator", PRIMARY = "Primary Node";
 
 const USERS: Record<string, { groups: string[]; isAdmin?: boolean }> = { viewer: { groups: ["deploy-viewer"] }, uat: { groups: ["deploy-uat"] }, prod: { groups: ["deploy-prod"] }, admin: { groups: [], isAdmin: true } };
 const keyPrincipal = (id: string, via: "key" | "service", groups: string[]): Principal => ({ id, displayName: id, via, groups, isAdmin: false, permissions: via === "service" ? ["view"] : permissionsFor(groups, false), csrfToken: "" });
-const KEYS: Record<string, Principal> = { dpk_uat: keyPrincipal("u@x", "key", ["deploy-uat"]), dpk_prod: keyPrincipal("p@x", "key", ["deploy-prod"]), dps_assistant: keyPrincipal("assistant", "service", []) };
+const KEYS: Record<string, Principal> = { dpk_admin: { ...keyPrincipal("a@x", "key", []), isAdmin: true, permissions: permissionsFor([], true) }, dpk_uat: keyPrincipal("u@x", "key", ["deploy-uat"]), dpk_prod: keyPrincipal("p@x", "key", ["deploy-prod"]), dps_assistant: keyPrincipal("assistant", "service", []) };
 
 interface Node { key: string; nodeId: string | null; running: boolean; pid: number; startedAt: string; files: Map<string, string>; status: string; roles: string[]; invalid: number; rest: boolean; joining: boolean; connects: boolean; dies: boolean; env: Record<string, string>; flow: string; backup?: Map<string, string>; flowBackup?: string; saved?: string[] }
 type Answer = { state: string; message?: string; result?: Record<string, unknown> };
@@ -1745,4 +1746,97 @@ test("how long a plan can take is shown with it: a whole cluster's outage, or a 
   assert.equal(seen.state, "stopped");
   assert.equal(seen.progress.canForceKill, true);
   assert.deepEqual(seen.progress.stuck, { pid: n.pid, startedAt: n.startedAt });
+});
+
+// Phase 3 step 15 (§16.2): removing a service only stops managing it.
+test("removing a service: an admin in a browser, the watch list drops it, NiFi and the files are not touched, nothing sensitive stays, the id is not taken again", async () => {
+  const t = setup();
+  takenOver(t);
+  const rev = await revision(t, "flow");
+  await revision(t, "solo");
+  const draft = await t.call("POST", "/api/services/flow/config/drafts", { as: "uat" }, { changes: [{ file: "nifi.properties", key: "nifi.security.keystorePasswd", value: "new-s3cret-value" }] });
+  assert.equal(draft.status, 201, await draft.clone().text());
+  t.store.openServiceAlert({ service: "flow", member: "*", rule: "process-down", level: "CRIT", detail: {} }, "2026-11-09T10:00:00Z", {});
+  const del = (who: { as?: string; key?: string }, id = "flow") => t.call("DELETE", `/api/services/${id}`, who);
+  const hostFiles = JSON.stringify([...t.w.nodes.entries()].map(([k, n]) => [k, [...n.files.entries()]]));
+  assert.ok(watchList(t.store, "local").some((e) => e.service === "flow"));
+
+  for (const who of [{ as: "viewer" }, { as: "uat" }, { as: "prod" }]) assert.equal((await del(who)).status, 403, JSON.stringify(who));
+  assert.equal((await del({ key: "dpk_admin" })).status, 403, "not with an API key, not even an admin's");
+  assert.equal((await del({ key: "dpk_uat" })).status, 403);
+  assert.equal((await del({ as: "admin" }, "nowhere")).status, 404);
+  assert.equal(t.store.clusters().length, 1, "nothing was removed by those");
+
+  const out = await del({ as: "admin" });
+  assert.equal(out.status, 200, await out.clone().text());
+  assert.deepEqual(await out.json(), { removed: "flow", kind: "cluster", members: [A, B, C] });
+  assert.equal((await del({ as: "admin" })).status, 404, "removed once");
+
+  // Gone from every view and from the watch list; the other service is untouched.
+  assert.deepEqual(watchList(t.store, "local").map((e) => e.service), ["solo"]);
+  assert.equal((await t.call("GET", "/api/services/flow/status", { as: "viewer" })).status, 404);
+  assert.equal((await t.call("GET", "/api/services/flow/events", { as: "viewer" })).status, 404);
+  const list = await (await t.call("GET", "/api/services", { as: "viewer" })).json();
+  assert.deepEqual([list.clusters.length, list.standalones.map((s: { id: string }) => s.id)], [0, ["solo"]]);
+  assert.equal((await t.call("GET", "/api/services/solo/status", { as: "viewer" })).status, 200);
+  assert.equal(t.store.serviceUsing("local", "/opt/a"), undefined, "the installation can be taken over again");
+  assert.equal(t.store.serviceUsing("local", "/opt/solo"), "solo");
+  assert.equal(t.store.serviceAlerts({ service: "flow", state: "open" }).length, 0, "its alerts are closed");
+  assert.equal((await (await t.call("GET", "/api/alerts", { as: "viewer" })).json()).open, 0);
+
+  // NiFi and its files: no job went to an executor, nothing was written.
+  assert.deepEqual(t.w.calls, []);
+  assert.equal(JSON.stringify([...t.w.nodes.entries()].map(([k, n]) => [k, [...n.files.entries()]])), hostFiles);
+
+  // History stays; what could leak or act does not.
+  assert.equal(t.store.serviceConfig("flow")!.revision, rev, "the revisions are history");
+  const raw = (t.store as unknown as { db: { prepare(s: string): { all(...a: unknown[]): Record<string, unknown>[] } } }).db;
+  assert.ok(raw.prepare("SELECT removed_at, start_env FROM service_nodes WHERE cluster = 'flow'").all().every((n) => n.removed_at && n.start_env === null), "the start environments are dropped");
+  assert.ok(raw.prepare("SELECT removed_by FROM service_clusters WHERE id = 'flow'").all().every((n) => String(n.removed_by).startsWith("admin")));
+  const drafts = raw.prepare("SELECT state, changes FROM service_config_drafts WHERE service = 'flow'").all();
+  assert.ok(drafts.length > 0 && drafts.every((d) => d.state !== "open") && drafts.filter((d) => d.state === "discarded").every((d) => d.changes === "[]") && drafts.some((d) => d.state === "discarded"), "an open draft is closed and its changes gone");
+  assert.equal(raw.prepare("SELECT 1 FROM service_standalones WHERE id = 'solo' AND start_env IS NOT NULL").all().length, 1, "only the removed service's");
+  const events = t.store.serviceEvents("flow");
+  assert.ok(events.some((e) => e.kind === "removed" && JSON.stringify(e.detail).includes("untouched")), "on the timeline");
+  assert.ok(events.some((e) => e.kind === "alert-resolved"));
+  const audit = t.store.listAudit(5, { action: "service.removed" });
+  assert.deepEqual(audit.map((a) => [a.actor.startsWith("admin"), a.target]), [[true, "flow"]]);
+  const traces = JSON.stringify([events, audit]);
+  assert.ok(!traces.includes("new-s3cret-value") && !traces.includes("keystore-s3cret") && !traces.includes("/old"), "no value in the records");
+
+  // The id is not taken again (service_configs is keyed by service + revision).
+  const again = { kind: "cluster", id: "flow", service: "nifi", profile: "nifi-2.x", version: "2.5.0", webUrl: null, zookeeper: null, zookeeperRoot: null, nodes: [serviceMember("/opt/a", 8443)] } as unknown as DraftCluster;
+  const d2 = t.store.createServiceDraft("uat", [], [again], cli);
+  assert.throws(() => t.store.confirmServiceDraft(d2.id, { flow: { members: [memberOf("/opt/a", { "nifi.properties": NIFI({}) })] } }, cli), /already registered/);
+
+  // A standalone instance goes the same way.
+  assert.equal((await del({ as: "admin" }, "solo")).status, 200);
+  assert.deepEqual(watchList(t.store, "local"), []);
+  assert.equal(t.store.serviceUsing("local", "/opt/solo"), undefined);
+});
+
+test("removing a service is refused while a change holds it (running, paused, stopped) and goes through once it is closed", async () => {
+  const t = setup();
+  takenOver(t);
+  await revision(t, "flow");
+  const del = () => t.call("DELETE", "/api/services/flow", { as: "admin" });
+
+  t.w.held.add("stop");
+  const id = await begin(t, "flow", { kind: "stop", members: [B] });
+  assert.equal(changeOf(t, "flow", id).state, "running");
+  const running = await del();
+  assert.equal(running.status, 409);
+  assert.equal((await running.json()).error, "service-change/active");
+
+  t.w.held.clear();
+  t.w.failing.set(`stop ${B}`, { state: "failed", message: "still running", result: { stillRunning: true } });
+  const c = await drive(t, "flow", id);
+  assert.equal(c.state, "stopped");
+  assert.equal((await del()).status, 409, "stopped is not finished: files may be mixed");
+  assert.equal(t.store.clusters().length, 1);
+
+  t.w.failing.clear();
+  assert.equal((await act(t, "flow", id, "close")).status, 200);
+  assert.equal((await del()).status, 200, "closed: nothing holds it");
+  assert.equal(t.store.clusters().length, 0);
 });
