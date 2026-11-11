@@ -3,12 +3,13 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
-## Unreleased
+## 0.3.0-rc.1
 
-Managed services, phases 1 and 2 (NiFi 1.x and 2.x, read only): every NiFi on the hosts in one place (phase 1), and
-looking into them without logging on to a server (phase 2: samples and metrics, health rules, alerts and a timeline,
-logs, the AI's read-only tools, Studio's `nifi-ops` graph, the FlowFile trace). Executor 0.9.0 (both executors;
-`EXECUTOR_VERSION` with it).
+Managed services, phases 1 to 3 (NiFi 1.x and 2.x): every NiFi on the hosts in one place (phase 1), looking into
+them without logging on to a server (phase 2: samples and metrics, health rules, alerts and a timeline, logs, the
+AI's read-only tools, Studio's `nifi-ops` graph, the FlowFile trace), and changing them (phase 3: configuration
+revisions and drift, start, stop and restart of a standalone instance or a cluster, removing a service). Executor
+0.9.0 (both executors; `EXECUTOR_VERSION` with it). A release candidate: try it on UAT before PROD.
 
 **Service executor**
 - **Run `install.sh` again on hosts with a service executor before it starts or stops anything** (a self-upgrade does
@@ -195,14 +196,33 @@ logs, the AI's read-only tools, Studio's `nifi-ops` graph, the FlowFile trace). 
   back pressure rule looks 3 intervals back (a stale reading cannot tell). Samples of an executor that sent it every
   round still read as before.
 
+**Phase 3: changing a service**
+- Configuration as revisions: the files imported at takeover are revision 1, sealed byte for byte; edits keep every
+  untouched byte and comment. A cluster has a common layer and per-node overrides. Each edit is checked against the
+  profile's catalog: keys that need a restart, keys that can roll node by node (`rolling`) or need the whole cluster
+  stopped (`full`), and moving `nifi.sensitive.props.key` / `.algorithm` (whether the flow's `enc{` values still open).
+- Drafts and revisions: `…/config/drafts` routes, a **Changes** tab on the service page (edit, diff against the running
+  files and between revisions, review, discard). The AI drafts through MCP tools and the result is reviewed on the
+  page; it never applies anything.
+- Drift: the files on a node are compared with the current revision; a difference is shown and can be adopted as a new
+  revision or overwritten by the next apply.
+- Applying a revision, start, stop and restart: a standalone instance, a rolling change on a cluster (disconnect,
+  offload, write, restart, reconnect, one node at a time) and a full-cluster stop and start, each shown as a plan
+  first, then run step by step (pause, stop, resume) with a backup of every file written. Service executor jobs
+  `svc-state`, `svc-write` and `svc-control` (as the service user, never root). Tried on the lab's 1.12.1, 2.0.0 and
+  2.5.0 cluster, including a node that does not come back.
+- Removing a service (admin): the Deployer stops managing it; NiFi is not touched.
+- The service executor upgrades from the page (Hosts, Overview); the upgrade is refused while its unit's `KillMode`
+  is not `process` (see Service executor above). The setup archive carries the service executor.
+
 **Known limits**
 - Alerts are not pushed (S13).
-- Not yet: removing a service, turning a standalone instance into a cluster, a cluster's common layer and node
-  overrides, configuration changes, starting and stopping (phase 3); alert diagnosis and briefs (phase 4).
+- Not yet: turning a standalone instance into a cluster; alert diagnosis and briefs (phase 4); upgrading and new
+  installs of NiFi (phase 5); flow-level operations.
+- Not tried on a real server yet: the service executor installed as root with its systemd unit, SELinux, a 1.x
+  cluster, an offload, a forced kill.
 - Alerts, events and the facts behind them are not pruned yet; the back pressure reading is still the root group's
   whole recursive status (only less often), large on a large flow.
-- The service executor cannot be upgraded from the Hosts page or the Overview yet, and the setup package does not
-  include it.
 
 ## 0.2.4
 
