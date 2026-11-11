@@ -967,6 +967,11 @@ class CollectorTest(Base):
         self.assertEqual(ex.watch, [], "a failed beat changes nothing")
 
     def test_a_round_samples_each_watched_nifi_from_proc_rest_and_its_certificates(self):
+        # No keytool on PATH, as on a host without a system JDK: a NiFi whose JDK is unknown then has none (a CI runner
+        # has /usr/bin/keytool, which the collector would rightly fall back to).
+        which = mock.patch.object(sx.shutil, "which", return_value=None)
+        which.start()
+        self.addCleanup(which.stop)
         c = self.collector()
         samples = self.by_service(c.round(sx.watch_entries(self.watch)))
         self.assertEqual(sorted(samples), ["c250-1", "c250-2", "n112", "n200"])
