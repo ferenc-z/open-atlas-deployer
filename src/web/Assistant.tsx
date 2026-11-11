@@ -76,7 +76,8 @@ export function AssistantPanel({ workbenchUrl, environment, page, app, actions, 
   const origin = base.origin;
   const src = new URL(`embed/chat?app=deployer&key=${encodeURIComponent(`env:${environment ?? "unknown"}`)}&title=${encodeURIComponent(`Deployer ${(environment ?? "").toUpperCase()}`)}`, base.href.endsWith("/") ? base.href : `${base.href}/`).href;
   const context = { env: environment ?? "unknown", page, ...(app ? { app } : {}) };
-  const send = (message: Record<string, unknown>) => frame.current?.contentWindow?.postMessage(message, origin);
+  // Workbench drops any message without the protocol version (docs/app-chat-embed: "messages all carry v: 1").
+  const send = (message: Record<string, unknown>) => frame.current?.contentWindow?.postMessage({ v: 1, ...message }, origin);
   // A frame Workbench cannot load (unreachable, or a certificate this browser does not trust) stays blank without an
   // error, so after a while without "ready" the panel says so and offers Workbench in a tab of its own.
   const [ready, setReady] = useState(false);
