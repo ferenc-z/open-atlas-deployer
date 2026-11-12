@@ -39,6 +39,8 @@ Node 22.18 起直接运行 `.ts`（类型剥离），服务端不需要构建；
 | `DEPLOYER_DATA` | `./data` | 状态库目录 |
 | `DEPLOYER_ENVIRONMENT_FILE` | `<data>/environment.json` | 本环境设置的初始文件：名称、登记的镜像仓库、每个应用的版本（格式同 [examples/uat.environment.json](examples/uat.environment.json)）。2026-11-02 起（D38）只在第一次启动时导入为状态库里的修订 1，之后在"Environment settings"页或 MCP 工具里改，文件不再读 |
 | `DEPLOYER_GITHUB_TOKEN_FILE` | 无 | GitHub 只读令牌，用来列出私有仓库的 tag，供选择版本 |
+| `DEPLOYER_GIT_SSH_KEY_FILE` | 无 | 只读 SSH 私钥（也可在页面上贴入）。设了之后，版本列表、版本评估的差异和提交记录用 git over SSH 读取，评估时源码打包后挂进 OMA 沙箱，沙箱不再自己克隆（D46）；不设则照旧用 GitHub API |
+| `DEPLOYER_GIT_KNOWN_HOSTS_FILE` | 无 | 固定的 SSH 主机指纹；不设则第一次连接时记下，之后严格核对 |
 | `DEPLOYER_OBSERVE_URLS` | 无 | JSON，服务名 → 地址；只在 compose 网络之外开发时用 |
 | `DEPLOYER_DEV`、`DEPLOYER_DEV_SKIP_SETUP` | 无 | 只用于本地开发实例：两个都设成 `1` 时 Setup 算完成，全新的库没有 Workbench 也能打开各页面。镜像里（`NODE_ENV=production`）忽略 |
 | `DEPLOYER_EMERGENCY_PASSWORD_HASH` | 无 | 紧急账号，`node bin/hash-password.ts` 从标准输入读密码生成；不设就没有紧急账号 |

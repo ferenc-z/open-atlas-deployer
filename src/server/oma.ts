@@ -38,14 +38,28 @@ export class OmaSessions {
     return text ? JSON.parse(text) : {};
   }
 
-  /** Opens a session and sends its first message; returns the session id. */
-  async open(title: string, correlation: string, text: string): Promise<string> {
+  /** Uploads a file (D46: the source archive of an assessment); returns its id. */
+  async upload(filename: string, bytes: Uint8Array, mediaType = "application/gzip"): Promise<string> {
+    const key = readToken(this.config.keyFile);
+    if (!key) throw new Error("No OMA API key");
+    const form = new FormData();
+    form.append("file", new Blob([new Uint8Array(bytes)], { type: mediaType }), filename);
+    const response = await this.fetcher(`${this.config.url.replace(/\/+$/, "")}/v1/files`, {
+      method: "POST", headers: { "x-api-key": key, accept: "application/json" }, body: form, signal: AbortSignal.timeout(120_000),
+    });
+    if (!response.ok) throw new Error(`OMA POST /v1/files returned HTTP ${response.status}`);
+    return String(((await response.json()) as { id: string }).id);
+  }
+
+  /** Opens a session, with files mounted in its sandbox, and sends its first message; returns the session id. */
+  async open(title: string, correlation: string, text: string, files: { id: string; mountPath: string }[] = []): Promise<string> {
     const c = this.config;
     const session = await this.call("POST", "/v1/sessions", {
       agent: c.agent, title,
       ...(c.environment ? { environment_id: c.environment } : {}),
       ...(c.vaults?.length ? { vault_ids: c.vaults } : {}),
       ...(c.application ? { app_id: c.application, correlation_id: correlation } : {}),
+      ...(files.length ? { resources: files.map((f) => ({ type: "file", file_id: f.id, mount_path: f.mountPath, access: "read_only" })) } : {}),
     });
     const id = String(session.id);
     await this.send(id, text);

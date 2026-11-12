@@ -3,6 +3,7 @@
 
 import { readFileSync } from "node:fs";
 import { compareVersions } from "../manifest/version.ts";
+import type { Git } from "./git.ts";
 
 const VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
 
@@ -29,8 +30,10 @@ export class Versions {
   private fetcher: typeof fetch;
   private now: () => number;
   private api: string;
+  private git: Git | undefined;
 
-  constructor(tokenFile: TokenSource, fetcher: typeof fetch = fetch, now: () => number = Date.now, api = "https://api.github.com") {
+  constructor(tokenFile: TokenSource, fetcher: typeof fetch = fetch, now: () => number = Date.now, api = "https://api.github.com", git?: Git) {
+    this.git = git;
     this.tokenFile = tokenFile;
     this.fetcher = fetcher;
     this.now = now;
@@ -41,6 +44,16 @@ export class Versions {
     const key = `${repo} ${pattern}`;
     const hit = this.cache.get(key);
     if (hit && this.now() - hit.at < 5 * 60_000) return { versions: hit.versions };
+    if (this.git?.configured) {
+      // D46: over SSH, the same for every host.
+      try {
+        const versions = versionsFromTags(await this.git.tags(repo), pattern);
+        this.cache.set(key, { at: this.now(), versions });
+        return { versions };
+      } catch (error) {
+        return { versions: [], error: `Cannot list the tags of ${repo} over SSH: ${(error as Error).message}` };
+      }
+    }
     const token = readToken(this.tokenFile);
     const tags: string[] = [];
     try {

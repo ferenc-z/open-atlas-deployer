@@ -29,6 +29,8 @@ export const SETTINGS: SettingDef[] = [
   { key: "DEPLOYER_RELEASE_REPO", kind: "release", group: "Releases and GitHub", help: "Where the Deployer's own versions are listed: github:owner/name." },
   { key: "DEPLOYER_RELEASE_TAG", kind: "tag", group: "Releases and GitHub", help: "The tag of a Deployer version.", default: "v{version}" },
   { key: "DEPLOYER_GITHUB_TOKEN_FILE", kind: "secret", group: "Releases and GitHub", help: "GitHub token for private release repositories (read-only)." },
+  { key: "DEPLOYER_GIT_SSH_KEY_FILE", kind: "secret", group: "Releases and GitHub", help: "Read-only SSH private key: versions, diffs and the source for assessments are read with git over SSH (D46). None: the GitHub API." },
+  { key: "DEPLOYER_GIT_KNOWN_HOSTS_FILE", kind: "fixed", group: "Fixed in deployer.env", help: "Pinned SSH host keys for reading repositories. None: a host's key is recorded on the first connection and checked after." },
   { key: "DEPLOYER_ISSUE_REPO", kind: "repo", group: "Releases and GitHub", help: "Where assessments open issues: owner/name." },
   { key: "DEPLOYER_ISSUE_TOKEN_FILE", kind: "secret", group: "Releases and GitHub", help: "GitHub token that may open issues there." },
   { key: "DEPLOYER_OMA_URL", kind: "url", group: "OMA", help: "OMA's API, e.g. http://oma-server:8080." },

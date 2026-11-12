@@ -18,6 +18,10 @@ export interface Config {
   environmentFile: string;
   /** GitHub read-only token for listing a private release repo's tags. */
   githubTokenFile?: TokenSource;
+  /** D46: the read-only SSH key the Deployer reads repositories with; none: the GitHub API. */
+  gitKeyFile?: TokenSource;
+  /** D46: pinned host keys; none: learned on the first connection. */
+  gitKnownHostsFile?: string;
   /** service -> base URL, for asking /meta/contracts outside the compose network (development). */
   observeUrls: Record<string, string>;
   emergencyPasswordHash?: string;
@@ -87,6 +91,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, tokens: Record<
     workbenchPublicUrl: env.DEPLOYER_WORKBENCH_PUBLIC_URL ?? "/",
     environmentFile: resolve(env.DEPLOYER_ENVIRONMENT_FILE ?? join(dataDir, "environment.json")),
     ...(token("DEPLOYER_GITHUB_TOKEN_FILE") ? { githubTokenFile: token("DEPLOYER_GITHUB_TOKEN_FILE") } : {}),
+    ...(token("DEPLOYER_GIT_SSH_KEY_FILE") ? { gitKeyFile: token("DEPLOYER_GIT_SSH_KEY_FILE") } : {}),
+    ...(env.DEPLOYER_GIT_KNOWN_HOSTS_FILE ? { gitKnownHostsFile: resolve(env.DEPLOYER_GIT_KNOWN_HOSTS_FILE) } : {}),
     observeUrls: env.DEPLOYER_OBSERVE_URLS ? JSON.parse(env.DEPLOYER_OBSERVE_URLS) : {},
     ...(env.DEPLOYER_EMERGENCY_PASSWORD_HASH ? { emergencyPasswordHash: env.DEPLOYER_EMERGENCY_PASSWORD_HASH } : {}),
     ...(env.DEPLOYER_CREDENTIAL_ENCRYPTION_KEY ? { credentialKey: env.DEPLOYER_CREDENTIAL_ENCRYPTION_KEY } : {}),

@@ -1,4 +1,5 @@
 import { mkdirSync } from "node:fs";
+import { Git } from "./git.ts";
 import { join, resolve } from "node:path";
 import { serve } from "@hono/node-server";
 import { createApp } from "./app.ts";
@@ -44,7 +45,9 @@ const box = process.env.DEPLOYER_CREDENTIAL_ENCRYPTION_KEY ? new SecretBox(proce
 const deployerSettings = new DeployerSettings(store, box, process.env);
 const config = loadConfig(deployerSettings.env(), deployerSettings.tokens());
 const observer = new Observer(config.observeUrls);
-const versions = new Versions(config.githubTokenFile, fetch, Date.now, config.githubApi);
+// D46: repositories are read with git over SSH once a key is set.
+const git = new Git({ dir: join(config.dataDir, "git"), keyFile: config.gitKeyFile, ...(config.gitKnownHostsFile ? { knownHostsFile: config.gitKnownHostsFile } : {}) });
+const versions = new Versions(config.githubTokenFile, fetch, Date.now, config.githubApi, git);
 const peer = new Peer(config.uatUrl, config.uatKeyFile);
 // Phase 5 drivers: Workbench through an Administration API key, Studio and OMA through their Builder MCPs.
 // §15.6 ③: the key from DEPLOYER_WORKBENCH_API_KEY_FILE, or the one an administrator pasted on the Setup page.
@@ -82,7 +85,7 @@ if (diagnoser) deployments.onFailure = (job) => diagnoser.start(job);
 const assessor = config.omaUrl && config.omaApiKeyFile && config.omaAssessorAgent
   ? new OmaSessions({ url: config.omaUrl, keyFile: config.omaApiKeyFile, agent: config.omaAssessorAgent, ...(config.omaAssessorEnvironment ? { environment: config.omaAssessorEnvironment } : {}), vaults: config.omaAssessorVaults, ...(config.omaApplicationId ? { application: config.omaApplicationId } : {}) })
   : undefined;
-const onboarding = new Onboarding({ store, deployments, oma: assessor, githubApi: config.githubApi, githubTokenFile: config.githubTokenFile, issueRepo: config.issueRepo, issueTokenFile: config.issueTokenFile, templatesDir: keptTemplates, pageUrl: config.workbenchPublicUrl });
+const onboarding = new Onboarding({ store, deployments, oma: assessor, git, githubApi: config.githubApi, githubTokenFile: config.githubTokenFile, issueRepo: config.issueRepo, issueTokenFile: config.issueTokenFile, templatesDir: keptTemplates, pageUrl: config.workbenchPublicUrl });
 deployments.evaluated = (app, version) => onboarding.evaluated(app, version);
 // Phase 8: the maintenance notice before a deploy (W3), drift, the daily brief.
 deployments.maintenance = workbench;

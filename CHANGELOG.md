@@ -3,6 +3,15 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
+## Unreleased
+
+- Repositories are read with git over SSH once `DEPLOYER_GIT_SSH_KEY_FILE` is set (design D46): the version list,
+  and for a version assessment every deploy-related file changed between the two tags (no 300-file cut, however many
+  versions lie between) and the commit messages, which stand in for release notes a host such as Bitbucket does not
+  have. The assessment's source goes to the OMA sandbox as an archive (`source.tar.gz`), so the sandbox no longer
+  clones and needs no credentials or certificates. Without the key, the GitHub API is used as before. The image now
+  has `git` and `openssh-client`. Republish the Onboarding Assessor (its prompt changed).
+
 ## 0.3.0-rc.1
 
 Managed services, phases 1 to 3 (NiFi 1.x and 2.x): every NiFi on the hosts in one place (phase 1), looking into

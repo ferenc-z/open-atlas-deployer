@@ -37,6 +37,8 @@ COPY agents ./agents
 COPY bin ./bin
 # The state (deployer.db, environment.json, templates kept from assessments) lives in /data/deployer, a host
 # directory owned by 1000:1000; files the settings point at (tokens, keys) must be readable by 1000 too.
+# D46: repositories are read with git over SSH (versions, diffs, source archives for assessments).
+RUN apt-get update && apt-get install -y --no-install-recommends git openssh-client && rm -rf /var/lib/apt/lists/*
 RUN mkdir -p /data/deployer && chown 1000:1000 /data/deployer
 ENV NODE_ENV=production \
     NODE_OPTIONS=--disable-warning=ExperimentalWarning \
