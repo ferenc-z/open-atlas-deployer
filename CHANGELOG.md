@@ -11,6 +11,8 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   have. The assessment's source goes to the OMA sandbox as an archive (`source.tar.gz`), so the sandbox no longer
   clones and needs no credentials or certificates. Without the key, the GitHub API is used as before. The image now
   has `git` and `openssh-client`. Republish the Onboarding Assessor (its prompt changed).
+- An assessment whose OMA session has more than 200 events no longer stays "assessing" after the report: the
+  Deployer read only the first page of events and never saw the turn end; it now reads every page (`after_seq`).
 
 ## 0.3.0-rc.1
 

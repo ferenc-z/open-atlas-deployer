@@ -111,3 +111,21 @@ test("D46: the source archive is uploaded to OMA and mounted read-only in the se
   await oma.open("t", "c", "x", [{ id, mountPath: "/sandbox/files/source.tar.gz" }]);
   assert.deepEqual(JSON.parse(String(calls[1]!.init.body)).resources, [{ type: "file", file_id: "file_1", mount_path: "/sandbox/files/source.tar.gz", access: "read_only" }]);
 });
+
+test("a session's events are read to the last page, where the turn's end is (OMA pages them with after_seq)", async () => {
+  const urls: string[] = [];
+  const page = (from: number, n: number, more: boolean, last?: string) => Response.json({
+    data: Array.from({ length: n }, (_, i) => ({ type: i === n - 1 && last ? last : "agent.tool_use", seq: from + i + 1 })),
+    has_more: more, next_page: more ? `seq_${from + n}` : null,
+  });
+  const fetcher = (async (url: string) => {
+    urls.push(String(url));
+    const after = Number(new URL(String(url)).searchParams.get("after_seq") ?? 0);
+    return after === 0 ? page(0, 200, true) : after === 200 ? page(200, 200, true) : page(400, 6, false, "session.status_idle");
+  }) as typeof fetch;
+  const oma = new OmaSessions({ url: "http://oma.test/", keyFile: () => "k", agent: "agent_assessor" }, fetcher);
+  const events = await oma.events("sess_1");
+  assert.equal(events.length, 406);
+  assert.equal(events.at(-1)!.type, "session.status_idle");
+  assert.deepEqual(urls.map((u) => new URL(u).searchParams.get("after_seq")), [null, "200", "400"]);
+});

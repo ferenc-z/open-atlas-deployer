@@ -70,8 +70,19 @@ export class OmaSessions {
     await this.call("POST", `/v1/sessions/${encodeURIComponent(session)}/events`, { events: [{ type: "user.message", content: [{ type: "text", text }] }] });
   }
 
+  /** Every event of the session: OMA pages them (next_page "seq_N", continued with after_seq=N), and a long turn, such as
+   * an assessment reading the source in the sandbox, has more than one page; the turn's end is on the last one. */
   async events(session: string): Promise<OmaEvent[]> {
-    return ((await this.call("GET", `/v1/sessions/${encodeURIComponent(session)}/events?limit=200`)).data ?? []) as OmaEvent[];
+    const all: OmaEvent[] = [];
+    let after: string | null = null;
+    for (let page = 0; page < 50; page++) {
+      const res = await this.call("GET", `/v1/sessions/${encodeURIComponent(session)}/events?limit=200${after ? `&after_seq=${after}` : ""}`) as { data?: OmaEvent[]; has_more?: boolean; next_page?: string | null };
+      all.push(...(res.data ?? []));
+      const next = /^seq_(\d+)$/.exec(res.next_page ?? "")?.[1];
+      if (!res.has_more || !next) break;
+      after = next;
+    }
+    return all;
   }
 }
 
