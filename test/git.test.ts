@@ -9,6 +9,9 @@ import { join } from "node:path";
 import { Git, pem, runGit, sshUrl } from "../src/server/git.ts";
 import { Versions } from "../src/server/versions.ts";
 import { OmaSessions } from "../src/server/oma.ts";
+import { Store } from "../src/server/store.ts";
+import { SecretBox } from "../src/server/secretbox.ts";
+import { DeployerSettings } from "../src/server/deployer-settings.ts";
 
 const URL_ = "git@github.com:acme/shop.git";
 
@@ -128,4 +131,16 @@ test("a session's events are read to the last page, where the turn's end is (OMA
   assert.equal(events.length, 406);
   assert.equal(events.at(-1)!.type, "session.status_idle");
   assert.deepEqual(urls.map((u) => new URL(u).searchParams.get("after_seq")), [null, "200", "400"]);
+});
+
+test("D46: an SSH private key pasted on the page is accepted, spaces and lost line breaks included", () => {
+  const store = new Store(join(mkdtempSync(join(tmpdir(), "git-set-")), "deployer.db"));
+  const box = new SecretBox(Buffer.alloc(32, 7).toString("base64"));
+  const settings = new DeployerSettings(store, box, {});
+  const body = "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZWQyNTUxOQAAACBdeployerTestKeyOnly";
+  const pasted = `-----BEGIN OPENSSH PRIVATE KEY----- ${body} -----END OPENSSH PRIVATE KEY-----`;
+  settings.save([{ key: "DEPLOYER_GIT_SSH_KEY_FILE", value: pasted }], { id: "admin", via: "workbench" });
+  // Saved values apply from the next start, as after the page's restart.
+  assert.equal(pem(new DeployerSettings(store, box, {}).tokens().DEPLOYER_GIT_SSH_KEY_FILE!()), `-----BEGIN OPENSSH PRIVATE KEY-----\n${body.slice(0, 70)}\n${body.slice(70)}\n-----END OPENSSH PRIVATE KEY-----`);
+  assert.throws(() => settings.save([{ key: "DEPLOYER_GITHUB_TOKEN_FILE", value: "ghp_a b" }], { id: "admin", via: "workbench" }), /not valid/);
 });

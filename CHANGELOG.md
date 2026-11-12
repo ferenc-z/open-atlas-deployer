@@ -3,6 +3,11 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
+## Unreleased
+
+- The SSH private key can be pasted on the page (Environment variables → Deployer → `DEPLOYER_GIT_SSH_KEY_FILE`):
+  0.3.0-rc.2 refused it because its BEGIN/END lines have spaces ("paste the token alone, without spaces").
+
 ## 0.3.0-rc.2
 
 - Repositories are read with git over SSH once `DEPLOYER_GIT_SSH_KEY_FILE` is set (design D46): the version list,

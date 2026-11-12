@@ -206,7 +206,8 @@ function check(d: SettingDef, v: string): string | undefined {
     case "hour": return /^\d{1,2}$/.test(v) && Number(v) <= 23 ? undefined : "a whole hour from 0 to 23";
     case "release": { const r = releaseSource(v); return "error" in r ? r.error : undefined; }
     case "repo": return /^[A-Za-z0-9][A-Za-z0-9-]*\/[A-Za-z0-9._-]+$/.test(v) ? undefined : "owner/name";
-    case "secret": return /\s/.test(v) ? "paste the token alone, without spaces" : undefined;
+    // An SSH private key (D46) has spaces in its BEGIN/END lines, and a single-line box drops its line breaks; git.ts's pem() restores them.
+    case "secret": return /^-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]+-----END [A-Z ]*PRIVATE KEY-----$/.test(v) || !/\s/.test(v) ? undefined : "paste the token alone, without spaces";
     default: return "not settable";
   }
 }
