@@ -222,7 +222,7 @@ sudo ./executor/install.sh          # /opt/open-atlas-deployer/executor/releases
 sudoedit /etc/open-atlas-deployer/executor.env   # 见 executor/executor.env.example（EXECUTOR_DEPLOYER_URL、EXECUTOR_TOKEN_FILE）
 # 这台机器的执行器凭据：在 Deployer 的 Hosts 页签发（只显示一次），存进 EXECUTOR_TOKEN_FILE（600）。
 # 第一次安装时用紧急账号在 Setup 页签发即可（D41）；命令行也行：node bin/executor-token.ts <DEPLOYER_DATA> <机器名> <文件>
-sudo docker login ghcr.io           # 推送与拉取凭据只在宿主机 root 下
+sudo docker login ghcr.io           # 推送与拉取凭据只在宿主机 root 下；Harbor 等也可以用 EXECUTOR_REGISTRY_AUTH 让执行器自己登录（0.9.2）
 sudo systemctl restart open-atlas-deployer-executor
 python3 /opt/open-atlas-deployer/executor/current/deployer_executor.py check
 ```

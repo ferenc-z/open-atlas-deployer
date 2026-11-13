@@ -853,7 +853,7 @@ class OldExecutorUpgradeTest(unittest.TestCase):
         new, new_ex = self.upgrade_and_start()
         old_cfg, new_cfg = self.old.config(self.env_file, environ=NO_ENV), new.config(self.env_file, environ=NO_ENV)
         self.assertEqual({k: str(v) for k, v in new_cfg.items() if k in old_cfg}, {k: str(v) for k, v in old_cfg.items()}, "the same executor.env means the same")
-        self.assertEqual({k: v for k, v in new_cfg.items() if k not in old_cfg}, {"deployer_user": None}, "settings added since are off when unset")
+        self.assertEqual({k: v for k, v in new_cfg.items() if k not in old_cfg}, {"deployer_user": None, "registry_auth": {}}, "settings added since are off when unset")
 
         # The first beat after the upgrade and an ordinary one say what 0.7.3 said, apart from the version and which
         # executor it is (S18; the Deployer takes a beat without it as the deploy executor's).
@@ -896,6 +896,102 @@ class OldExecutorUpgradeTest(unittest.TestCase):
         self.assertEqual(sent[0][:3], ("https://deployer.test/executor/v1/heartbeat", "POST", "Bearer dpe_host-token"))
         self.assertEqual(sent[1][:3], sent[0][:3])
         self.assertEqual((sent[0][3], sent[1][3]), ("open-atlas-deployer-executor/0.7.3", "open-atlas-deployer-executor/0.8.0"))
+
+
+class RegistryAuthTest(unittest.TestCase):
+    """EXECUTOR_REGISTRY_AUTH: the executor logs in to a registry itself, the password through stdin only."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = pathlib.Path(self.tmp.name)
+        self.cred = self.root / "harbor.cred"
+        self.cred.write_text("robot$open-atlas+deployer\ns3cret-pass\n")
+        os.chmod(self.cred, 0o600)
+        self.devnull = open("/dev/null", "w")
+        self.addCleanup(self.devnull.close)
+        self.ex = dx.Executor(cfg(self.root, registry_auth={"harbor.example.com": str(self.cred)}), out=self.devnull, api=FakeApi())
+        self.ran = []
+        self.ex.sh = lambda args, **kw: self.ran.append((args, kw.get("input"))) or type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    def as_root(self, mode=0o100600):
+        real = os.stat
+        def stat(path, *a, **kw):
+            st = real(path, *a, **kw)
+            if str(path) != str(self.cred):
+                return st
+            return type("S", (), {"st_uid": 0, "st_mode": mode})()
+        return mock.patch.object(dx.os, "stat", stat)
+
+    def test_reads_the_setting(self):
+        c = dx.config(environ={"EXECUTOR_REGISTRY_AUTH": "harbor.example.com=/etc/oa/harbor.cred reg.local:5000=/etc/oa/r"})
+        self.assertEqual(c["registry_auth"], {"harbor.example.com": "/etc/oa/harbor.cred", "reg.local:5000": "/etc/oa/r"})
+        self.assertEqual(dx.config(environ={})["registry_auth"], {})
+        for bad in ("harbor.example.com", "harbor.example.com=relative", "harbor.example.com/proj=/etc/x", "=/etc/x"):
+            with self.assertRaises(SystemExit, msg=bad):
+                dx.config(environ={"EXECUTOR_REGISTRY_AUTH": bad})
+
+    def test_registry_host(self):
+        self.assertEqual(dx.registry_host("harbor.example.com/open-atlas/open-atlas-studio:1.0"), "harbor.example.com")
+        self.assertEqual(dx.registry_host("harbor.example.com/open-atlas"), "harbor.example.com")
+        self.assertEqual(dx.registry_host("localhost:5000/x:1"), "localhost:5000")
+        self.assertEqual(dx.registry_host("caddy:2"), "docker.io")
+        self.assertEqual(dx.registry_host("library/caddy:2"), "docker.io")
+
+    def test_logs_in_with_the_password_on_stdin(self):
+        with self.as_root():
+            self.ex.registry_login("harbor.example.com/open-atlas/open-atlas-studio:1.0")
+        self.assertEqual(self.ran, [(["docker", "login", "harbor.example.com", "--username", "robot$open-atlas+deployer", "--password-stdin"], "s3cret-pass\n")])
+        self.assertNotIn("s3cret-pass", json.dumps([a for a, _ in self.ran]))
+
+    def test_once_per_host_in_a_job_and_not_for_other_hosts(self):
+        done = set()
+        with self.as_root():
+            for ref in ("harbor.example.com/p/a:1", "harbor.example.com/p/b:1", "ghcr.io/acme/c:1", "caddy:2"):
+                self.ex.registry_login(ref, done)
+        self.assertEqual([a[:3] for a, _ in self.ran], [["docker", "login", "harbor.example.com"]])
+
+    def test_reads_a_changed_password_at_the_next_login(self):
+        with self.as_root():
+            self.ex.registry_login("harbor.example.com/p/a:1")
+            self.cred.write_text("robot$open-atlas+deployer\nrotated\n")
+            self.ex.registry_login("harbor.example.com/p/a:1")
+        self.assertEqual([i for _, i in self.ran], ["s3cret-pass\n", "rotated\n"])
+
+    def test_refuses_a_file_others_can_read_or_root_does_not_own(self):
+        with self.as_root(mode=0o100644), self.assertRaisesRegex(dx.Failed, "owned by root with mode 600"):
+            self.ex.registry_login("harbor.example.com/p/a:1")
+        if os.getuid() != 0:
+            with self.assertRaisesRegex(dx.Failed, "owned by root with mode 600"):
+                self.ex.registry_login("harbor.example.com/p/a:1")
+        self.assertEqual(self.ran, [])
+
+    def test_refuses_a_missing_or_malformed_file(self):
+        with self.as_root():
+            self.cred.write_text("only-a-user\n")
+            with self.assertRaisesRegex(dx.Failed, "two lines"):
+                self.ex.registry_login("harbor.example.com/p/a:1")
+        self.cred.unlink()
+        with self.assertRaisesRegex(dx.Failed, "cannot be read"):
+            self.ex.registry_login("harbor.example.com/p/a:1")
+
+    def test_check_host_checks_every_configured_file(self):
+        with self.as_root(mode=0o100640), self.assertRaises(dx.Failed):
+            self.ex.check_host()
+        with self.as_root():
+            self.ex.check_host()
+
+    def test_the_deployer_upgrade_logs_in_before_it_pulls(self):
+        d = self.root / "deployer"
+        (d / "data").mkdir(parents=True)
+        (d / "compose.yaml").write_text('services:\n  deployer:\n    image: "${DEPLOYER_IMAGE}"\n')
+        self.ex.cfg.update(deployer_dir=d, deployer_image="harbor.example.com/open-atlas/open-atlas-deployer",
+                           registries=["harbor.example.com/open-atlas"])
+        self.ex.api.queue.append({"protocol": 2, "id": "deployer-upgrade-0001", "kind": "deployer-upgrade", "version": "0.2.0"})
+        with self.as_root():
+            self.ex.run_once()
+        cmds = [a[:2] for a, _ in self.ran]
+        self.assertLess(cmds.index(["docker", "login"]), cmds.index(["docker", "pull"]))
 
 
 class FragmentTest(unittest.TestCase):

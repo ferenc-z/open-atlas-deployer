@@ -70,7 +70,7 @@ from executor_core import (  # noqa: F401
     Refused, Restarting, load_env_file, now_iso, version_key, write_json)
 # <<< executor_core
 
-VERSION = "0.9.1"
+VERSION = "0.9.2"
 # Job kinds, plus what a deploy may ask for (bundle files, migrations): an older executor is not sent those.
 KINDS = ["build", "deploy", "env", "env-read", "bundle", "db-migration", "executor-upgrade", "deployer-upgrade"]
 ENV_FILE_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*\.env$")
@@ -90,6 +90,23 @@ MIGRATIONS_TABLE = ("CREATE SCHEMA IF NOT EXISTS deployer; CREATE TABLE IF NOT E
 # The executor's release (§8.6): one directory in the archive, holding only these files.
 PACKAGE = "open-atlas-deployer-executor"
 PACKAGE_FILES = ("deployer_executor.py", "launch.sh", "switch", "install.sh", "open-atlas-deployer-executor.service", "executor.env.example")
+
+
+def registry_auth(value):
+    """`host=/path host2=/path2` -> {host: path}."""
+    out = {}
+    for item in value.split():
+        host, sep, path = item.partition("=")
+        if not sep or not host or "/" in host or not os.path.isabs(path):
+            raise SystemExit(f"EXECUTOR_REGISTRY_AUTH: {item!r} is not host=/absolute/path")
+        out[host] = path
+    return out
+
+
+def registry_host(ref):
+    """The registry host of an image reference or a registry prefix (docker.io when the name has none)."""
+    first = ref.split("/", 1)[0]
+    return first if "/" in ref and ("." in first or ":" in first or first == "localhost") else "docker.io"
 
 
 def config(env_file=None, environ=None):
@@ -113,6 +130,9 @@ def config(env_file=None, environ=None):
         "backups": pathlib.Path(e.get("EXECUTOR_BACKUPS", str(deployer / "backups"))),
         "work": pathlib.Path(e.get("EXECUTOR_WORK", "/var/lib/open-atlas-deployer-executor")),
         "registries": [r.rstrip("/") for r in e.get("EXECUTOR_REGISTRIES", "").split()],
+        # Registry host -> a root-only file holding the user name and the password (a Harbor robot account): the
+        # executor logs in with it before each job that pulls from or pushes to that host.
+        "registry_auth": registry_auth(e.get("EXECUTOR_REGISTRY_AUTH", "")),
         "bind_roots": [pathlib.Path(p) for p in e.get("EXECUTOR_BIND_ROOTS", "").split()],
         "token_file": e.get("EXECUTOR_GITHUB_TOKEN_FILE", ""),
         "github_api": e.get("EXECUTOR_GITHUB_API", "https://api.github.com").rstrip("/"),
@@ -260,6 +280,37 @@ class Executor(ProtocolExecutor):
 
     def check_host(self):
         self.sh(["docker", "version", "--format", "{{.Server.Version}}"])
+        for host in self.cfg.get("registry_auth") or {}:
+            self.registry_credentials(host)
+
+    def registry_credentials(self, host):
+        """The user name and password for a host in EXECUTOR_REGISTRY_AUTH, read each time (a changed password
+        takes effect at the next job); None for a host without one. The file must be root's and mode 600."""
+        path = (self.cfg.get("registry_auth") or {}).get(host)
+        if not path:
+            return None
+        try:
+            st = os.stat(path)
+            lines = [l.strip() for l in pathlib.Path(path).read_text().splitlines() if l.strip()]
+        except OSError as e:
+            raise Failed(f"the credentials for {host} ({path}) cannot be read: {e.strerror}")
+        if st.st_uid != 0 or st.st_mode & 0o077:
+            raise Failed(f"the credentials for {host} ({path}) must be owned by root with mode 600")
+        if len(lines) != 2:
+            raise Failed(f"the credentials for {host} ({path}) must be two lines: the user name, then the password")
+        return lines[0], lines[1]
+
+    def registry_login(self, ref, done=None):
+        """Logs in to the registry of `ref` when EXECUTOR_REGISTRY_AUTH has credentials for it; the password goes
+        through stdin, never the command line or the log. `done` keeps the hosts already logged in to in one job."""
+        host = registry_host(ref)
+        if done is not None and host in done:
+            return
+        creds = self.registry_credentials(host)
+        if creds:
+            self.sh(["docker", "login", host, "--username", creds[0], "--password-stdin"], input=creds[1] + "\n")
+        if done is not None:
+            done.add(host)
 
     def pipe(self, args, out=None, src=None, timeout=3600):
         """A database dump (stdout to `out`, mode 600) or restore (stdin from `src`); only messages are logged."""
@@ -424,6 +475,7 @@ class Executor(ProtocolExecutor):
         ref = f"{image}:{version}"
 
         self.step(status, "pull")
+        self.registry_login(ref)
         self.sh(["docker", "pull", "--quiet", ref], timeout=3600)
         found = json.loads(self.sh(["docker", "image", "inspect", "--format", "{{json .RepoDigests}}", ref]).stdout or "[]")
         digest = next((x.split("@", 1)[1] for x in found if x.split("@", 1)[0] == image), None)
@@ -550,6 +602,7 @@ class Executor(ProtocolExecutor):
             status["result"]["tools"] = tools_version
 
             self.step(status, "build")
+            self.registry_login(registry)
             self.sh(["bash", str(tools / "scripts/release/build-images.sh"), app, "--source", str(src),
                      "--platform", platform, "--registry", registry, "--push"], timeout=3 * 3600)
 
@@ -617,12 +670,13 @@ class Executor(ProtocolExecutor):
 
         # 2. pull every image and pin it to its digest
         self.step(status, "pull")
-        digests = {}
+        digests, logged_in = {}, set()
         for im in req.get("images") or []:
             ref, pin = im["ref"], im.get("pin")
             if not image_allowed(ref, cfg["registries"]):
                 raise Refused(f"image {ref} is neither from a registered registry nor a pinned public image")
             pull = pinned(ref, pin) if pin else ref
+            self.registry_login(ref, logged_in)
             self.sh(["docker", "pull", "--quiet", pull], timeout=3600)
             repo = repository(ref)
             found = json.loads(self.sh(["docker", "image", "inspect", "--format", "{{json .RepoDigests}}", pull]).stdout or "[]")

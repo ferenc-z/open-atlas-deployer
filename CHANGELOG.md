@@ -3,6 +3,12 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
+## Unreleased
+
+- Executor 0.9.2: `EXECUTOR_REGISTRY_AUTH=<host>=<file>` makes the executor log in to a registry itself (a Harbor
+  robot account) before each build, deploy or Deployer upgrade that uses it. The file holds the user name and the
+  password on two lines, root's with mode 600, read each time; the password goes through stdin, never the log.
+
 ## 0.3.0-rc.5
 
 No changes beyond the version: a version to upgrade to for a Deployer that went to 0.3.0-rc.4 before its executor

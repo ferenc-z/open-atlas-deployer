@@ -16,7 +16,7 @@ export { EXECUTOR_KINDS, type ExecutorKind } from "./store.ts";
 
 export const PROTOCOL = 2;
 /** §8.6: the executor release this Deployer ships with (executor/deployer_executor.py VERSION); hosts on an older one are offered the upgrade. */
-export const EXECUTOR_VERSION = "0.9.1";
+export const EXECUTOR_VERSION = "0.9.2";
 
 /** §16.3: the service executor's read channel (service_executor.py READ_JOBS): what it may be handed while a change runs there. */
 export const SERVICE_READ_KINDS = ["svc-discover", "svc-read", "svc-state", "log-read", "log-tail", "nifi-provenance"];
