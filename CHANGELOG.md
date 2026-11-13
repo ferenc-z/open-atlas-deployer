@@ -3,6 +3,12 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
+## 0.3.0-rc.5
+
+No changes beyond the version: a version to upgrade to for a Deployer that went to 0.3.0-rc.4 before its executor
+went to 0.9.1. With `EXECUTOR_DEPLOYER_USER` set (and the executor restarted), upgrading to this one from the page
+runs the Deployer as that user.
+
 ## 0.3.0-rc.4
 
 - Executor 0.9.1 (both executors; `EXECUTOR_VERSION` with it): `EXECUTOR_DEPLOYER_USER=<user>` in the executor.env
