@@ -6,6 +6,7 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { userInfo } from "node:os";
 import { join } from "node:path";
 import { readToken, type TokenSource } from "./versions.ts";
 
@@ -32,6 +33,22 @@ export function sshUrl(repo: string): string {
   const m = /^(?:https?:\/\/github\.com\/)?([A-Za-z0-9][A-Za-z0-9-]*)\/([A-Za-z0-9._-]+?)(?:\.git)?\/?$/.exec(r);
   if (!m) throw new Error(`${repo} is neither owner/name on GitHub nor an SSH address (git@host:path or ssh://…)`);
   return `git@github.com:${m[1]}/${m[2]}.git`;
+}
+
+export const NSS_WRAPPER = "/usr/local/lib/libnss_wrapper.so";
+
+/**
+ * ssh refuses to run for a uid the image's /etc/passwd does not know ("No user exists for uid"), which is the case when
+ * the container runs as the host's own user (compose user: DEPLOYER_UID, bootstrap.sh --user). nss_wrapper (installed
+ * in the image) then lends git and ssh a passwd entry for this uid; nothing else in the process is affected.
+ */
+export function identity(dir: string, home: string, lib = NSS_WRAPPER, known = (): boolean => { try { userInfo(); return true; } catch { return false; } }): NodeJS.ProcessEnv {
+  if (known() || !existsSync(lib) || typeof process.getuid !== "function") return {};
+  const uid = process.getuid(), gid = process.getgid!();
+  const passwd = join(dir, "passwd"), group = join(dir, "group");
+  writeFileSync(passwd, `deployer:x:${uid}:${gid}:Open Atlas Deployer:${home}:/bin/sh\n`, { mode: 0o600 });
+  writeFileSync(group, `deployer:x:${gid}:\n`, { mode: 0o600 });
+  return { LD_PRELOAD: lib, NSS_WRAPPER_PASSWD: passwd, NSS_WRAPPER_GROUP: group };
 }
 
 /** A key pasted into a one-line field loses its line breaks; ssh accepts it only with the body back in lines. */
@@ -79,6 +96,7 @@ export class Git {
       GIT_CONFIG_NOSYSTEM: "1",
       GIT_CONFIG_GLOBAL: "/dev/null",
       GIT_SSH_COMMAND: `ssh -i ${q(key)} -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=15 -o UserKnownHostsFile=${q(known)} -o StrictHostKeyChecking=${this.o.knownHostsFile ? "yes" : "accept-new"}`,
+      ...identity(ssh, this.o.dir),
     };
   }
 

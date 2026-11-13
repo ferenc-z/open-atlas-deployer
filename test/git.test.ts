@@ -3,10 +3,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Git, pem, runGit, sshUrl } from "../src/server/git.ts";
+import { Git, identity, pem, runGit, sshUrl } from "../src/server/git.ts";
 import { Versions } from "../src/server/versions.ts";
 import { OmaSessions } from "../src/server/oma.ts";
 import { Store } from "../src/server/store.ts";
@@ -143,4 +143,20 @@ test("D46: an SSH private key pasted on the page is accepted, spaces and lost li
   // Saved values apply from the next start, as after the page's restart.
   assert.equal(pem(new DeployerSettings(store, box, {}).tokens().DEPLOYER_GIT_SSH_KEY_FILE!()), `-----BEGIN OPENSSH PRIVATE KEY-----\n${body.slice(0, 70)}\n${body.slice(70)}\n-----END OPENSSH PRIVATE KEY-----`);
   assert.throws(() => settings.save([{ key: "DEPLOYER_GITHUB_TOKEN_FILE", value: "ghp_a b" }], { id: "admin", via: "workbench" }), /not valid/);
+});
+
+test("a uid the image does not know gets a passwd entry for git and ssh only through nss_wrapper", () => {
+  const dir = mkdtempSync(join(tmpdir(), "git-id-"));
+  const lib = join(dir, "libnss_wrapper.so");
+  // Known uid, or no nss_wrapper in the image: nothing changes.
+  assert.deepEqual(identity(dir, "/data", lib, () => true), {});
+  assert.deepEqual(identity(dir, "/data", lib, () => false), {});
+  writeFileSync(lib, "");
+  const env = identity(dir, "/data/deployer/git", lib, () => false);
+  assert.equal(env.LD_PRELOAD, lib);
+  const [, , uid, gid, , home] = readFileSync(env.NSS_WRAPPER_PASSWD!, "utf8").trim().split(":");
+  assert.equal(Number(uid), process.getuid!());
+  assert.equal(Number(gid), process.getgid!());
+  assert.equal(home, "/data/deployer/git");
+  assert.equal(readFileSync(env.NSS_WRAPPER_GROUP!, "utf8"), `deployer:x:${process.getgid!()}:\n`);
 });

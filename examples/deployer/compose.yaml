@@ -4,10 +4,11 @@
 #
 #   /webapp/data/open-atlas/deployer/          (the executors' deploy root skips this directory)
 #   ├─ compose.yaml                            this file
-#   ├─ .env                                    DEPLOYER_IMAGE=<repository>:<version>; the executor rewrites it on upgrades
+#   ├─ .env                                    DEPLOYER_IMAGE=<repository>:<version> (the executor rewrites only this
+#   │                                          line on upgrades); DEPLOYER_UID/DEPLOYER_GID: the user it runs as
 #   ├─ deployer.env                            from deployer.env.example, mode 600
-#   ├─ data/                                   state: deployer.db, environment.json; owned by 1000:1000
-#   └─ secrets/                                token and key files the settings name; owned by 1000:1000, mode 600
+#   ├─ data/                                   state: deployer.db, environment.json; owned by that user
+#   └─ secrets/                                token and key files the settings name; owned by that user, mode 600
 #
 #   docker compose up -d                       (after the apps' project exists: it joins their network)
 #
@@ -18,6 +19,8 @@ name: open-atlas-deployer
 services:
   deployer:
     image: "${DEPLOYER_IMAGE:?set DEPLOYER_IMAGE in .env}"
+    # The host user that owns data/ and secrets/ (bootstrap.sh --user writes both into .env); 1000:1000 without.
+    user: "${DEPLOYER_UID:-1000}:${DEPLOYER_GID:-1000}"
     restart: "unless-stopped"
     env_file:
       - "deployer.env"

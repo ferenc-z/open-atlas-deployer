@@ -197,8 +197,8 @@ bin/build-image.sh [镜像仓库]       # 默认 ghcr.io/ferenc-z；同时把执
 docker push <镜像仓库>/open-atlas-deployer:<package.json 的版本>
 ```
 
-- [Dockerfile](Dockerfile)：Node 22 直接运行服务端的 TypeScript，用自带的 `node:sqlite`；页面在构建时按 `DEPLOYER_BASE_PATH`（默认 `/deploy`）打包，一个镜像对应一个挂载路径。以 1000:1000 运行，不挂 Docker socket、没有镜像仓库凭据；健康检查访问 `/health`。镜像带 `org.open-atlas.version` 和提交号标签。工作区有未提交改动时，构建脚本会提示镜像对不上提交号。
-- 服务器上的布局见 [examples/deployer/compose.yaml](examples/deployer/compose.yaml) 和 [deployer.env.example](examples/deployer/deployer.env.example)：放在 `/webapp/data/open-atlas/deployer/`（执行器的部署根目录跳过这个目录），自成一个 compose 项目 `open-atlas-deployer`，执行器对应用做的 compose up、回滚、恢复都碰不到它；端口只绑 127.0.0.1:8095，由 nginx 经 https 转发；加入应用的网络 `open-atlas_default`，按服务名访问 Workbench 和各服务的 `/meta/contracts`。`data/` 和 `secrets/` 要属 1000:1000，令牌和 key 文件权限 600。
+- [Dockerfile](Dockerfile)：Node 22 直接运行服务端的 TypeScript，用自带的 `node:sqlite`；页面在构建时按 `DEPLOYER_BASE_PATH`（默认 `/deploy`）打包，一个镜像对应一个挂载路径。默认以 1000:1000 运行（compose 的 `user:` 读 `.env` 的 `DEPLOYER_UID`/`DEPLOYER_GID`，可改成主机上的登录用户；那个 uid 不在镜像的 `/etc/passwd` 里时，git 和 ssh 经 nss_wrapper 拿到一个用户条目），不挂 Docker socket、没有镜像仓库凭据；健康检查访问 `/health`。镜像带 `org.open-atlas.version` 和提交号标签。工作区有未提交改动时，构建脚本会提示镜像对不上提交号。
+- 服务器上的布局见 [examples/deployer/compose.yaml](examples/deployer/compose.yaml) 和 [deployer.env.example](examples/deployer/deployer.env.example)：放在 `/webapp/data/open-atlas/deployer/`（执行器的部署根目录跳过这个目录），自成一个 compose 项目 `open-atlas-deployer`，执行器对应用做的 compose up、回滚、恢复都碰不到它；端口只绑 127.0.0.1:8095，由 nginx 经 https 转发；加入应用的网络 `open-atlas_default`，按服务名访问 Workbench 和各服务的 `/meta/contracts`。`data/` 和 `secrets/` 要属 Deployer 运行的用户（默认 1000:1000，`bootstrap.sh --user` 可指定），令牌和 key 文件权限 600。
 - 第一个正式版是 `0.1.0`（之前有 `0.1.0-rc.1` 到 `rc.5` 五个候选版本；`0.1.0-beta.*` 只在本地构建过），`0.2.0` 加了首次初始化（D41）。compose 里的镜像写成 `${DEPLOYER_IMAGE}`，值在同目录的 `.env`（[.env.example](examples/deployer/.env.example)）：第一次手写，之后由执行器改。
 
 Deployer 自己的升级（D16，2026-11-02 已实现）：admin 在 Overview 的 Platform 区选版本、看过计划后确认（D39，原先在 Hosts 页，已移走）。Deployer 找到心跳里说自己运行 Deployer 的那台机器（`executor.env` 设了 `EXECUTOR_DEPLOYER_DIR` 和 `EXECUTOR_DEPLOYER_IMAGE`，只能有一台），排一个 `deployer-upgrade` 任务，请求里只有版本号。执行器：
@@ -698,7 +698,7 @@ sudo ./bootstrap.sh --workbench-public-url https://uat.example.internal:8443/
 ```
 
 - 执行器还没装时，先运行 `executor/install.sh`（`--no-executor` 跳过）。
-- 布置 `/webapp/data/open-atlas/deployer/`（`--dir` 可改）：`compose.yaml`、`.env`（这个版本的镜像）、`data/`、`secrets/`（属 1000:1000）。
+- 布置 `/webapp/data/open-atlas/deployer/`（`--dir` 可改）：`compose.yaml`、`.env`（这个版本的镜像）、`data/`、`secrets/`（属 1000:1000；加 `--user nifi` 则 Deployer 以 nifi 的 uid/gid 运行，写进 `.env` 的 `DEPLOYER_UID`/`DEPLOYER_GID`，整个目录归 nifi，`backups/` 仍归 root，由执行器写）。已装好、靠页面升级的服务器，在执行器的 `executor.env` 里设 `EXECUTOR_DEPLOYER_USER=nifi`（执行器 0.9.1 起），之后页面上的 Upgrade 会写 `.env`、补 `user:`、改属主，回滚时属主一并恢复；也可以手动再跑一次 `bootstrap.sh --user <用户>` 迁过去：改属主、给旧的 `compose.yaml` 补上 `user:`（原文件留作 `compose.yaml.before-user`）、重启 Deployer。
 - `deployer.env` 不存在时才生成：加密密钥、对比密钥、紧急密码的哈希直接写进文件，不打印。紧急密码另存为同目录的 `emergency-password`（600）。哈希用 Deployer 镜像里的 `bin/hash-password.ts` 算，宿主机不需要 Node。PROD 用 `--compare-key-file` 传入 UAT 的对比密钥，两边必须相同。
 - 应用的网络 `open-atlas_default` 不存在时，由 compose 用一个临时服务建出来再删掉服务。这样第一次部署应用时，compose 会把这个网络当成自己项目的，不会报"网络不是本项目建的"，也不会重建（2026-11-02 在 WSL 上验证：网络上已有别的容器时，应用项目照常沿用）。
 - 最后 `docker compose up -d`（`--no-start` 跳过），并打印接下来要做的三件事：nginx 转发、填 `executor.env`、打开页面。

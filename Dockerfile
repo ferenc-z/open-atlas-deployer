@@ -21,7 +21,8 @@ LABEL org.opencontainers.image.title="Open Atlas Deployer" \
       org.opencontainers.image.version=$VERSION \
       org.opencontainers.image.revision=$REVISION \
       org.open-atlas.version=$VERSION \
-      org.open-atlas.executor-protocols="2"
+      org.open-atlas.executor-protocols="2" \
+      org.open-atlas.any-user="true"
 WORKDIR /opt/open-atlas-deployer
 COPY --from=build /build/node_modules ./node_modules
 COPY --from=build /build/dist/web ./dist/web
@@ -37,8 +38,12 @@ COPY agents ./agents
 COPY bin ./bin
 # The state (deployer.db, environment.json, templates kept from assessments) lives in /data/deployer, a host
 # directory owned by 1000:1000; files the settings point at (tokens, keys) must be readable by 1000 too.
+# The host may run it as another user instead (compose user: DEPLOYER_UID:DEPLOYER_GID, bootstrap.sh --user): ssh
+# needs a passwd entry for that uid, which nss_wrapper lends to git only (src/server/git.ts identity()).
 # D46: repositories are read with git over SSH (versions, diffs, source archives for assessments).
-RUN apt-get update && apt-get install -y --no-install-recommends git openssh-client && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends git openssh-client libnss-wrapper \
+ && ln -s "$(dpkg -L libnss-wrapper | grep 'libnss_wrapper.so$')" /usr/local/lib/libnss_wrapper.so \
+ && rm -rf /var/lib/apt/lists/*
 RUN mkdir -p /data/deployer && chown 1000:1000 /data/deployer
 ENV NODE_ENV=production \
     NODE_OPTIONS=--disable-warning=ExperimentalWarning \

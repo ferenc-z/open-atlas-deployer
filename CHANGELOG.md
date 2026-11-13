@@ -3,6 +3,22 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
+## Unreleased
+
+- Executor 0.9.1 (both executors; `EXECUTOR_VERSION` with it): `EXECUTOR_DEPLOYER_USER=<user>` in the executor.env
+  of the host that runs the Deployer makes the page's Upgrade run the Deployer as that user: it writes the user's
+  uid/gid into `.env`, adds the `user:` line to a `compose.yaml` without one (the old file kept as
+  `compose.yaml.before-user`) and hands `data/`, `secrets/` and the directory's files to the user; a rollback gives
+  them their owners back. Versions whose image lacks the `org.open-atlas.any-user` label are refused while it is set.
+  Order: upgrade the executors from the Overview, set it and restart the executor, then upgrade the Deployer.
+- The Deployer can run as a host user of your choice instead of uid 1000: `sudo ./bootstrap.sh --user nifi` writes
+  that user's uid and gid into `.env` (`DEPLOYER_UID`, `DEPLOYER_GID`), which the compose file's new
+  `user: "${DEPLOYER_UID:-1000}:${DEPLOYER_GID:-1000}"` reads, and hands `data/`, `secrets/`, `compose.yaml`, `.env`,
+  `deployer.env` and `emergency-password` to that user (`backups/` stays root's, the executor writes it). Run it again
+  on an existing install to move it over: a `compose.yaml` without the `user:` line gets it (the old one is kept as
+  `compose.yaml.before-user`) and the Deployer restarts. Without `--user` nothing changes. The image now has
+  `libnss-wrapper`: ssh refuses a uid the image does not know, so git and ssh borrow a passwd entry through it.
+
 ## 0.3.0-rc.3
 
 - The SSH private key can be pasted on the page (Environment variables → Deployer → `DEPLOYER_GIT_SSH_KEY_FILE`):

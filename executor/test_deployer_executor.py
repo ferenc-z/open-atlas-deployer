@@ -9,6 +9,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import deployer_executor as dx  # noqa: E402
@@ -632,6 +633,61 @@ class DeployerUpgradeTest(unittest.TestCase):
         self.assertFalse(any(a[:2] == ["docker", "compose"] and "ps" not in a for a in self.ran), "nothing was stopped or started")
         self.assertIn("sha256:old", (self.dir / ".env").read_text())
 
+    def run_as_nifi(self):
+        """EXECUTOR_DEPLOYER_USER=nifi, a user (uid 4242) the test cannot really chown to: lchown is recorded."""
+        self.ex.cfg["deployer_user"] = "nifi"
+        self.labels["org.open-atlas.any-user"] = "true"
+        (self.dir / "secrets").mkdir()
+        (self.dir / "secrets" / "key").write_text("k")
+        (self.dir / "deployer.env").write_text("X=1\n")
+        (self.dir / "compose.yaml").write_text('services:\n  deployer:\n    image: "${DEPLOYER_IMAGE}"\n    restart: always\n')
+        self.chowned = []
+        nifi = type("Pw", (), {"pw_uid": 4242, "pw_gid": 4343})()
+        users = mock.patch.object(dx.pwd, "getpwnam", lambda n: nifi if n == "nifi" else (_ for _ in ()).throw(KeyError(n)))
+        lchown = mock.patch.object(dx.os, "lchown", lambda p, u, g: self.chowned.append((pathlib.Path(p).relative_to(self.dir).as_posix(), u, g)))
+        users.start(); lchown.start()
+        self.addCleanup(users.stop); self.addCleanup(lchown.stop)
+
+    def test_an_upgrade_runs_the_deployer_as_the_configured_user(self):
+        self.run_as_nifi()
+        status = self.upgrade()
+        self.assertEqual(status["state"], "succeeded", status.get("message"))
+        self.assertEqual((self.dir / ".env").read_text(), "COMPOSE_FILE_NOTE=kept\nDEPLOYER_UID=4242\nDEPLOYER_GID=4343\nDEPLOYER_IMAGE=localhost:5000/open-atlas-deployer:0.2.0@sha256:new\n")
+        self.assertEqual((self.dir / "compose.yaml").read_text(), 'services:\n  deployer:\n    image: "${DEPLOYER_IMAGE}"\n    user: "${DEPLOYER_UID:-1000}:${DEPLOYER_GID:-1000}"\n    restart: always\n')
+        self.assertTrue((self.dir / "compose.yaml.before-user").is_file())
+        owned = {p for p, u, g in self.chowned if (u, g) == (4242, 4343)}
+        self.assertTrue({"data", "data/deployer.db", "secrets", "secrets/key", "compose.yaml", ".env", "deployer.env"} <= owned, owned)
+        # The next upgrade keeps the line and the user.
+        self.assertEqual(self.upgrade("0.2.0", job="deployer-upgrade-0002")["state"], "succeeded")
+        self.assertEqual((self.dir / "compose.yaml").read_text().count("user:"), 1)
+        self.assertEqual((self.dir / ".env").read_text().count("DEPLOYER_UID="), 1)
+
+    def test_a_rollback_gives_the_files_their_owners_back(self):
+        self.run_as_nifi()
+        self.new_answers = False
+        real_stat = pathlib.Path.stat
+        # As on a host: .env belonged to 1000 before; what the executor writes anew is root's.
+        fake = lambda p, *a, **k: type("S", (), {"st_uid": 1000 if p.name in (".env", "compose.yaml") else 0, "st_gid": 1000 if p.name in (".env", "compose.yaml") else 0, "st_mode": real_stat(p, *a, **k).st_mode})()
+        stat = mock.patch.object(pathlib.Path, "stat", lambda p, *a, **k: fake(p, *a, **k) if p.name in (".env", "compose.yaml") and "follow_symlinks" not in k else real_stat(p, *a, **k))
+        stat.start(); self.addCleanup(stat.stop)
+        status = self.upgrade()
+        self.assertEqual(status["state"], "rolled-back", status.get("message"))
+        me = (os.getuid(), os.getgid())
+        back = {p for p, u, g in self.chowned if (u, g) == me}
+        self.assertTrue({"secrets", "secrets/key", "deployer.env"} <= back, back)
+        self.assertIn((".env", 1000, 1000), self.chowned, "the .env that came back gets the owner it had")
+        self.assertIn(("compose.yaml.before-user", 1000, 1000), self.chowned)
+        self.assertNotIn("DEPLOYER_UID", (self.dir / ".env").read_text())
+
+    def test_refuses_a_user_it_cannot_apply(self):
+        self.run_as_nifi()
+        del self.labels["org.open-atlas.any-user"]
+        self.assertIn("cannot run as another user", self.upgrade(job="deployer-upgrade-old")["message"])
+        self.ex.cfg["deployer_user"] = "nobody-here"
+        self.assertIn("is not a user on this host", self.upgrade(job="deployer-upgrade-who")["message"])
+        self.assertFalse(any(a[:2] == ["docker", "compose"] and "ps" not in a for a in self.ran), "nothing was stopped or started")
+        self.assertEqual(self.chowned, [])
+
     def test_refuses_when_the_compose_file_names_another_project(self):
         (self.dir / "compose.yaml").write_text('name: open-atlas-deployer-prod\nservices:\n  deployer:\n    image: "${DEPLOYER_IMAGE}"\n')
         status = self.upgrade()
@@ -796,7 +852,8 @@ class OldExecutorUpgradeTest(unittest.TestCase):
     def test_the_new_executor_keeps_the_hosts_token_and_registers_as_before(self):
         new, new_ex = self.upgrade_and_start()
         old_cfg, new_cfg = self.old.config(self.env_file, environ=NO_ENV), new.config(self.env_file, environ=NO_ENV)
-        self.assertEqual({k: str(v) for k, v in new_cfg.items()}, {k: str(v) for k, v in old_cfg.items()}, "the same executor.env means the same")
+        self.assertEqual({k: str(v) for k, v in new_cfg.items() if k in old_cfg}, {k: str(v) for k, v in old_cfg.items()}, "the same executor.env means the same")
+        self.assertEqual({k: v for k, v in new_cfg.items() if k not in old_cfg}, {"deployer_user": None}, "settings added since are off when unset")
 
         # The first beat after the upgrade and an ordinary one say what 0.7.3 said, apart from the version and which
         # executor it is (S18; the Deployer takes a beat without it as the deploy executor's).

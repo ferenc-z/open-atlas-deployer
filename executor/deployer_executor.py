@@ -51,6 +51,7 @@ import hashlib
 import json
 import os
 import pathlib
+import pwd
 import re
 import shlex
 import shutil
@@ -69,7 +70,7 @@ from executor_core import (  # noqa: F401
     Refused, Restarting, load_env_file, now_iso, version_key, write_json)
 # <<< executor_core
 
-VERSION = "0.9.0"
+VERSION = "0.9.1"
 # Job kinds, plus what a deploy may ask for (bundle files, migrations): an older executor is not sent those.
 KINDS = ["build", "deploy", "env", "env-read", "bundle", "db-migration", "executor-upgrade", "deployer-upgrade"]
 ENV_FILE_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*\.env$")
@@ -127,6 +128,7 @@ def config(env_file=None, environ=None):
         # D16: on the host that runs the Deployer, its compose project and the image repository it is upgraded from.
         "deployer_dir": pathlib.Path(e["EXECUTOR_DEPLOYER_DIR"]) if e.get("EXECUTOR_DEPLOYER_DIR") else None,
         "deployer_project": e.get("EXECUTOR_DEPLOYER_PROJECT", "open-atlas-deployer"),
+        "deployer_user": e.get("EXECUTOR_DEPLOYER_USER", "").strip() or None,
         "deployer_image": e.get("EXECUTOR_DEPLOYER_IMAGE", "").strip().rstrip("/"),
     }
 
@@ -354,6 +356,53 @@ class Executor(ProtocolExecutor):
                 return last
             self.sleep(5)
 
+    # EXECUTOR_DEPLOYER_USER: the host user the Deployer's container runs as (compose user: from .env), who owns these.
+    DEPLOYER_FILES = ("compose.yaml", "compose.yaml.before-user", ".env", ".env.previous", "deployer.env", "emergency-password")
+    COMPOSE_IMAGE_RE = re.compile(r'^( +)image: *"?\$\{DEPLOYER_IMAGE.*$', re.M)
+
+    def deployer_run_as(self, d):
+        """(uid, gid) of EXECUTOR_DEPLOYER_USER, or None when unset; refuses what it could not apply."""
+        name = self.cfg.get("deployer_user")
+        if not name:
+            return None
+        try:
+            pw = pwd.getpwnam(name)
+        except KeyError:
+            raise Refused(f"EXECUTOR_DEPLOYER_USER {name} is not a user on this host")
+        if pw.pw_uid == 0:
+            raise Refused("EXECUTOR_DEPLOYER_USER must not be root")
+        text = (d / "compose.yaml").read_text()
+        if "DEPLOYER_UID" not in text and not self.COMPOSE_IMAGE_RE.search(text):
+            raise Refused(f"{d}/compose.yaml has no user: line, nor the deployer's image: line to put one under")
+        return pw.pw_uid, pw.pw_gid
+
+    def deployer_own(self, d, run_as, original):
+        """Gives compose.yaml its user: line (the old file kept as compose.yaml.before-user) and hands data/, secrets/
+        and the directory's files to the user; returns each changed path's previous owner, for a rollback. Files this
+        executor wrote anew (.env, .env.previous, compose.yaml.before-user) go back to the owner of the file they replace
+        or copy (`original`), not to root."""
+        text = (d / "compose.yaml").read_text()
+        if "DEPLOYER_UID" not in text:
+            shutil.copy2(d / "compose.yaml", d / "compose.yaml.before-user")
+            line = lambda m: m.group(0) + "\n" + m.group(1) + 'user: "${DEPLOYER_UID:-1000}:${DEPLOYER_GID:-1000}"'
+            (d / "compose.yaml").write_text(self.COMPOSE_IMAGE_RE.sub(line, text, count=1))
+            self.log(f"added user: to {d}/compose.yaml (the previous one is compose.yaml.before-user)")
+        uid, gid = run_as
+        paths = [p for top in ("data", "secrets") if (d / top).is_dir() for p in [d / top, *sorted((d / top).rglob("*"))]]
+        paths += [d / f for f in self.DEPLOYER_FILES if (d / f).is_file()]
+        before = {}
+        for p in paths:
+            st = p.lstat()
+            if (st.st_uid, st.st_gid) != (uid, gid):
+                before[p] = (st.st_uid, st.st_gid)
+                os.lchown(p, uid, gid)
+        for name, source in ((".env", ".env"), (".env.previous", ".env"), ("compose.yaml.before-user", "compose.yaml")):
+            if d / name in before and source in original:
+                before[d / name] = original[source]
+        if before:
+            self.log(f"{len(before)} paths in {d} handed to {self.cfg['deployer_user']} ({uid}:{gid})")
+        return before
+
     def deployer_upgrade(self, req, status):
         """Pulls the version, backs up the state with the Deployer stopped, switches the image and checks the new one
         answers; otherwise puts the previous image and the state back. The Deployer only names the version."""
@@ -370,6 +419,7 @@ class Executor(ProtocolExecutor):
         named = re.search(r'^name:\s*["\']?([^"\'\s#]+)', (d / "compose.yaml").read_text(), re.M)
         if named and named.group(1) != self.cfg["deployer_project"]:
             raise Refused(f"{d}/compose.yaml names project {named.group(1)}, this host EXECUTOR_DEPLOYER_PROJECT={self.cfg['deployer_project']}: set it to the same")
+        run_as = self.deployer_run_as(d)
         self.status_tries = 1
         ref = f"{image}:{version}"
 
@@ -385,6 +435,9 @@ class Executor(ProtocolExecutor):
         speaks = [p for p in (labels.get("org.open-atlas.executor-protocols") or "").split(",") if p]
         if speaks and not any(str(p) in speaks for p in PROTOCOLS):
             raise Refused(f"Deployer {version} speaks executor protocol {','.join(speaks)}, this executor {PROTOCOLS}: upgrade the executors first")
+        # Older images cannot read repositories over SSH as a uid they do not know (no nss_wrapper).
+        if run_as and labels.get("org.open-atlas.any-user") != "true":
+            raise Refused(f"Deployer {version} cannot run as another user: unset EXECUTOR_DEPLOYER_USER to upgrade to it")
         new = pinned(ref, digest)
         env_file = d / ".env"
         lines = env_file.read_text().splitlines() if env_file.is_file() else []
@@ -412,11 +465,16 @@ class Executor(ProtocolExecutor):
         self.log(f"state backed up to {archive}")
 
         self.step(status, "switch")
+        original = {n: ((d / n).stat().st_uid, (d / n).stat().st_gid) for n in (".env", "compose.yaml") if (d / n).is_file()}
         (d / ".env.previous").write_text("\n".join(lines) + ("\n" if lines else ""))
-        kept = [x for x in lines if not x.startswith("DEPLOYER_IMAGE=")]
+        names = ("DEPLOYER_IMAGE=", "DEPLOYER_UID=", "DEPLOYER_GID=") if run_as else ("DEPLOYER_IMAGE=",)
+        kept = [x for x in lines if not x.startswith(names)]
+        if run_as:
+            kept += [f"DEPLOYER_UID={run_as[0]}", f"DEPLOYER_GID={run_as[1]}"]
         part = env_file.with_name(".env.part")
         part.write_text("\n".join(kept + [f"DEPLOYER_IMAGE={new}"]) + "\n")
         os.replace(part, env_file)
+        owners = self.deployer_own(d, run_as, original) if run_as else {}
         # Compose itself can fail here (a port taken, a container in the way): that goes back too, not just a bad start.
         try:
             self.deployer_compose("up", "-d")
@@ -443,6 +501,10 @@ class Executor(ProtocolExecutor):
         failed = d / f"data.failed-{stamp}"
         os.replace(data, failed)
         self.sh(["tar", "xzf", str(archive), "-C", str(d)])
+        # The state came back with its owners from the archive; secrets/ and the files get theirs back here.
+        for p, (u, g) in owners.items():
+            if p.exists() and data not in p.parents and p != data:
+                os.lchown(p, u, g)
         self.deployer_compose("up", "-d", check=False)
         back = self.wait_healthy(["deployer"], ids_of=self.deployer_containers) or self.deployer_answers()
         status["result"]["failedData"] = str(failed)
