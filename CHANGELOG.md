@@ -3,7 +3,7 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
-## Unreleased
+## 0.3.0-rc.7
 
 - The Deploy Assistant knows what is open on the page: the assessment on Onboarding, the service on Services, the
   app on Environment variables and Apps & manifests (page context `assessment`, `service`, `app`). It can read
