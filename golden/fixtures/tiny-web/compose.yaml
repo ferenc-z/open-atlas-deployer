@@ -1,0 +1,10 @@
+services:
+  tiny-web:
+    image: ghcr.io/example/tiny-web:${TINY_WEB_VERSION:-1.0.0}
+    ports:
+      - "18300:80"
+    environment:
+      GREETING: ${GREETING:-hello}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/"]
+      interval: 30s

@@ -13,11 +13,20 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   BuildKit's build containers (no `--ssh`, `--secret`, host network). The image is `open-atlas-<app>` or
   `open-atlas-<app>-<component>`. A repository without `tools.lock` but with a self-contained Dockerfile (a
   multi-stage `mvn package`, for example) is now deployable instead of level C.
+- The agents' prompts hold less to the model's judgement, so different models reach the same result: the
+  Onboarding Assessor follows fixed steps and a level table, and the server holds its rules (`draft_report`
+  refuses `unchanged` outside a version assessment, A/B without a draft that passes `validate_draft`, C/D with
+  components in the draft, C without an onboarding issue; a failed assessment takes no more changes). Golden cases
+  for both agents against a real OMA: `node bin/golden.ts <assistant|assessor|all>` (`golden/cases.ts`).
+- The Deploy Assistant can read service configuration changes and drift: `list_service_changes`,
+  `get_service_change`, `get_service_drift`, `draft_service_config` join its allowed tools.
 
 ### After upgrading
 
 - [ ] Upgrade the executors to 0.9.3 before deploying a manifest with `build.dockerfile`: 0.9.2 refuses it.
-- [ ] OMA: republish the Onboarding Assessor (level table: a self-contained Dockerfile is A; `draft_source`
+- [ ] OMA: republish the Deploy Assistant (four service configuration tools in its allowed tools), then point
+  `DEPLOYER_OMA_AGENT` and the Workbench Business Agent at it. Open a new chat afterwards.
+- [ ] OMA: republish the Onboarding Assessor (new steps and level table: a self-contained Dockerfile is A; `draft_source`
   describes `build.dockerfile` and `prefix`), then set `DEPLOYER_OMA_ASSESSOR_AGENT` to the new agent.
 - [ ] Re-assess repositories rated C only for "no tools.lock" (dossier-clj).
 

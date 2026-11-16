@@ -1,0 +1,11 @@
+services:
+  notes-api:
+    image: ghcr.io/example/notes-api:1.2.0
+    ports:
+      - "18310:8080"
+    environment:
+      NOTES_DB_PASSWORD: ${NOTES_DB_PASSWORD}
+    volumes:
+      - ./data:/var/lib/notes
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]

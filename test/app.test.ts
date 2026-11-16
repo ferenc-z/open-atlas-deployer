@@ -1905,6 +1905,30 @@ test("D46: an assessment needs the Deployer's SSH key; the source goes to the sa
   const failed = await (await t.request(`/api/assessments/${a.id}`, { as: "viewer" })).json();
   assert.deepEqual([failed.state, failed.level, failed.issue], ["failed", null, null]);
   assert.match(failed.message, /could not read the source: source\.tar\.gz is missing/);
+  const after = await agentTool(t, service, "draft_issue", a.id, token, { kind: "onboarding", title: "Restore the repository", body: "x" });
+  assert.equal(after.value.finding.code, "assessment/failed", "after unreadable the Agent changes nothing, drafts no issue");
+});
+
+test("the level table is held by the server: unchanged, A/B without a valid draft, C/D with a draft, C without an issue", async () => {
+  const t = withBook();
+  t.beat();
+  t.s.tags["acme/hello"] = ["v1.0.0"];
+  const service = (await makeKey(t, "admin", { kind: "service", name: "assessor", days: 30 })).body.key as string;
+  const a = (await (await post(t, "/api/assessments", "uat", { repo: "https://github.com/acme/hello" })).json()).assessment;
+  const token = tokenOf(t.s.oma.sessions[0]!.messages[0]!);
+  const report = (level: string) => agentTool(t, service, "draft_report", a.id, token, { level, report: `level ${level}` });
+  assert.equal((await report("unchanged")).value.finding.code, "draft/level");
+  const invalid = await report("B");
+  assert.equal(invalid.value.finding.code, "draft/not-valid");
+  assert.ok(invalid.value.details.some((d: string) => d.startsWith("draft/app")), "the findings come with it");
+  await agentTool(t, service, "draft_component", a.id, token, { component: "web", type: "compose-service" });
+  assert.equal((await report("C")).value.finding.code, "draft/configured");
+  assert.equal((await report("D")).value.finding.code, "draft/configured");
+  await agentTool(t, service, "remove_draft_component", a.id, token, { component: "web" });
+  assert.equal((await report("C")).value.finding.code, "draft/no-issue");
+  await agentTool(t, service, "draft_issue", a.id, token, { kind: "onboarding", title: "Add a Dockerfile", body: "x" });
+  assert.equal((await report("C")).isError, false);
+  assert.equal((await report("D")).isError, false, "D needs no issue");
 });
 
 test("D32: an older version is assessed against the first manifest, and \"unchanged\" extends the manifest down to it", async () => {
