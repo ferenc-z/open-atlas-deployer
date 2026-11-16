@@ -3,7 +3,7 @@
   "app": "workbench",
   "appliesFrom": "1.25.1",
   "release": {
-    "repo": "ferenc-z/open-atlas-workbench",
+    "repo": "gaojie197710-tech/open-atlas-workbench",
     "tag": "workbench-{version}",
     "manifest": "release.json"
   },

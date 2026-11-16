@@ -722,7 +722,7 @@ sudo ./bootstrap.sh --workbench-public-url https://uat.example.internal:8443/
 
 - 层级：有环境修订且所有执行器在线为 L1；Workbench 由这个 Deployer 部署并且通、API key 能用、三个 Group 都在，为 L2，也就是初始化完成。可选的一步不影响完成。完成之后，执行器暂时掉线不会把页面打回 Setup；Overview 顶部显示一行 "Setup complete"，点开能看到步骤。
 - 紧急账号的横幅在初始化期间改成说明：这是首次初始化，Workbench 通了以后这个账号自动失效。
-- 内置的 Workbench 清单以本地 UAT 注册表里的版本为底稿（2026-11-02），按 D42 去掉 `build`：来源是 `ghcr` 仓库里的 `open-atlas-workbench`，release 读 `ferenc-z/open-atlas-workbench`，从 1.25.1 起（1.25.1 修好了全新安装时的崩溃）。env 模板 [templates/workbench.env.example](templates/workbench.env.example) 核对过 1.25.1，没有新的变量。
+- 内置的 Workbench 清单以本地 UAT 注册表里的版本为底稿（2026-11-02），按 D42 去掉 `build`：来源是 `ghcr` 仓库里的 `open-atlas-workbench`，release 读 `ferenc-z/open-atlas-workbench`（2026-11-16 起改读上游 `gaojie197710-tech/open-atlas-workbench`，Workbench 只维护上游，D48），从 1.25.1 起（1.25.1 修好了全新安装时的崩溃）。env 模板 [templates/workbench.env.example](templates/workbench.env.example) 核对过 1.25.1，没有新的变量。
 
 ### 测试与验证（2026-11-02）
 

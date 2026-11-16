@@ -352,7 +352,7 @@ test("§15: a new installation is set up with the emergency account up to Workbe
   const imported = await call("POST", "/api/setup/workbench-manifest", {});
   assert.equal(imported.status, 201);
   assert.deepEqual(await imported.json(), { app: "workbench", appliesFrom: "1.25.1", revision: 1 });
-  assert.equal(t.store.app("workbench")!.repo, "ferenc-z/open-atlas-workbench");
+  assert.equal(t.store.app("workbench")!.repo, "gaojie197710-tech/open-atlas-workbench");
   assert.equal((await call("POST", "/api/setup/workbench-manifest", {})).status, 409, "only while the registry has no Workbench");
   s = await steps();
   assert.equal(s.level, "L1");
