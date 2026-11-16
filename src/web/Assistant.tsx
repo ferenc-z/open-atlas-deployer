@@ -70,12 +70,15 @@ export async function runHostOperation(operation: string, payload: Payload, acti
   return { ok: false, outcome: "Not handled" };
 }
 
-export function AssistantPanel({ workbenchUrl, environment, page, app, actions, onClose, onSetup }: { workbenchUrl: string; environment?: string; page: string; app?: string; actions: HostActions; onClose: () => void; onSetup?: () => void }) {
+export function AssistantPanel({ workbenchUrl, environment, page, app, focus = {}, actions, onClose, onSetup }: { workbenchUrl: string; environment?: string; page: string; app?: string; focus?: Record<string, string>; actions: HostActions; onClose: () => void; onSetup?: () => void }) {
   const frame = useRef<HTMLIFrameElement>(null);
   const base = new URL(workbenchUrl, window.location.href);
   const origin = base.origin;
   const src = new URL(`embed/chat?app=deployer&key=${encodeURIComponent(`env:${environment ?? "unknown"}`)}&title=${encodeURIComponent(`Deployer ${(environment ?? "").toUpperCase()}`)}`, base.href.endsWith("/") ? base.href : `${base.href}/`).href;
-  const context = { env: environment ?? "unknown", page, ...(app ? { app } : {}) };
+  // Workbench refuses a context with a value outside [\w .:@/-]{1,64}, so such a value is left out rather than the whole context.
+  const opened = Object.fromEntries(Object.entries(focus).filter(([k, v]) => /^[a-z_]{1,24}$/u.test(k) && /^[\w .:@/-]{1,64}$/u.test(v)).slice(0, 5));
+  const context = { env: environment ?? "unknown", page, ...(app ? { app } : {}), ...opened };
+  const contextKey = JSON.stringify(context);
   // Workbench drops any message without the protocol version (docs/app-chat-embed: "messages all carry v: 1").
   const send = (message: Record<string, unknown>) => frame.current?.contentWindow?.postMessage({ v: 1, ...message }, origin);
   // A frame Workbench cannot load (unreachable, or a certificate this browser does not trust) stays blank without an
@@ -97,7 +100,7 @@ export function AssistantPanel({ workbenchUrl, environment, page, app, actions, 
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
   }, [origin, actions]);
-  useEffect(() => { send({ type: "workbench-chat:context", pageContext: context }); }, [environment, page, app]);
+  useEffect(() => { send({ type: "workbench-chat:context", pageContext: context }); }, [contextKey]);
 
   // D34: a column beside the page, not over it. Its width can be dragged and is remembered; it can fold into a strip
   // (the conversation stays loaded) or take the whole content area. Under 1100px it is a drawer over the page.

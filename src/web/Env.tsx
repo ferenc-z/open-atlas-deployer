@@ -11,6 +11,7 @@ import { JobPanel } from "./Deploy.tsx";
 import { ask } from "./Confirm.tsx";
 import { DeployerSettingsPanel, deployerCardState } from "./DeployerSettings.tsx";
 import type { DeployerSettingsView } from "./api.ts";
+import { usePageFocus } from "./focus.ts";
 
 /** The Deployer's card; not an app id (ids are lower-case words). */
 const DEPLOYER = ":deployer";
@@ -41,6 +42,7 @@ export function EnvPage() {
   const [apps, setApps] = useState<RegisteredApp[] | undefined>();
   const [views, setViews] = useState<Record<string, EnvView | { error: string }>>({});
   const [app, setApp] = useState("");
+  usePageFocus("app", app === DEPLOYER ? undefined : app);
   const [error, setError] = useState("");
   const [own, setOwn] = useState<DeployerSettingsView | undefined>();
   useEffect(() => { api.deployerSettings().then(setOwn, () => setOwn(undefined)); }, []);

@@ -7,6 +7,7 @@ import { Markdown } from "./Markdown.tsx";
 import { AiMissing } from "./Setup.tsx";
 import type { AssessmentView } from "./api.ts";
 import { ask } from "./Confirm.tsx";
+import { usePageFocus } from "./focus.ts";
 
 const STATE: Record<string, { label: string; tone: string }> = {
   assessing: { label: "Assessing", tone: "info" }, ready: { label: "Assessed", tone: "ok" }, failed: { label: "Failed", tone: "bad" },
@@ -18,6 +19,7 @@ const when = (iso?: string | null) => (iso ? new Date(iso).toLocaleString("en-US
 export function OnboardingPage({ canStart, isAdmin, onJob, initialOpen, onSetup }: { canStart: boolean; isAdmin: boolean; onJob: (id: string) => void; initialOpen?: string; onSetup?: () => void }) {
   const [list, setList] = useState<AssessmentView[] | undefined>();
   const [open, setOpen] = useState<string | undefined>(initialOpen);
+  usePageFocus("assessment", open);
   const [repo, setRepo] = useState("");
   const [version, setVersion] = useState("");
   const [error, setError] = useState("");

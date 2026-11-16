@@ -21,6 +21,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # check-oma-notes.sh compares with the previous tag
 
       - name: Check versions
         id: v
@@ -46,6 +48,7 @@ jobs:
           # The section of CHANGELOG.md under "## <version>", up to the next "## ".
           awk -v v="## ${{ steps.v.outputs.version }}" '$0 == v || index($0, v " ") == 1 { on = 1; next } on && /^## / { exit } on' CHANGELOG.md > notes.md
           [ -s notes.md ] || { echo "::error::CHANGELOG.md has no section for ${{ steps.v.outputs.version }}"; exit 1; }
+          sh bin/check-oma-notes.sh "${{ steps.v.outputs.version }}"
           printf '\nImage: `%s:%s` · executor %s\n' "${{ steps.v.outputs.image }}" "${{ steps.v.outputs.version }}" "${{ steps.v.outputs.executor }}" >> notes.md
 
       - uses: actions/setup-node@v4

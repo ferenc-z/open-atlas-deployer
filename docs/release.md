@@ -16,6 +16,9 @@
 # 1. 版本号：package.json 和 package-lock.json 一起改
 npm version 0.2.5 --no-git-tag-version
 # 2. CHANGELOG.md 加上 "## 0.2.5" 一节；执行器代码改了，就同时调 executor/deployer_executor.py 的 VERSION 和 handoff.ts 的 EXECUTOR_VERSION
+#    助手定义改了（agents/*.md、agents/skills/*.md、templates/deploy-assistant.oma.json、templates/onboarding-assessor.oma.json），
+#    这一节要有 "### After upgrading" 和一行 "- [ ] OMA: ..."，写明要在各环境的 OMA 上重新发布哪个 agent、为什么（见下文）
+#    本地先查一遍：sh bin/check-oma-notes.sh 0.2.5
 # 3. 提交，确认本地检查通过（.check/last 是 "<提交> ok"，或手动跑 sh bin/check.sh），再推送分支
 git push origin main
 # 4. 打 tag 并推送，release 流程随之开始
@@ -24,6 +27,20 @@ git push origin v0.2.5
 ```
 
 发布完成后，管理员在各环境 Deployer 的 Overview → Platform 里就能看到新版本：先升 UAT，跑一段时间再升 PROD。执行器有新版本时，在同一个区域里升级。
+
+### 助手定义的更新（D47）
+
+Deployer 不会自己把 Deploy Assistant 和 Onboarding Assessor 发布到 OMA。某个版本改了它们的提示词、Skill、包定义或工具白名单，CHANGELOG 里这一版就要写一行待办，升级各环境的人照着做：
+
+```md
+### After upgrading
+
+- [ ] OMA: republish the Deploy Assistant (new tools list_assessments, onboarding_draft; prompt reads the page's open object).
+  Run bin/publish-assistant.ts against this environment's OMA, then point DEPLOYER_OMA_AGENT and the Workbench
+  Business Agent "Deploy Assistant" at the new agent id.
+```
+
+改了 Skill 也写在这一行（发布时内容没变的 Skill 不出新版本）；Onboarding Assessor 要单独写一行，发布命令末尾加 `onboarding-assessor`，改的是 `DEPLOYER_OMA_ASSESSOR_AGENT`。release 流程里 [bin/check-oma-notes.sh](../bin/check-oma-notes.sh) 会对比上一个 tag：改了这些文件而没有 `- [ ] OMA:` 这一行，就不发布。
 
 ## 第一次发布的注意事项
 

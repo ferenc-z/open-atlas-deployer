@@ -4,6 +4,7 @@ import type { AiStatus, AuditEntry, Manifest, ManifestCheck, Me, Principal, Regi
 import { DeployPanel, History, JobPanel, JobState, KIND } from "./Deploy.tsx";
 import { EnvPage } from "./Env.tsx";
 import { Artifacts } from "./Artifacts.tsx";
+import { PageFocus, usePageFocus, type SetFocus } from "./focus.ts";
 import { AssistantPanel, KeysPage } from "./Assistant.tsx";
 import { OnboardingPage } from "./Onboarding.tsx";
 import { BriefCard, DriftBanner } from "./Brief.tsx";
@@ -47,6 +48,13 @@ export function App() {
   const [panel, setPanel] = useState<Panel>();
   const [assistant, setAssistant] = useState(false);
   const [assessment, setAssessment] = useState<string | undefined>();
+  // What is open on the page (focus.ts), for the Assistant's page context.
+  const [focus, setFocusState] = useState<Record<string, string>>({});
+  const setFocus = useCallback<SetFocus>((key, value) => setFocusState((was) => {
+    if (was[key] === value) return was;
+    const { [key]: _gone, ...rest } = was;
+    return value === undefined ? rest : { ...rest, [key]: value };
+  }), []);
   // A service to open on the Services page (from the Alerts page or the health card).
   const [service, setService] = useState<string | undefined>();
   // A configuration draft to open with it (the Assistant's card); at: each card opens afresh, even on the same service.
@@ -79,6 +87,7 @@ export function App() {
   const go = (t: Tab) => { setTab(t); if (t !== "onboarding") setAssessment(undefined); setService(undefined); };
   const openService = (id: string) => { setTab("services"); setService(id); setServiceDraft(undefined); };
   return (
+    <PageFocus.Provider value={setFocus}>
     <div className="shell">
       <Sidebar principal={p} environment={me.environment} tab={shown} setTab={go} setupOnly={setupOnly} onSignedOut={load} assistant={assistant} toggleAssistant={() => setAssistant(!assistant)} />
       <div className="content">
@@ -105,8 +114,9 @@ export function App() {
           {shown === "audit" && p.permissions.includes("admin") && <Audit />}
         </main>
       </div>
-      {assistant && <AssistantPanel workbenchUrl={me.workbenchUrl} {...(me.environment ? { environment: me.environment } : {})} page={shown} {...(panel?.kind === "deploy" ? { app: panel.app } : {})} actions={actions} onClose={() => setAssistant(false)} onSetup={() => go("setup")} />}
+      {assistant && <AssistantPanel workbenchUrl={me.workbenchUrl} {...(me.environment ? { environment: me.environment } : {})} page={shown} {...(panel?.kind === "deploy" ? { app: panel.app } : {})} focus={focus} actions={actions} onClose={() => setAssistant(false)} onSetup={() => go("setup")} />}
     </div>
+    </PageFocus.Provider>
   );
 }
 
@@ -319,6 +329,7 @@ function AppRows({ app, open, toggle, action, peer, host }: { app: StatusView["a
 function Registry({ principal, prod }: { principal: Principal; prod: boolean }) {
   const [list, setList] = useState<RegisteredApp[] | undefined>();
   const [selected, setSelected] = useState<string | undefined>();
+  usePageFocus("app", selected);
   const [adding, setAdding] = useState(false);
   const [error, setError] = useState("");
   const [taken, setTaken] = useState("");

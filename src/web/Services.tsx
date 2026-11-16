@@ -14,6 +14,7 @@ import { ServiceDetail } from "./ServiceDetail.tsx";
 import { CertBadge, ConfCell, confElsewhere, DifferenceBadge, memberKey, membersOf, serviceName, SEVERITY, STATE, StatusNotes, UpBadge, webPort, when } from "./svc.tsx";
 import { Sparkline } from "./Charts.tsx";
 import { AlertBadge } from "./Alerts.tsx";
+import { usePageFocus } from "./focus.ts";
 
 type Problem = { message: string; details: string[] };
 const problemOf = (e: unknown): Problem => ({ message: (e as Error).message, details: (e as api.ApiError).details ?? [] });
@@ -35,6 +36,7 @@ const where = (m: { host: string; ports: { https?: number | null; http?: number 
 export function ServicesPage({ onTakeover, isAdmin, initialOpen, initialDraft }: { onTakeover: () => void; isAdmin: boolean; initialOpen?: string; initialDraft?: string }) {
   const [list, setList] = useState<{ standalones: RegisteredService[]; clusters: RegisteredService[] } | undefined>();
   const [open, setOpen] = useState<string | undefined>(initialOpen);
+  usePageFocus("service", open);
   const [layout, setLayoutState] = useState<Layout>(savedLayout);
   const [error, setError] = useState("");
   const refresh = useCallback(() => { api.services().then(setList, (e: Error) => setError(e.message)); }, []);

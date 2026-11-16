@@ -3,6 +3,19 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
+## Unreleased
+
+- The Deploy Assistant knows what is open on the page: the assessment on Onboarding, the service on Services, the
+  app on Environment variables and Apps & manifests (page context `assessment`, `service`, `app`). It can read
+  assessments: new read-only MCP tool `list_assessments`; `list_assessments` and `onboarding_draft` are in its
+  allowed tools.
+
+### After upgrading
+
+- [ ] OMA: republish the Deploy Assistant (allowed tools gain `list_assessments`, `onboarding_draft`; the prompt
+  names the new page context). Run `bin/publish-assistant.ts` against this environment's OMA, then point
+  `DEPLOYER_OMA_AGENT` and the Workbench Business Agent "Deploy Assistant" at the new agent id.
+
 ## 0.3.0-rc.6
 
 - Executor 0.9.2: `EXECUTOR_REGISTRY_AUTH=<host>=<file>` makes the executor log in to a registry itself (a Harbor
