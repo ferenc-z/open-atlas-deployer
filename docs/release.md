@@ -37,7 +37,8 @@ Deployer 不会自己把 Deploy Assistant 和 Onboarding Assessor 发布到 OMA�
 
 - [ ] OMA: republish the Deploy Assistant (new tools list_assessments, onboarding_draft; prompt reads the page's open object).
   Run bin/publish-assistant.ts against this environment's OMA, then point DEPLOYER_OMA_AGENT and the Workbench
-  Business Agent "Deploy Assistant" at the new agent id.
+  Business Agent "Deploy Assistant" at the new agent id. Existing assistant conversations keep the old agent:
+  start a new chat to use the new one.
 ```
 
 改了 Skill 也写在这一行（发布时内容没变的 Skill 不出新版本）；Onboarding Assessor 要单独写一行，发布命令末尾加 `onboarding-assessor`，改的是 `DEPLOYER_OMA_ASSESSOR_AGENT`。release 流程里 [bin/check-oma-notes.sh](../bin/check-oma-notes.sh) 会对比上一个 tag：改了这些文件而没有 `- [ ] OMA:` 这一行，就不发布。

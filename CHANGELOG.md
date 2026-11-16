@@ -14,7 +14,8 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
 
 - [ ] OMA: republish the Deploy Assistant (allowed tools gain `list_assessments`, `onboarding_draft`; the prompt
   names the new page context). Run `bin/publish-assistant.ts` against this environment's OMA, then point
-  `DEPLOYER_OMA_AGENT` and the Workbench Business Agent "Deploy Assistant" at the new agent id.
+  `DEPLOYER_OMA_AGENT` and the Workbench Business Agent "Deploy Assistant" at the new agent id. Existing assistant
+  conversations keep the old agent: start a new chat to use the new one.
 
 ## 0.3.0-rc.6
 
