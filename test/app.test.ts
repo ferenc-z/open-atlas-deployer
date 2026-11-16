@@ -40,7 +40,7 @@ import { OmaSessions } from "../src/server/oma.ts";
 import { Onboarding } from "../src/server/onboarding.ts";
 import { Drift } from "../src/server/drift.ts";
 import { Briefs, collectFacts, type BriefFacts } from "../src/server/brief.ts";
-import { fakeServices, fakeState, sha256, tarGz, type FakeState } from "./fakes.ts";
+import { fakeServices, fakeState, sha256, tarGz, type FakeState, fakeGit } from "./fakes.ts";
 import { NifiOpsGraph } from "../src/server/services/graph-publish.ts";
 import { sealedText, sealFile } from "../src/server/services/config.ts";
 import { splitBody } from "../src/server/services/layers.ts";
@@ -158,7 +158,7 @@ function setup(options: SetupOptions = {}) {
   const onboarding = phase5 ? new Onboarding({
     store, deployments, oma: new OmaSessions({ url: "http://oma.test", keyFile: join(dir, "oma.key"), agent: "agent_assessor", environment: "env_isolated" }, phase5.fetcher),
     githubApi: "https://api.github.test", githubTokenFile: undefined, issueRepo: "acme/deployer", issueTokenFile: join(dir, "issue.token"),
-    templatesDir: join(dir, "kept"), pageUrl: "https://wb.example/deploy/", fetcher: phase5.fetcher, now: () => now,
+    templatesDir: join(dir, "kept"), pageUrl: "https://wb.example/deploy/", fetcher: phase5.fetcher, now: () => now, git: fakeGit(options.services!),
   }) : undefined;
   if (onboarding) deployments.evaluated = (a, v) => onboarding.evaluated(a, v);
   if (phase5) deployments.maintenance = phase5.workbench;
@@ -1879,6 +1879,32 @@ test("D27: where the environment requires it, a new version deploys after its as
   assert.equal(adopted.state, "adopted");
   const allowed = await (await post(t, "/api/apps/book/plan", "uat", { version: "1.1.0" })).json();
   assert.ok(!allowed.findings.some((f: { code: string }) => f.code === "deploy/not-evaluated"));
+});
+
+test("D46: an assessment needs the Deployer's SSH key; the source goes to the sandbox, and an unreadable source fails the assessment", async () => {
+  const t = withBook();
+  t.beat();
+  t.s.tags["acme/hello"] = ["v1.0.0"];
+  t.s.gitKey = false;
+  const list = await (await t.request("/api/assessments", { as: "uat" })).json();
+  assert.equal(list.sourceReady, false);
+  const refused = await post(t, "/api/assessments", "uat", { repo: "https://github.com/acme/hello" });
+  assert.equal(refused.status, 409);
+  assert.equal((await refused.json()).error, "assessment/no-git-key");
+  assert.equal(t.s.oma.sessions.length, 0, "no session that would only clone");
+
+  t.s.gitKey = true;
+  const service = (await makeKey(t, "admin", { kind: "service", name: "assessor", days: 30 })).body.key as string;
+  const a = (await (await post(t, "/api/assessments", "uat", { repo: "https://github.com/acme/hello", version: "1.0.0" })).json()).assessment;
+  assert.deepEqual(t.s.archives, [{ repo: "acme/hello", tag: "v1.0.0" }]);
+  const first = t.s.oma.sessions[0]!.messages[0]!;
+  assert.match(first, /attached as source\.tar\.gz/);
+  assert.doesNotMatch(first, /clone and read|Clone the repository/);
+  const token = tokenOf(first);
+  await agentTool(t, service, "draft_report", a.id, token, { level: "unreadable", report: "source.tar.gz is missing from session/resources" });
+  const failed = await (await t.request(`/api/assessments/${a.id}`, { as: "viewer" })).json();
+  assert.deepEqual([failed.state, failed.level, failed.issue], ["failed", null, null]);
+  assert.match(failed.message, /could not read the source: source\.tar\.gz is missing/);
 });
 
 test("D32: an older version is assessed against the first manifest, and \"unchanged\" extends the manifest down to it", async () => {

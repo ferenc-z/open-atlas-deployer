@@ -211,7 +211,7 @@ export const deployWithNotice = (id: string, version: string, minutes: number, p
 import type { Assessment } from "../server/onboarding.ts";
 export type AssessmentView = Omit<Assessment, "tokenSha256"> & { manifest: Manifest };
 const asm = (id: string, rest = "") => `assessments/${encodeURIComponent(id)}${rest}`;
-export const assessments = () => call<{ assessments: AssessmentView[] }>("GET", "assessments");
+export const assessments = () => call<{ assessments: AssessmentView[]; sourceReady?: boolean }>("GET", "assessments");
 export const assessment = (id: string) => call<AssessmentView>("GET", asm(id));
 export const startAssessment = (body: { repo?: string; version?: string; app?: string }) => call<{ assessment: AssessmentView }>("POST", "assessments", body);
 export const changeDraft = (id: string, operation: string, body: Record<string, unknown>) => call<AssessmentView>("POST", asm(id, `/draft/${operation}`), body);

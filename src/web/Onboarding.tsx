@@ -32,7 +32,9 @@ export function OnboardingPage({ canStart, isAdmin, onJob, initialOpen, onSetup 
     setError("");
     api.startAssessment({ app, version: appVersion }).then((r) => { setOpen(r.assessment.id); setAppVersion(""); refresh(); }, (e: Error) => setError(e.message));
   };
-  const refresh = () => api.assessments().then((r) => setList(r.assessments), (e: Error) => setError(e.message));
+  // D46: without the Deployer's SSH key an assessment cannot start (the sandbox does not clone).
+  const [sourceReady, setSourceReady] = useState(true);
+  const refresh = () => api.assessments().then((r) => { setList(r.assessments); setSourceReady(r.sourceReady !== false); }, (e: Error) => setError(e.message));
   useEffect(() => { refresh(); const t = setInterval(refresh, 5_000); return () => clearInterval(t); }, []);
   const start = (e: FormEvent) => {
     e.preventDefault();
@@ -43,12 +45,13 @@ export function OnboardingPage({ canStart, isAdmin, onJob, initialOpen, onSetup 
     <>
       <div className="toolbar"><h1>Onboarding</h1><span className="muted">Give a repository address; the Onboarding Assessor assesses it in an isolated sandbox and configures a draft. Trial deploys and registering are confirmed by a person.</span></div>
       <AiMissing use="assessments" what="The Onboarding Assessor" {...(onSetup ? { onSetup } : {})} />
+      {canStart && !sourceReady && <div className="banner warn">Assessments need a read-only SSH private key: the Deployer reads the repository over SSH and hands the source to the sandbox, which does not clone. Set <span className="mono">DEPLOYER_GIT_SSH_KEY_FILE</span> under Environment variables, Deployer card, then assess.</div>}
       {canStart && (
         <form className="card panel" onSubmit={start}>
           <div className="row">
             <input value={repo} onChange={(e) => setRepo(e.target.value)} placeholder="https://github.com/owner/repo or git@bitbucket…" style={{ flex: 1 }} />
             <input value={version} onChange={(e) => setVersion(e.target.value.trim())} placeholder="Version (optional)" />
-            <button className="primary" disabled={!repo.trim()}>Assess repository</button>
+            <button className="primary" disabled={!repo.trim() || !sourceReady}>Assess repository</button>
           </div>
           {error && <p className="error">{error}</p>}
         </form>
@@ -59,7 +62,7 @@ export function OnboardingPage({ canStart, isAdmin, onJob, initialOpen, onSetup 
             <span>Assess a new version (D27):</span>
             <select value={app} onChange={(e) => setApp(e.target.value)}><option value="">Choose an app</option>{apps.map((x) => <option key={x} value={x}>{x}</option>)}</select>
             <input value={appVersion} onChange={(e) => setAppVersion(e.target.value.trim())} placeholder="New version, e.g. 1.4.0" />
-            <button disabled={!app || !appVersion}>Assess this version</button>
+            <button disabled={!app || !appVersion || !sourceReady}>Assess this version</button>
             <span className="muted">The AI compares deploy-related files between the two tags and decides whether the manifest needs changes</span>
           </div>
         </form>

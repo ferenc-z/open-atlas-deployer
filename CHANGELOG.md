@@ -9,6 +9,11 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   app on Environment variables and Apps & manifests (page context `assessment`, `service`, `app`). It can read
   assessments: new read-only MCP tool `list_assessments`; `list_assessments` and `onboarding_draft` are in its
   allowed tools.
+- Assessments need the Deployer's read-only SSH key (`DEPLOYER_GIT_SSH_KEY_FILE`, design D46): without it the page
+  says so and refuses to start one (`assessment/no-git-key`), instead of letting the sandbox clone, which fails
+  behind a company proxy (no CA, no credentials) and produced a misleading level C report. The Onboarding Assessor
+  never clones; when the attached source cannot be read it reports level `unreadable`, and the assessment fails
+  with that reason, without a level or an issue for the repository's author.
 
 ### After upgrading
 
@@ -16,6 +21,11 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   names the new page context). Run `bin/publish-assistant.ts` against this environment's OMA, then point
   `DEPLOYER_OMA_AGENT` and the Workbench Business Agent "Deploy Assistant" at the new agent id. Existing assistant
   conversations keep the old agent: start a new chat to use the new one.
+- [ ] OMA: republish the Onboarding Assessor (its prompt no longer clones and knows level `unreadable`): the same
+  `bin/publish-assistant.ts` run with `onboarding-assessor` at the end, then set `DEPLOYER_OMA_ASSESSOR_AGENT` to
+  the new agent id.
+- [ ] Before assessing: set `DEPLOYER_GIT_SSH_KEY_FILE` (Environment variables, Deployer card) to a read-only key
+  without a passphrase, if it is not set yet.
 
 ## 0.3.0-rc.6
 

@@ -4,6 +4,7 @@
 import { createHash } from "node:crypto";
 import { gzipSync } from "node:zlib";
 import { readTarGz, stripTop } from "../src/server/tar.ts";
+import type { Git, GitDiffFile } from "../src/server/git.ts";
 
 /** A .tar.gz of these files under one top directory, as release scripts make them. */
 export function tarGz(files: Record<string, string>, top = "pkg"): Buffer {
@@ -42,6 +43,9 @@ export interface FakeState {
   releases: Record<string, { tag_name: string; name: string; draft: boolean; prerelease: boolean; published_at: string; body?: string; assets: { name: string }[] }[]>;
   compares: Record<string, { files: { filename: string; status: string; patch?: string }[]; commits: { commit: { message: string } }[] }>;
   issues: { repo: string; title: string; body: string; labels: string[]; token: string | null }[];
+  /** D46: whether the Deployer has its SSH key (fakeGit), and the sources it packed for assessments. */
+  gitKey: boolean;
+  archives: { repo: string; tag: string | null }[];
   workbench: {
     apps: { id: string; version: string; previousVersion?: string; agentSlots?: Record<string, { name?: string; businessAgentId: string | null }> }[];
     agents: { id: string; name: string; agentId: string; enabled: boolean }[];
@@ -74,6 +78,8 @@ export function fakeState(): FakeState {
     releases: {},
     compares: {},
     issues: [],
+    gitKey: true,
+    archives: [],
     workbench: { apps: [], agents: [], key: "wbk_test",
       users: [{ email: "u@x", displayName: "U", enabled: true, isAdmin: false, roleIds: ["r_uat"] }, { email: "p@x", enabled: true, isAdmin: false, roleIds: ["r_prod"] }, { email: "a@x", enabled: true, isAdmin: true, roleIds: [] }],
       roles: [{ id: "r_uat", name: "deploy-uat", enabled: true }, { id: "r_prod", name: "deploy-prod", enabled: true }],
@@ -221,6 +227,7 @@ export function fakeServices(s: FakeState): typeof fetch {
       if (r && request.method === "GET") return rest.credentials[r[1]!] || rest.hidden?.includes(r[1]!) ? Response.json({ id: r[1], archived_at: null }) : new Response("{}", { status: 404 });
       r = /^\/v1\/vaults\/([^/]+)\/credentials$/.exec(url.pathname);
       if (r && request.method === "GET") { const c = rest.credentials[r[1]!]; return c ? Response.json({ data: c }) : new Response("{}", { status: 404 }); }
+      if (url.pathname === "/v1/files" && request.method === "POST") return Response.json({ id: `file_${s.archives.length}` });
       if (url.pathname === "/v1/sessions" && request.method === "POST") {
         const id = `sess_${s.oma.sessions.length + 1}`;
         s.oma.sessions.push({ id, body: await request.json() as Record<string, unknown>, messages: [] });
@@ -255,4 +262,21 @@ export function fakeServices(s: FakeState): typeof fetch {
     }
     return new Response("unexpected", { status: 599 });
   }) as typeof fetch;
+}
+
+/** D46: the Deployer's git over SSH, answering from the same tags and compares as the GitHub stand-in. */
+export function fakeGit(s: FakeState): Git {
+  const slug = (repo: string) => repo.replace(/^git@[^:]+:/, "").replace(/^(https?|ssh):\/\/[^/]+\//, "").replace(/\.git$/, "");
+  const compare = (repo: string, from: string, to: string) => s.compares[`${slug(repo)} ${from}...${to}`];
+  return {
+    get configured() { return s.gitKey; },
+    async tags(repo: string) { return [...(s.tags[slug(repo)] ?? [])]; },
+    async diff(repo: string, from: string, to: string, pick: RegExp) {
+      const c = compare(repo, from, to);
+      if (!c) throw new Error(`unknown revision ${from} or ${to}`);
+      return { changed: c.files.length, files: c.files.filter((f) => pick.test(f.filename)).map((f) => ({ file: f.filename, status: f.status as GitDiffFile["status"], patch: f.patch ?? "" })) };
+    },
+    async log(repo: string, from: string, to: string) { return { commits: (compare(repo, from, to)?.commits ?? []).map((c) => c.commit.message.split("\n")[0]!), more: false }; },
+    async archive(repo: string, tag: string | null) { s.archives.push({ repo: slug(repo), tag }); return Buffer.from("source"); },
+  } as unknown as Git;
 }

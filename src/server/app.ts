@@ -1596,7 +1596,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     try { return await run(p, onboarding); } catch (error) { return assessmentError(c, error); }
   };
   api.get("/api/environment-facts", (c) => withOnboarding(c, "view", (_p, o) => c.json(o.environmentFacts())));
-  api.get("/api/assessments", (c) => withOnboarding(c, "view", async (_p, o) => { await o.poll(); return c.json({ assessments: o.list().map((a) => o.view(a)) }); }));
+  api.get("/api/assessments", (c) => withOnboarding(c, "view", async (_p, o) => { await o.poll(); return c.json({ assessments: o.list().map((a) => o.view(a)), sourceReady: o.sourceReady }); }));
   api.post("/api/assessments", (c) => withOnboarding(c, "view", async (p, o) => {
     const body = await c.req.json().catch(() => ({})) as { repo?: string; version?: string; app?: string };
     const { assessment } = await o.start(p, body);
