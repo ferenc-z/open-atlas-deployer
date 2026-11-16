@@ -3,7 +3,7 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
-## Unreleased
+## 0.3.0-rc.8
 
 - Executor 0.9.3, a plain Dockerfile build (design D49): a component's `source.build` is either
   `{script: "build-images.sh"}` (the release tools, the repository has `tools.lock`) or `{dockerfile, prefix?}`.
