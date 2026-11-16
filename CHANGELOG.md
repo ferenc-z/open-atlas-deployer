@@ -3,6 +3,24 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
+## Unreleased
+
+- Executor 0.9.3, a plain Dockerfile build (design D49): a component's `source.build` is either
+  `{script: "build-images.sh"}` (the release tools, the repository has `tools.lock`) or `{dockerfile, prefix?}`.
+  The executor puts the tag's files (`git archive`, under `prefix` when the Dockerfile copies `apps/<name>/...`)
+  into an empty context and runs `docker build` with the labels `org.open-atlas.app/version/commit`, then pushes.
+  Nothing from the repository runs on the host: its own build scripts never run; the Dockerfile runs only in
+  BuildKit's build containers (no `--ssh`, `--secret`, host network). The image is `open-atlas-<app>` or
+  `open-atlas-<app>-<component>`. A repository without `tools.lock` but with a self-contained Dockerfile (a
+  multi-stage `mvn package`, for example) is now deployable instead of level C.
+
+### After upgrading
+
+- [ ] Upgrade the executors to 0.9.3 before deploying a manifest with `build.dockerfile`: 0.9.2 refuses it.
+- [ ] OMA: republish the Onboarding Assessor (level table: a self-contained Dockerfile is A; `draft_source`
+  describes `build.dockerfile` and `prefix`), then set `DEPLOYER_OMA_ASSESSOR_AGENT` to the new agent.
+- [ ] Re-assess repositories rated C only for "no tools.lock" (dossier-clj).
+
 ## 0.3.0-rc.7
 
 - The Deploy Assistant knows what is open on the page: the assessment on Onboarding, the service on Services, the

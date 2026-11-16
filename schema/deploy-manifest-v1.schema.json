@@ -94,11 +94,14 @@
               "description": "Present when the Deployer builds the image from the git tag and pushes it; absent when the project's own pipeline pushes it.",
               "type": "object",
               "additionalProperties": false,
-              "required": ["repo", "tag", "script"],
+              "required": ["repo", "tag"],
+              "oneOf": [{ "required": ["script"] }, { "required": ["dockerfile"] }],
               "properties": {
                 "repo": { "$ref": "#/$defs/repo" },
                 "tag": { "$ref": "#/$defs/versionPattern" },
-                "script": { "type": "string" },
+                "script": { "description": "build-images.sh: the release tools at the repository's tools.lock version.", "const": "build-images.sh" },
+                "dockerfile": { "description": "D49: a plain docker build of this Dockerfile (relative to the repository root); the repository's own scripts never run.", "type": "string", "pattern": "^[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*$" },
+                "prefix": { "description": "With dockerfile: the directory of the build context the repository's files go to, for a Dockerfile that copies apps/<name>/...", "type": "string", "pattern": "^[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*$" },
                 "platform": { "type": "string", "default": "linux/amd64" }
               }
             }

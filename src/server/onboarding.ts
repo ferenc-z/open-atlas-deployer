@@ -481,6 +481,20 @@ export class Onboarding {
       const bad = Object.keys((c.compose ?? {}) as Record<string, unknown>).filter((k) => FORBIDDEN_COMPOSE.includes(k));
       if (bad.length) add("draft/compose-forbidden", ["components", c.id, "compose"], `Not allowed: ${bad.join(", ")}`);
       for (const v of c.volumes ?? []) if (v.path && (v.path.startsWith("/") || v.path.split("/").includes(".."))) add("draft/volume", ["components", c.id, "volumes", v.target], "Data directories must be relative paths inside the app directory");
+      // What the executor builds (deployer_executor.py build, D49): the release tools' build-images.sh (the repository
+      // has tools.lock; image open-atlas-<app>) or a plain docker build of a Dockerfile (image open-atlas-<app> or
+      // open-atlas-<app>-<component>); a repository's own build script never runs.
+      const build = c.source?.kind === "company-registry" ? c.source.build : undefined;
+      const at = ["components", c.id, "source", "build"];
+      const rel = (x: unknown) => typeof x === "string" && /^[A-Za-z0-9_][A-Za-z0-9._-]*(\/[A-Za-z0-9_][A-Za-z0-9._-]*)*$/u.test(x) && !x.split("/").includes("..");
+      if (build && "dockerfile" in build && build.dockerfile !== undefined) {
+        if ("script" in build && build.script !== undefined) add("draft/build-script", at, "build is either {script: build-images.sh} or {dockerfile, prefix?}, not both");
+        if (!rel(build.dockerfile) || (build.prefix !== undefined && !rel(build.prefix))) add("draft/build-path", at, "dockerfile and prefix are relative paths inside the repository");
+        if (m.app && c.source?.kind === "company-registry" && c.source.image !== `open-atlas-${m.app}` && !c.source.image.startsWith(`open-atlas-${m.app}-`)) add("draft/build-image", ["components", c.id, "source", "image"], `A Deployer-built image is named open-atlas-${m.app} or open-atlas-${m.app}-<component>`);
+      } else if (build) {
+        if (build.script !== "build-images.sh") add("draft/build-script", [...at, "script"], `The executor runs only the release tools' build-images.sh (the repository needs tools.lock); ${String(build.script)} would be refused. A repository without tools.lock builds with {dockerfile, prefix?} when its Dockerfile is self-contained`);
+        if (m.app && c.source?.kind === "company-registry" && c.source.image !== `open-atlas-${m.app}`) add("draft/build-image", ["components", c.id, "source", "image"], `build-images.sh names the image open-atlas-${m.app}`);
+      }
     }
     if (out.length) return out;
     const others = this.store.listApps().filter((x) => x.id !== m.app).flatMap((x) => this.store.manifests(x.id));

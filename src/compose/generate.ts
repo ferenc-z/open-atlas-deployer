@@ -16,7 +16,9 @@ export interface Manifest {
 
 export type Source =
   | { kind: "public-registry"; image: string }
-  | { kind: "company-registry"; registry: string; image: string; tag?: string; build?: { repo: string; tag: string; script: string; platform?: string } };
+  | { kind: "company-registry"; registry: string; image: string; tag?: string; build?: Build };
+/** How the executor builds an own image (§5.2): the release tools' build-images.sh, or a plain docker build of a Dockerfile (D49). */
+export type Build = { repo: string; tag: string; platform?: string } & ({ script: string; dockerfile?: never; prefix?: never } | { dockerfile: string; prefix?: string; script?: never });
 
 interface Port { container: number; host?: number; name?: string }
 interface Volume { target: string; path?: string; file?: string }

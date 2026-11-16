@@ -70,7 +70,7 @@ from executor_core import (  # noqa: F401
     Refused, Restarting, load_env_file, now_iso, version_key, write_json)
 # <<< executor_core
 
-VERSION = "0.9.2"
+VERSION = "0.9.3"
 # Job kinds, plus what a deploy may ask for (bundle files, migrations): an older executor is not sent those.
 KINDS = ["build", "deploy", "env", "env-read", "bundle", "db-migration", "executor-upgrade", "deployer-upgrade"]
 ENV_FILE_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*\.env$")
@@ -81,6 +81,7 @@ SERVICE_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]*$")
 TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
 ASSET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 COMPONENT_RE = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
+BUILD_PATH_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*$")
 CA_RE = re.compile(r"^(-----BEGIN CERTIFICATE-----[A-Za-z0-9+/=\s]+-----END CERTIFICATE-----\s*)+$")
 # Runs psql in the database container as the image's own superuser, on its local socket; arguments follow.
 PSQL = 'exec psql -X -q -v ON_ERROR_STOP=1 -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-${POSTGRES_USER:-postgres}}" "$@"'
@@ -566,7 +567,7 @@ class Executor(ProtocolExecutor):
             self.step(status, "rollback", "done")
             self.finish(status, "rolled-back", f"{why}; back on {previous or 'the previous image'} with the state from before the upgrade")
 
-    # --- build: the pinned release tools' build-images.sh (§5.2) ----------------------------------------
+    # --- build: the pinned release tools' build-images.sh, or a plain docker build (§5.2, D49) -------------
 
     def build(self, req, status):
         app, version, b = req.get("app", ""), req.get("version", ""), req.get("build") or {}
@@ -575,12 +576,19 @@ class Executor(ProtocolExecutor):
             raise Refused("app or version is malformed")
         if not REPO_RE.match(b.get("repo", "")) or version not in b.get("tag", ""):
             raise Refused("build.repo or build.tag is malformed")
-        if b.get("script") != "build-images.sh":
-            raise Refused("only open-atlas-release's build-images.sh builds images")
+        dockerfile = b.get("dockerfile")
+        if dockerfile is not None and "script" in b:
+            raise Refused("build names both a script and a dockerfile: one or the other")
+        if dockerfile is None and b.get("script") != "build-images.sh":
+            raise Refused("only open-atlas-release's build-images.sh or a dockerfile builds images; the repository's own scripts never run")
+        if dockerfile is not None and not all(BUILD_PATH_RE.match(x) and ".." not in x.split("/") for x in (dockerfile, b.get("prefix") or "x")):
+            raise Refused("build.dockerfile or build.prefix is not a relative path inside the repository")
         if registry not in self.cfg["registries"]:
             raise Refused(f"registry {registry} is not registered on this host (EXECUTOR_REGISTRIES)")
-        if image != f"open-atlas-{app}":
+        if dockerfile is None and image != f"open-atlas-{app}":
             raise Refused(f"build-images.sh names the image open-atlas-{app}, the manifest says {image}")
+        if dockerfile is not None and not (image == f"open-atlas-{app}" or re.match(rf"^open-atlas-{re.escape(app)}-[a-z][a-z0-9-]*$", image)):
+            raise Refused(f"a dockerfile build names the image open-atlas-{app} or open-atlas-{app}-<component>, the manifest says {image}")
         platform = b.get("platform", "linux/amd64")
         if platform not in ("linux/amd64", "linux/arm64"):
             raise Refused(f"platform {platform} is not supported")
@@ -591,6 +599,8 @@ class Executor(ProtocolExecutor):
             self.clone(b["repo"], b["tag"], src)
             commit = self.sh(["git", "-C", str(src), "rev-parse", "HEAD"]).stdout.strip()
             status["result"]["commit"] = commit
+            if dockerfile is not None:
+                return self.build_dockerfile(status, app, version, commit, src, b, registry, image, platform)
 
             self.step(status, "tools")
             tools_version = (src / "tools.lock").read_text().strip()
@@ -621,6 +631,44 @@ class Executor(ProtocolExecutor):
             self.finish(status, "succeeded", f"built and pushed {ref}@{digest[:19]}")
         finally:
             shutil.rmtree(src, ignore_errors=True)
+            shutil.rmtree(src.with_name(src.name + ".ctx"), ignore_errors=True)
+
+    def build_dockerfile(self, status, app, version, commit, src, b, registry, image, platform):
+        """D49: the tag's files (git archive, so no .git and nothing uncommitted) under build.prefix, then docker build.
+        Nothing from the repository runs on this host: its Dockerfile runs in BuildKit's build containers, without
+        --ssh, --secret, the host network or insecure entitlements."""
+        ctx = src.with_name(src.name + ".ctx")
+        shutil.rmtree(ctx, ignore_errors=True)
+        dest = ctx / b["prefix"] if b.get("prefix") else ctx
+        dest.mkdir(parents=True)
+        self.step(status, "context")
+        archive = ctx.with_name(ctx.name + ".tar")
+        try:
+            self.sh(["git", "-C", str(src), "archive", "--format=tar", "-o", str(archive), "HEAD"])
+            self.sh(["tar", "-x", "-f", str(archive), "-C", str(dest)])
+        finally:
+            archive.unlink(missing_ok=True)
+        file = dest / b["dockerfile"]
+        if not file.is_file():
+            raise Failed(f"{b['dockerfile']} is not in {b['repo']} at {b['tag']}")
+
+        self.step(status, "build")
+        ref = f"{registry}/{image}:{version}"
+        self.registry_login(registry)
+        self.sh(["docker", "build", "--pull", "--platform", platform, "-f", str(file), "-t", ref,
+                 "--build-arg", f"BUILD_COMMIT={commit}", "--build-arg", f"BUILD_VERSION={version}",
+                 "--label", f"org.open-atlas.app={app}", "--label", f"org.open-atlas.version={version}",
+                 "--label", f"org.open-atlas.commit={commit}", str(ctx)], timeout=3 * 3600)
+        self.sh(["docker", "push", "--quiet", ref], timeout=3600)
+
+        self.step(status, "verify-build")
+        digests = json.loads(self.sh(["docker", "image", "inspect", "--format", "{{json .RepoDigests}}", ref]).stdout or "[]")
+        digest = next((d.split("@", 1)[1] for d in digests if d.startswith(f"{registry}/{image}@")), None)
+        if not digest:
+            raise Failed(f"{ref} has no digest in {registry}: was it pushed?")
+        info = {"version": version, "commit": commit, "dirty": False, "builder": "dockerfile"}
+        status["result"].update(image=ref, digest=digest, build=info)
+        self.finish(status, "succeeded", f"built and pushed {ref}@{digest[:19]}")
 
     # --- deploy: one app's fragment, pinned, checked, switched, verified, rolled back (§8.1, §8.3) ---------
 

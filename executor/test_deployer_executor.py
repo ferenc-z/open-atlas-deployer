@@ -159,6 +159,11 @@ class RequestTest(unittest.TestCase):
         base = {"protocol": 2, "kind": "build", "app": "shop", "version": "1.2.0", "registry": "ghcr.io/acme", "image": "open-atlas-shop",
                 "build": {"repo": "acme/shop", "tag": "shop-1.2.0", "script": "build-images.sh", "platform": "linux/amd64"}}
         cases = [({"build": {**base["build"], "script": "rm -rf /"}}, "build-images.sh"),
+                 ({"build": {**base["build"], "script": "scripts/build-image.sh"}}, "never run"),
+                 ({"build": {**base["build"], "dockerfile": "Dockerfile"}}, "one or the other"),
+                 ({"build": {"repo": "acme/shop", "tag": "shop-1.2.0", "dockerfile": "../Dockerfile"}}, "relative path"),
+                 ({"build": {"repo": "acme/shop", "tag": "shop-1.2.0", "dockerfile": "Dockerfile", "prefix": "/etc"}}, "relative path"),
+                 ({"build": {"repo": "acme/shop", "tag": "shop-1.2.0", "dockerfile": "Dockerfile"}, "image": "nginx"}, "open-atlas-shop-<component>"),
                  ({"registry": "ghcr.io/evil"}, "not registered"),
                  ({"image": "shop"}, "names the image"),
                  ({"protocol": 1}, "protocol 1")]
@@ -167,6 +172,33 @@ class RequestTest(unittest.TestCase):
             self.assertEqual(status["state"], "refused")
             self.assertIn(word, status["message"])
         self.assertEqual(self.ran[-1][:2], ["docker", "ps"], "only the state report ran")
+
+    def test_a_dockerfile_build_runs_only_git_tar_and_docker(self):
+        """D49: the tag's files under build.prefix, docker build with labels, push; no script from the repository."""
+        def sh(args, **kw):
+            self.ran.append(args)
+            out = ""
+            if args[:2] == ["tar", "-x"]:
+                d = pathlib.Path(args[args.index("-C") + 1]); d.mkdir(parents=True, exist_ok=True); (d / "Dockerfile").write_text("FROM x\n")
+            elif "rev-parse" in args:
+                out = "c0ffee" * 6 + "cafe"
+            elif args[:3] == ["docker", "image", "inspect"]:
+                out = '["ghcr.io/acme/open-atlas-shop@sha256:abc"]'
+            return type("P", (), {"returncode": 0, "stdout": out, "stderr": ""})()
+        self.ex.sh = sh
+        status = self.submit({"protocol": 2, "kind": "build", "id": "build-job-0100", "app": "shop", "version": "1.2.0",
+                              "registry": "ghcr.io/acme", "image": "open-atlas-shop",
+                              "build": {"repo": "acme/shop", "tag": "shop-1.2.0", "dockerfile": "Dockerfile", "prefix": "apps/shop"}})
+        self.assertEqual(status["state"], "succeeded", status.get("message"))
+        self.assertEqual(status["result"]["digest"], "sha256:abc")
+        self.assertEqual(status["result"]["build"], {"version": "1.2.0", "commit": "c0ffee" * 6 + "cafe", "dirty": False, "builder": "dockerfile"})
+        build = next(a for a in self.ran if a[:2] == ["docker", "build"])
+        self.assertTrue(build[build.index("-f") + 1].endswith(".ctx/apps/shop/Dockerfile"))
+        self.assertTrue(build[-1].endswith(".ctx"), "the context is the archive, not the clone")
+        self.assertIn("org.open-atlas.version=1.2.0", build)
+        for word in ("--ssh", "--secret", "--network", "--allow"):
+            self.assertNotIn(word, build)
+        self.assertEqual({a[0] for a in self.ran}, {"git", "tar", "docker"}, "nothing from the repository runs")
 
     def test_deploy_refuses_a_root_for_another_project_or_a_missing_include(self):
         base = {"protocol": 2, "kind": "deploy", "app": "shop", "version": "1.2.0", "services": ["shop"], "fragment": "services: {}",

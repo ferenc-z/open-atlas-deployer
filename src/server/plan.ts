@@ -354,7 +354,7 @@ export function buildRequests(env: Environment, manifest: Manifest, version: str
     const b = c.source.build;
     return [{ service: c.service!, request: {
       kind: "build", app: manifest.app, version, service: c.service!, registry, image: c.source.image,
-      build: { repo: b.repo, tag: b.tag.replaceAll("{version}", version), script: b.script, platform: b.platform ?? "linux/amd64" },
+      build: { repo: b.repo, tag: b.tag.replaceAll("{version}", version), ...("dockerfile" in b && b.dockerfile ? { dockerfile: b.dockerfile, ...(b.prefix ? { prefix: b.prefix } : {}) } : { script: b.script }), platform: b.platform ?? "linux/amd64" },
     } }];
   });
 }
