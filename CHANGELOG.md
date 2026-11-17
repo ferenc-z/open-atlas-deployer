@@ -3,7 +3,7 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
-## Unreleased
+## 0.3.0-rc.14
 
 - D51: a first install starts from the defaults: when the first import finds no env file on the server and the
   manifest uses a template the Deployer keeps (an assessment's), a revision with the template's defaults (never
