@@ -1360,6 +1360,29 @@ test("writing goes through a plan; the request carries the file, the job record 
   assert.equal(t.store.appliedEnv("shop")!.meta.revision, 3);
 });
 
+test("D51: an app whose manifest declares no env file gets one in UAT; the first write adds it to the manifest", async () => {
+  const t = withBuiltApp();
+  t.beat();
+  const view = await (await t.request("/api/apps/shop/env", { as: "viewer" })).json();
+  assert.deepEqual([view.implicit, view.file, view.findings], [true, "shop.env", []]);
+  assert.ok(!("error" in view.schema), "no template is not an error");
+  await importFile(t, null);
+  await put(t, "/api/apps/shop/env", "uat", { base: 1, values: [{ key: "SHOP_TLS", value: "off" }] });
+  const p = await (await post(t, "/api/apps/shop/env/plan", "uat", { revision: 2 })).json();
+  assert.deepEqual(p.findings.filter((f: { blocking: boolean }) => f.blocking), []);
+  assert.ok(p.findings.some((f: { code: string }) => f.code === "env/next-deploy"));
+  const before = t.store.manifests("shop").at(-1)!;
+  assert.equal(before.env, undefined);
+  const { job } = await (await post(t, "/api/apps/shop/env/apply", "uat", { revision: 2 })).json();
+  finish(t, job.id, "succeeded");
+  await t.request("/api/jobs", { as: "viewer" });
+  const after = t.store.manifests("shop").at(-1)!;
+  assert.deepEqual(after.env, { file: "shop.env" }, "the file comes first, then the manifest names it");
+  assert.ok(after.components.filter((c) => c.type === "compose-service").every((c) => c.envFile));
+  assert.ok(t.store.listAudit().some((e) => e.action === "manifest.env-added"));
+  assert.equal((await (await t.request("/api/apps/shop/env", { as: "viewer" })).json()).implicit, false);
+});
+
 test("a deploy needs every ${KEY} its fragment uses in the server's env file, and records the env revision", async () => {
   const t = withEnvApp();
   const b = (await (await post(t, "/api/apps/shop/build", "uat", { version: "1.2.0" })).json()).jobs[0].id;
@@ -1717,7 +1740,8 @@ test("/mcp: tools are the page's calls; a service key sees only the read-only on
   assert.equal(plan.value.steps.length, 6);
   assert.equal((await tool(t, service, "deploy", { app: "book", version: "1.0.0", request_id: "r1" })).value.finding.code, "mcp/unknown-tool", "no write tools for the service key");
   assert.equal((await tool(t, service, "plan_deploy", { app: "book", version: "1.0.0", force: true })).value.finding.expected, "plan_deploy has no parameter force");
-  assert.equal((await tool(t, service, "get_env", { app: "book" })).value.finding.code, "env/none", "a refusal is the route's own finding");
+  assert.equal((await tool(t, service, "get_env", { app: "nobody" })).value.finding.code, "app/unknown", "a refusal is the route's own finding");
+  assert.equal((await tool(t, service, "get_env", { app: "book" })).value.implicit, true, "D51: an app without an env file still has one");
 
   // A command with request_id: the retry returns the first answer, one job only.
   const first = await tool(t, personal, "deploy", { app: "book", version: "1.0.0", request_id: "deploy-1" });

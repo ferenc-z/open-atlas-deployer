@@ -3,6 +3,20 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
+## Unreleased
+
+- D51: an app whose manifest declares no env file still has one in UAT, `<app>.env`, without a template: Environment
+  variables (and the MCP env tools) import, edit and write it as usual, with keys added by hand. Once the first write
+  succeeds, the Deployer saves a manifest revision that names the file and has every compose service read it
+  (`manifest.env-added` in the audit log); the containers read it from the next deploy. In PROD such an app still has
+  no env file until the manifest comes from UAT.
+- The Onboarding Assessor declares every variable an operator may need to change, defaults included.
+
+### After upgrading
+
+- [ ] OMA: republish the Onboarding Assessor (env keys with defaults are declared too), then set
+  `DEPLOYER_OMA_ASSESSOR_AGENT` to the new agent.
+
 ## 0.3.0-rc.12
 
 - An MCP command's `request_id` replays the earlier answer only for the same tool with the same arguments; a reused

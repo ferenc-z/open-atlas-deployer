@@ -286,6 +286,11 @@ function Values({ data, editing, revealed, reveal, onCancel, onSaved }: { data: 
   );
   return (
     <>
+      {data.implicit && (
+        <p className="banner">
+          The manifest declares no env file, so <span className="mono">{data.file}</span> has no template: add the keys here. The first write adds the file to the manifest, and the containers read it from the next deploy.
+        </p>
+      )}
       {containerMissing.length > 0 && (
         <button className="banner bad clickable" onClick={() => setFilter("missing")}>
           The containers need {containerMissing.length} key{containerMissing.length > 1 ? "s" : ""} that {containerMissing.length > 1 ? "are" : "is"} not set: {containerMissing.slice(0, 4).map((r) => r.key).join(", ")}{containerMissing.length > 4 ? "…" : ""}. Deploys and writes are blocked until they are set.

@@ -128,8 +128,32 @@ export class EnvManager {
     const { env, deployed } = this.deployments.environment();
     const at = version ?? deployed[appId] ?? env.apps[appId]?.version ?? manifests.at(-1)?.appliesFrom;
     const manifest = (at && covering(manifests, at)) || manifests.at(-1);
-    if (!manifest?.env) throw new DeployError(404, "env/none", `The ${appId} manifest has no env file.`);
-    return { app, manifest, version: at ?? manifest.appliesFrom, deployed: appId in deployed, envFile: manifest.env };
+    if (!manifest) throw new DeployError(404, "env/none", `The ${appId} manifest has no env file.`);
+    const base = { app, manifest, version: at ?? manifest.appliesFrom, deployed: appId in deployed };
+    if (manifest.env) return { ...base, envFile: manifest.env, implicit: false };
+    // D51: an app whose manifest declares no env still has one, <app>.env, kept here; the first write adds it to the
+    // manifest. PROD takes its manifests from UAT (D38), so there it has to come from UAT.
+    if (!manifest.components.some((c) => c.type === "compose-service")) throw new DeployError(404, "env/none", `The ${appId} manifest has no env file.`);
+    if (isProd(env)) throw new DeployError(404, "env/none", `The ${appId} manifest has no env file. Add the keys in UAT: the manifest gets its env file there, and this environment takes it with the manifest.`);
+    return { ...base, envFile: { file: `${appId}.env` }, implicit: true };
+  }
+
+  /** D51: after the first write of an implicit env file, the manifest names it and every service reads it. */
+  private addEnvToManifest(job: Job) {
+    const actor = { id: job.requestedBy, via: job.via as Actor["via"] };
+    try {
+      const { manifest, envFile, implicit } = this.context(job.app);
+      if (!implicit) return;
+      const next: Manifest = {
+        ...structuredClone(manifest),
+        env: { file: envFile.file },
+        components: manifest.components.map((c) => (c.type === "compose-service" ? { ...structuredClone(c), envFile: true } : structuredClone(c))),
+      };
+      const saved = this.store.saveManifest(next, actor, { note: `env file ${envFile.file} added with env revision ${job.request.revision} (D51)` });
+      this.store.audit(actor, "manifest.env-added", `${saved.app}@${saved.appliesFrom}`, { revision: saved.revision, file: envFile.file, job: job.id });
+    } catch (error) {
+      this.store.audit(actor, "manifest.env-add-failed", job.app, { job: job.id, reason: (error as Error).message });
+    }
   }
 
   private secretKeys(manifest: Manifest, keys: string[]): string[] {
@@ -168,17 +192,19 @@ export class EnvManager {
 
   async view(principal: Principal, appId: string, options: { revision?: number; version?: string } = {}) {
     this.need(principal, "view");
-    const { manifest, version, deployed, envFile } = this.context(appId, options.version);
+    const { manifest, version, deployed, envFile, implicit } = this.context(appId, options.version);
     const shown = this.store.envRevision(appId, options.revision);
     if (options.revision !== undefined && !shown) throw new DeployError(404, "env/revision", `No revision ${options.revision}.`);
     const applied = this.store.appliedEnv(appId);
     const keys = shown ? Object.keys(shown.values) : [];
     const secrets = this.secretKeys(manifest, keys);
     const values: EnvValue[] = shown ? Object.entries(shown.values).map(([key, v]) => (secrets.includes(key) || "s" in v ? { key, secret: true } : { key, value: v.v, secret: false })) : [];
-    const schema = await this.schemas.get(manifest, version);
-    const findings = checkEnv(keys, "keys" in schema ? schema.keys : null, referencedKeys(manifest));
+    const schema: Schema | { error: string } = implicit
+      ? { version, source: "no template: the manifest declares no env yet, so keys are added here", keys: [] }
+      : await this.schemas.get(manifest, version);
+    const findings = checkEnv(keys, !implicit && "keys" in schema ? schema.keys : null, referencedKeys(manifest));
     return {
-      app: appId, file: envFile.file, version, deployed, secrets,
+      app: appId, file: envFile.file, implicit, version, deployed, secrets,
       revision: shown?.meta ?? null, values,
       applied: applied?.meta.revision ?? null,
       revisions: this.store.envRevisions(appId),
@@ -240,7 +266,7 @@ export class EnvManager {
 
   plan(principal: Principal, appId: string, revision?: number): EnvPlan {
     this.need(principal, "view");
-    const { manifest, deployed, envFile } = this.context(appId);
+    const { manifest, deployed, envFile, implicit } = this.context(appId);
     const target = this.store.envRevision(appId, revision);
     if (!target) throw new DeployError(404, "env/revision", revision === undefined ? "No revisions yet: import the env file from the server first." : `No revision ${revision}.`);
     const applied = this.store.appliedEnv(appId);
@@ -264,7 +290,8 @@ export class EnvManager {
     if (!deployed) findings.push({ code: "env/write-only", message: `${appId} has not been deployed by the Deployer yet: the file is written without a restart and takes effect on the next deploy (or a manual restart).`, blocking: false });
     // Compose recreates a container only when its configuration changed, so an unchanged file restarts nothing.
     const restarts = deployed && changes.length ? affectedServices(manifest, changes.map((c) => c.key)) : [];
-    if (deployed && changes.length && !restarts.length) findings.push({ code: "env/no-restart", message: "No service reads these keys: the file is written only.", blocking: false });
+    if (implicit) findings.push({ code: "env/next-deploy", message: `The ${appId} manifest declares no env file yet: once this write succeeds, the Deployer adds ${envFile.file} to the manifest, and the containers read it from the next deploy.`, blocking: false });
+    else if (deployed && changes.length && !restarts.length) findings.push({ code: "env/no-restart", message: "No service reads these keys: the file is written only.", blocking: false });
     return { app: appId, revision: target.meta.revision, applied: applied?.meta.revision ?? null, file: envFile.file, changes, restarts, restart: deployed, findings };
   }
 
@@ -303,7 +330,10 @@ export class EnvManager {
 
   /** After the executor finishes: a written revision is now the server's; an imported file becomes a revision. */
   async afterJob(job: Job, status: ExecutorStatus) {
-    if (job.kind === "env" && status.state === "succeeded") this.store.markEnvApplied(job.app, Number(job.request.revision), job.id);
+    if (job.kind === "env" && status.state === "succeeded") {
+      this.store.markEnvApplied(job.app, Number(job.request.revision), job.id);
+      this.addEnvToManifest(job);
+    }
     if (job.kind !== "env-read" || status.state !== "succeeded" || !this.box) return;
     const found = status.result.env;
     let text = "";
