@@ -1383,6 +1383,30 @@ test("D51: an app whose manifest declares no env file gets one in UAT; the first
   assert.equal((await (await t.request("/api/apps/shop/env", { as: "viewer" })).json()).implicit, false);
 });
 
+test("D51: a first install starts from the defaults of the Deployer's template; optional keys are never missing", async () => {
+  const t = withBuiltApp();
+  mkdirSync(join(t.dir, "templates"), { recursive: true });
+  writeFileSync(join(t.dir, "templates", "shop.env.example"), "# Port\nSHOP_PORT=8080\n# Token (secret)\nAPI_TOKEN=\n# Single sign-on\n#OIDC_CLIENT_ID=\n# TLS\n#SHOP_TLS=auto\n");
+  t.store.saveManifest({ ...built, env: { file: "shop.env", template: "templates/shop.env.example", secrets: ["API_TOKEN"] }, components: [{ ...built.components[0], envFile: true }] }, { id: "t", via: "cli" });
+  t.beat();
+  await importFile(t, null);
+  const view = await (await t.request("/api/apps/shop/env", { as: "viewer" })).json();
+  assert.deepEqual(view.revisions.map((r: { revision: number; source: string }) => `${r.revision} ${r.source}`), ["2 edit", "1 import"]);
+  assert.equal(view.applied, 1, "the defaults are not on the server until a person writes them");
+  assert.match(view.revision.note, /^Started from the defaults of templates\/shop\.env\.example/);
+  assert.deepEqual(view.values, [{ key: "SHOP_PORT", value: "8080", secret: false }, { key: "SHOP_TLS", value: "auto", secret: false }], "no secret, no empty key");
+  assert.deepEqual(view.schema.keys.filter((k: { required: boolean }) => !k.required).map((k: { key: string }) => k.key), ["OIDC_CLIENT_ID", "SHOP_TLS"]);
+
+  // A file already on the server is imported as it is, with nothing added.
+  const other = withBuiltApp();
+  mkdirSync(join(other.dir, "templates"), { recursive: true });
+  writeFileSync(join(other.dir, "templates", "shop.env.example"), "SHOP_PORT=8080\n");
+  other.store.saveManifest({ ...built, env: { file: "shop.env", template: "templates/shop.env.example" }, components: [{ ...built.components[0], envFile: true }] }, { id: "t", via: "cli" });
+  other.beat();
+  await importFile(other, "SHOP_PORT=9090\n");
+  assert.deepEqual((await (await other.request("/api/apps/shop/env", { as: "viewer" })).json()).revisions.map((r: { source: string }) => r.source), ["import"]);
+});
+
 test("a deploy needs every ${KEY} its fragment uses in the server's env file, and records the env revision", async () => {
   const t = withEnvApp();
   const b = (await (await post(t, "/api/apps/shop/build", "uat", { version: "1.2.0" })).json()).jobs[0].id;

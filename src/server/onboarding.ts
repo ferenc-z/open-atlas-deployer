@@ -32,7 +32,8 @@ export class OnboardingError extends Error {
 export type Level = "A" | "B" | "C" | "D" | "unchanged";
 /** What draft_report takes: the levels, and unreadable (no level: the assessment fails). The tool's description says it. */
 export const LEVELS = ["A", "B", "C", "D", "unchanged", "unreadable"] as const;
-export interface EnvKey { key: string; description: string; secret: boolean; default?: string }
+/** optional: the app runs without it (D51); such a key is a commented line of the template, never "missing". */
+export interface EnvKey { key: string; description: string; secret: boolean; default?: string; optional?: boolean }
 export interface Draft { app: string | null; name: string | null; manifest: Partial<Manifest> & { components: Component[] }; envKeys: EnvKey[] }
 export interface Change { at: string; by: string; operation: string; reason: string; summary: string }
 export interface Finding { code: string; at: string[]; expected: string }
@@ -412,7 +413,7 @@ export class Onboarding {
       case "env-key": {
         if (!/^[A-Z_][A-Z0-9_]*$/.test(String(args.key ?? ""))) throw new OnboardingError(400, "draft/env-key", "env keys are uppercase letters, digits and underscores.");
         if (args.secret && args.default) throw new OnboardingError(400, "draft/env-secret", "A secret cannot have a default: mark it as \"filled in by a person\".");
-        const key: EnvKey = { key: args.key, description: String(args.description ?? ""), secret: Boolean(args.secret), ...(args.default !== undefined ? { default: String(args.default) } : {}) };
+        const key: EnvKey = { key: args.key, description: String(args.description ?? ""), secret: Boolean(args.secret), ...(args.default !== undefined ? { default: String(args.default) } : {}), ...(args.optional ? { optional: true } : {}) };
         a.draft.envKeys = [...a.draft.envKeys.filter((k) => k.key !== args.key), key];
         summary = `env key ${args.key}${key.secret ? " (secret, filled in by a person)" : ""}`;
         break;
@@ -533,7 +534,9 @@ export class Onboarding {
   private writeTemplate(a: Assessment) {
     if (!a.draft.envKeys.length) return;
     mkdirSync(this.o.templatesDir, { recursive: true });
-    const lines = ["# Kept by Open Atlas Deployer from an assessment; secrets are left empty for a person to fill.", ...a.draft.envKeys.flatMap((k) => [`# ${k.description}${k.secret ? " (secret)" : ""}`, `${k.key}=${k.secret ? "" : k.default ?? ""}`])];
+    // D51: KEY=value is a key to set, #KEY=value an optional one (the app runs without it); a value is the default the
+    // first revision starts from.
+    const lines = ["# Kept by Open Atlas Deployer from an assessment; secrets are left empty for a person to fill.", ...a.draft.envKeys.flatMap((k) => [`# ${k.description}${k.secret ? " (secret)" : ""}`, `${k.optional ? "#" : ""}${k.key}=${k.secret ? "" : k.default ?? ""}`])];
     writeFileSync(join(this.o.templatesDir, `${a.draft.app}.env.example`), lines.join("\n") + "\n");
   }
 

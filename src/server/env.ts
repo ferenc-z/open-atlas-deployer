@@ -347,7 +347,7 @@ export class EnvManager {
     const parsed = parseEnv(text);
     const latest = this.store.envRevision(job.app);
     const before = latest ? this.plain(latest.values) : {};
-    const { manifest } = this.context(job.app);
+    const { manifest, version } = this.context(job.app);
     const secrets = this.secretKeys(manifest, [...Object.keys(before), ...Object.keys(parsed.values)]);
     const changes = changedKeys(before, parsed.values, secrets);
     if (latest && !changes.length) {
@@ -363,6 +363,17 @@ export class EnvManager {
     const note = [found?.exists ? `Imported from ${job.request.file} on the server` : `${job.request.file} does not exist on the server`, ...parsed.errors].join("; ");
     const actor = { id: job.requestedBy, via: job.via as Actor["via"] };
     this.store.saveEnv(job.app, this.seal(manifest, parsed.values), changes, "import", actor, { note, appliedJob: job.id });
+    // D51: a first install (no file on the server, no revision before) starts from the defaults of the template the
+    // Deployer keeps (an assessment's), as a revision a person checks and writes; never secrets, never the samples of
+    // a repository's .env.example.
+    if (!latest && !found?.exists && manifest.env?.template) {
+      const schema = await this.schemas.get(manifest, version);
+      const defaults = "keys" in schema ? Object.fromEntries(schema.keys.filter((k) => k.example !== "").map((k) => [k.key, k.example])) : {};
+      for (const k of this.secretKeys(manifest, Object.keys(defaults))) delete defaults[k];
+      if (Object.keys(defaults).length) {
+        this.store.saveEnv(job.app, this.seal(manifest, defaults), changedKeys({}, defaults, []), "edit", actor, { note: `Started from the defaults of ${manifest.env.template}: check them, then write` });
+      }
+    }
     // Edits saved before this import and never written stay the newest revision, so the next write still carries them
     // and nobody edits on top of the imported file by mistake (a first install saves values, then has to import).
     if (latest && !latest.meta.appliedAt) {

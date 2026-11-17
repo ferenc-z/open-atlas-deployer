@@ -3,6 +3,21 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
+## Unreleased
+
+- D51: a first install starts from the defaults: when the first import finds no env file on the server and the
+  manifest uses a template the Deployer keeps (an assessment's), a revision with the template's defaults (never
+  secrets) is saved on top of the import, for a person to check and write. A repository's `.env.example` is not used
+  for this: its values are samples.
+- `draft_env_key` takes `optional` (the app runs without it); the assessment's template writes such a key as
+  `#KEY=`, so the env page shows it as optional instead of missing. Before, every key of an assessment's template
+  counted as required.
+
+### After upgrading
+
+- [ ] OMA: republish the Onboarding Assessor (`optional` for env keys), then set `DEPLOYER_OMA_ASSESSOR_AGENT` to the
+  new agent.
+
 ## 0.3.0-rc.13
 
 - D51: an app whose manifest declares no env file still has one in UAT, `<app>.env`, without a template: Environment
