@@ -1741,6 +1741,10 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     return c.json({ signedIn: false });
   });
 
+  // Where each app of this environment is opened (its ingress), for the Overview's links; none without an ingress.
+  const appUrls = (env: Environment): Record<string, string> => Object.fromEntries(Object.keys(env.apps).flatMap((id) => {
+    try { const url = deployments.endpointOf(id)?.url; return url ? [[id, url]] : []; } catch { return []; }
+  }));
   api.get("/api/status", async (c) => {
     const p = await authenticate(c, "view");
     if (p instanceof Response) return p;
@@ -1750,7 +1754,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     const status = await environmentStatus(env, apps, hostStateOf(deployments.handoff.reports(hostIds(env))), observer);
     let uat: (PeerStatus & { url?: string }) | { error: string } | undefined;
     if (peer?.configured) { try { uat = await peer.status(); } catch (error) { uat = { error: (error as Error).message }; } }
-    return c.json({ ...status, ...(uat ? { peer: uat } : {}), executor: deployments.handoff.executors(env)[0], executors: deployments.handoff.executors(env), hostOf: Object.fromEntries(Object.keys(env.apps).map((a) => [a, hostOf(env, a)])), canDeploy: deployments.canDeploy(p), envEnabled: envVars.enabled, active: store.activeJobs().map((j) => ({ id: j.id, kind: j.kind, app: j.app, version: j.version, state: j.state })) });
+    return c.json({ ...status, ...(uat ? { peer: uat } : {}), executor: deployments.handoff.executors(env)[0], executors: deployments.handoff.executors(env), hostOf: Object.fromEntries(Object.keys(env.apps).map((a) => [a, hostOf(env, a)])), urls: appUrls(env), canDeploy: deployments.canDeploy(p), envEnabled: envVars.enabled, active: store.activeJobs().map((j) => ({ id: j.id, kind: j.kind, app: j.app, version: j.version, state: j.state })) });
   });
 
   // Drift (§7.1): shown, never changed back.

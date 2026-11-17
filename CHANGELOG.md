@@ -3,6 +3,11 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
+## Unreleased
+
+- The Overview's app list links each deployed app that has an ingress ("Open ↗", a new tab); `/api/status`
+  returns the URLs as `urls`.
+
 ## 0.3.0-rc.10
 
 - A published image is never level C for want of the Deployer's registry setup (design D50): a private image counts

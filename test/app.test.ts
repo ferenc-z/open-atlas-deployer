@@ -1227,6 +1227,9 @@ test("D36: after a deploy the app is reached once at its address; a failure only
   assert.match(note.message, /Apps that refer to it \(api\)/);
   assert.match(note.message, /OMA Integration/);
   assert.equal(note.blocking, false);
+  // The Overview links each app to where it is opened: its ingress address; none for a direct app without an address.
+  const urls = (await (await t.request("/api/status", { as: "viewer" })).json()).urls;
+  assert.equal(urls.shop, "https://atlas.example.internal:8443/");
   // shop moves to app2: the plan says the containers on app1 stay until someone stops them there.
   write({ apps: { shop: { version: "1.2.0", host: "app2", ingress: { kind: "nginx", port: 443 } }, api: { version: "1.0.0", host: "app2", ingress: { kind: "direct" } } } });
   const rehosted = await (await post(t, "/api/apps/shop/plan", "uat", { version: "1.2.0" })).json();

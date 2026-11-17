@@ -270,7 +270,7 @@ function Status({ panel, setPanel, isAdmin, canRegenerate, onAssessment, service
           {data.apps.map((a) => {
             const active = data.active.find((j) => j.app === a.app);
             return (
-              <AppRows key={a.app} app={a} {...(data.executors.length > 1 ? { host: data.hostOf[a.app] ?? "—" } : {})} {...(peerApps ? { peer: peerApps[a.app]?.version ?? null } : {})} open={!!open[a.app]} toggle={() => setOpen({ ...open, [a.app]: !open[a.app] })}
+              <AppRows key={a.app} app={a} {...(data.executors.length > 1 ? { host: data.hostOf[a.app] ?? "—" } : {})} {...(peerApps ? { peer: peerApps[a.app]?.version ?? null } : {})} {...(a.desired && data.urls?.[a.app] ? { url: data.urls[a.app] } : {})} open={!!open[a.app]} toggle={() => setOpen({ ...open, [a.app]: !open[a.app] })}
                 action={active
                   ? <button className="link" onClick={() => setPanel({ kind: "job", id: active.id })}><JobState state={active.state} /> {KIND[active.kind]} {active.kind.startsWith("env") ? "" : active.version}</button>
                   : data.canDeploy ? <button onClick={() => setPanel({ kind: "deploy", app: a.app })}>Deploy…</button> : null} />
@@ -290,11 +290,11 @@ function Status({ panel, setPanel, isAdmin, canRegenerate, onAssessment, service
   );
 }
 
-function AppRows({ app, open, toggle, action, peer, host }: { app: StatusView["apps"][number]; open: boolean; toggle: () => void; action: React.ReactNode; peer?: string | null; host?: string }) {
+function AppRows({ app, open, toggle, action, peer, host, url }: { app: StatusView["apps"][number]; open: boolean; toggle: () => void; action: React.ReactNode; peer?: string | null; host?: string; url?: string }) {
   return (
     <>
       <tr className="app" onClick={toggle}>
-        <td><span className="caret">{open ? "▾" : "▸"}</span>{app.name}<span className="muted"> {app.app}</span></td>
+        <td><span className="caret">{open ? "▾" : "▸"}</span>{app.name}<span className="muted"> {app.app}</span>{url && <> <a className="small" href={url} target="_blank" rel="noopener noreferrer" title={url} onClick={(e) => e.stopPropagation()}>Open ↗</a></>}</td>
         {host !== undefined && <td className="mono">{host}</td>}
         <td className="mono">{app.desired ?? <span className="muted">Not in this environment</span>}</td>
         {peer !== undefined && <td className="mono">{peer ?? <span className="muted">—</span>}{peer && app.desired && peer !== app.desired && <span className="badge info">Can promote</span>}</td>}

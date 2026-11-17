@@ -103,7 +103,7 @@ import type { Job } from "../server/store.ts";
 import type { ExecutorInfo } from "../server/handoff.ts";
 export type { ExecutorInfo, Job, Plan };
 
-export type StatusView = EnvironmentStatus & { executor: ExecutorInfo; executors: ExecutorInfo[]; hostOf: Record<string, string>; canDeploy: boolean; active: Pick<Job, "id" | "kind" | "app" | "version" | "state">[]; peer?: import("../server/peer.ts").PeerStatus | { error: string } };
+export type StatusView = EnvironmentStatus & { executor: ExecutorInfo; executors: ExecutorInfo[]; hostOf: Record<string, string>; urls?: Record<string, string>; canDeploy: boolean; active: Pick<Job, "id" | "kind" | "app" | "version" | "state">[]; peer?: import("../server/peer.ts").PeerStatus | { error: string } };
 export interface JobView { job: Omit<Job, "request">; request: Record<string, unknown>; log: string; record?: Record<string, unknown>; promotion?: import("../server/plan.ts").Promotion }
 
 export const statusView = () => call<StatusView>("GET", "status");
