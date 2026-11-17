@@ -3,7 +3,7 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
-## Unreleased
+## 0.3.0-rc.9
 
 - The Onboarding Assessor writes its report and issues in Chinese: the Deployer's first message says so, since its
   English task lines made some models answer in English. Golden cases (`bin/golden.ts`): the Assessor's sessions can
