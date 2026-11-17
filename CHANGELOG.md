@@ -3,6 +3,12 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
+## Unreleased
+
+- An MCP command's `request_id` replays the earlier answer only for the same tool with the same arguments; a reused
+  `request_id` with other arguments (for example another assessment's task token) is refused with
+  `mcp/request-id-reused` instead of returning the other call's answer.
+
 ## 0.3.0-rc.11
 
 - The Overview's app list links each deployed app that has an ingress ("Open ↗", a new tab); `/api/status`

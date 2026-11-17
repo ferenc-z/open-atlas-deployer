@@ -321,6 +321,8 @@ export class Store {
     }
     // Service ops step 5: a takeover draft's AI review (step 4's tables had no such column).
     if (!(this.db.prepare("PRAGMA table_info(service_drafts)").all() as Row[]).some((c) => c.name === "review")) this.db.exec("ALTER TABLE service_drafts ADD COLUMN review TEXT");
+    // The arguments an MCP command's request_id was used with (NULL for answers saved before 0.3.0-rc.12).
+    if (!(this.db.prepare("PRAGMA table_info(mcp_requests)").all() as Row[]).some((c) => c.name === "args_sha256")) this.db.exec("ALTER TABLE mcp_requests ADD COLUMN args_sha256 TEXT");
     // An installation's conf directory when bootstrap.conf's conf.dir moves it (NULL, as before: <install_dir>/conf).
     for (const table of ["service_standalones", "service_nodes"]) {
       if (!(this.db.prepare(`PRAGMA table_info(${table})`).all() as Row[]).some((c) => c.name === "conf_dir")) this.db.exec(`ALTER TABLE ${table} ADD COLUMN conf_dir TEXT`);
@@ -597,13 +599,13 @@ export class Store {
   }
 
   /** An MCP command's answer by request_id, so a retry does not do it twice (§10.4). */
-  mcpAnswer(keyId: string, requestId: string): { tool: string; response: unknown } | undefined {
-    const r = this.db.prepare("SELECT tool, response FROM mcp_requests WHERE key_id = ? AND request_id = ?").get(keyId, requestId) as Row | undefined;
-    return r && { tool: r.tool, response: JSON.parse(r.response) };
+  mcpAnswer(keyId: string, requestId: string): { tool: string; argsSha256: string | null; response: unknown } | undefined {
+    const r = this.db.prepare("SELECT tool, args_sha256, response FROM mcp_requests WHERE key_id = ? AND request_id = ?").get(keyId, requestId) as Row | undefined;
+    return r && { tool: r.tool, argsSha256: r.args_sha256 ?? null, response: JSON.parse(r.response) };
   }
 
-  saveMcpAnswer(keyId: string, requestId: string, tool: string, response: unknown) {
-    this.db.prepare("INSERT OR IGNORE INTO mcp_requests (key_id, request_id, tool, response, at) VALUES (?, ?, ?, ?, ?)").run(keyId, requestId, tool, JSON.stringify(response), this.stamp());
+  saveMcpAnswer(keyId: string, requestId: string, tool: string, argsSha256: string, response: unknown) {
+    this.db.prepare("INSERT OR IGNORE INTO mcp_requests (key_id, request_id, tool, args_sha256, response, at) VALUES (?, ?, ?, ?, ?, ?)").run(keyId, requestId, tool, argsSha256, JSON.stringify(response), this.stamp());
   }
 
   setDiagnosis(id: string, diagnosis: Diagnosis) {

@@ -1725,6 +1725,10 @@ test("/mcp: tools are the page's calls; a service key sees only the read-only on
   assert.equal(first.isError, false);
   assert.equal(again.value.job.id, first.value.job.id);
   assert.equal(t.store.listJobs({ kind: "deploy" }).length, 1);
+  const reused = await tool(t, personal, "deploy", { app: "book", version: "1.0.1", request_id: "deploy-1" });
+  assert.equal(reused.value.finding.code, "mcp/request-id-reused", "other arguments under an old request_id are not a retry");
+  assert.match(reused.value.finding.expected, /with other arguments/);
+  assert.equal(t.store.listJobs({ kind: "deploy" }).length, 1);
   assert.equal((await tool(t, personal, "deploy", { app: "book", version: "1.0.0" })).value.finding.expected, "deploy is missing parameter request_id");
   assert.ok(t.store.listAudit().some((e) => e.action === "mcp.deploy" && e.via === "key" && e.actor === "u@x"));
 });

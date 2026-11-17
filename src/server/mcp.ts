@@ -10,6 +10,7 @@
 // recommendation, hosts, keys, the audit log. Only a personal key of a Workbench admin sees them. Saving them does not
 // deploy anything; nothing secret (env values, tokens, keys) is ever a tool's answer.
 
+import { createHash } from "node:crypto";
 import type { Principal } from "./auth.ts";
 import type { Store } from "./store.ts";
 import { installKey } from "./services/draft.ts";
@@ -334,22 +335,32 @@ export async function handleMcp(message: any, ctx: McpContext): Promise<unknown>
       const bad = checkArgs(tool, args);
       if (bad) return rpc(id, text({ finding: { code: "mcp/arguments", at: [tool.name], expected: bad } }, true));
       const keyId = principal.keyId ?? principal.id;
+      const { request_id: requestId, ...rest } = args;
+      // A retry is the same tool with the same arguments; anything else under an old request_id (another
+      // assessment's task token, another app) is refused rather than answered with the earlier result.
+      const argsSha256 = fingerprint(rest);
       if (!tool.readOnly) {
-        const earlier = store.mcpAnswer(keyId, String(args.request_id));
+        const earlier = store.mcpAnswer(keyId, String(requestId));
         if (earlier) {
-          if (earlier.tool !== tool.name) return rpc(id, text({ finding: { code: "mcp/request-id-reused", at: ["request_id"], expected: `a new request_id (this one was used for ${earlier.tool})` } }, true));
+          if (earlier.tool !== tool.name || earlier.argsSha256 !== argsSha256) return rpc(id, text({ finding: { code: "mcp/request-id-reused", at: ["request_id"], expected: `a new request_id (this one was used for ${earlier.tool}${earlier.tool === tool.name ? " with other arguments" : ""})` } }, true));
           return rpc(id, earlier.response);
         }
       }
-      const { request_id: requestId, ...rest } = args;
       const answer = await ctx.call(tool.request(rest));
       const ok = answer.status < 400;
       const result = ok ? text(tool.shape ? tool.shape(answer.body, rest) : answer.body) : text({ finding: { code: answer.body?.error ?? `http/${answer.status}`, at: [tool.name], expected: answer.body?.message ?? `HTTP ${answer.status}` }, ...(answer.body?.details?.length ? { details: answer.body.details } : {}) }, true);
       store.audit({ id: principal.id, via: principal.via === "service" ? "service" : "key" }, `mcp.${tool.name}`, String(args.app ?? args.job ?? args.host ?? args.id ?? "-"), { key: principal.keyId ?? null, status: answer.status, ...(requestId ? { requestId } : {}), ...(typeof args.note === "string" ? { note: args.note } : {}) });
-      if (!tool.readOnly && ok) store.saveMcpAnswer(keyId, String(requestId), tool.name, result);
+      if (!tool.readOnly && ok) store.saveMcpAnswer(keyId, String(requestId), tool.name, argsSha256, result);
       return rpc(id, result);
     }
     default:
       return rpcError(id, -32601, `unknown method ${message?.method}`);
   }
+}
+
+/** The arguments of a command without its request_id, as a hash that does not depend on key order. */
+function fingerprint(args: Record<string, unknown>): string {
+  const canon = (v: unknown): unknown => Array.isArray(v) ? v.map(canon)
+    : v && typeof v === "object" ? Object.fromEntries(Object.keys(v as object).sort().map((k) => [k, canon((v as Record<string, unknown>)[k])])) : v;
+  return createHash("sha256").update(JSON.stringify(canon(args))).digest("hex");
 }
