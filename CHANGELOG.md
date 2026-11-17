@@ -3,7 +3,7 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
-## Unreleased
+## 0.3.0-rc.13
 
 - D51: an app whose manifest declares no env file still has one in UAT, `<app>.env`, without a template: Environment
   variables (and the MCP env tools) import, edit and write it as usual, with keys added by hand. Once the first write
