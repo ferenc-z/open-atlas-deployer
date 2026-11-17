@@ -3,7 +3,7 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
-## Unreleased
+## 0.3.0-rc.10
 
 - A published image is never level C for want of the Deployer's registry setup (design D50): a private image counts
   as published. In a registry the environment lists → A (pull credentials live on the executors, which the
