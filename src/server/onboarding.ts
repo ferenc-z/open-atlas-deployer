@@ -303,6 +303,7 @@ export class Onboarding {
       `Assessment id: ${a.id}`,
       `Task token (pass it as task_token on every draft_* call; valid only for this assessment's draft, expires in ${TOKEN_HOURS} hours): ${token}`,
       "Every draft_* call needs a reason (why it is configured this way) and a new request_id.",
+      "Write the report and the issues in Chinese; these task lines are in English only because the Deployer writes them.",
       "",
       "Facts the Deployer scanned:",
       "```json",

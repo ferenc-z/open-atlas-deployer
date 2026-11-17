@@ -3,6 +3,18 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
+## Unreleased
+
+- The Onboarding Assessor writes its report and issues in Chinese: the Deployer's first message says so, since its
+  English task lines made some models answer in English. Golden cases (`bin/golden.ts`): the Assessor's sessions can
+  run in their own environment (`GOLDEN_ASSESSOR_ENVIRONMENT`, one sandbox per session), a report not in Chinese
+  fails, quoted text in a shell line is not taken for a command, and a capability issue is allowed for dossier-clj.
+
+### After upgrading
+
+- [ ] OMA: republish the Onboarding Assessor (the report language line), then set `DEPLOYER_OMA_ASSESSOR_AGENT` to
+  the new agent.
+
 ## 0.3.0-rc.8
 
 - Executor 0.9.3, a plain Dockerfile build (design D49): a component's `source.build` is either

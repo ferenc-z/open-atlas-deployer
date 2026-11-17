@@ -2,6 +2,8 @@
 
 衡量 Deploy Assistant（[agents/deploy-assistant.md](../agents/deploy-assistant.md)）的固定用例。每次改提示词、工具或 Agent 包定义后，在 UAT 的 OMA 上跑一遍，和上次的结果对比。格式照 Logbook 的 `golden-cases.md`。
 
+自动化用例（2026-11-16 起）：两个 agent 的可重复用例在 [golden/cases.ts](../golden/cases.ts)，用 `node bin/golden.ts <assistant|assessor|all> [ids] [--repeat N]` 对真实 OMA 跑，按会话事件和评估记录判定（用法见 `bin/golden.ts` 开头）。下面的表是手工用例，覆盖身份和页面核对。
+
 - **身份**：管理员（Workbench admin）、UAT 部署人（`deploy-uat`）、PROD 部署人（`deploy-prod`）、查看者（`deploy-viewer`）。
 - **目标**：读类问题 40 秒以内，调用 1–3 次。
 - **Status**：verified = 已对照页面核对；timed = 已答、记了时间、没核对；open = 还没跑（2026-10-30 全部是 open：还没有真实的 OMA 环境）。

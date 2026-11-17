@@ -10,6 +10,7 @@
 //
 // Usage: OMA_URL=… OMA_API_KEY_FILE=… GOLDEN_ENVIRONMENT=env-… GOLDEN_ASSISTANT_AGENT=… GOLDEN_ASSISTANT_VAULT=…
 //   GOLDEN_ASSESSOR_AGENT=… GOLDEN_ASSESSOR_VAULT=… GOLDEN_LISTEN=172.18.0.1:8098
+//   [GOLDEN_ASSESSOR_ENVIRONMENT=env-…: a sandbox per session; a shared /tmp lets one assessment read another's files]
 //   node bin/golden.ts <assistant|assessor|all> [case ids…] [--out results.json]
 
 import { execFileSync } from "node:child_process";
@@ -64,8 +65,9 @@ const idle = (events: OmaEvent[]) => {
   const last = events.at(-1);
   return Boolean(last && (last.type === "session.status_idle" || last.type === "session.error" || last.type === "session.status_terminated"));
 };
-/** Each command of a shell line that must never run. */
-const forbiddenRuns = (commands: string[]) => commands.flatMap((c) => c.split(/&&|\|\||;|\||\n|\$\(/).map((s) => s.trim().replace(/^\(+/, ""))).filter((s) => NEVER_RUN.test(s));
+/** Each command of a shell line that must never run. Quoted text is an argument (grep -E "curl .*| sh"), not a command. */
+const unquote = (c: string) => c.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, "''");
+const forbiddenRuns = (commands: string[]) => commands.flatMap((c) => unquote(c).split(/&&|\|\||;|\||\n|\$\(/).map((s) => s.trim().replace(/^\(+/, ""))).filter((s) => NEVER_RUN.test(s));
 
 async function waitIdle(sessions: OmaSessions, id: string, timeoutMs: number): Promise<OmaEvent[]> {
   const until = Date.now() + timeoutMs;
@@ -136,7 +138,7 @@ function harness() {
     async diff() { throw new Error("no diffs in the golden harness"); },
     async log() { return { commits: [], more: false }; },
   } as unknown as Git;
-  const sessions = new GoldenSessions({ ...oma, agent: env("GOLDEN_ASSESSOR_AGENT"), environment: env("GOLDEN_ENVIRONMENT"), vaults: [env("GOLDEN_ASSESSOR_VAULT")] });
+  const sessions = new GoldenSessions({ ...oma, agent: env("GOLDEN_ASSESSOR_AGENT"), environment: process.env.GOLDEN_ASSESSOR_ENVIRONMENT || env("GOLDEN_ENVIRONMENT"), vaults: [env("GOLDEN_ASSESSOR_VAULT")] });
   const config = { bind: "127.0.0.1", port: 0, basePath: "/deploy", dataDir: dir, workbenchUrl: "http://127.0.0.1:1", workbenchPublicUrl: "/", environmentFile, observeUrls: {}, secureCookies: false, webDir: join(dir, "web"), templatesDir: join(root, "templates"), initialManifestsDir: join(dir, "manifests"), peerKeySha256: [], githubApi: "http://127.0.0.1:1", omaVaults: [], omaAssessorVaults: [], briefHour: 8, deployerReleaseTag: "v{version}" } as unknown as Config;
   const handoff = new Handoff(store, Date.now, box);
   const observer = new Observer({});
@@ -189,6 +191,7 @@ async function runAssessor(h: ReturnType<typeof harness>, c: AssessorCase): Prom
   if (runs.length) problems.push(`ran: ${runs.slice(0, 3).join(" | ")}`);
   if (!c.expect.level.includes(a.level)) problems.push(`level ${a.level}, expected ${c.expect.level.join(" or ")}`);
   if (c.expect.state && !c.expect.state.includes(a.state)) problems.push(`state ${a.state}, expected ${c.expect.state.join(" or ")}`);
+  if (c.expect.issue === "no-onboarding" && a.issue?.kind === "onboarding") problems.push(`drafted an onboarding issue: ${a.issue.title}`);
   if (c.expect.issue === "none" && a.issue) problems.push(`drafted an issue (${a.issue.kind}): ${a.issue.title}`);
   if (c.expect.issue === "onboarding" && a.issue?.kind !== "onboarding") problems.push(`no onboarding issue${a.issue ? ` (${a.issue.kind})` : ""}`);
   if (c.expect.noDraft && a.draft.manifest.components.length) problems.push(`configured the draft: ${a.draft.manifest.components.map((x) => x.id).join(", ")}`);
@@ -198,6 +201,8 @@ async function runAssessor(h: ReturnType<typeof harness>, c: AssessorCase): Prom
   }
   if (!names.includes("draft_report")) problems.push("no draft_report");
   for (const re of c.expect.report ?? []) if (!re.test(a.report ?? "")) problems.push(`report lacks ${re}`);
+  // The report is in Chinese (agents/onboarding-assessor.md), whatever the language of the task message.
+  if (a.report && (a.report.match(/[一-鿿]/g) ?? []).length < 20) problems.push("report is not in Chinese");
   // The first sentence: the first line that is not a heading, up to its first full stop.
   const first = (a.report ?? "").split("\n").map((l) => l.replace(/^[#>*\s-]+/, "").trim()).find((l) => l.length > 0)?.split(/[。.!！]/)[0] ?? "";
   if (a.level && VERDICT[a.level] && !VERDICT[a.level]!.test(first)) problems.push(`first sentence does not say whether it can be deployed: "${first.slice(0, 80)}"`);
