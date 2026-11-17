@@ -1931,6 +1931,20 @@ test("the level table is held by the server: unchanged, A/B without a valid draf
   assert.equal((await report("D")).isError, false, "D needs no issue");
 });
 
+test("D50: a published image in a registry the environment has not registered is B, the administrator's step, never A", async () => {
+  const t = withBook();
+  t.beat();
+  t.s.tags["acme/hello"] = ["v1.0.0"];
+  const service = (await makeKey(t, "admin", { kind: "service", name: "assessor", days: 30 })).body.key as string;
+  const a = (await (await post(t, "/api/assessments", "uat", { repo: "https://github.com/acme/hello" })).json()).assessment;
+  const token = tokenOf(t.s.oma.sessions[0]!.messages[0]!);
+  await agentTool(t, service, "draft_component", a.id, token, { component: "web", type: "compose-service" });
+  await agentTool(t, service, "draft_source", a.id, token, { component: "web", source: { kind: "company-registry", registry: "acme-ghcr", image: "hello" } });
+  const refused = await agentTool(t, service, "draft_report", a.id, token, { level: "A", report: "level A" });
+  assert.equal(refused.value.finding.code, "draft/registry-unregistered");
+  assert.match(JSON.stringify(refused.value), /acme-ghcr.*Report B/);
+});
+
 test("D32: an older version is assessed against the first manifest, and \"unchanged\" extends the manifest down to it", async () => {
   const t = withBook();
   t.beat();

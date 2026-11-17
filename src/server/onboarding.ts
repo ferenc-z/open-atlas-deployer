@@ -425,6 +425,13 @@ export class Onboarding {
         if (!(LEVELS as readonly string[]).includes(String(args.level))) throw new OnboardingError(400, "draft/level", `level is one of ${LEVELS.join(", ")}.`);
         // The rules of the level table (agents/onboarding-assessor.md), held here rather than left to the model.
         if (args.level === "unchanged" && a.kind !== "version") throw new OnboardingError(400, "draft/level", "unchanged is only for a version assessment; an onboarding assessment is A, B, C, D or unreadable.");
+        if (args.level === "A") {
+          // A published image in a registry this environment has not registered is the administrator's step, not the
+          // author's: B, with the step in the report (D50). Credentials live on the executors; the Agent cannot see them.
+          const known = Object.keys(this.environmentFacts().registries ?? {});
+          const missing = [...new Set(m.components.flatMap((c) => c.source?.kind === "company-registry" && !known.includes(c.source.registry) ? [c.source.registry] : []))];
+          if (missing.length) throw new OnboardingError(409, "draft/registry-unregistered", `Registry ${missing.join(", ")} is not registered in this environment (registered: ${known.join(", ") || "none"}). Report B, and start the report with the administrator's step: register ${missing.join(", ")} (name = host/namespace) in Environment settings and give the executors pull access.`);
+        }
         if (args.level === "A" || args.level === "B") {
           const findings = this.check(a);
           if (findings.length) throw new OnboardingError(409, "draft/not-valid", `Level ${args.level} needs a draft that passes validate_draft; fix these first.`, findings.map((f) => `${f.code} ${f.at.join(".")}: ${f.expected}`));

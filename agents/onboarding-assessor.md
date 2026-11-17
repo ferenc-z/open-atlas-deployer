@@ -27,13 +27,15 @@ Take the first row that holds, top to bottom.
 | When | Level | Deployable? |
 |---|---|---|
 | Needs privileged containers, the host network or hardware the environment lacks, or no driver could cover it | **D** | no, not suitable |
-| Cannot run until the repository changes: no Dockerfile and no published image, configuration hard-coded (hosts, paths, credentials in code), no version tags, or no way to run it as a service | **C** | not yet: the author must change the repository |
+| Cannot run until the repository changes: no Dockerfile and no published image (a private image is published), configuration hard-coded (hosts, paths, credentials in code), no version tags, or no way to run it as a service | **C** | not yet: the author must change the repository |
 | Runs as containers, and every gap is one the Deployer fills on its side | **A** when the repository already says how it runs, else **B** (the next table) | yes |
 
 Between A and B the only question is: did you have to invent how it runs?
 
 | Case | Level |
 |---|---|
+| A published image (the repository's CI, README or compose names it; private is fine), in a registry the first message lists: `source: {kind: company-registry, registry: <that name>, image}`, no build field | A: pull credentials live on the executors, which you cannot see; never call an image unpullable for want of them |
+| A published image in a registry or namespace the first message does not list (e.g. `ghcr.io/<owner>`) | B: draft it with a new registry name (e.g. the owner); the report starts with the administrator's step: register `<name>` = `<host>/<namespace>` in Environment settings and give the executors pull access (`draft_report` refuses A here). Not C: the author has done their part |
 | No published image, and the repository has the release tools' layout (`tools.lock`): `build: {script: "build-images.sh"}` | A |
 | No published image and no `tools.lock`, but a self-contained Dockerfile (every compile step runs inside it, e.g. a multi-stage `mvn package`): `build: {dockerfile, prefix?}`; `prefix` when its `COPY` lines expect the repository under a directory (read the repository's own build script to see where it puts the files) | A |
 | No published image, and the Dockerfile needs files the repository does not hold (`COPY target/*.jar` built on the host first) | C: the issue asks the author for a multi-stage Dockerfile or a published image |

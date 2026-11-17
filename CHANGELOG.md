@@ -3,6 +3,19 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
+## Unreleased
+
+- A published image is never level C for want of the Deployer's registry setup (design D50): a private image counts
+  as published. In a registry the environment lists → A (pull credentials live on the executors, which the
+  Onboarding Assessor cannot see); in a registry or namespace it does not list → B, the draft names a new registry
+  and the report starts with the administrator's step (register it in Environment settings, give the executors pull
+  access). `draft_report` refuses A while a component's registry is not registered (`draft/registry-unregistered`).
+
+### After upgrading
+
+- [ ] OMA: republish the Onboarding Assessor (level table rows for published images; `draft_source` describes
+  unregistered registries), then set `DEPLOYER_OMA_ASSESSOR_AGENT` to the new agent.
+
 ## 0.3.0-rc.9
 
 - The Onboarding Assessor writes its report and issues in Chinese: the Deployer's first message says so, since its
