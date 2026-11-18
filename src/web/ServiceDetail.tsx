@@ -15,6 +15,7 @@ import { Logs } from "./Logs.tsx";
 import { FlowFileTrace } from "./Trace.tsx";
 import { TraceModelEditor } from "./TraceModel.tsx";
 import { NginxAddress } from "./Nginx.tsx";
+import { ServiceNow } from "./ServiceNow.tsx";
 import { AlertBadge, EventsAndAlerts, OpenAlerts, Timeline } from "./Alerts.tsx";
 import { ago, CertBadge, certTone, ConfCell, daysLeft, daysText, fmtBytes, fmtNumber, memberKey, serviceName, SEVERITY, STATE, StatusNotes, UpBadge, webPort, when } from "./svc.tsx";
 
@@ -22,6 +23,7 @@ type Loaded = { s: ServiceStatus; cfg: ServiceConfigView | null | undefined; rel
 type Tab = { id: string; label: string; shown: (l: Loaded) => boolean; render: (l: Loaded) => ReactNode };
 
 const TABS: Tab[] = [
+  { id: "status", label: "Status", shown: () => true, render: (l) => <ServiceNow s={l.s} canAct={Boolean(l.cfg?.canDraft) && !l.desk.active} plan={(r) => l.desk.plan(r)} open={l.open} /> },
   { id: "overview", label: "Overview", shown: () => true, render: (l) => <Overview {...l} /> },
   { id: "metrics", label: "Metrics", shown: (l) => l.s.members.some((m) => m.live), render: (l) => <Metrics s={l.s} /> },
   { id: "logs", label: "Logs", shown: (l) => l.s.members.length > 0, render: (l) => <Logs s={l.s} /> },
@@ -39,7 +41,7 @@ export const memberLabel = (s: ServiceStatus, m: MemberStatus) => (s.kind === "c
 export function ServiceDetail({ id, isAdmin, initialDraft, onBack }: { id: string; isAdmin: boolean; initialDraft?: string; onBack: () => void }) {
   const [s, setS] = useState<ServiceStatus | undefined>();
   const [cfg, setCfg] = useState<ServiceConfigView | null | undefined>();
-  const [tab, setTab] = useState(initialDraft ? "changes" : "overview");
+  const [tab, setTab] = useState(initialDraft ? "changes" : "status");
   const [error, setError] = useState("");
   const load = useCallback(() => { api.serviceStatus(id).then(setS, (e: Error) => setError(e.message)); }, [id]);
   useEffect(() => { load(); const t = setInterval(load, 10_000); return () => clearInterval(t); }, [load]);
