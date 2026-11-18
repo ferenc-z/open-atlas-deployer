@@ -398,3 +398,10 @@ export const importE2eModel = (id: string) => call<{ model: import("../server/se
 // S37 step 3: the Status tab renders this as it is (the to-do engine, rules.ts health()).
 export type { ServiceHealth, Todo, TodoAction } from "../server/services/rules.ts";
 export const serviceHealth = (id: string) => call<import("../server/services/rules.ts").ServiceHealth>("GET", `services/${encodeURIComponent(id)}/health`);
+
+// S37 step 8: the Data trace tab (the engine's answer as it is) and the sentence-to-conditions suggestion (Q6).
+export type { TraceAnswer, TraceResult, Segment, StepResult, Verdict, VerdictAction, HandoverResult, StuckContext } from "../server/services/trace/engine.ts";
+export type { NlConditions } from "../server/services/trace/nl.ts";
+export type TraceInput = { business?: string; fileName?: string; emailFrom?: string; emailSubject?: string; from?: string; to?: string };
+export const traceBusinessData = (id: string, q: TraceInput) => call<import("../server/services/trace/engine.ts").TraceAnswer>("POST", provPath(id, "/trace-business-data"), q);
+export const traceParse = (id: string, text: string) => call<{ conditions: import("../server/services/trace/nl.ts").NlConditions; ms: number } | { fallback: string; ms: number }>("POST", provPath(id, "/trace-parse"), { text, utcOffsetMinutes: -new Date().getTimezoneOffset() });

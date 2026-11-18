@@ -44,6 +44,14 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   is there is reported as incomplete, so the next source is asked. A worker's historical P95 (7 days, 20 runs, at
   least 60 s) is its allowed time. "Import businesses from e2e_trace" turns schedule_header/schedule_detail into
   businesses in the editor. The graph's contract and saved queries: `src/server/services/trace/e2e-graph.ts`.
+- S37 step 8: a service's Data trace tab for "my data did not arrive". Clues (business, file name, email sender and
+  subject, a time range, the last 24 hours by default) give the end-to-end steps across services, each with state, node,
+  time, evidence source, "inferred" where it is a guess and the allowed time; the step where the data stopped is
+  highlighted, the verdict's message, its queue / back pressure / downstream context and its actions are buttons (edit
+  the other service's model, Open in NiFi), and evidence cards link into NiFi. A sentence in the box on top is read into
+  the conditions by a one-shot Deploy Assistant session (only the sentence, the business names and the time go out; no
+  answer in 5 seconds means the plain form). New read-only MCP tool `trace_business_data` (not on the Assistant's
+  allow-list until step 9).
 
 ### After upgrading
 

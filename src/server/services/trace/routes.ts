@@ -12,6 +12,7 @@ import { TraceEngine, type TraceQuery } from "./engine.ts";
 import type { EvidenceAdapter } from "./events.ts";
 import { stuckContextFrom } from "./flowstate.ts";
 import { CUES, emptyModel, parseModel, type TraceModel } from "./model.ts";
+import type { NlConverter } from "./nl.ts";
 
 type Reject = (c: Context, status: 400 | 401 | 403 | 404 | 409 | 429 | 503, code: string, message: string, details?: string[]) => Response;
 export interface TraceDeps {
@@ -22,6 +23,8 @@ export interface TraceDeps {
   registered: (id: string) => unknown;
   actorOf: (p: Principal) => Actor;
   adapters: Map<string, EvidenceAdapter>;
+  /** S37 step 8 (Q6): one sentence to conditions through a one-shot OMA session; without it the page offers only the form. */
+  nl?: NlConverter;
 }
 
 export const TRACE_SPAN_DAYS = 31;
@@ -111,5 +114,20 @@ export function mountTrace(api: Hono, d: TraceDeps) {
     const q = parseTraceQuery(id, await c.req.json().catch(() => ({})));
     if ("error" in q) return d.reject(c, 400, "trace/query", q.error);
     return c.json(await engine.trace(q));
+  });
+
+  // S37 step 8 (Q6): a sentence to conditions. Always 200: `conditions` (a suggestion for the form) or `fallback` (why the
+  // person fills the form instead). Only the sentence, the business list and the time go to the Assistant.
+  api.post("/api/services/:id/trace-parse", async (c) => {
+    const p = await d.authenticate(c, "view");
+    if (p instanceof Response) return p;
+    const id = c.req.param("id");
+    if (!d.registered(id)) return unknown(c, id);
+    const body = (await c.req.json().catch(() => null)) as { text?: unknown; utcOffsetMinutes?: unknown } | null;
+    if (!body || typeof body.text !== "string" || !body.text.trim()) return d.reject(c, 400, "trace/parse", "Send {text, utcOffsetMinutes?}: the sentence to read.");
+    if (!d.nl) return c.json({ fallback: "The Deploy Assistant is not configured here; fill in the form.", ms: 0 });
+    const offset = typeof body.utcOffsetMinutes === "number" && Math.abs(body.utcOffsetMinutes) <= 14 * 60 ? Math.round(body.utcOffsetMinutes) : -new Date().getTimezoneOffset();
+    const businesses = (d.store.traceModel(id)?.body as { businesses?: { id: string; name: string }[] } | undefined)?.businesses?.map((b) => ({ id: b.id, name: b.name })) ?? [];
+    return c.json(await d.nl.convert(id, body.text, businesses, offset));
   });
 }

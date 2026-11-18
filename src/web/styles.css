@@ -511,3 +511,20 @@ button.change-now.state-paused { color: var(--warn); border-color: var(--warn); 
 /* S37 step 3 (T15): the business model for someone who is not an admin: shown, not editable, and no edit buttons. */
 fieldset.model-fields { border: 0; padding: 0; margin: 0; min-width: 0; display: grid; gap: 1rem; }
 fieldset.model-fields:disabled button { display: none; }
+
+/* S37 step 8: the Data trace tab (the step strip across services, the stopped step, the verdict). */
+.trace-form input.from-ai, .trace-form select.from-ai { border-color: var(--accent); background: var(--warn-bg); }
+.trace-card > summary { cursor: pointer; }
+.trace-verdict { border-left: 4px solid var(--border); padding: 0.4rem 0.8rem; margin: 0.6rem 0; }
+.trace-verdict.tone-ok { border-color: var(--ok); }
+.trace-verdict.tone-warn { border-color: var(--warn); }
+.trace-verdict.tone-bad { border-color: var(--bad); }
+.trace-seg h4 { margin: 0.8rem 0 0.3rem; }
+.trace-steps { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 0.5rem; }
+.trace-step { border: 1px solid var(--border); border-radius: 6px; padding: 0.4rem 0.6rem; min-width: 11rem; background: var(--surface); }
+.trace-step.tone-ok { border-left: 4px solid var(--ok); }
+.trace-step.tone-bad { border-left: 4px solid var(--bad); }
+.trace-step.tone-warn { border-left: 4px solid var(--warn); }
+.trace-step.stop { background: var(--bad-bg); border-color: var(--bad); }
+.trace-evidence { border-top: 1px dashed var(--border); padding: 0.3rem 0; word-break: break-all; }
+.trace-handover { margin: 0.3rem 0 0; }

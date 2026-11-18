@@ -254,6 +254,14 @@ const HEALTH_TOOLS: Tool[] = [
     properties: { id: SERVICE }, required: ["id"], request: (a) => ({ method: "GET", path: `/api/services/${enc(a.id)}/health` }), shape: redacted },
 ];
 
+// S37 step 8: the business data trace (the same body as POST /api/services/:id/trace-business-data). Not on the Assistant's
+// allow-list yet: step 9 adds it with the rest of the Assistant's changes.
+const TRACE_TOOLS: Tool[] = [
+  { name: "trace_business_data", readOnly: true, description: "Follows one piece of business data through a NiFi service (and across services over Site-to-Site or MQ) from what the business person knows: a business, a file name, an email sender or subject, and a time range (the last 24 hours by default; at least one clue is required). Answers with the traces found (up to 20): each with the steps of every segment (state, time, the evidence source, whether inferred), the allowed time of a step, and a verdict: completed, failed, stuck, handover-lost, insufficient evidence (with the reason) or in-progress, with where it stopped, a plain message, the queue and downstream state when stuck, and the next actions. Read-only.",
+    properties: { id: SERVICE, business: s("Optional: a business id of the service's model."), file_name: s("Optional: the file name or part of it."), email_from: s("Optional: the email sender."), email_subject: s("Optional: a keyword of the email subject."), from: s("Optional ISO time, the range's start (default: 24 hours before `to`)."), to: s("Optional ISO time, the range's end (default: now).") }, required: ["id"],
+    request: (a) => ({ method: "POST", path: `/api/services/${enc(a.id)}/trace-business-data`, body: { business: a.business, fileName: a.file_name, emailFrom: a.email_from, emailSubject: a.email_subject, from: a.from, to: a.to } }), shape: redacted },
+];
+
 function manifestBody(a: Record<string, unknown>) {
   return { appliesFrom: a.applies_from, newAppliesFrom: a.new_applies_from, base: a.base, patch: a.patch, manifest: a.manifest };
 }
@@ -276,6 +284,7 @@ export const TOOLS: Tool[] = [
   { name: "get_cluster_status", readOnly: true, description: "One cluster or standalone instance (id from list_service_clusters): every member with its host's service executor (online or not) and its state from the collector's newest sample: running or stopped as of that sample (asOf), unknown after 3 sampling periods without one, lost when the executor is offline; never sampled: as of the newest discovery (source). Also the live pid, version, cluster connection, key numbers, every certificate with its expiry, and summary.backpressure: the newest back pressure reading (read every 5 minutes by default, flow-wide): connections at their threshold (full), the fullest percentage and the most congested queues (top, fullest first).", properties: { id: s("The cluster's or standalone instance's id, as list_service_clusters names it.") }, required: ["id"], request: (a) => ({ method: "GET", path: `/api/services/${enc(a.id)}/status` }) },
   ...SERVICE_TOOLS,
   ...HEALTH_TOOLS,
+  ...TRACE_TOOLS,
   // Assessments (§10.5.6): the Onboarding Assessor reads these and writes only its own draft, with the task token;
   // the Deploy Assistant reads them (list_assessments, onboarding_draft) to answer about the Onboarding page.
   { name: "list_assessments", readOnly: true, description: "Every assessment, newest first: id (asm_…), kind (onboarding or version), repository or app, version, who started it, status and level.", properties: {}, request: () => ({ method: "GET", path: "/api/assessments" }) },

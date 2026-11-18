@@ -14,6 +14,7 @@ import { ask } from "./Confirm.tsx";
 import { Logs } from "./Logs.tsx";
 import { FlowFileTrace } from "./Trace.tsx";
 import { TraceModelEditor } from "./TraceModel.tsx";
+import { DataTrace } from "./TraceData.tsx";
 import { NginxAddress } from "./Nginx.tsx";
 import { ServiceNow } from "./ServiceNow.tsx";
 import { AlertBadge, EventsAndAlerts, OpenAlerts, Timeline } from "./Alerts.tsx";
@@ -29,6 +30,7 @@ const TABS: Tab[] = [
   { id: "logs", label: "Logs", shown: (l) => l.s.members.length > 0, render: (l) => <Logs s={l.s} /> },
   { id: "trace", label: "FlowFile trace", shown: (l) => l.s.members.length > 0, render: (l) => <FlowFileTrace s={l.s} /> },
   { id: "trace-model", label: "Business model", shown: () => true, render: (l) => <TraceModelEditor s={l.s} /> },
+  { id: "data-trace", label: "Data trace", shown: () => true, render: (l) => <DataTrace s={l.s} open={l.open} /> },
   { id: "events", label: "Events and alerts", shown: () => true, render: (l) => <EventsAndAlerts s={l.s} /> },
   { id: "nodes", label: "Nodes", shown: () => true, render: (l) => <Nodes {...l} /> },
   { id: "configuration", label: "Configuration", shown: () => true, render: (l) => <ServiceConfig cfg={l.cfg} status={l.s} drafts={l.drafts} onReview={() => l.open("changes")} /> },
@@ -38,10 +40,16 @@ const TABS: Tab[] = [
 /** How a member is named on the charts: a node by address and port, a standalone by host. */
 export const memberLabel = (s: ServiceStatus, m: MemberStatus) => (s.kind === "cluster" ? `${m.nodeAddress ?? m.host}:${webPort(m.ports) ?? "?"}` : m.host);
 
-export function ServiceDetail({ id, isAdmin, initialDraft, onBack }: { id: string; isAdmin: boolean; initialDraft?: string; onBack: () => void }) {
+export function ServiceDetail({ id, isAdmin, initialDraft, initialTab, onBack }: { id: string; isAdmin: boolean; initialDraft?: string; initialTab?: string; onBack: () => void }) {
   const [s, setS] = useState<ServiceStatus | undefined>();
   const [cfg, setCfg] = useState<ServiceConfigView | null | undefined>();
-  const [tab, setTab] = useState(initialDraft ? "changes" : "status");
+  const [tab, setTab] = useState(initialDraft ? "changes" : initialTab ?? "status");
+  // S37 step 8: another page (the Data trace) asks for a tab of this service.
+  useEffect(() => {
+    const on = (e: Event) => { const d = (e as CustomEvent<{ id: string; tab: string }>).detail; if (d.id === id) setTab(d.tab); };
+    window.addEventListener("oa:open-service", on);
+    return () => window.removeEventListener("oa:open-service", on);
+  }, [id]);
   const [error, setError] = useState("");
   const load = useCallback(() => { api.serviceStatus(id).then(setS, (e: Error) => setError(e.message)); }, [id]);
   useEffect(() => { load(); const t = setInterval(load, 10_000); return () => clearInterval(t); }, [load]);
