@@ -303,12 +303,21 @@ export class Onboarding {
       "",
       `Assessment id: ${a.id}`,
       `Task token (pass it as task_token on every draft_* call; valid only for this assessment's draft, expires in ${TOKEN_HOURS} hours): ${token}`,
-      "Every draft_* call needs a reason (why it is configured this way) and a new request_id.",
+      "Every draft_* call needs a reason (why it is configured this way) and a new request_id. A draft_* call answers with a receipt only ({ok, operation, target, changes}); read the draft with get_draft.",
       "Write the report and the issues in Chinese; these task lines are in English only because the Deployer writes them.",
       "",
+      // D52: the draft_* tools answer with a receipt only, so a version assessment gets the manifest it starts from here
+      // (compact, once; get_draft shows it again). The facts then leave it out.
+      ...(a.kind === "version" ? [
+        "The draft's starting manifest (the current manifest with appliesFrom set; get_draft shows the draft as it is now):",
+        "```json",
+        JSON.stringify(this.manifestOf(a)).slice(0, 12_000),
+        "```",
+        "",
+      ] : []),
       "Facts the Deployer scanned:",
       "```json",
-      JSON.stringify(a.facts, null, 1).slice(0, 30_000),
+      JSON.stringify(a.kind === "version" ? { ...a.facts, manifest: undefined } : a.facts, null, 1).slice(0, 30_000),
       "```",
     ].join("\n");
   }
@@ -411,11 +420,21 @@ export class Onboarding {
         break;
       }
       case "env-key": {
-        if (!/^[A-Z_][A-Z0-9_]*$/.test(String(args.key ?? ""))) throw new OnboardingError(400, "draft/env-key", "env keys are uppercase letters, digits and underscores.");
-        if (args.secret && args.default) throw new OnboardingError(400, "draft/env-secret", "A secret cannot have a default: mark it as \"filled in by a person\".");
-        const key: EnvKey = { key: args.key, description: String(args.description ?? ""), secret: Boolean(args.secret), ...(args.default !== undefined ? { default: String(args.default) } : {}), ...(args.optional ? { optional: true } : {}) };
-        a.draft.envKeys = [...a.draft.envKeys.filter((k) => k.key !== args.key), key];
-        summary = `env key ${args.key}${key.secret ? " (secret, filled in by a person)" : ""}`;
+        // One key, or keys: [...] in one call (D52). Every item is checked before any is written.
+        if (args.keys !== undefined && args.key !== undefined) throw new OnboardingError(400, "draft/env-key", "Give either key or keys, not both.");
+        const items: Record<string, any>[] = args.keys !== undefined ? args.keys : [args];
+        if (!Array.isArray(items) || !items.length || items.some((x) => !x || typeof x !== "object")) throw new OnboardingError(400, "draft/env-key", "keys is a non-empty array of {key, description, secret, default?, optional?}.");
+        const made = items.map((x, i): EnvKey => {
+          const at = args.keys !== undefined ? ` (keys[${i}])` : "";
+          if (!/^[A-Z_][A-Z0-9_]*$/.test(String(x.key ?? ""))) throw new OnboardingError(400, "draft/env-key", `env keys are uppercase letters, digits and underscores${at}.`);
+          if (x.secret && x.default) throw new OnboardingError(400, "draft/env-secret", `A secret cannot have a default: mark it as "filled in by a person" (${x.key}).`);
+          return { key: x.key, description: String(x.description ?? ""), secret: Boolean(x.secret), ...(x.default !== undefined ? { default: String(x.default) } : {}), ...(x.optional ? { optional: true } : {}) };
+        });
+        const names = made.map((k) => k.key);
+        if (new Set(names).size !== names.length) throw new OnboardingError(400, "draft/env-key", "keys lists the same key twice.");
+        a.draft.envKeys = [...a.draft.envKeys.filter((k) => !names.includes(k.key)), ...made];
+        summary = made.length === 1 ? `env key ${names[0]}${made[0]!.secret ? " (secret, filled in by a person)" : ""}`
+          : `env keys ${names.join(", ")}${made.some((k) => k.secret) ? ` (secret: ${made.filter((k) => k.secret).map((k) => k.key).join(", ")})` : ""}`;
         break;
       }
       case "remove-env-key":

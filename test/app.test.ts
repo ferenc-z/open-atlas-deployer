@@ -2862,3 +2862,40 @@ test("phase 3 step 2: no service endpoint or tool answers with a sealed copy or 
   const key = (await makeKey(t, "admin", { kind: "service", name: "deploy-assistant", days: 30 })).body.key as string;
   for (const name of ["get_service_config", "diff_service_config"]) clean(name, JSON.stringify((await tool(t, key, name, { id: "flow", all: true })).value));
 });
+
+test("D52: draft tools answer with a receipt, get_draft is small, env keys can be written in one call", async () => {
+  const t = withBook();
+  t.beat();
+  t.s.tags["acme/hello"] = ["v1.0.0"];
+  const service = (await makeKey(t, "admin", { kind: "service", name: "assessor", days: 30 })).body.key as string;
+  const a = (await (await post(t, "/api/assessments", "uat", { repo: "https://github.com/acme/hello", version: "1.0.0" })).json()).assessment;
+  const token = tokenOf(t.s.oma.sessions[0]!.messages[0]!);
+  const r = await agentTool(t, service, "draft_component", a.id, token, { component: "web", type: "compose-service" });
+  assert.deepEqual(r.value, { ok: true, operation: "component", target: "web", changes: 1 });
+  const batch = await agentTool(t, service, "draft_env_key", a.id, token, { keys: [{ key: "GREETING", description: "g", secret: false, default: "hi" }, { key: "API_TOKEN", description: "t", secret: true }] });
+  assert.deepEqual(batch.value, { ok: true, operation: "env-key", target: "GREETING,API_TOKEN", changes: 2 });
+  const got = (await tool(t, service, "get_draft", { id: a.id })).value;
+  assert.deepEqual(Object.keys(got).sort(), ["draft", "findings", "manifest"]);
+  assert.deepEqual(got.draft.envKeys.map((k: { key: string }) => k.key), ["GREETING", "API_TOKEN"]);
+  assert.equal(got.manifest.components[0].id, "web");
+  assert.equal(got.changes, undefined);
+  // One bad item: nothing of the batch is written.
+  const bad = await agentTool(t, service, "draft_env_key", a.id, token, { keys: [{ key: "NEW_ONE", description: "x", secret: false }, { key: "SECRET_X", description: "x", secret: true, default: "s" }] });
+  assert.equal(bad.value.finding.code, "draft/env-secret");
+  const after = (await tool(t, service, "get_draft", { id: a.id })).value;
+  assert.deepEqual(after.draft.envKeys.map((k: { key: string }) => k.key), ["GREETING", "API_TOKEN"]);
+  assert.equal((await agentTool(t, service, "draft_env_key", a.id, token, { key: "A", keys: [] })).value.finding.code, "draft/env-key");
+  // The page still gets the whole assessment.
+  const page = await (await post(t, `/api/assessments/${a.id}/draft/env-key`, "uat", { key: "PAGE_KEY", description: "p", secret: false, reason: "on the page" })).json();
+  assert.ok(page.changes.length >= 3 && page.report === null);
+});
+
+test("D52: a version assessment's first message carries the starting manifest once", async () => {
+  const t = withBook();
+  t.beat();
+  t.s.tags["acme/book"] = ["v1.0.0", "v1.1.0"];
+  await post(t, "/api/assessments", "uat", { app: "book", version: "1.1.0" });
+  const msg = t.s.oma.sessions[0]?.messages[0] ?? "";
+  assert.match(msg, /starting manifest/);
+  assert.equal(msg.split('"components"').length - 1, 1, "the manifest appears once, not again in the facts");
+});

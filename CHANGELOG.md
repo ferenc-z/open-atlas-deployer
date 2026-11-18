@@ -3,6 +3,18 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
+## Unreleased
+
+- D52: the Onboarding Assessor's `draft_*` tools answer with a receipt (`{ok, operation, target, changes}`) instead
+  of the whole assessment, which made OMA fail with a context-too-large harness error. New read-only tool
+  `get_draft` (draft, manifest, findings); `draft_env_key` takes `keys` to write several env keys in one call
+  (all or none); a version assessment's first message carries the manifest it starts from.
+
+### After upgrading
+
+- [ ] OMA: republish the Onboarding Assessor (`get_draft`, `keys` for env keys, shorter reading rules), then set
+  `DEPLOYER_OMA_ASSESSOR_AGENT` to the new agent. Not published to PROD automatically (D47).
+
 ## 0.3.0-rc.14
 
 - D51: a first install starts from the defaults: when the first import finds no env file on the server and the
