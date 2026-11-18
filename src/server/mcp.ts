@@ -254,6 +254,13 @@ const HEALTH_TOOLS: Tool[] = [
     properties: { id: SERVICE }, required: ["id"], request: (a) => ({ method: "GET", path: `/api/services/${enc(a.id)}/health` }), shape: redacted },
 ];
 
+// S37 step 4: the investigation's evidence (GET /api/services/:id/investigate, compact: no curves, one raw line each).
+const INVESTIGATE_TOOLS: Tool[] = [
+  { name: "investigate_service", readOnly: true, description: "The evidence for why a NiFi service (or one member) misbehaved in a window, worked out by the Deployer: cards for process starts, stops, disconnections and out-of-memory signs; bulletins by component (with a link into NiFi); WARN/ERROR log patterns that are new or surging against the same hours a day before; metrics far from that baseline; configuration changes, Deployer changes and drift in the 24 hours before. Each card has a weight (high, medium, low, none) and its items; notes say what could not be compared. Window at most 24 hours, default the last hour. Use after get_service_health, with a to-do's member and since.",
+    properties: { id: SERVICE, member: s("Optional: a member key (from get_service_health), to look at one node."), from: s("Optional ISO time, default an hour before to."), to: s("Optional ISO time, default now."), focus: s("Optional: a to-do's rule (e.g. process-down, error-bulletins, heap) or a card (process, bulletins, logs, metrics, changes) to put first.") },
+    required: ["id"], request: (a) => ({ method: "GET", path: `/api/services/${enc(a.id)}/investigate`, query: { member: a.member, from: a.from, to: a.to, focus: a.focus, compact: "1" } }), shape: redacted },
+];
+
 function manifestBody(a: Record<string, unknown>) {
   return { appliesFrom: a.applies_from, newAppliesFrom: a.new_applies_from, base: a.base, patch: a.patch, manifest: a.manifest };
 }
@@ -276,6 +283,7 @@ export const TOOLS: Tool[] = [
   { name: "get_cluster_status", readOnly: true, description: "One cluster or standalone instance (id from list_service_clusters): every member with its host's service executor (online or not) and its state from the collector's newest sample: running or stopped as of that sample (asOf), unknown after 3 sampling periods without one, lost when the executor is offline; never sampled: as of the newest discovery (source). Also the live pid, version, cluster connection, key numbers, every certificate with its expiry, and summary.backpressure: the newest back pressure reading (read every 5 minutes by default, flow-wide): connections at their threshold (full), the fullest percentage and the most congested queues (top, fullest first).", properties: { id: s("The cluster's or standalone instance's id, as list_service_clusters names it.") }, required: ["id"], request: (a) => ({ method: "GET", path: `/api/services/${enc(a.id)}/status` }) },
   ...SERVICE_TOOLS,
   ...HEALTH_TOOLS,
+  ...INVESTIGATE_TOOLS,
   // Assessments (§10.5.6): the Onboarding Assessor reads these and writes only its own draft, with the task token;
   // the Deploy Assistant reads them (list_assessments, onboarding_draft) to answer about the Onboarding page.
   { name: "list_assessments", readOnly: true, description: "Every assessment, newest first: id (asm_…), kind (onboarding or version), repository or app, version, who started it, status and level.", properties: {}, request: () => ({ method: "GET", path: "/api/assessments" }) },

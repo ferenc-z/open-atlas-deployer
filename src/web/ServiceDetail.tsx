@@ -16,6 +16,7 @@ import { FlowFileTrace } from "./Trace.tsx";
 import { TraceModelEditor } from "./TraceModel.tsx";
 import { NginxAddress } from "./Nginx.tsx";
 import { ServiceNow } from "./ServiceNow.tsx";
+import { Investigate } from "./Investigate.tsx";
 import { AlertBadge, EventsAndAlerts, OpenAlerts, Timeline } from "./Alerts.tsx";
 import { ago, CertBadge, certTone, ConfCell, daysLeft, daysText, fmtBytes, fmtNumber, memberKey, serviceName, SEVERITY, STATE, StatusNotes, UpBadge, webPort, when } from "./svc.tsx";
 
@@ -24,6 +25,7 @@ type Tab = { id: string; label: string; shown: (l: Loaded) => boolean; render: (
 
 const TABS: Tab[] = [
   { id: "status", label: "Status", shown: () => true, render: (l) => <ServiceNow s={l.s} canAct={Boolean(l.cfg?.canDraft) && !l.desk.active} plan={(r) => l.desk.plan(r)} open={l.open} /> },
+  { id: "investigate", label: "Investigate", shown: (l) => l.s.members.length > 0, render: (l) => <Investigate s={l.s} /> },
   { id: "overview", label: "Overview", shown: () => true, render: (l) => <Overview {...l} /> },
   { id: "metrics", label: "Metrics", shown: (l) => l.s.members.some((m) => m.live), render: (l) => <Metrics s={l.s} /> },
   { id: "logs", label: "Logs", shown: (l) => l.s.members.length > 0, render: (l) => <Logs s={l.s} /> },

@@ -44,6 +44,13 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   is there is reported as incomplete, so the next source is asked. A worker's historical P95 (7 days, 20 runs, at
   least 60 s) is its allowed time. "Import businesses from e2e_trace" turns schedule_header/schedule_detail into
   businesses in the editor. The graph's contract and saved queries: `src/server/services/trace/e2e-graph.ts`.
+- S37 step 4: a service page's "Investigate" tab gathers the evidence of a window (at most 24 hours) without AI:
+  process starts, stops, disconnections and out-of-memory signs; bulletins by component with "Open in NiFi" (the
+  component selected); WARN/ERROR log patterns new or surging against the same hours a day before; metrics far from
+  that baseline (with the curve); configuration changes, Deployer changes and drift of the 24 hours before. It starts
+  from a to-do (the Status tab's "Investigate" now opens it), an alert, or a node and a window. Same body from
+  `GET /api/services/:id/investigate` and the MCP tool `investigate_service` (compact, redacted; not in the Deploy
+  Assistant's whitelist yet, step 9). Bulletins now keep their component and process group ids.
 
 ### After upgrading
 

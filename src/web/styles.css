@@ -511,3 +511,12 @@ button.change-now.state-paused { color: var(--warn); border-color: var(--warn); 
 /* S37 step 3 (T15): the business model for someone who is not an admin: shown, not editable, and no edit buttons. */
 fieldset.model-fields { border: 0; padding: 0; margin: 0; min-width: 0; display: grid; gap: 1rem; }
 fieldset.model-fields:disabled button { display: none; }
+
+/* S37 step 4: the Investigate tab's evidence cards. */
+details.evidence > summary { cursor: pointer; display: flex; gap: 0.5rem; align-items: baseline; flex-wrap: wrap; }
+details.evidence.evidence-high { border-left: 3px solid var(--bad, #c0392b); }
+details.evidence.evidence-medium { border-left: 3px solid var(--warn, #d68910); }
+ul.evidence-items { list-style: none; padding-left: 0.25rem; margin: 0.5rem 0 0; }
+ul.evidence-items > li { padding: 0.2rem 0; border-top: 1px solid var(--border, #ddd); }
+ul.evidence-items details > summary { cursor: pointer; }
+pre.raw { white-space: pre-wrap; word-break: break-word; max-height: 24rem; overflow: auto; padding: 0.5rem; background: var(--code-bg, rgba(127,127,127,0.08)); }

@@ -9,6 +9,7 @@ import type { ServiceHealth, Todo, TodoAction } from "./api.ts";
 import { Timeline } from "./Alerts.tsx";
 import { STATE, ago, fmtNumber, when } from "./svc.tsx";
 import type { ChangeKind } from "./api.ts";
+import { investigateFrom, windowAround } from "./Investigate.tsx";
 
 type Props = { s: api.ServiceStatus; canAct: boolean; plan: (r: { kind: ChangeKind; members: string[] }) => void; open: (tab: string) => void };
 
@@ -98,12 +99,12 @@ function TodoRow({ t, canAct, plan, open }: { t: Todo; canAct: boolean; plan: Pr
       </div>
       <p className="small">{t.cause}</p>
       {t.evidence.length > 0 && <ul className="small">{t.evidence.slice(0, 3).map((e, i) => <li key={i}>{e}</li>)}</ul>}
-      {t.actions.length > 0 && <div className="row wrap">{t.actions.map((a, i) => <ActionButton key={i} a={a} canAct={canAct} plan={plan} open={open} />)}</div>}
+      {t.actions.length > 0 && <div className="row wrap">{t.actions.map((a, i) => <ActionButton key={i} t={t} a={a} canAct={canAct} plan={plan} open={open} />)}</div>}
     </li>
   );
 }
 
-function ActionButton({ a, canAct, plan, open }: { a: TodoAction; canAct: boolean; plan: Props["plan"]; open: Props["open"] }) {
+function ActionButton({ t, a, canAct, plan, open }: { t: Todo; a: TodoAction; canAct: boolean; plan: Props["plan"]; open: Props["open"] }) {
   const target = a.target ?? {};
   switch (a.kind) {
     case "open-nifi": return typeof target.url === "string" ? <a className="button" href={target.url} target="_blank" rel="noreferrer">{a.label} ↗</a> : null;
@@ -112,8 +113,8 @@ function ActionButton({ a, canAct, plan, open }: { a: TodoAction; canAct: boolea
       if (!canAct || !CONTROL.has(action) || typeof target.member !== "string") return null;
       return <button onClick={() => plan({ kind: action as ChangeKind, members: [target.member as string] })} title="Shows a plan first">{a.label}</button>;
     }
-    // The investigation page is not live yet (S37 step 4): until then it opens the nearest tab, Logs.
-    case "investigate": return <button onClick={() => open("logs")} title="The investigation page is not live yet: this opens Logs">{a.label} (opens Logs)</button>;
+    // S37 step 4: the Investigate tab, on this to-do's member and a window from half an hour before it started.
+    case "investigate": return <button onClick={() => { investigateFrom({ member: typeof target.member === "string" ? target.member : t.member !== "*" ? t.member : undefined, ...windowAround(t.since), focus: t.rule, label: `To-do ${t.rule}${t.memberLabel ? ` on ${t.memberLabel}` : ""}` }); open("investigate"); }}>{a.label}</button>;
     case "metrics": return <button onClick={() => open("metrics")}>{a.label}</button>;
     case "draft-config": case "config-diff": return <button onClick={() => open("configuration")}>{a.label}</button>;
     default: return null;
