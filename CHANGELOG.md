@@ -9,11 +9,18 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   of the whole assessment, which made OMA fail with a context-too-large harness error. New read-only tool
   `get_draft` (draft, manifest, findings); `draft_env_key` takes `keys` to write several env keys in one call
   (all or none); a version assessment's first message carries the manifest it starts from.
+- S34: a cluster member's JVM, flow and repository numbers no longer stay empty when its NiFis share one port (a NiFi
+  per machine) and the member's recorded node address is written differently from the API address NiFi lists (an IP,
+  a short name, none). Service executor 0.9.4 finds its own node by port and its names or a local address and sends
+  `nifi.selfNodeId`; the Deployer reads the node by that id (the Metrics tab, live states, a rolling restart's
+  "node connected" check). With an older executor it matches port and address as before, now case-insensitively,
+  and a point it cannot match carries `_unmatched`.
 
 ### After upgrading
 
 - [ ] OMA: republish the Onboarding Assessor (`get_draft`, `keys` for env keys, shorter reading rules), then set
   `DEPLOYER_OMA_ASSESSOR_AGENT` to the new agent. Not published to PROD automatically (D47).
+- [ ] Upgrade the service executors to 0.9.4 (the Executors page) so clusters on one port get their numbers.
 
 ## 0.3.0-rc.14
 

@@ -85,7 +85,7 @@ from executor_core import (  # noqa: F401
     FINAL, ID_RE, PROTOCOLS, Failed, ProtocolExecutor, Refused, Restarting, load_env_file, now_iso, write_json)
 # <<< executor_core
 
-VERSION = "0.9.3"
+VERSION = "0.9.4"
 # The executor's release (§8.6): one directory in the archive, holding only these files.
 PACKAGE = "open-atlas-service-executor"
 PACKAGE_FILES = ("service_executor.py", "launch.sh", "switch", "install.sh", "open-atlas-service-executor.service", "service-executor.env.example")
@@ -829,6 +829,65 @@ def endpoint(https_host, node_address=None):
     return host, host
 
 
+LOCAL_TTL = 300
+_local_cache = {}
+
+
+def host_name(name):
+    """A host name as compared: lower case, without the trailing dot."""
+    return str(name or "").strip().lower().rstrip(".")
+
+
+def is_local_address(address):
+    """Whether an address (name or IP) resolves to an IP of this machine: one it can bind. Remembered LOCAL_TTL seconds,
+    so a slow resolver is asked once in a while, not every round."""
+    key = host_name(address)
+    if not key:
+        return False
+    hit = _local_cache.get(key)
+    if hit and hit[1] > time.monotonic():
+        return hit[0]
+    local = False
+    try:
+        infos = socket.getaddrinfo(key, None, 0, socket.SOCK_STREAM)
+    except (OSError, UnicodeError):
+        infos = []
+    for family, _, _, _, sockaddr in infos:
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as s:
+                s.bind((sockaddr[0], 0) if family == socket.AF_INET else (sockaddr[0], 0, 0, sockaddr[3] if len(sockaddr) > 3 else 0))
+            local = True
+            break
+        except OSError:
+            continue
+    _local_cache[key] = (local, time.monotonic() + LOCAL_TTL)
+    return local
+
+
+def own_names(w, props):
+    """What this NiFi may call itself in its cluster's node list (S34): its API host, its cluster node address, the
+    machine's names."""
+    names = {host_name((w.get("https") or {}).get("host")), host_name(props.get("nifi.web.https.host")),
+             host_name(w.get("nodeAddress")), host_name(props.get("nifi.cluster.node.address"))}
+    with contextlib.suppress(OSError):
+        names.add(host_name(socket.gethostname()))
+    with contextlib.suppress(OSError):
+        names.add(host_name(socket.getfqdn()))
+    return {n for n in names if n and n not in WILDCARD_HOSTS}
+
+
+def self_node(nodes, port, names, local=is_local_address):
+    """nodeId of this machine's NiFi among a cluster's nodes (S34): the API port is its HTTPS port, and the address is
+    one of its names or resolves to this machine. The only node on that port when none says so (NiFis of one machine
+    differ by port). None when it cannot tell."""
+    # By node id: the same node may come from both the nodewise diagnostics and the cluster view.
+    on_port = {n["nodeId"]: n.get("address") for n in nodes or [] if isinstance(n, dict) and n.get("apiPort") == port and n.get("nodeId")}
+    mine = [i for i, a in on_port.items() if host_name(a) in names] or [i for i, a in on_port.items() if local(a)]
+    if len(mine) == 1:
+        return mine[0]
+    return next(iter(on_port)) if len(on_port) == 1 else None
+
+
 def _num(d, *keys):
     return {k: d[k] for k in keys if isinstance(d.get(k), (int, float)) and not isinstance(d.get(k), bool)}
 
@@ -1103,6 +1162,10 @@ class Collector:
                 out[name] = TRIM[name](json.loads(body))
             except (ValueError, AttributeError, TypeError) as e:
                 errors[name] = f"unexpected answer: {e}"[:300]
+        if node:
+            # Which node entry is this NiFi (S34): the Deployer reads its own numbers by this id.
+            listed = ((out.get("cluster") or {}).get("nodes") or []) + ((out.get("diagnostics") or {}).get("nodes") or [])
+            out["selfNodeId"] = self_node(listed, port, own_names(w, props)) if listed else None
         if errors:
             out.update(state="partial", errors=errors)
         return out
@@ -1297,11 +1360,10 @@ class Collector:
             out["error"] = (e.strerror or str(e))[:200]
         return out
 
-    def cluster_table(self, nodes, address, port):
-        """The nodes as svc-state says them, and which is this member (by nifi.cluster.node.address and HTTPS port)."""
+    def cluster_table(self, nodes, port, names):
+        """The nodes as svc-state says them, and which is this member (self_node: HTTPS port, and its names or address)."""
         table = [{"nodeId": n.get("nodeId"), "address": n.get("address"), "apiPort": n.get("apiPort"), "status": n.get("status"), "roles": n.get("roles") or []} for n in nodes]
-        me = next((n["nodeId"] for n in table if n["address"] == address and n["apiPort"] == port), None) if address else None
-        return {"nodes": table, "self": me}
+        return {"nodes": table, "self": self_node(table, port, names)}
 
     def state_rest(self, w, props):
         """svc-state's REST part, with the monitor certificate, within NIFI_BUDGET. state: ok, partial (it answered, but
@@ -1334,7 +1396,7 @@ class Collector:
                 if name == "status":
                     out["invalidCount"] = trim_status(d).get("invalidCount")
                 else:
-                    out["cluster"] = self.cluster_table(trim_cluster(d)["nodes"], w.get("nodeAddress") or props.get("nifi.cluster.node.address", "").strip(), port)
+                    out["cluster"] = self.cluster_table(trim_cluster(d)["nodes"], port, own_names(w, props))
             except (ValueError, AttributeError, TypeError) as e:
                 errors[name] = f"unexpected answer: {e}"[:300]
         if errors:

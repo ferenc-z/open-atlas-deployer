@@ -192,7 +192,7 @@ export function serviceStatus(store: Store, executor: (host: string) => Executor
   const views = [...samples.values()].filter((x) => Array.isArray((x.body.nifi as Any | undefined)?.cluster?.nodes)).sort((a, b) => (a.at < b.at ? 1 : -1));
   const coordinator = views.find((x) => {
     const m = members.find((mm) => installKey(mm) === x.member);
-    return m && (ownNode((x.body.nifi as Any).cluster.nodes as Any[], m)?.roles as string[] | undefined)?.includes("Cluster Coordinator");
+    return m && (ownNode((x.body.nifi as Any).cluster.nodes as Any[], m, (x.body.nifi as Any).selfNodeId)?.roles as string[] | undefined)?.includes("Cluster Coordinator");
   }) ?? views[0];
   let period = DEFAULT_PERIOD;
   const statuses = members.map((m): MemberStatus => {
@@ -206,7 +206,7 @@ export function serviceStatus(store: Store, executor: (host: string) => Executor
     let live: LiveView | null = null;
     if (sample) {
       const b = sample.body as Any;
-      const view = coordinator ? ownNode((coordinator.body.nifi as Any).cluster.nodes as Any[], m) : undefined;
+      const view = coordinator ? ownNode((coordinator.body.nifi as Any).cluster.nodes as Any[], m, b.nifi?.selfNodeId) : undefined;
       live = {
         at: sample.at, receivedAt: sample.receivedAt, running: typeof b.process?.running === "boolean" ? b.process.running : null, pid: b.process?.pid ?? null,
         startedAt: b.process?.startedAt ?? null, nifi: b.nifi?.state ?? null, version: b.nifi?.about?.version ?? null,

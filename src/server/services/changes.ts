@@ -20,6 +20,7 @@ import { effectiveProperties } from "./configdoc.ts";
 import { fileDiffs } from "./configedit.ts";
 import { openFile, type ConfigFileRecord, type ConfigMember } from "./config.ts";
 import { confDirOf, filterStartEnvironment, installKey, type ServiceMember } from "./draft.ts";
+import { ownNode } from "./metrics.ts";
 import { profile as profileById } from "./profiles.ts";
 
 export type ChangeKind = "apply" | "overwrite" | "restart" | "rolling-restart" | "start" | "stop";
@@ -604,7 +605,8 @@ export class ServiceChanges {
 
   private nodeOf(view: View, m: ServiceMember): ClusterNode | undefined {
     const self = view.answers.get(installKey(m))?.rest.cluster?.self;
-    return view.nodes.find((n) => (self && n.nodeId === self) || (n.address === m.nodeAddress && n.apiPort === m.ports.https));
+    // S34: the node svc-state recognised as this member; an older executor's may be missing: port and address then.
+    return ownNode(view.nodes, m, self);
   }
 
   /** §16.3: an ordinary node first; only when just those are left the primary node, the coordinator last. */

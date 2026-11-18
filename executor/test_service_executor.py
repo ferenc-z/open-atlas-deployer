@@ -10,6 +10,7 @@ import os
 import pathlib
 import pwd
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -802,6 +803,34 @@ class WatchApi(FakeApi):
         self.samples.extend(samples)
 
 
+class SelfNodeTest(unittest.TestCase):
+    """S34: a NiFi per machine, all on 9443, listed by their API address; this machine is nifi01.corp."""
+    NODES = [{"nodeId": "n1", "address": "nifi01.corp", "apiPort": 9443}, {"nodeId": "n2", "address": "nifi02.corp", "apiPort": 9443}]
+
+    def test_same_port_the_address_written_differently(self):
+        not_local = lambda a: False  # noqa: E731
+        # The cluster node address as an IP, a short name, or not set: the API host or the machine's name tells.
+        for names in ({"10.0.0.11", "nifi01.corp"}, {"nifi01", "nifi01.corp"}, {"nifi01.corp"}):
+            self.assertEqual(sx.self_node(self.NODES, 9443, names, not_local), "n1", names)
+        # None of its names: the one whose address resolves to this machine.
+        self.assertEqual(sx.self_node(self.NODES, 9443, {"10.0.0.11"}, lambda a: a == "nifi01.corp"), "n1")
+        self.assertIsNone(sx.self_node(self.NODES, 9443, {"10.0.0.11"}, not_local), "cannot tell: none rather than a guess")
+        # Different ports (the lab: one machine): the port alone.
+        lab = [{"nodeId": "a", "address": "localhost", "apiPort": 18445}, {"nodeId": "b", "address": "localhost", "apiPort": 18446}]
+        self.assertEqual(sx.self_node(lab, 18446, set(), not_local), "b")
+        self.assertIsNone(sx.self_node(lab, 9443, {"localhost"}, not_local))
+
+    def test_names_and_local_addresses(self):
+        self.assertTrue(sx.is_local_address("127.0.0.1"))
+        self.assertTrue(sx.is_local_address(socket.gethostname()))
+        self.assertFalse(sx.is_local_address("192.0.2.1"), "TEST-NET-1 is nobody's")
+        self.assertFalse(sx.is_local_address("no-such-host.invalid"))
+        self.assertEqual(sx.host_name(" NIFI01.Corp. "), "nifi01.corp")
+        names = sx.own_names({"nodeAddress": "10.0.0.11", "https": {"host": "0.0.0.0"}}, {"nifi.web.https.host": "NiFi01.corp", "nifi.cluster.node.address": ""})
+        self.assertTrue({"10.0.0.11", "nifi01.corp", sx.host_name(socket.gethostname())} <= names)
+        self.assertFalse({"", "0.0.0.0"} & names)
+
+
 class RestTrimTest(unittest.TestCase):
     def test_what_each_version_answers_is_cut_to_what_the_deployer_keeps(self):
         for version, want in (("1.12.1", "1.12.1"), ("2.0.0", "2.0.0"), ("2.5.0-cluster", "2.5.0")):
@@ -986,6 +1015,7 @@ class CollectorTest(Base):
         self.assertEqual((n["state"], n["url"], n["about"]["version"]), ("ok", "https://localhost:18445", "2.5.0"))
         self.assertEqual(len(n["diagnostics"]["nodes"]), 2, "a node asks nodewise")
         self.assertEqual(len(n["cluster"]["nodes"]), 2)
+        self.assertEqual(n["selfNodeId"], next(c["nodeId"] for c in n["cluster"]["nodes"] if c["apiPort"] == 18445), "S34: which entry is this node")
         self.assertEqual(len(n["bulletins"]), 3)
         paths = [call[3] for call in c.calls if call[1] == 18445]
         self.assertEqual(paths, ["flow/about", "system-diagnostics?nodewise=true", "flow/status", "controller/cluster", f"flow/bulletin-board?limit={sx.BULLETINS}",
@@ -1061,7 +1091,7 @@ class CollectorTest(Base):
         self.assertEqual([(n["apiPort"], n["address"], n["status"], n["roles"]) for n in rest["cluster"]["nodes"]],
                          [(18445, "localhost", "CONNECTED", ["Primary Node", "Cluster Coordinator"]), (18446, "localhost", "CONNECTED", [])])
         self.assertEqual(sorted(rest["cluster"]["nodes"][0]), ["address", "apiPort", "nodeId", "roles", "status"])
-        self.assertEqual(rest["cluster"]["self"], rest["cluster"]["nodes"][0]["nodeId"], "by address and HTTPS port")
+        self.assertEqual(rest["cluster"]["self"], rest["cluster"]["nodes"][0]["nodeId"], "by HTTPS port and address (self_node)")
         props = next(f for f in out["files"] if f["name"] == "nifi.properties")
         self.assertEqual(props["sha256"], hashlib.sha256((self.c250 / "conf" / "nifi.properties").read_bytes()).hexdigest())
         self.assertEqual((props["owner"], props["mode"]), (sx.user_name(os.geteuid()), "0640"))
