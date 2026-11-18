@@ -530,7 +530,7 @@ export class Onboarding {
       if (build && "dockerfile" in build && build.dockerfile !== undefined) {
         if ("script" in build && build.script !== undefined) add("draft/build-script", at, "build is either {script: build-images.sh} or {dockerfile, prefix?}, not both");
         if (!rel(build.dockerfile) || (build.prefix !== undefined && !rel(build.prefix))) add("draft/build-path", at, "dockerfile and prefix are relative paths inside the repository");
-        if (m.app && c.source?.kind === "company-registry" && c.source.image !== `open-atlas-${m.app}` && !c.source.image.startsWith(`open-atlas-${m.app}-`)) add("draft/build-image", ["components", c.id, "source", "image"], `A Deployer-built image is named open-atlas-${m.app} or open-atlas-${m.app}-<component>`);
+        if (m.app && c.source?.kind === "company-registry" && c.source.image !== `open-atlas-${m.app}` && !String(c.source.image ?? "").startsWith(`open-atlas-${m.app}-`)) add("draft/build-image", ["components", c.id, "source", "image"], `A Deployer-built image is named open-atlas-${m.app} or open-atlas-${m.app}-<component>`);
       } else if (build) {
         if (build.script !== "build-images.sh") add("draft/build-script", [...at, "script"], `The executor runs only the release tools' build-images.sh (the repository needs tools.lock); ${String(build.script)} would be refused. A repository without tools.lock builds with {dockerfile, prefix?} when its Dockerfile is self-contained`);
         if (m.app && c.source?.kind === "company-registry" && c.source.image !== `open-atlas-${m.app}`) add("draft/build-image", ["components", c.id, "source", "image"], `build-images.sh names the image open-atlas-${m.app}`);
