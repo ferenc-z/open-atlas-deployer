@@ -76,6 +76,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import urllib.parse
 import zlib
 
 # >>> executor_core
@@ -1719,7 +1720,11 @@ PROV_POLL = 0.25
 PROV_CLEANUP_TIMEOUT = 2.0
 PROV_ENRICH_MAX = 100          # lineage: the event nodes given their component, at most
 PROV_ATTRS_MAX, PROV_VALUE_MAX = 500, 4096
-PROV_OPS = ("provenance", "lineage", "event", "search-options")
+PROV_OPS = ("provenance", "lineage", "event", "search-options", "flow-search")
+# S37 step 5: NiFi's component search (GET flow/search-results), for a trace model's step positions; at most this many.
+FLOW_SEARCH_MAX = 50
+FLOW_SEARCH_KINDS = (("processGroupResults", "process-group"), ("inputPortResults", "input-port"),
+                     ("outputPortResults", "output-port"), ("processorResults", "processor"))
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 NIFI_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 # What of an event leaves the host: never content claims (no content is read) or replay details.
@@ -1863,6 +1868,22 @@ class ProvenanceQuery:
     def search_options(self, request):
         fields = (self.call("GET", "provenance/search-options").get("provenanceOptions") or {}).get("searchableFields") or []
         return {"op": "search-options", "fields": [{k: f.get(k) for k in ("id", "field", "label", "type")} for f in fields if isinstance(f, dict)]}
+
+    def flow_search(self, request):
+        """Components whose name or id matches q (NiFi's own search): process groups, ports and processors, with
+        the group they are in. A read of the flow only."""
+        q = request.get("q")
+        if not isinstance(q, str) or not q.strip() or len(q) > 100:
+            raise Refused("q is 1 to 100 characters")
+        found = self.call("GET", "flow/search-results?q=" + urllib.parse.quote(q.strip())).get("searchResultsDTO") or {}
+        out = []
+        for key, kind in FLOW_SEARCH_KINDS:
+            for r in found.get(key) or []:
+                if not isinstance(r, dict) or not isinstance(r.get("id"), str):
+                    continue
+                parent = r.get("parentGroup") if isinstance(r.get("parentGroup"), dict) else {}
+                out.append({"kind": kind, "id": r["id"], "name": r.get("name"), "groupId": r.get("groupId"), "groupName": parent.get("name")})
+        return {"op": "flow-search", "q": q.strip(), "results": out[:FLOW_SEARCH_MAX], "truncated": len(out) > FLOW_SEARCH_MAX}
 
     def job(self, path, key, body, node):
         """Submit, poll until finished, delete (always). Returns (the finished job, its id)."""

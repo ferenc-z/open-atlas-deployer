@@ -206,4 +206,10 @@ export class ServiceProvenance {
     const { body } = await this.ask(id, { op: "search-options" });
     return body;
   }
+
+  /** S37 step 5: components found by name or id (NiFi's flow search), for a trace model step's position. */
+  async flowSearch(id: string, q: string): Promise<Any> {
+    const { body, member } = await this.ask(id, { op: "flow-search", q });
+    return { ...body, via: { member: member.key, label: member.label } };
+  }
 }

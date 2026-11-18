@@ -2451,6 +2451,13 @@ class FakeNifi:
             return 200, json.dumps({"provenanceOptions": {"searchableFields": fields}}).encode()
         if bare == "flow/about":
             return 200, json.dumps({"about": {"title": "NiFi", "version": self.version, "timezone": "CST"}}).encode()
+        if bare == "flow/search-results":
+            parent = {"id": "pg-root", "name": "NiFi Flow"}
+            return 200, json.dumps({"searchResultsDTO": {
+                "processorResults": [{"id": "p-1", "groupId": "pg-in", "name": "GetFile in", "parentGroup": {"id": "pg-in", "name": "Inbound"}}],
+                "processGroupResults": [{"id": "pg-in", "groupId": "pg-root", "name": "Inbound", "parentGroup": parent}],
+                "inputPortResults": [{"id": "ip-1", "groupId": "pg-root", "name": "in from n112", "parentGroup": parent}, "junk"],
+                "connectionResults": [{"id": "c-1", "name": "ignored"}]}}).encode()
         if method == "POST" and bare == "provenance":
             req = body["provenance"]["request"]
             term = next(iter(req["searchTerms"].values()))
@@ -2602,6 +2609,16 @@ class ProvenanceTest(Base):
     def test_refused_certificate_says_which_policies(self):
         with self.assertRaisesRegex(sx.Failed, "query provenance.*view provenance"):
             self.query(FakeNifi(status=403), {"op": "search-options"})
+
+    def test_flow_search_lists_groups_ports_and_processors(self):
+        nifi = FakeNifi()
+        out = self.query(nifi, {"op": "flow-search", "q": " in "})
+        self.assertEqual(nifi.calls, ["GET flow/search-results?q=in"])
+        self.assertEqual([(r["kind"], r["id"], r["groupName"]) for r in out["results"]],
+                         [("process-group", "pg-in", "NiFi Flow"), ("input-port", "ip-1", "NiFi Flow"), ("processor", "p-1", "Inbound")])
+        self.assertFalse(out["truncated"])
+        with self.assertRaises(sx.Refused):
+            self.query(nifi, {"op": "flow-search", "q": ""})
 
     def test_lineage_its_components_and_the_node_on_a_cluster(self):
         events = [{"eventId": 1, "uuid": UUID_A, "type": "CREATE", "ms": AT, "node": "node-1"},

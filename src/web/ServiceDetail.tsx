@@ -13,6 +13,7 @@ import { ServiceConfig } from "./ServiceConfig.tsx";
 import { ask } from "./Confirm.tsx";
 import { Logs } from "./Logs.tsx";
 import { FlowFileTrace } from "./Trace.tsx";
+import { TraceModelEditor } from "./TraceModel.tsx";
 import { NginxAddress } from "./Nginx.tsx";
 import { AlertBadge, EventsAndAlerts, OpenAlerts, Timeline } from "./Alerts.tsx";
 import { ago, CertBadge, certTone, ConfCell, daysLeft, daysText, fmtBytes, fmtNumber, memberKey, serviceName, SEVERITY, STATE, StatusNotes, UpBadge, webPort, when } from "./svc.tsx";
@@ -25,6 +26,7 @@ const TABS: Tab[] = [
   { id: "metrics", label: "Metrics", shown: (l) => l.s.members.some((m) => m.live), render: (l) => <Metrics s={l.s} /> },
   { id: "logs", label: "Logs", shown: (l) => l.s.members.length > 0, render: (l) => <Logs s={l.s} /> },
   { id: "trace", label: "FlowFile trace", shown: (l) => l.s.members.length > 0, render: (l) => <FlowFileTrace s={l.s} /> },
+  { id: "trace-model", label: "Business model", shown: () => true, render: (l) => <TraceModelEditor s={l.s} /> },
   { id: "events", label: "Events and alerts", shown: () => true, render: (l) => <EventsAndAlerts s={l.s} /> },
   { id: "nodes", label: "Nodes", shown: () => true, render: (l) => <Nodes {...l} /> },
   { id: "configuration", label: "Configuration", shown: () => true, render: (l) => <ServiceConfig cfg={l.cfg} status={l.s} drafts={l.drafts} onReview={() => l.open("changes")} /> },
