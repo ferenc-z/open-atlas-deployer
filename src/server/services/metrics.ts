@@ -172,7 +172,8 @@ export function bulletinsOf(sample: Any, service: string, member: string): Servi
   return list.flatMap((b): ServiceBulletin[] => {
     const at = bulletinTime(b.timestamp, sample.at, offset);
     if (at === null || typeof b.id !== "number") return [];
-    return [{ service, member, node: String(b.nodeAddress ?? member), id: b.id, at, level: b.level ?? null, category: b.category ?? null, source: b.sourceName ?? null, sourceType: b.sourceType ?? null, message: b.message ?? null }];
+    return [{ service, member, node: String(b.nodeAddress ?? member), id: b.id, at, level: b.level ?? null, category: b.category ?? null, source: b.sourceName ?? null, sourceType: b.sourceType ?? null, message: b.message ?? null,
+      ...(typeof b.sourceId === "string" ? { sourceId: b.sourceId } : {}), ...(typeof b.groupId === "string" ? { groupId: b.groupId } : {}) }];
   });
 }
 

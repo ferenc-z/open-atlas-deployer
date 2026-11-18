@@ -337,6 +337,11 @@ export class Store {
     }
     // Phase 2 step 2: each sample's flat numbers (the Metrics tab, the rollups), next to step 1's raw body.
     if (!(this.db.prepare("PRAGMA table_info(service_samples)").all() as Row[]).some((c) => c.name === "point")) this.db.exec("ALTER TABLE service_samples ADD COLUMN point TEXT");
+    // S37 step 4: a bulletin's component and process group (the investigation page's links into NiFi).
+    {
+      const have = (this.db.prepare("PRAGMA table_info(service_bulletins)").all() as Row[]).map((c) => c.name);
+      for (const column of ["source_id", "group_id"]) if (!have.includes(column)) this.db.exec(`ALTER TABLE service_bulletins ADD COLUMN ${column} TEXT`);
+    }
     // Phase 2 step 6: the nginx address operations put a service behind (Studio's nifi-ops graph) and its last check.
     for (const table of ["service_standalones", "service_clusters"]) {
       const have = (this.db.prepare(`PRAGMA table_info(${table})`).all() as Row[]).map((c) => c.name);
@@ -1515,10 +1520,10 @@ export class Store {
   addServiceBulletins(rows: ServiceBulletin[]): number {
     if (!rows.length) return 0;
     const received = this.stamp();
-    const insert = this.db.prepare(`INSERT OR IGNORE INTO service_bulletins (service, member, node, bulletin_id, at, level, category, source, source_type, message, received_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    const insert = this.db.prepare(`INSERT OR IGNORE INTO service_bulletins (service, member, node, bulletin_id, at, level, category, source, source_type, message, received_at, source_id, group_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     let added = 0;
-    this.inTransaction(() => { for (const b of rows) added += Number(insert.run(b.service, b.member, b.node, b.id, b.at, b.level, b.category, b.source, b.sourceType, b.message, received).changes); });
+    this.inTransaction(() => { for (const b of rows) added += Number(insert.run(b.service, b.member, b.node, b.id, b.at, b.level, b.category, b.source, b.sourceType, b.message, received, b.sourceId ?? null, b.groupId ?? null).changes); });
     return added;
   }
 
@@ -1529,7 +1534,15 @@ export class Store {
     if (options.level) { where.push("level = ?"); args.push(options.level); }
     args.push(Math.min(1000, Math.max(1, options.limit ?? 200)));
     return (this.db.prepare(`SELECT * FROM service_bulletins WHERE ${where.join(" AND ")} ORDER BY at DESC, bulletin_id DESC LIMIT ?`).all(...args) as Row[])
-      .map((r) => ({ service: r.service, member: r.member, node: r.node, id: r.bulletin_id, at: r.at, level: r.level ?? null, category: r.category ?? null, source: r.source ?? null, sourceType: r.source_type ?? null, message: r.message ?? null }));
+      .map((r) => ({ service: r.service, member: r.member, node: r.node, id: r.bulletin_id, at: r.at, level: r.level ?? null, category: r.category ?? null, source: r.source ?? null, sourceType: r.source_type ?? null, message: r.message ?? null,
+        ...(r.source_id ? { sourceId: r.source_id } : {}), ...(r.group_id ? { groupId: r.group_id } : {}) }));
+  }
+
+  /** S37 step 4: each member's NiFi process start times seen in samples of [from, to), with the first sample that showed each. */
+  serviceProcessStarts(service: string, from: string, to: string): { member: string; startedAt: string; pid: number | null; firstSeen: string }[] {
+    return (this.db.prepare(`SELECT member, json_extract(body, '$.process.startedAt') AS started, json_extract(body, '$.process.pid') AS pid, MIN(at) AS first_seen FROM service_samples
+      WHERE service = ? AND at >= ? AND at < ? AND json_extract(body, '$.process.startedAt') IS NOT NULL GROUP BY member, started ORDER BY first_seen`).all(service, from, to) as Row[])
+      .map((r) => ({ member: r.member, startedAt: String(r.started), pid: typeof r.pid === "number" ? r.pid : null, firstSeen: r.first_seen }));
   }
 
   /** S27: a member's certificates as of one reading, kept only when newer (by readAt) than what is there; only the newest reading stays. */
@@ -1784,5 +1797,5 @@ export interface LogPattern { member: string; pattern: string; level: string; lo
 
 /** A sample's flat numbers (services/metrics.ts). */
 export type Point = Record<string, number | null>;
-export interface ServiceBulletin { service: string; member: string; node: string; id: number; at: string; level: string | null; category: string | null; source: string | null; sourceType: string | null; message: string | null }
+export interface ServiceBulletin { service: string; member: string; node: string; id: number; at: string; level: string | null; category: string | null; source: string | null; sourceType: string | null; message: string | null; sourceId?: string; groupId?: string }
 export interface ServiceCert { member: string; store: string; path: string | null; type: string | null; alias: string | null; chain: number | null; subject: string | null; issuer: string | null; notBefore: string | null; notAfter: string | null; readAt: string; error: string | null }

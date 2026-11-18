@@ -43,6 +43,7 @@ import { installKey, type DraftItem } from "./services/draft.ts";
 import { serviceStatus, thresholdsOf, timeline } from "./services/status.ts";
 import { alertView, check, health, parseThresholds, RULES, THRESHOLDS } from "./services/rules.ts";
 import { TakeoverError, type Takeover } from "./services/takeover.ts";
+import { investigate, InvestigateError } from "./services/investigate.ts";
 import { acceptSamples, watchList } from "./services/watch.ts";
 import { FIELDS, ingest, metrics, RANGES, trend, type Field, type Range } from "./services/metrics.ts";
 import { DOWNLOAD_MAX, LogsError, parseSearch, ServiceLogs } from "./services/logs.ts";
@@ -1375,6 +1376,20 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     if (p instanceof Response) return p;
     const h = health(store, (host) => handoff.executor(host, "service"), c.req.param("id"));
     return h ? c.json(h) : reject(c, 404, "service/unknown", `No standalone instance or cluster ${c.req.param("id")}.`);
+  });
+  // S37 step 4 (pages-rethink §4.3): the investigation's evidence over a window (investigate_service). Raw for the page;
+  // the MCP tool asks compact=1 and redacts.
+  api.get("/api/services/:id/investigate", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    const q = (k: string) => c.req.query(k) || undefined;
+    try {
+      const r = investigate(store, (host) => handoff.executor(host, "service"), c.req.param("id"), { member: q("member"), from: q("from"), to: q("to"), focus: q("focus"), compact: q("compact") === "1" });
+      return r ? c.json(r) : reject(c, 404, "service/unknown", `No standalone instance or cluster ${c.req.param("id")}.`);
+    } catch (e) {
+      if (e instanceof InvestigateError) return reject(c, e.status, e.code, e.message);
+      throw e;
+    }
   });
   api.get("/api/services/:id/events", async (c) => {
     const p = await authenticate(c, "view");

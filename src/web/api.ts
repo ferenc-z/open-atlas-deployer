@@ -398,3 +398,10 @@ export const importE2eModel = (id: string) => call<{ model: import("../server/se
 // S37 step 3: the Status tab renders this as it is (the to-do engine, rules.ts health()).
 export type { ServiceHealth, Todo, TodoAction } from "../server/services/rules.ts";
 export const serviceHealth = (id: string) => call<import("../server/services/rules.ts").ServiceHealth>("GET", `services/${encodeURIComponent(id)}/health`);
+
+// S37 step 4: the Investigate tab's evidence (services/investigate.ts).
+export type { EvidenceCard, EvidenceItem, Investigation } from "../server/services/investigate.ts";
+export const investigateService = (id: string, q: { member?: string | undefined; from: string; to: string; focus?: string | undefined }) => {
+  const qs = new URLSearchParams(Object.entries(q).filter((e): e is [string, string] => typeof e[1] === "string" && e[1] !== ""));
+  return call<import("../server/services/investigate.ts").Investigation>("GET", `services/${encodeURIComponent(id)}/investigate?${qs}`);
+};
