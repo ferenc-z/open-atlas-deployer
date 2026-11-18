@@ -248,6 +248,12 @@ const SERVICE_TOOLS: Tool[] = [
     request: (a) => ({ method: "GET", path: "/api/service-properties", query: { service: a.service, profile: a.profile, version: a.version, key: a.key, q: a.q, file: a.file, limit: a.limit } }) },
 ];
 
+// S37 step 2: the to-do list of a service (the same body as GET /api/services/:id/health).
+const HEALTH_TOOLS: Tool[] = [
+  { name: "get_service_health", readOnly: true, description: "What needs doing on a service now: a verdict (ok, attention, critical), the to-dos worst first (rule, severity CRIT/WARN/INFO, since when, member, the evidence, a template cause, the next actions) and one row per member (state, connection, heap, queue, version). Includes incomplete collection (the REST API could not be read, or a node was not recognised) and preventive risks (disk full in some days, heap baseline rising, a certificate expiring) that are not alerts yet. Start here before searching logs or metrics.",
+    properties: { id: SERVICE }, required: ["id"], request: (a) => ({ method: "GET", path: `/api/services/${enc(a.id)}/health` }), shape: redacted },
+];
+
 function manifestBody(a: Record<string, unknown>) {
   return { appliesFrom: a.applies_from, newAppliesFrom: a.new_applies_from, base: a.base, patch: a.patch, manifest: a.manifest };
 }
@@ -269,6 +275,7 @@ export const TOOLS: Tool[] = [
   { name: "list_service_clusters", readOnly: true, description: "The managed services (NiFi) registered in this environment: clusters with their nodes and standalone instances, each with version, profile, hosts and install directories, configuration revision, and in short how many members are running (live, from the service executors' samples), as of when, and the soonest certificate expiry.", properties: {}, request: () => ({ method: "GET", path: "/api/services" }) },
   { name: "get_cluster_status", readOnly: true, description: "One cluster or standalone instance (id from list_service_clusters): every member with its host's service executor (online or not) and its state from the collector's newest sample: running or stopped as of that sample (asOf), unknown after 3 sampling periods without one, lost when the executor is offline; never sampled: as of the newest discovery (source). Also the live pid, version, cluster connection, key numbers, every certificate with its expiry, and summary.backpressure: the newest back pressure reading (read every 5 minutes by default, flow-wide): connections at their threshold (full), the fullest percentage and the most congested queues (top, fullest first).", properties: { id: s("The cluster's or standalone instance's id, as list_service_clusters names it.") }, required: ["id"], request: (a) => ({ method: "GET", path: `/api/services/${enc(a.id)}/status` }) },
   ...SERVICE_TOOLS,
+  ...HEALTH_TOOLS,
   // Assessments (§10.5.6): the Onboarding Assessor reads these and writes only its own draft, with the task token;
   // the Deploy Assistant reads them (list_assessments, onboarding_draft) to answer about the Onboarding page.
   { name: "list_assessments", readOnly: true, description: "Every assessment, newest first: id (asm_…), kind (onboarding or version), repository or app, version, who started it, status and level.", properties: {}, request: () => ({ method: "GET", path: "/api/assessments" }) },

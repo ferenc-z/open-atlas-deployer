@@ -323,3 +323,162 @@ export function parseThresholds(body: unknown, defaults: Thresholds): { override
 
 /** An alert as the pages and GET /api/alerts show it. */
 export const alertView = (a: ServiceAlert) => ({ ...a, label: RULES[a.rule as RuleId]?.label ?? a.rule, text: String(a.detail.text ?? ""), memberLabel: a.member === "*" ? null : String(a.detail.label ?? a.member) });
+
+// --- S37 step 2 (pages-rethink §4.1): the to-do list. Every round of samples the rules above are read as findings: what is wrong
+// now, since when, the evidence, a template cause and the next actions. Two rules are findings only (no alert, no timeline):
+// collection incomplete and preventive risk. Same function for the page and the MCP tool get_service_health (D10).
+
+export type TodoRule = RuleId | "collection-incomplete" | "preventive-risk";
+export type Severity = "CRIT" | "WARN" | "INFO";
+/** A next step: investigate (the troubleshooting page, from this finding), open-nifi, draft-config, member-control (start/stop), metrics, config-diff. */
+export interface TodoAction { kind: "investigate" | "open-nifi" | "draft-config" | "member-control" | "metrics" | "config-diff"; label: string; target?: Record<string, unknown> }
+export interface Todo { id: string; rule: TodoRule; severity: Severity; since: string; member: string; memberLabel: string | null; evidence: string[]; cause: string; actions: TodoAction[] }
+
+const CAUSES: Record<TodoRule, string> = {
+  "executor-lost": "The service executor on the host sends no heartbeat: the executor or the host is down, or the network between them and the Deployer is cut. Nothing is known of the member until it is back.",
+  "no-samples": "The executor is online but the member's samples stopped coming: the collector may be stuck or the sample could not be built.",
+  "process-down": "No NiFi process runs for this installation: it was stopped, crashed (check the log and the OS for an out-of-memory kill) or failed to start.",
+  "node-disconnected": "The cluster coordinator sees the node as disconnected: the node is down or cannot reach the coordinator or ZooKeeper, or it was disconnected or offloaded on purpose.",
+  "no-coordinator": "No node holds the cluster coordinator role: the election has not finished or ZooKeeper cannot be reached from the nodes.",
+  "backpressure": "A connection's queue has stayed at its back pressure threshold: the component after it is slower than what comes in, stopped, or blocked downstream.",
+  "repo-disk": "A repository's disk is filling: content is not removed fast enough (long queues, content claims held by a stuck queue) or the data grows with the flow's volume.",
+  "heap": "The JVM heap stays high: a flow holds many FlowFiles or attributes in memory, or the heap is too small for the load; a leak shows as a baseline that keeps rising.",
+  "error-bulletins": "Components are reporting ERRORs: a processor fails (credentials, target down, bad data). The bulletins name the component.",
+  "zk-errors": "The nodes keep losing the ZooKeeper connection: ZooKeeper is down or overloaded, or the network or time sync is unstable.",
+  "version-mismatch": "The running nodes report different NiFi versions: a rolling upgrade did not finish or one node was started from another installation.",
+  "no-certificate": "The service executor has no monitor certificate, so only the process and the host are sampled, not NiFi's REST API.",
+  "cert-expiry": "A certificate used by NiFi is expired or about to be: connections that rely on it will fail once it is.",
+  "cert-unreadable": "A keystore or truststore could not be read (encrypted password, missing file, no keytool), so its expiry is not watched.",
+  "config-drift": "A configuration file on the host differs from what the Deployer keeps: someone or something edited or removed it.",
+  "collection-incomplete": "The numbers of this member are not complete: the collector could not read NiFi's REST API, or could not tell which cluster node this member is. Charts and rules for it are blind until this is fixed.",
+  "preventive-risk": "A trend, not a fault yet: if it continues, the limit is reached within the time shown.",
+};
+
+const nifiLink = (s: ServiceStatus): TodoAction[] => (s.webUrl ? [{ kind: "open-nifi", label: "Open in NiFi", target: { url: s.webUrl } }] : []);
+const investigate = (member?: string): TodoAction => ({ kind: "investigate", label: "Investigate", ...(member && member !== "*" ? { target: { member } } : {}) });
+const ACTIONS: Partial<Record<TodoRule, (s: ServiceStatus, member: string) => TodoAction[]>> = {
+  "no-samples": (_s, m) => [investigate(m)],
+  "process-down": (_s, m) => [investigate(m), { kind: "member-control", label: "Start", target: { member: m, action: "start" } }],
+  "node-disconnected": (_s, m) => [investigate(m), { kind: "member-control", label: "Restart", target: { member: m, action: "restart" } }],
+  "no-coordinator": () => [investigate()],
+  "backpressure": (s) => [investigate(), ...nifiLink(s)],
+  "repo-disk": (_s, m) => [investigate(m), { kind: "metrics", label: "Disk trend", target: { member: m, fields: ["repoFlowfilePct", "repoContentPct", "repoProvenancePct"] } }],
+  "heap": (_s, m) => [investigate(m), { kind: "draft-config", label: "Draft a heap change", target: { file: "bootstrap.conf" } }, { kind: "metrics", label: "Heap trend", target: { member: m, fields: ["heapPct", "gcMsPerMin"] } }],
+  "error-bulletins": (s) => [investigate(), ...nifiLink(s)],
+  "zk-errors": () => [investigate()],
+  "version-mismatch": () => [{ kind: "config-diff", label: "Compare the nodes" }],
+  "cert-expiry": (_s, m) => [investigate(m)],
+  "config-drift": (_s, m) => [{ kind: "config-diff", label: "See the differences", target: { member: m } }],
+  "collection-incomplete": (_s, m) => [investigate(m)],
+  "preventive-risk": (_s, m) => [{ kind: "metrics", label: "Trend", target: { member: m } }],
+};
+
+const ORDER: Record<Severity, number> = { CRIT: 0, WARN: 1, INFO: 2 };
+/** Preventive: how far ahead a trend is worth a to-do (days), the window read, and the least history it needs (hours). */
+export const PREVENT = { diskDays: 14, diskWarnDays: 3, windowHours: 24, certDays: 90, minHours: 3 };
+
+const lineFit = (xs: number[], ys: number[]) => {
+  const n = xs.length, mx = xs.reduce((a, b) => a + b, 0) / n, my = ys.reduce((a, b) => a + b, 0) / n;
+  let sxx = 0, sxy = 0;
+  for (let i = 0; i < n; i++) { sxx += (xs[i]! - mx) ** 2; sxy += (xs[i]! - mx) * (ys[i]! - my); }
+  return sxx > 0 ? sxy / sxx : 0;
+};
+
+/** The preventive rule over one member's 5-minute summaries of the last day: disk full in N days, heap baseline rising. */
+export function preventive(rows: { bucket: string; avg: Record<string, number | null> }[], t: Thresholds): { kind: "disk" | "heap"; severity: Severity; text: string; detail: Record<string, unknown> }[] {
+  const out: ReturnType<typeof preventive> = [];
+  const series = (f: string) => rows.map((r) => [Date.parse(r.bucket) / 3_600_000, r.avg[f]] as const).filter((x): x is readonly [number, number] => typeof x[1] === "number");
+  const hours = (xs: readonly (readonly [number, number])[]) => (xs.length ? xs[xs.length - 1]![0] - xs[0]![0] : 0);
+  for (const [f, name] of [["repoFlowfilePct", "FlowFile"], ["repoContentPct", "content"], ["repoProvenancePct", "provenance"]] as const) {
+    const xs = series(f);
+    if (xs.length < 12 || hours(xs) < PREVENT.minHours) continue;
+    const last = xs[xs.length - 1]![1];
+    if (last >= t.repoDiskCritPct) continue; // already an alert
+    const slope = lineFit(xs.map((x) => x[0]), xs.map((x) => x[1])); // points per hour
+    if (slope <= 0.01) continue;
+    const days = (100 - last) / slope / 24;
+    if (days <= PREVENT.diskDays) out.push({ kind: "disk", severity: days <= PREVENT.diskWarnDays ? "WARN" : "INFO", text: `the ${name} repository's disk (${Math.round(last * 10) / 10} % now) grows ${Math.round(slope * 240) / 10} points a day: full in about ${Math.max(0.1, Math.round(days * 10) / 10)} days`, detail: { repository: name, pct: last, perDay: slope * 24, daysLeft: days } });
+  }
+  // The heap's baseline: the lowest hourly average, not the peaks (a full GC brings it down to the baseline).
+  const heap = series("heapPct");
+  if (heap.length >= 12 && hours(heap) >= PREVENT.minHours) {
+    const byHour = new Map<number, number>();
+    for (const [x, y] of heap) { const h = Math.floor(x); byHour.set(h, Math.min(byHour.get(h) ?? Infinity, y)); }
+    const lows = [...byHour].sort((a, b) => a[0] - b[0]);
+    if (lows.length >= 3) {
+      const slope = lineFit(lows.map((l) => l[0]), lows.map((l) => l[1]));
+      const first = lows[0]![1], last = lows[lows.length - 1]![1];
+      if (slope >= 0.5 && last - first >= 8 && last >= 40 && last < t.heapPct) {
+        const hoursLeft = (t.heapPct - last) / slope;
+        out.push({ kind: "heap", severity: hoursLeft <= 24 ? "WARN" : "INFO", text: `the heap's lowest level rose from ${Math.round(first)} % to ${Math.round(last)} % over ${lows.length} hours (${Math.round(slope * 10) / 10} points an hour): it reaches ${t.heapPct} % in about ${Math.round(hoursLeft)} hours`, detail: { from: first, to: last, perHour: slope, hoursLeft } });
+      }
+    }
+  }
+  return out;
+}
+
+/** The to-do list of a service: the rules' conditions, the two findings-only rules, worst first. */
+export function todos(store: Store, s: ServiceStatus, t: Thresholds, now: Date): Todo[] {
+  const nowIso = now.toISOString();
+  const facts = store.serviceFacts(s.id);
+  const onlineSince = new Map<string, string>();
+  for (const m of s.members) { const v = facts.get(`${m.key}\0onlineSince`); if (v) onlineSince.set(m.key, v); }
+  const openSince = new Map(store.serviceAlerts({ service: s.id, state: "open", limit: 1000 }).map((a) => [keyOf(a.rule, a.member), a.openedAt] as const));
+  const label = (member: string) => { if (member === "*") return null; const m = s.members.find((x) => x.key === member); return m ? memberName(s, m) : member; };
+  const list: Todo[] = [];
+  const push = (rule: TodoRule, member: string, severity: Severity, since: string, evidence: string[]) => {
+    if (list.some((x) => x.rule === rule && x.member === member)) { list.find((x) => x.rule === rule && x.member === member)!.evidence.push(...evidence); return; }
+    list.push({ id: `${rule}:${member}`, rule, severity, since, member, memberLabel: label(member), evidence, cause: CAUSES[rule], actions: ACTIONS[rule]?.(s, member) ?? [] });
+  };
+  const seen = new Set<string>();
+  for (const c of evaluate(store, s, t, now, onlineSince).active) {
+    const key = keyOf(c.rule, c.member);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    push(c.rule, c.member, c.level, openSince.get(key) ?? nowIso, [c.text]);
+  }
+  for (const m of s.members) {
+    const live = m.live;
+    // Collection incomplete: REST says anything but ok (no certificate and a stopped process have their own rules), or the node was not recognised.
+    if (m.state === "running" && live?.nifi && !["ok", "no-certificate", "not-running"].includes(live.nifi))
+      push("collection-incomplete", m.key, "WARN", live.at, [`${memberName(s, m)}: the REST API reading is "${live.nifi}"`, ...live.problems.map((p) => `collector: ${p}`)]);
+    if (live?.point && live.point._unmatched)
+      push("collection-incomplete", m.key, "WARN", live.at, [`${memberName(s, m)}: this member was not found in NiFi's node list, so its heap, threads, repositories and queue are empty`]);
+  }
+  // Preventive: the 5-minute summaries of the last day per member; the certificates' days.
+  const rolls = store.serviceRollups(s.id, new Date(now.getTime() - PREVENT.windowHours * 3_600_000).toISOString(), nowIso);
+  for (const m of s.members) {
+    const rows = rolls.filter((r) => r.member === m.key).map((r) => ({ bucket: r.bucket, avg: (r.body?.avg ?? {}) as Record<string, number | null> }));
+    for (const p of preventive(rows, t)) push("preventive-risk", m.key, p.severity, nowIso, [`${memberName(s, m)}: ${p.text}`]);
+    let soonest: (typeof s.certs)[number] | undefined;
+    for (const c of s.certs) if (c.member === m.key && c.notAfter && (!soonest || c.notAfter < soonest.notAfter!)) soonest = c;
+    if (soonest) {
+      const days = Math.floor((Date.parse(soonest.notAfter!) - now.getTime()) / DAY);
+      if (days > t.certWarnDays && days <= PREVENT.certDays) push("preventive-risk", m.key, "INFO", nowIso, [`${memberName(s, m)}: ${soonest.subject ?? soonest.alias ?? "a certificate"} (${soonest.store}) expires in ${days} days, ${soonest.notAfter}`]);
+    }
+  }
+  return list.sort((a, b) => ORDER[a.severity] - ORDER[b.severity] || (a.since < b.since ? -1 : a.since > b.since ? 1 : 0) || (a.id < b.id ? -1 : 1));
+}
+
+export interface ServiceHealth {
+  service: string; asOf: string;
+  /** ok: nothing to do; attention: only WARN and INFO to-dos; critical: some CRIT. */
+  verdict: "ok" | "attention" | "critical";
+  counts: Record<Severity, number>;
+  todos: Todo[];
+  /** One row per member: the node strip. */
+  members: { key: string; label: string; state: string; connection: string | null; heapPct: number | null; queuedCount: number | null; version: string | null }[];
+}
+
+/** get_service_health and GET /api/services/:id/health. */
+export function health(store: Store, executor: (host: string) => ExecutorInfo, id: string, now: Date = new Date()): ServiceHealth | undefined {
+  const s = serviceStatus(store, executor, id, now);
+  if (!s) return undefined;
+  const list = todos(store, s, thresholdsOf(store, id, s.profile).effective, now);
+  const counts: Record<Severity, number> = { CRIT: 0, WARN: 0, INFO: 0 };
+  for (const x of list) counts[x.severity]++;
+  return {
+    service: id, asOf: now.toISOString(), verdict: counts.CRIT ? "critical" : list.length ? "attention" : "ok", counts, todos: list,
+    members: s.members.map((m) => ({ key: m.key, label: memberName(s, m), state: m.state, connection: m.live?.connection ?? null, heapPct: m.live?.point?.heapPct ?? null, queuedCount: m.live?.point?.queuedCount ?? null, version: m.live?.version ?? null })),
+  };
+}

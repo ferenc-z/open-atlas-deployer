@@ -41,7 +41,7 @@ import { ChangeError, changeView as serviceChangeView, checkContextOf, planView,
 import { adoptedBody, DriftError, hasDrifted, liveDifferences, readLive, serviceDrift, type LiveReadOptions } from "./services/configdrift.ts";
 import { installKey, type DraftItem } from "./services/draft.ts";
 import { serviceStatus, thresholdsOf, timeline } from "./services/status.ts";
-import { alertView, check, parseThresholds, RULES, THRESHOLDS } from "./services/rules.ts";
+import { alertView, check, health, parseThresholds, RULES, THRESHOLDS } from "./services/rules.ts";
 import { TakeoverError, type Takeover } from "./services/takeover.ts";
 import { acceptSamples, watchList } from "./services/watch.ts";
 import { FIELDS, ingest, metrics, RANGES, trend, type Field, type Range } from "./services/metrics.ts";
@@ -1345,6 +1345,13 @@ export function createApp({ config, store, sessions, observer, deployments, vers
       rules: RULES, thresholds: { ...thresholdsOf(store, id, s.profile), info: THRESHOLDS },
       canEdit: p.permissions.includes("admin") && !isKey(p),
     });
+  });
+  // S37 step 2 (pages-rethink §4.1): the to-do list, the verdict and the node strip (get_service_health).
+  api.get("/api/services/:id/health", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    const h = health(store, (host) => handoff.executor(host, "service"), c.req.param("id"));
+    return h ? c.json(h) : reject(c, 404, "service/unknown", `No standalone instance or cluster ${c.req.param("id")}.`);
   });
   api.get("/api/services/:id/events", async (c) => {
     const p = await authenticate(c, "view");
