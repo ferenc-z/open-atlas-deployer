@@ -42,6 +42,7 @@ import { adoptedBody, DriftError, hasDrifted, liveDifferences, readLive, service
 import { installKey, type DraftItem } from "./services/draft.ts";
 import { serviceStatus, thresholdsOf, timeline } from "./services/status.ts";
 import { alertView, check, health, parseThresholds, RULES, THRESHOLDS } from "./services/rules.ts";
+import { opsDesk } from "./services/ops.ts";
 import { mountCases, withAnalysis } from "./services/cases.ts";
 import { TakeoverError, type Takeover } from "./services/takeover.ts";
 import { investigate, InvestigateError } from "./services/investigate.ts";
@@ -794,6 +795,12 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     throw error;
   };
   const noTakeover = (c: Context) => reject(c, 503, "takeover/off", "Taking over services is not set up in this Deployer.");
+  // S37 step 10: the ops desk, every service's to-dos in one queue worst first and a sentence per service (same health()).
+  api.get("/api/services/ops", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    return c.json(opsDesk(store, (host) => handoff.executor(host, "service")));
+  });
   api.get("/api/services", async (c) => {
     const p = await authenticate(c, "view");
     if (p instanceof Response) return p;

@@ -399,7 +399,10 @@ export const importE2eModel = (id: string) => call<{ model: import("../server/se
 
 // S37 step 3: the Status tab renders this as it is (the to-do engine, rules.ts health()).
 export type { ServiceHealth, Todo, TodoAction } from "../server/services/rules.ts";
-export const serviceHealth = (id: string) => call<import("../server/services/rules.ts").ServiceHealth>("GET", `services/${encodeURIComponent(id)}/health`);
+export type OpsDesk = import("../server/services/ops.ts").OpsDesk;
+export type OpsTodo = import("../server/services/ops.ts").OpsTodo;
+export const opsDesk = () => call<OpsDesk>("GET", "services/ops");
+export const serviceHealth =(id: string) => call<import("../server/services/rules.ts").ServiceHealth>("GET", `services/${encodeURIComponent(id)}/health`);
 
 // S37 step 4: the Investigate tab's evidence (services/investigate.ts).
 export type { EvidenceCard, EvidenceItem, Investigation } from "../server/services/investigate.ts";

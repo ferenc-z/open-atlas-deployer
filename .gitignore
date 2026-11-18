@@ -2,3 +2,8 @@ node_modules/
 dist/
 data/
 .check/
+
+# e2e (S37 step 10)
+e2e/node_modules
+test-results/
+node_modules

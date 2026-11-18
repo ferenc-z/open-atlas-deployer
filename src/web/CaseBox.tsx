@@ -2,7 +2,7 @@
 // own analysis. The page's result goes to the Deploy Assistant only when a person presses the button; the answer comes
 // back in three parts (likely cause, evidence, next steps) and the person can go on asking in the same session. Every
 // analysis is a case: the outcome a person writes is kept with it, and the Assistant reads earlier cases of the same
-// service and rule. What the AI proposes to change is a card: a configuration draft opens on the Changes tab, a start,
+// service and rule. What the AI proposes to change is a card: a configuration draft opens on the Changes section, a start,
 // stop or restart shows its plan there; a person confirms it (S9, D7).
 
 import { useCallback, useEffect, useState } from "react";
@@ -15,7 +15,7 @@ import { ago, when } from "./svc.tsx";
 export type PlanChange = (r: { kind: ChangeKind; members: string[] }) => void;
 const CONFIDENCE: Record<string, string> = { high: "ok", medium: "warn", low: "info" };
 
-/** Opens a configuration draft on its service's Changes tab (App.tsx listens). */
+/** Opens a configuration draft on its service's Changes section (App.tsx listens). */
 export function openDraft(service: string, draft: string) { window.dispatchEvent(new CustomEvent("oa:open-service-draft", { detail: { id: service, draft } })); }
 
 /** The case's state, polled while the assistant answers. */
@@ -131,7 +131,7 @@ function ProposalCard({ service, p, plan, canAct }: { service: string; p: CasePr
     <div className="card proposal">
       <b>{KIND_TEXT[p.kind]}</b> <span className="mono small">{p.members.join(", ")}</span>
       {p.label && <p className="small">{p.label}</p>}
-      {plan && canAct ? <button onClick={() => plan({ kind: p.kind, members: p.members })} title="Shows the plan on the Changes tab; nothing runs until you confirm it there">Show the plan on Changes</button>
+      {plan && canAct ? <button onClick={() => plan({ kind: p.kind, members: p.members })} title="Shows the plan on the Changes section; nothing runs until you confirm it there">Show the plan on Changes</button>
         : <p className="muted small">Needs the right to change this service, and no change running.</p>}
     </div>
   );

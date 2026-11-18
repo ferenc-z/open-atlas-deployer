@@ -15,6 +15,7 @@ import { CertBadge, ConfCell, confElsewhere, DifferenceBadge, memberKey, members
 import { Sparkline } from "./Charts.tsx";
 import { AlertBadge } from "./Alerts.tsx";
 import { usePageFocus } from "./focus.ts";
+import { investigateFrom, windowAround } from "./Investigate.tsx";
 
 type Problem = { message: string; details: string[] };
 const problemOf = (e: unknown): Problem => ({ message: (e as Error).message, details: (e as api.ApiError).details ?? [] });
@@ -46,7 +47,12 @@ export function ServicesPage({ onTakeover, isAdmin, initialOpen, initialDraft }:
   }, [open]);
   const [layout, setLayoutState] = useState<Layout>(savedLayout);
   const [error, setError] = useState("");
-  const refresh = useCallback(() => { api.services().then(setList, (e: Error) => setError(e.message)); }, []);
+  const [ops, setOps] = useState<api.OpsDesk | undefined>();
+  const refresh = useCallback(() => {
+    api.services().then(setList, (e: Error) => setError(e.message));
+    api.opsDesk().then(setOps, () => setOps(undefined));
+  }, []);
+  const goTo = (id: string, tab?: string) => { setOpenTab(tab); setOpen(id); };
   useEffect(() => { refresh(); const t = setInterval(refresh, 15_000); return () => clearInterval(t); }, [refresh]);
   const setLayout = (l: Layout) => { setLayoutState(l); try { localStorage.setItem(LAYOUT_KEY, l); } catch { /* per-viewer convenience only */ } };
   if (open) return <ServiceDetail key={open} id={open} isAdmin={isAdmin} {...(initialDraft && open === initialOpen ? { initialDraft } : {})} {...(openTab ? { initialTab: openTab } : {})} onBack={() => { setOpen(undefined); refresh(); }} />;
@@ -66,6 +72,7 @@ export function ServicesPage({ onTakeover, isAdmin, initialOpen, initialDraft }:
       </div>
       <p className="muted page-note">NiFi taken over by the Deployer, by environment. Whether a member runs is live, from its host's service executor's samples (unknown after 3 sampling periods without one, lost when the executor is offline). The trends are the last hour.</p>
       {error && <p className="error">{error}</p>}
+      {ops && all.length > 0 && <OpsQueue desk={ops} onOpen={goTo} />}
       {!all.length && <section className="card"><p className="muted">Nothing is registered yet. Discover on the hosts and confirm a takeover draft first.</p><button className="primary" onClick={onTakeover}>Open Takeover</button></section>}
       {all.length > 0 && envs.map((env) => {
         const here = all.filter((s) => s.environment.toUpperCase() === env);
@@ -80,8 +87,8 @@ export function ServicesPage({ onTakeover, isAdmin, initialOpen, initialDraft }:
           <section key={env} className="env-group">
             <div className="env-head"><span className={`env ${env === "PROD" ? "prod" : ""}`}>{env}</span> <span className="muted">{here.length} service{here.length > 1 ? "s" : ""} · {installs} installation{installs > 1 ? "s" : ""}</span></div>
             {layout === "cards"
-              ? <div className="svc-cards">{here.map((s) => <ServiceCard key={s.id} s={s} onOpen={() => setOpen(s.id)} />)}</div>
-              : <ServiceTable services={here} onOpen={setOpen} />}
+              ? <div className="svc-cards">{here.map((s) => <ServiceCard key={s.id} s={s} now={ops?.services.find((x) => x.id === s.id)} onOpen={() => goTo(s.id)} />)}</div>
+              : <ServiceTable services={here} ops={ops} onOpen={(id) => goTo(id)} />}
           </section>
         );
       })}
@@ -89,11 +96,45 @@ export function ServicesPage({ onTakeover, isAdmin, initialOpen, initialDraft }:
   );
 }
 
-function ServiceCard({ s, onOpen }: { s: RegisteredService; onOpen: () => void }) {
+const VERDICT = { ok: { label: "Normal", tone: "ok" }, attention: { label: "Needs attention", tone: "warn" }, critical: { label: "Critical", tone: "bad" } } as const;
+const SEV = { CRIT: { label: "Critical", tone: "bad" }, WARN: { label: "Warning", tone: "warn" }, INFO: { label: "Notice", tone: "info" } } as const;
+
+/** S37 step 10: every NiFi's to-dos in one queue, worst first (the same health() as each service's Status tab). */
+function OpsQueue({ desk, onOpen }: { desk: api.OpsDesk; onOpen: (id: string, tab?: string) => void }) {
+  const todos = desk.queue.filter((t) => t.rule !== "preventive-risk");
+  const risks = desk.queue.length - todos.length;
+  const crit = desk.services.filter((s) => s.verdict === "critical").length;
+  return (
+    <section className="card ops-desk" aria-label="Operations desk">
+      <div className="toolbar">
+        <h2>Operations desk</h2>
+        <span className={`badge ${crit ? "bad" : todos.length ? "warn" : "ok"}`}>{todos.length ? `${todos.length} to-do${todos.length === 1 ? "" : "s"}${crit ? `, ${crit} service${crit === 1 ? "" : "s"} critical` : ""}` : "Nothing needs doing"}</span>
+        {risks > 0 && <span className="muted small">{risks} preventive risk{risks === 1 ? "" : "s"} (on each service's Status)</span>}
+      </div>
+      {todos.length > 0 && <ul className="todos">{todos.slice(0, 30).map((t) => (
+        <li key={`${t.service}:${t.id}`} className={`card todo todo-${t.severity.toLowerCase()}`}>
+          <div className="row wrap">
+            <span className={`badge ${SEV[t.severity].tone}`}>{SEV[t.severity].label}</span>
+            <button className="link mono" onClick={() => onOpen(t.service)} title={`Open ${t.service}`}>{t.service}</button>
+            <span className="muted small">{t.environment.toUpperCase()}</span>
+            <strong>{t.rule}</strong>
+            {t.memberLabel && <span className="mono small">{t.memberLabel}</span>}
+          </div>
+          <p className="small">{t.cause}</p>
+          <div className="row wrap"><button onClick={() => onOpen(t.service)}>Open</button><button onClick={() => { investigateFrom({ member: t.member !== "*" ? t.member : undefined, ...windowAround(t.since), focus: t.rule, label: `To-do ${t.rule}${t.memberLabel ? ` on ${t.memberLabel}` : ""}` }); onOpen(t.service, "investigate"); }}>Investigate</button></div>
+        </li>
+      ))}</ul>}
+      {todos.length > 30 && <p className="muted small">The worst 30 of {todos.length}; the rest are on each service's Status.</p>}
+    </section>
+  );
+}
+
+function ServiceCard({ s, now, onOpen }: { s: RegisteredService; now: api.OpsDesk["services"][number] | undefined; onOpen: () => void }) {
   const members = membersOf(s);
   return (
     <button className="svc-card" onClick={onOpen} title={`Open ${s.id}`}>
       <div className="svc-card-head"><strong className="mono">{s.id}</strong><span><AlertBadge s={s.status} /> <UpBadge s={s.status} /></span></div>
+      {now && <div className="svc-card-now small"><span className={`badge ${VERDICT[now.verdict].tone}`}>{VERDICT[now.verdict].label}</span> <span>{now.sentence}</span></div>}
       <div className="muted small">{kindLabel(s)} · {serviceName(s.service)} <span className="mono">{s.version}</span> <span className="muted">({s.profile})</span></div>
       <ul className="svc-members mono small">{members.map((m, i) => (
         <li key={memberKey(m)}><span className={`dot ${STATE[s.states[i] ?? "unknown"].tone}`} title={STATE[s.states[i] ?? "unknown"].label} />{where(m)}{s.kind === "cluster" && m.nodeAddress ? <span className="muted"> · {m.nodeAddress}</span> : null}</li>
@@ -112,13 +153,13 @@ function ServiceCard({ s, onOpen }: { s: RegisteredService; onOpen: () => void }
   );
 }
 
-function ServiceTable({ services, onOpen }: { services: RegisteredService[]; onOpen: (id: string) => void }) {
+function ServiceTable({ services, ops, onOpen }: { services: RegisteredService[]; ops: api.OpsDesk | undefined; onOpen: (id: string) => void }) {
   // Clusters open into their node rows in place; folded ones are remembered while the page is open.
   const [folded, setFolded] = useState<Set<string>>(new Set());
   const toggle = (id: string) => setFolded((was) => { const next = new Set(was); if (next.has(id)) next.delete(id); else next.add(id); return next; });
   return (
     <table className="svc-table">
-      <thead><tr><th>Name</th><th>Kind</th><th>Version</th><th>Host and port</th><th>Up</th><th>Configuration</th><th>Differences</th></tr></thead>
+      <thead><tr><th>Name</th><th>Kind</th><th>Version</th><th>Host and port</th><th>Up</th><th>Now</th><th>Configuration</th><th>Differences</th></tr></thead>
       <tbody>{services.map((s) => {
         const cluster = s.kind === "cluster";
         const shut = folded.has(s.id);
@@ -133,6 +174,7 @@ function ServiceTable({ services, onOpen }: { services: RegisteredService[]; onO
               <td>{serviceName(s.service)} <span className="mono">{s.version}</span></td>
               <td className="mono small">{cluster ? <span className="muted">{members.length} nodes</span> : where(members[0]!)}</td>
               <td><UpBadge s={s.status} /> <AlertBadge s={s.status} /> <CertBadge s={s.status} only30 /> <StatusNotes s={s.status} /></td>
+              <td className="small">{(() => { const n = ops?.services.find((x) => x.id === s.id); return n ? <><span className={`badge ${VERDICT[n.verdict].tone}`}>{VERDICT[n.verdict].label}</span> {n.verdict === "ok" ? null : n.sentence}</> : <span className="muted">—</span>; })()}</td>
               <td>{s.configRevision ? <span className="mono">r{s.configRevision}</span> : <span className="muted">None</span>}</td>
               <td>{cluster ? <DifferenceBadge s={s.status} cluster /> : <span className="muted">—</span>}</td>
             </tr>
@@ -143,7 +185,7 @@ function ServiceTable({ services, onOpen }: { services: RegisteredService[]; onO
                 <td></td>
                 <td className="mono small">{where(m)}</td>
                 <td><span className={`badge ${STATE[s.states[i] ?? "unknown"].tone}`} title={STATE[s.states[i] ?? "unknown"].title}>{STATE[s.states[i] ?? "unknown"].label}</span></td>
-                <td className="mono small muted" colSpan={2}>{m.installDir}{confElsewhere(m) && <> · conf {confElsewhere(m)}</>}</td>
+                <td className="mono small muted" colSpan={3}>{m.installDir}{confElsewhere(m) && <> · conf {confElsewhere(m)}</>}</td>
               </tr>
             ))}
           </Fragment>
@@ -175,7 +217,7 @@ function MonitorPolicies() {
         <tbody>{MONITOR_POLICIES.map(([resource, policy, why]) => <tr key={resource}><td className="mono small">{resource}</td><td>{policy}</td><td className="muted small">{why}</td></tr>)}</tbody>
       </table>
       <p className="muted small">On a cluster, also give every node's own identity (its certificate's, e.g. CN=node1, OU=NIFI) <strong>view the data</strong> on the root group: a node passes the request on to the node that holds the event as a proxy, and NiFi checks that policy for every identity on the way; without it the attributes stay hidden.</p>
-      <p className="muted small">Changes that restart a cluster (Changes tab) also use an <strong>operator</strong> identity: the certificate in EXECUTOR_NIFI_OPERATOR_CERT on each host. In NiFi give it, besides the policies above, <strong>modify the controller</strong> (<span className="mono">/controller</span>, write): it is the only thing that disconnects, offloads and reconnects a node. A standalone instance does not need it. The monitor certificate never writes.</p>
+      <p className="muted small">Changes that restart a cluster (Changes section) also use an <strong>operator</strong> identity: the certificate in EXECUTOR_NIFI_OPERATOR_CERT on each host. In NiFi give it, besides the policies above, <strong>modify the controller</strong> (<span className="mono">/controller</span>, write): it is the only thing that disconnects, offloads and reconnects a node. A standalone instance does not need it. The monitor certificate never writes.</p>
     </details>
   );
 }

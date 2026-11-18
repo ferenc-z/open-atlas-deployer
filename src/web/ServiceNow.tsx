@@ -19,7 +19,7 @@ const VERDICT = {
   critical: { label: "Critical", tone: "bad", text: "" },
 } as const;
 const SEV: Record<Todo["severity"], { label: string; tone: string }> = { CRIT: { label: "Critical", tone: "bad" }, WARN: { label: "Warning", tone: "warn" }, INFO: { label: "Notice", tone: "info" } };
-// What the Timeline calls a change or a restart (the rest of it stays on Events and alerts).
+// What the Timeline calls a change or a restart (the rest of it stays in the Toolbox).
 const CHANGES = new Set(["process-restarted", "node-stopped", "node-started", "version-changed", "config-saved", "config-applied", "config-rolled-back", "change-started", "change-finished", "change-stopped", "change-paused", "change-resumed"]);
 const CONTROL = new Set<string>(["start", "stop", "restart"]);
 
@@ -79,7 +79,7 @@ export function ServiceNow({ s, canAct, plan, open }: Props) {
       <div>
         <h3>Recent changes and restarts</h3>
         {recent.length ? <Timeline events={recent} /> : <p className="muted small">None on the timeline yet.</p>}
-        <p className="muted small">All of it on Events and alerts and Changes.</p>
+        <p className="muted small">All of it in the Toolbox (Alerts and timeline) and on Configuration and changes.</p>
       </div>
     </div>
   );

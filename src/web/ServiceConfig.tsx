@@ -1,4 +1,4 @@
-// A service's Configuration tab (S24): a tab per file, and three ways to look at a properties file: the grouped
+// A service's Configuration section (S24): a tab per file, and three ways to look at a properties file: the grouped
 // property table (default; by the profile catalog's sections, each key's status against the shipped default, the
 // catalog's description on hover), the node comparison (clusters only: a column per node, differences first and
 // coloured by how much they matter, the identical keys folded into one row), and the file itself (line numbers,
@@ -43,7 +43,7 @@ const samePlace = (a: DraftChangeInput, b: DraftChangeInput) => a.file === b.fil
 
 const failure = (e: unknown) => (e as Error).message;
 
-/** Which draft edits go into, and the way to the Changes tab. */
+/** Which draft edits go into, and the way to the Changes section. */
 function DraftBar({ cfg, drafts, onReview }: { cfg: ServiceConfigView; drafts: Drafts; onReview: () => void }) {
   const a = drafts.active;
   if (!cfg.canDraft && !drafts.list.length) return null;
@@ -61,7 +61,7 @@ function DraftBar({ cfg, drafts, onReview }: { cfg: ServiceConfigView; drafts: D
         <span className="spacer" />
         {a && <button className={cfg.canDraft ? "primary" : ""} onClick={onReview}>{cfg.canDraft ? "Review and save" : "See it"}</button>}
       </div>
-      {cfg.canDraft && <p className="muted small">{a?.stale ? "This draft was made on an older revision: move it to the newest on the Changes tab before editing it."
+      {cfg.canDraft && <p className="muted small">{a?.stale ? "This draft was made on an older revision: move it to the newest on the Changes section before editing it."
         : a ? "Your edits go into this draft. They reach no host: saving makes a revision, and a revision is kept until it is applied."
         : "Use Edit on a key to start a draft. It reaches no host: saving makes a revision, and a revision is kept until it is applied."}</p>}
     </div>

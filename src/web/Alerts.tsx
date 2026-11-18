@@ -188,7 +188,7 @@ export function AlertsPage({ onOpen }: { onOpen: (service: string) => void }) {
   return (
     <>
       <div className="toolbar"><h1>Alerts</h1><span className="muted">{open.length} open · {open.filter((a) => a.level === "CRIT").length} critical</span><span className="spacer" /><button onClick={load}>Refresh</button></div>
-      <p className="muted page-note">The managed services' health rules (§9.2), checked in this Deployer as samples come in and once a minute. Shown here and on each service's page only; nothing is pushed. Thresholds are on each service's Events and alerts tab.</p>
+      <p className="muted page-note">The managed services' health rules (§9.2), checked in this Deployer as samples come in and once a minute. Shown here and on each service's page only; nothing is pushed. Thresholds are in each service's Toolbox (Alerts and timeline).</p>
       {error && <p className="error">{error}</p>}
       <section className="card">
         <h2>Open</h2>
@@ -238,5 +238,5 @@ export function ServiceHealthCard({ onServices, onAlerts }: { onServices: () => 
 export function AlertBadge({ s }: { s: { alerts?: { open: number; CRIT: number; WARN: number } } | null }) {
   const a = s?.alerts;
   if (!a?.open) return null;
-  return <span className={`badge ${a.CRIT ? "bad" : "warn"}`} title={`${a.CRIT} critical, ${a.WARN} warning (Events and alerts)`}>{a.open} alert{a.open > 1 ? "s" : ""}</span>;
+  return <span className={`badge ${a.CRIT ? "bad" : "warn"}`} title={`${a.CRIT} critical, ${a.WARN} warning (Toolbox, Alerts and timeline)`}>{a.open} alert{a.open > 1 ? "s" : ""}</span>;
 }

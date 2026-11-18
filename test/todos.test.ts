@@ -5,6 +5,7 @@ import { test } from "node:test";
 import type { ExecutorInfo } from "../src/server/handoff.ts";
 import { ingest } from "../src/server/services/metrics.ts";
 import { check, health, preventive } from "../src/server/services/rules.ts";
+import { opsDesk } from "../src/server/services/ops.ts";
 import { NIFI_THRESHOLDS } from "../src/server/services/profiles.ts";
 import type { ServiceSample } from "../src/server/services/watch.ts";
 import { Store } from "../src/server/store.ts";
@@ -148,5 +149,22 @@ test("an expired or close certificate is the cert-expiry rule's CRIT to-do, not 
   ingest(store, both("2026-11-06T12:00:00Z", { certs: "2026-11-10T00:00:00Z" }));
   const h = health(store, () => online, "c250", now.t)!;
   assert.deepEqual(rules(h), ["CRIT cert-expiry 1", "CRIT cert-expiry 2"]);
+  store.close();
+});
+
+test("ops desk: one queue worst first and one sentence per service, from the same health()", () => {
+  const now = { t: new Date("2026-11-06T12:00:10Z") };
+  const store = lab(now);
+  ingest(store, both("2026-11-06T12:00:00Z"));
+  let desk = opsDesk(store, () => online, now.t);
+  assert.deepEqual(desk.queue, []);
+  assert.deepEqual(desk.services.map((x) => [x.id, x.verdict, x.sentence]), [["c250", "ok", "Normal. Nothing needs doing."]]);
+  ingest(store, [sample(KEY1, "2026-11-06T12:00:05Z"), sample(KEY2, "2026-11-06T12:00:05Z", { running: false })]);
+  desk = opsDesk(store, () => online, now.t);
+  const h = health(store, () => online, "c250", now.t)!;
+  assert.equal(desk.services[0]!.verdict, "critical");
+  assert.deepEqual(desk.queue.map((x) => x.id), h.todos.map((x) => x.id));
+  assert.ok(desk.queue.every((x) => x.service === "c250"));
+  assert.match(desk.services[0]!.sentence, /^Critical: /);
   store.close();
 });

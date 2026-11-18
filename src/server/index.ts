@@ -16,6 +16,7 @@ import { Analyst } from "./services/cases.ts";
 import { investigate } from "./services/investigate.ts";
 import { NlConverter } from "./services/trace/nl.ts";
 import { Briefs, collectFacts } from "./brief.ts";
+import { opsDesk } from "./services/ops.ts";
 import { Drift } from "./drift.ts";
 import { environmentStatus, hostStateOf } from "./observe.ts";
 import { Onboarding } from "./onboarding.ts";
@@ -100,7 +101,7 @@ const drift = new Drift(store, deployments, (host) => deployments.handoff.report
 const briefWriter = config.omaUrl && config.omaApiKeyFile && config.omaAgent
   ? new OmaSessions({ url: config.omaUrl, keyFile: config.omaApiKeyFile, agent: config.omaAgent, ...(config.omaEnvironment ? { environment: config.omaEnvironment } : {}), vaults: config.omaVaults, ...(config.omaApplicationId ? { application: config.omaApplicationId } : {}) })
   : undefined;
-const briefs = new Briefs(store, () => collectFacts({ store, deployments, status: statusOf, versions, ...(peer.configured ? { peer: () => peer.status() } : {}), drift: () => drift.check() }), briefWriter, { hour: config.briefHour });
+const briefs = new Briefs(store, () => collectFacts({ store, deployments, status: statusOf, versions, ...(peer.configured ? { peer: () => peer.status() } : {}), drift: () => drift.check(), ops: () => opsDesk(store, (host) => deployments.handoff.executor(host, "service")) }), briefWriter, { hour: config.briefHour });
 // Service ops §6: taking over discovered NiFi (drafts, confirmation); the AI review uses the Onboarding Assessor.
 const takeover = new Takeover({ store, handoff: deployments.handoff, box, oma: assessor, environment: () => deployments.environment().env.name, hosts: () => hostIds(deployments.environment().env) });
 // Phase 2 step 6: the nifi-ops Studio graph, published through the same Builder MCP as studio-graph.

@@ -9,11 +9,12 @@ import type { DriftItem } from "./drift.ts";
 import type { EnvironmentStatus } from "./observe.ts";
 import { sessionOutcome, type OmaSessions } from "./oma.ts";
 import type { PeerStatus } from "./peer.ts";
+import type { OpsDesk } from "./services/ops.ts";
 import type { Store } from "./store.ts";
 import type { Versions } from "./versions.ts";
 
 /** The brief's facts, from what the status page, the versions list, UAT and the drift check already know. */
-export async function collectFacts(d: { store: Store; deployments: Deployments; status: () => Promise<EnvironmentStatus>; versions: Pick<Versions, "list">; peer?: () => Promise<PeerStatus>; drift: () => Promise<DriftItem[]>; now?: () => number }): Promise<BriefFacts> {
+export async function collectFacts(d: { store: Store; deployments: Deployments; status: () => Promise<EnvironmentStatus>; versions: Pick<Versions, "list">; peer?: () => Promise<PeerStatus>; drift: () => Promise<DriftItem[]>; ops?: () => OpsDesk; now?: () => number }): Promise<BriefFacts> {
   const now = d.now?.() ?? Date.now();
   const status = await d.status();
   const { deployed } = d.deployments.environment();
@@ -33,8 +34,17 @@ export async function collectFacts(d: { store: Store; deployments: Deployments; 
   }
   const since = new Date(now - 24 * 3_600_000).toISOString();
   const jobs = d.store.listJobs({ kind: "deploy", limit: 100 });
+  // S37 step 10: the NiFi services' to-dos, from the same queue as the Services page (the ops desk).
+  let nifi: BriefFacts["nifi"];
+  if (d.ops) {
+    try {
+      const desk = d.ops();
+      nifi = { services: desk.services.map((s) => ({ id: s.id, verdict: s.verdict, sentence: s.sentence })), todos: desk.queue.slice(0, 10).map((t) => ({ service: t.service, rule: t.rule, severity: t.severity, since: t.since, member: t.memberLabel, cause: t.cause })), todoCount: desk.queue.length };
+    } catch { nifi = undefined; }
+  }
   return {
     environment: status.environment, apps, promotable,
+    ...(nifi ? { nifi } : {}),
     drift: (await d.drift()).map((x) => ({ app: x.app, kind: x.kind, detail: x.detail, since: x.firstSeen })),
     failed: jobs.filter((j) => (j.state === "failed" || j.state === "rolled-back") && (j.finishedAt ?? "") >= since).map((j) => ({ job: j.id, app: j.app, version: j.version, state: j.state, message: j.message, diagnosis: j.diagnosis?.cause ?? null })),
     waiting: jobs.filter((j) => j.state === "running").flatMap((j) => (j.rollout?.steps ?? []).filter((s) => s.state === "waiting").map((s) => ({ job: j.id, app: j.app, version: j.version, step: s.component }))),
@@ -50,6 +60,8 @@ export interface BriefFacts {
   drift: { app: string; kind: string; detail: string; since: string }[];
   failed: { job: string; app: string; version: string; state: string; message: string | null; diagnosis: string | null }[];
   waiting: { job: string; app: string; version: string; step: string }[];
+  /** The managed NiFi services: a verdict sentence each, and the worst to-dos (todoCount of them in all) of the ops desk. */
+  nifi?: { services: { id: string; verdict: string; sentence: string }[]; todos: { service: string; rule: string; severity: string; since: string; member: string | null; cause: string }[]; todoCount: number };
 }
 
 export interface Brief {
@@ -66,7 +78,7 @@ export interface Brief {
 export function briefPrompt(facts: BriefFacts): string {
   return [
     `Write today's deploy brief for the ${facts.environment.toUpperCase()} environment, for the team to read on the Deployer home page. Use only the facts below and invent nothing; check with the read-only tools if needed.`,
-    "Format: a one-sentence summary, then sections as needed: upgrades available, versions UAT has run that are waiting for PROD, environment drift (someone changed the server by hand), deploys that failed or are waiting for a person. At most 5 lines per section, naming the app, version and evidence. Leave out empty sections. End with one line: the single thing to do first.",
+    "Format: a one-sentence summary, then sections as needed: upgrades available, versions UAT has run that are waiting for PROD, environment drift (someone changed the server by hand), deploys that failed or are waiting for a person, and NiFi services that need attention (the nifi fact: name the service and its worst to-do; say nothing if every service is normal). At most 5 lines per section, naming the app, version and evidence. Leave out empty sections. End with one line: the single thing to do first.",
     "```json",
     JSON.stringify(facts, null, 1),
     "```",

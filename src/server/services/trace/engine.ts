@@ -164,7 +164,7 @@ export class TraceEngine {
       // T13: an external entry is the edge of what NiFi saw; say what did not arrive there and where to look.
       const clue = cues.map((c) => `${c} ${q[c]}`).join(", ");
       const edge = outside.size ? ` ${q.service} received no email or file matching ${clue} between ${q.from} and ${q.to} at ${[...outside].join(", ")}: check that it was sent to the location NiFi watches.` : "";
-      return { query: q, traces: [], truncated: false, notFound: { insufficient, message: insufficient ? "Nothing found at the entries, and some evidence could not be read: the result is not conclusive." : `Nothing found at the entries in this time range.${edge}`, missing }, notes };
+      return { query: q, traces: [], truncated: false, notFound: { insufficient, message: insufficient ? `No result: the evidence could not be searched, so this does not show the data never arrived. ${[...new Set(missing.map((m) => m.message))].slice(0, 3).join(" ")}` : `Nothing found at the entries in this time range.${edge}`, missing }, notes };
     }
     starts.sort((a, b) => t(a.event.at) - t(b.event.at));
     const traces: TraceResult[] = [];

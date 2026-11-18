@@ -1,4 +1,4 @@
-// A service's Changes tab (§12.2, §16.3): what is being done to it and what was (a plan to look at, the change holding the
+// A service's Changes section (§12.2, §16.3): what is being done to it and what was (a plan to look at, the change holding the
 // service with its buttons, the ones that ended), whether the hosts still have what is kept, the open configuration drafts,
 // and the saved revisions compared two at a time. A draft is a list of changes on a revision (made on the Configuration
 // tab); saving one makes the next revision and changes nothing on the hosts; only a confirmed plan touches a host.
@@ -11,7 +11,7 @@ import { ask } from "./Confirm.tsx";
 import { Markdown } from "./Markdown.tsx";
 import { SEVERITY, SOURCE, webPort, when } from "./svc.tsx";
 
-/** The open drafts of a service, and the one edits on the Configuration tab go into. */
+/** The open drafts of a service, and the one edits on the Configuration section go into. */
 export type Drafts = {
   list: ConfigDraft[];
   /** undefined: edits start a new draft. */
@@ -41,7 +41,7 @@ export const memberName = (s: ServiceStatus, key: string | null) => {
   const m = s.members.find((x) => x.key === key);
   if (!m) return key;
   if (s.kind !== "cluster") return m.host;
-  // As on the Configuration tab: by address, or by host and port when the addresses do not tell the nodes apart.
+  // As on the Configuration section: by address, or by host and port when the addresses do not tell the nodes apart.
   const addresses = s.members.map((x) => x.nodeAddress ?? x.host);
   return m.nodeAddress && new Set(addresses).size === addresses.length ? m.nodeAddress : `${m.host}:${webPort(m.ports) ?? "?"}`;
 };
@@ -177,7 +177,7 @@ function DraftDetail({ draft, s, cfg, drafts, onSaved, onEdit }: { draft: Config
         <span className="muted small">by {draft.createdBy}{draft.via === "service" ? " (AI)" : ""} · {when(draft.updatedAt)}</span>
       </div>
       {draft.stale && <div className="banner warn inline">Someone saved a revision after this draft was made. Move it to r{cfg.revision} to save it: its changes are made again on that revision. {cfg.canDraft && <button onClick={move} disabled={busy}>Move to r{cfg.revision}</button>}</div>}
-      {draft.changes.length === 0 ? <p className="muted">No changes yet. {cfg.canDraft && <button className="link" onClick={onEdit}>Edit on the Configuration tab</button>}</p> : <table className="props">
+      {draft.changes.length === 0 ? <p className="muted">No changes yet. {cfg.canDraft && <button className="link" onClick={onEdit}>Edit on the Configuration section</button>}</p> : <table className="props">
         <thead><tr><th>File</th>{s.kind === "cluster" && <th>Applies to</th>}<th>Key</th><th>New value</th>{cfg.canDraft && <th></th>}</tr></thead>
         <tbody>{draft.changes.map((c, i) => (
           <tr key={i}>
@@ -199,7 +199,7 @@ function DraftDetail({ draft, s, cfg, drafts, onSaved, onEdit }: { draft: Config
           <span className="muted small">Kept with the revision and shown on the timeline. Anything that looks like a password is masked.</span></label>
         <div className="row">
           <button className="primary" onClick={save} disabled={busy || draft.stale || !draft.changes.length || Boolean(problem)} title={draft.stale ? "Move it to the newest revision first" : undefined}>Save as revision {next}</button>
-          <button onClick={onEdit}>Edit on the Configuration tab</button>
+          <button onClick={onEdit}>Edit on the Configuration section</button>
           <button onClick={discard} disabled={busy}>Discard</button>
         </div>
         <p className="muted small">Saving keeps a new revision here. The hosts keep their files until the revision is applied.</p>
@@ -722,7 +722,7 @@ function ChangeRun({ c, s, desk, canSteer, onLogs }: { c: ServiceChangeView; s: 
             </tr>
           ))}</tbody>
         </table>
-        <p className="muted small">What NiFi itself said is on the <button className="link" onClick={onLogs}>Logs tab</button>.</p>
+        <p className="muted small">What NiFi itself said is on the <button className="link" onClick={onLogs}>Logs (Toolbox)</button>.</p>
       </details>}
     </section>
   );
@@ -780,7 +780,7 @@ export function ServiceChanges({ s, cfg, drafts, desk, onSaved, onEdit, onLogs }
       <Drift s={s} cfg={cfg} desk={desk} onSaved={onSaved} />
       <section className="panel">
         <h3>Drafts</h3>
-        {!drafts.list.length ? <p className="muted">No open drafts. {cfg.canDraft ? <>Edit a key on the <button className="link" onClick={onEdit}>Configuration tab</button> to start one.</> : "You can see drafts here, but not make them."}</p> : <>
+        {!drafts.list.length ? <p className="muted">No open drafts. {cfg.canDraft ? <>Edit a key on the <button className="link" onClick={onEdit}>Configuration section</button> to start one.</> : "You can see drafts here, but not make them."}</p> : <>
           <table className="props revisions">
             <thead><tr><th>Draft</th><th>On</th><th>Changes</th><th>Checks</th><th>By</th><th>Updated</th></tr></thead>
             <tbody>{drafts.list.map((d) => (

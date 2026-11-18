@@ -13,7 +13,7 @@ export const HOST_OPERATIONS = ["plan_deploy", "plan_rollback", "build_artifact"
 export interface HostActions {
   /** Opens the deploy panel with a plan for this version (and the deploy to go back to). */
   openPlan: (app: string, version: string, pinFrom?: string) => void;
-  /** Opens a service's Changes tab on this configuration draft. */
+  /** Opens a service's Changes section on this configuration draft. */
   openServiceChange: (service: string, draft: string) => void;
 }
 
@@ -34,7 +34,7 @@ export async function runHostOperation(operation: string, payload: Payload, acti
       return { ok: false, outcome: (error as Error).message };
     }
     actions.openServiceChange(service, draft);
-    return { ok: true, outcome: `Opened draft ${draft} of ${service} on its Changes tab: nothing is saved until it is reviewed there, and nothing reaches a host until a plan for applying it is confirmed` };
+    return { ok: true, outcome: `Opened draft ${draft} of ${service} on its Changes section: nothing is saved until it is reviewed there, and nothing reaches a host until a plan for applying it is confirmed` };
   }
   if (!app) return { ok: false, outcome: "The card has no app" };
   try {
