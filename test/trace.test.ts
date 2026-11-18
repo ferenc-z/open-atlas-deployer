@@ -254,7 +254,7 @@ test("T11: a stuck verdict carries the connection's queue, back pressure and whe
   // Not among the fullest queues, an old executor without processor states, no reading at all: said, not guessed.
   const old = stuckContextFrom({ latestServiceBackpressure: () => ({ ...sample, backpressure: { top: [] } }) } as unknown as Store, () => NOW)({ service: "n112", from: pos("p-in"), to: pos("p-tx") });
   assert.deepEqual([old.queue, old.downstream?.running], [null, null]);
-  assert.match(old.notes.join(" "), /not among the 0 fullest.*older than 0\.9\.4/);
+  assert.match(old.notes.join(" "), /No queue of n112 was above 0 %.*older than 0\.9\.4/);
   const none = stuckContextFrom({ latestServiceBackpressure: () => undefined } as unknown as Store, () => NOW)({ service: "n112", to: pos("p-tx") });
   assert.match(none.notes[0]!, /no back pressure reading/);
   assert.match(describeStuck(none), /no back pressure reading/);

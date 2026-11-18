@@ -15,6 +15,9 @@ dl nifi-toolkit-1.28.1.zip $A/nifi/1.28.1/nifi-toolkit-1.28.1-bin.zip &
 dl nifi-2.0.0.zip $A/nifi/2.0.0/nifi-2.0.0-bin.zip &
 dl nifi-2.5.0.zip $A/nifi/2.5.0/nifi-2.5.0-bin.zip &
 dl nifi-1.12.1.tar.gz $A/nifi/1.12.1/nifi-1.12.1-bin.tar.gz &
+# S37 step 6: NiFi 1.9.2 (n192) and the JDK 8 it needs.
+dl jdk8.tar.gz $J/8/ga/linux/x64/jdk/hotspot/normal/eclipse &
+dl nifi-1.9.2.tar.gz $A/nifi/1.9.2/nifi-1.9.2-bin.tar.gz &
 wait
 check() { # local-file remote-path
   local want; want=$(curl -sf "$A/$2.sha512" | grep -oE '[0-9a-f]{128}' | head -1)

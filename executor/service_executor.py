@@ -1728,7 +1728,7 @@ PROV_POLL = 0.25
 PROV_CLEANUP_TIMEOUT = 2.0
 PROV_ENRICH_MAX = 100          # lineage: the event nodes given their component, at most
 PROV_ATTRS_MAX, PROV_VALUE_MAX = 500, 4096
-PROV_OPS = ("provenance", "lineage", "event", "search-options", "flow-search")
+PROV_OPS = ("provenance", "lineage", "event", "search-options", "flow-search", "oldest")
 # S37 step 5: NiFi's component search (GET flow/search-results), for a trace model's step positions; at most this many.
 FLOW_SEARCH_MAX = 50
 FLOW_SEARCH_KINDS = (("processGroupResults", "process-group"), ("inputPortResults", "input-port"),
@@ -1794,6 +1794,14 @@ def trim_event(e, offset_ms):
         out["details"] = out["details"][:PROV_VALUE_MAX]
     out["at"] = iso_ms(nifi_time_ms(e.get("eventTime"), offset_ms))
     return out
+
+
+def event_attributes(e):
+    """S37 step 6: an event's FlowFile attributes as {name: value} (bounded), or None when NiFi hides them."""
+    attrs = e.get("attributes") if isinstance(e, dict) else None
+    if not isinstance(attrs, list):
+        return None
+    return {str(a.get("name"))[:256]: str(a["value"])[:PROV_VALUE_MAX] for a in attrs[:PROV_ATTRS_MAX] if isinstance(a, dict) and a.get("value") is not None}
 
 
 def old_terms(version):
@@ -1930,6 +1938,8 @@ class ProvenanceQuery:
         elif not isinstance(field, str) or not isinstance(value, str) or not 1 <= len(value) <= 256:
             raise Refused("give uuid, or field (a searchable field's id, see search-options) and value (1 to 256 characters)")
         node = self.node_of(r, False)
+        # S37 step 6: the trace needs the attributes (business match rules, the file name); NiFi gives them only unsummarized.
+        full = r.get("attributes") is True
         allowed = {f["id"] for f in self.search_options(r)["fields"]}
         if field not in allowed:
             raise Refused(f"{field} is not searchable on this NiFi (it can search {', '.join(sorted(allowed)) or 'nothing'}; nifi.provenance.repository.indexed.fields)")
@@ -1938,7 +1948,7 @@ class ProvenanceQuery:
         shift = 0.0
 
         def body(old_form):
-            req = {"maxResults": maximum, "summarize": True, "incrementalResults": False,
+            req = {"maxResults": maximum, "summarize": not full, "incrementalResults": False,
                    "startDate": nifi_date(s0 - shift), "endDate": nifi_date(e0 - shift),
                    "searchTerms": {field: value if old_form else {"value": value, "inverse": False}}}
             if node:
@@ -1972,12 +1982,42 @@ class ProvenanceQuery:
             if off is not None and abs(off) >= 60_000:
                 self.notes.append(f"NiFi still reads the dates {round(off / 3600_000, 2):g} h off: the events may not cover the time range asked")
             break
-        events = [trim_event(e, self.offset_ms) for e in (results.get("provenanceEvents") or [])[:maximum]]
+        events = []
+        for e in (results.get("provenanceEvents") or [])[:maximum]:
+            out = trim_event(e, self.offset_ms)
+            if full:
+                attrs = event_attributes(e)
+                out.update({"attributes": attrs} if attrs is not None else {"attributesHidden": True})
+            events.append(out)
         events.sort(key=lambda e: (e.get("at") or "", e.get("eventId") or 0))
         return {"op": "provenance", "query": qid, "nifiVersion": version, "events": events, "total": results.get("totalCount", len(events)),
                 "totalText": results.get("total"), "limit": maximum, "limitReached": len(events) >= maximum, "timeOffset": self.offset_ms,
                 "shiftedHours": round(shift / 3600, 2) if shift else 0, "errors": [str(x)[:300] for x in results.get("errors") or []][:20],
-                "scope": f"node {node}" if node else ("cluster" if self.cluster else "standalone")}
+                "scope": f"node {node}" if node else ("cluster" if self.cluster else "standalone"),
+                "oldest": iso_ms(nifi_time_ms(results.get("oldestEvent"), self.offset_ms)) if isinstance(results.get("oldestEvent"), str) else None}
+
+    def oldest(self, request):
+        """S37 step 6 (T4): the oldest event each node still holds (max.storage.size can age events out before the
+        configured time), from a one-event query per node; a cluster's connected nodes from controller/cluster."""
+        nodes = [None]
+        if self.cluster:
+            listed = (self.call("GET", "controller/cluster").get("cluster") or {}).get("nodes") or []
+            nodes = [n for n in listed if isinstance(n, dict) and n.get("status") == "CONNECTED" and NIFI_ID_RE.match(str(n.get("nodeId") or ""))]
+        now = time.time()
+        out = []
+        for n in nodes:
+            node = n["nodeId"] if n else None
+            req = {"maxResults": 1, "summarize": True, "incrementalResults": False, "startDate": nifi_date(now - 60), "endDate": nifi_date(now + 60)}
+            if node:
+                req["clusterNodeId"] = node
+            job, qid = self.job("provenance", "provenance", {"provenance": {"request": req}}, node)
+            results = job.get("results") or {}
+            if isinstance(results.get("timeOffset"), (int, float)) and not isinstance(results.get("timeOffset"), bool):
+                self.offset_ms = results["timeOffset"]
+            text = results.get("oldestEvent")
+            out.append({"node": node, **({"address": f"{n.get('address')}:{n.get('apiPort')}"} if n else {}),
+                        "oldest": iso_ms(nifi_time_ms(text, self.offset_ms)) if isinstance(text, str) else None})
+        return {"op": "oldest", "nodes": out, "timeOffset": self.offset_ms}
 
     def lineage(self, request):
         r = request

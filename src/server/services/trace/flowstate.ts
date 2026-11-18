@@ -25,7 +25,9 @@ export function stuckContextFrom(store: Store, now: () => Date = () => new Date(
     if (conn) {
       const percent = Math.max(num(conn.percentUseCount) ?? 0, num(conn.percentUseBytes) ?? 0);
       queue = { name: conn.name ?? null, ...(num(conn.flowFilesQueued) !== undefined ? { flowFilesQueued: num(conn.flowFilesQueued) } : {}), ...(num(conn.bytesQueued) !== undefined ? { bytesQueued: num(conn.bytesQueued) } : {}), percent, backpressure: percent >= 100 };
-    } else notes.push(`The connection into ${q.to.name ?? q.to.id} is not among the ${top.length} fullest queues the collector keeps (as of ${at}): its queue is small or empty.`);
+    } else notes.push(top.length
+      ? `The connection into ${q.to.name ?? q.to.id} is not among the ${top.length} fullest queues the collector keeps (as of ${at}): its queue is small or empty.`
+      : `No queue of ${q.service} was above 0 % of its back pressure threshold (as of ${at}): the connection into ${q.to.name ?? q.to.id} holds little or nothing.`);
     let downstream: StuckContext["downstream"] = null;
     if (q.to.kind === "processor") {
       if (Array.isArray(b.notRunning)) {

@@ -49,6 +49,7 @@ import { DOWNLOAD_MAX, LogsError, parseSearch, ServiceLogs } from "./services/lo
 import { parseLineage, parseProvenance, ServiceProvenance } from "./services/provenance.ts";
 import type { EvidenceAdapter } from "./services/trace/events.ts";
 import { mountTrace } from "./services/trace/routes.ts";
+import { PROVENANCE_SOURCE, ProvenanceAdapter } from "./services/trace/provenance-adapter.ts";
 import { checkNginx, graphServices, NifiOpsGraph } from "./services/graph-publish.ts";
 import { checkNginxUrl } from "./services/graph.ts";
 import { streamSSE } from "hono/streaming";
@@ -1269,7 +1270,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     return c.json(await provenance.event(c.req.param("id"), eventId, c.req.query("node") || undefined));
   });
   // S37 step 5 (§4.2.0): the business data trace — a service's model, position search, trace_business_data.
-  mountTrace(api, { store, provenance, authenticate, reject, registered: registeredService, actorOf, adapters: deps.traceAdapters ?? new Map() });
+  mountTrace(api, { store, provenance, authenticate, reject, registered: registeredService, actorOf, adapters: deps.traceAdapters ?? new Map<string, EvidenceAdapter>([[PROVENANCE_SOURCE, new ProvenanceAdapter(provenance)]]) });
   // Phase 2 step 4 (§9.3, §15.3): a service's logs, read through its members' service executors (deploy-viewer, §13):
   // the members with their log directories and the WARN/ERROR summary; a member's files; a search of all (or some)
   // members in parallel, merged by time; a member's files as a tar.gz; following one file (SSE, shared per file).

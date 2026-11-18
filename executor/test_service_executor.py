@@ -2460,6 +2460,10 @@ class FakeNifi:
             fields = [{"id": i, "field": f, "label": lab, "type": "STRING"} for i, f, lab in (("EventType", "eventType", "Event Type"), ("FlowFileUUID", "uuid", "FlowFile UUID"),
                                                                                          ("Filename", "filename", "Filename"), ("ProcessorID", "processorId", "Component ID"))]
             return 200, json.dumps({"provenanceOptions": {"searchableFields": fields}}).encode()
+        if bare == "controller/cluster":
+            return 200, json.dumps({"cluster": {"nodes": [{"nodeId": "node-1", "address": "localhost", "apiPort": 18445, "status": "CONNECTED"},
+                                                          {"nodeId": "node-2", "address": "localhost", "apiPort": 18446, "status": "CONNECTED"},
+                                                          {"nodeId": "node-3", "address": "localhost", "apiPort": 18447, "status": "DISCONNECTED"}]}}).encode()
         if bare == "flow/about":
             return 200, json.dumps({"about": {"title": "NiFi", "version": self.version, "timezone": "CST"}}).encode()
         if bare == "flow/search-results":
@@ -2471,7 +2475,8 @@ class FakeNifi:
                 "connectionResults": [{"id": "c-1", "name": "ignored"}]}}).encode()
         if method == "POST" and bare == "provenance":
             req = body["provenance"]["request"]
-            term = next(iter(req["searchTerms"].values()))
+            terms = req.get("searchTerms") or {"none": {"value": ""} if not self.old else ""}  # no terms: every event in the range
+            term = next(iter(terms.values()))
             if self.old and isinstance(term, dict):
                 return 400, b"Cannot deserialize instance of `java.lang.String` out of START_OBJECT token"
             if not self.old and not isinstance(term, dict):
@@ -2481,13 +2486,14 @@ class FakeNifi:
             moved = self.shift * 3600_000 if self.cluster else 0
             start, end = self.parse(req["startDate"]) + moved, self.parse(req["endDate"]) + moved
             value = term["value"] if isinstance(term, dict) else term
-            field = next(iter(req["searchTerms"]))
+            field = next(iter(terms))
             hits = [e for e in self.events if start <= e["ms"] <= end and (field != "FlowFileUUID" or e["uuid"] == value) and (field != "EventType" or e["type"] == value)
                     and (not req.get("clusterNodeId") or e.get("node") == req["clusterNodeId"])]
             hits.sort(key=lambda e: -e["ms"])
             echo = {**req, "startDate": self.local(start + moved, millis=False), "endDate": self.local(end + moved, millis=False)}
             self.jobs[qid] = {"id": qid, "finished": False, "percentCompleted": 0, "request": echo,
-                              "results": {"provenanceEvents": [self.event(e) for e in hits[:req["maxResults"]]], "totalCount": len(hits), "total": str(len(hits)), "timeOffset": self.OFFSET}}
+                              "results": {"provenanceEvents": [self.event(e, full=not req["summarize"]) for e in hits[:req["maxResults"]]], "totalCount": len(hits), "total": str(len(hits)), "timeOffset": self.OFFSET,
+                                          **({"oldestEvent": self.local(min(held))} if (held := [e["ms"] for e in self.events if not req.get("clusterNodeId") or e.get("node") == req["clusterNodeId"]]) else {})}}
             return 201, json.dumps({"provenance": {k: v for k, v in self.jobs[qid].items() if k != "results"}}).encode()
         if method == "POST" and bare == "provenance/lineage":
             req = body["lineage"]["request"]
@@ -2574,6 +2580,27 @@ class ProvenanceTest(Base):
         out = self.query(nifi, {"op": "provenance", "field": "EventType", "value": "CREATE", "node": "node-2", **self.window()}, cluster=True)
         self.assertEqual([e["flowFileUuid"] for e in out["events"]], [UUID_B])
         self.assertEqual([out["scope"], nifi.calls[-1]], ["node node-2", "DELETE provenance/q0001-01a1-1000?clusterNodeId=node-2"])
+
+    def test_attributes_for_the_trace_and_the_oldest_event_each_node_holds(self):
+        # S37 step 6: the trace asks unsummarized (attributes as a map; hidden ones said so) and learns how far back each
+        # node's provenance goes (T4: max.storage.size can age events out before the configured time).
+        events = [{"eventId": 1, "uuid": UUID_A, "type": "RECEIVE", "ms": AT, "node": "node-1", "attributes": [{"name": "filename", "value": "a.csv"}, {"name": "x", "value": None}]},
+                  {"eventId": 2, "uuid": UUID_B, "type": "CREATE", "ms": AT - 3600_000, "node": "node-2"}]
+        nifi = FakeNifi("2.5.0", cluster=True, events=events)
+        out = self.query(nifi, {"op": "provenance", "uuid": UUID_A, "attributes": True, **self.window()}, cluster=True)
+        self.assertFalse(nifi.bodies[0]["provenance"]["request"]["summarize"])
+        self.assertEqual(out["events"][0]["attributes"], {"filename": "a.csv"})
+        self.assertEqual(out["oldest"], sx.iso_ms(AT - 3600_000))
+        nifi = FakeNifi("2.5.0", cluster=True, events=events)
+        out = self.query(nifi, {"op": "provenance", "uuid": UUID_A, **self.window()}, cluster=True)
+        self.assertTrue(nifi.bodies[0]["provenance"]["request"]["summarize"], "the page's search stays summarized")
+        self.assertNotIn("attributes", out["events"][0])
+        nifi = FakeNifi("2.5.0", cluster=True, events=events)
+        out = self.query(nifi, {"op": "oldest"}, cluster=True)
+        self.assertEqual(out["nodes"], [{"node": "node-1", "address": "localhost:18445", "oldest": sx.iso_ms(AT)}, {"node": "node-2", "address": "localhost:18446", "oldest": sx.iso_ms(AT - 3600_000)}])
+        self.assertEqual([c for c in nifi.calls if c.startswith("DELETE")], ["DELETE provenance/q0001-01a1-1000?clusterNodeId=node-1", "DELETE provenance/q0002-01a1-1000?clusterNodeId=node-2"])
+        out = self.query(FakeNifi("1.9.2", events=events[1:]), {"op": "oldest"})
+        self.assertEqual(out["nodes"], [{"node": None, "oldest": sx.iso_ms(AT - 3600_000)}])
 
     def test_a_version_whose_term_form_is_not_known_gets_the_other_one(self):
         nifi = FakeNifi("1.12.1", events=[{"eventId": 0, "uuid": UUID_A, "type": "CREATE", "ms": AT}])
