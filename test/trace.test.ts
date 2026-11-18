@@ -277,3 +277,13 @@ test("T13: an external exit ends NiFi's part with when and by what; an external 
   assert.equal(r.notFound?.insufficient, false);
   assert.match(r.notFound!.message, /n112 received no email or file matching fileName missing\.csv .* at sftp:\/in: check that it was sent/);
 });
+
+test("S37 step 9: a source that cannot be asked a key is skipped quietly; said only when no source could be asked", async () => {
+  const cannot = new Fake("a", []);
+  cannot.missing = { reason: "incapable", message: "Provenance of n112: file_name is not searchable on this NiFi" };
+  let r = await engine(models(), cannot, new Fake("b", [])).trace(Q);
+  assert.deepEqual([r.notFound?.insufficient, r.notFound?.missing.length], [false, 0]);
+  r = await engine(models({ sources: { n112: ["a"], c250: ["a"] } }), cannot).trace(Q);
+  assert.equal(r.notFound?.insufficient, true);
+  assert.deepEqual(r.notFound?.missing.map((m) => [m.source, m.reason]), [["a", "incapable"]]);
+});

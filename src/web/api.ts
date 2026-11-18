@@ -325,7 +325,9 @@ import type { Thresholds } from "../server/services/profiles.ts";
 import type { TimelineEvent } from "../server/services/status.ts";
 import type { ServiceAlert } from "../server/store.ts";
 export type { RuleId, Thresholds, TimelineEvent };
-export type AlertView = ServiceAlert & { label: string; text: string; memberLabel: string | null };
+/** S37 step 9: a CRIT alert's own AI analysis, when one was made. */
+export interface AlertAnalysis { case: number; state: "running" | "done" | "failed"; cause: string | null; confidence: string | null }
+export type AlertView = ServiceAlert & { label: string; text: string; memberLabel: string | null; analysis?: AlertAnalysis };
 export type RuleInfo = { label: string; scope: "member" | "service"; levels: ("WARN" | "CRIT")[]; description: string };
 export type ThresholdInfo = { label: string; unit: string; min: number; max: number; rule: RuleId; description: string };
 export type ThresholdsView = { defaults: Thresholds; overrides: Partial<Thresholds>; effective: Thresholds; info: Record<keyof Thresholds, ThresholdInfo> };
@@ -409,5 +411,15 @@ export const investigateService = (id: string, q: { member?: string | undefined;
 export type { TraceAnswer, TraceResult, Segment, StepResult, Verdict, VerdictAction, HandoverResult, StuckContext } from "../server/services/trace/engine.ts";
 export type { NlConditions } from "../server/services/trace/nl.ts";
 export type TraceInput = { business?: string; fileName?: string; emailFrom?: string; emailSubject?: string; from?: string; to?: string };
+// S37 step 9: cases (the AI analysis, its follow-up questions, the outcome a person writes).
+export type ServiceCase = import("../server/services/cases.ts").ServiceCase;
+export type CaseProposal = import("../server/services/cases.ts").Proposal;
+const casePath = (id: string, rest = "") => `services/${encodeURIComponent(id)}/cases${rest}`;
+export const serviceCases = (id: string, q: { rule?: string; kind?: string; limit?: number } = {}) =>
+  call<{ enabled: boolean; cases: Omit<ServiceCase, "evidence" | "session">[] }>("GET", `${casePath(id)}?${new URLSearchParams(Object.entries(q).filter(([, v]) => v !== undefined && v !== "").map(([k, v]) => [k, String(v)]))}`);
+export const serviceCase = (id: string, kase: number) => call<ServiceCase>("GET", casePath(id, `/${kase}`));
+export const startCase = (id: string, body: { kind: "investigate"; member?: string | undefined; from: string; to: string; focus?: string | undefined; label?: string } | { kind: "trace"; answer: unknown; label?: string }) => call<ServiceCase>("POST", casePath(id), body);
+export const askCase = (id: string, kase: number, text: string) => call<ServiceCase>("POST", casePath(id, `/${kase}/messages`), { text });
+export const caseOutcome = (id: string, kase: number, text: string) => call<ServiceCase>("PUT", casePath(id, `/${kase}/outcome`), { text });
 export const traceBusinessData = (id: string, q: TraceInput) => call<import("../server/services/trace/engine.ts").TraceAnswer>("POST", provPath(id, "/trace-business-data"), q);
 export const traceParse = (id: string, text: string) => call<{ conditions: import("../server/services/trace/nl.ts").NlConditions; ms: number } | { fallback: string; ms: number }>("POST", provPath(id, "/trace-parse"), { text, utcOffsetMinutes: -new Date().getTimezoneOffset() });

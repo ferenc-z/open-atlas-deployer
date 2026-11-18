@@ -536,3 +536,13 @@ pre.raw { white-space: pre-wrap; word-break: break-word; max-height: 24rem; over
 .trace-step.stop { background: var(--bad-bg); border-color: var(--bad); }
 .trace-evidence { border-top: 1px dashed var(--border); padding: 0.3rem 0; word-break: break-all; }
 .trace-handover { margin: 0.3rem 0 0; }
+
+/* S37 step 9: the AI analysis (CaseBox.tsx) */
+.ai-case .case { margin-top: 0.6rem; }
+.case-answer h4 { margin: 0.6rem 0 0.2rem; }
+.case-msg { border-left: 3px solid var(--border, #ccc); padding: 0.2rem 0.6rem; margin: 0.4rem 0; }
+.case-msg.case-assistant { border-left-color: var(--accent, #5b8def); }
+.case .grow { flex: 1; min-width: 12rem; }
+.case textarea { width: 100%; }
+.card.proposal { padding: 0.5rem 0.7rem; max-width: 28rem; }
+.alert-case summary { cursor: pointer; margin-top: 0.3rem; }

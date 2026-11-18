@@ -44,8 +44,9 @@ export interface Capabilities { byKey: string[] | "*"; byPosition: boolean; hand
 export interface AdapterAnswer {
   events: ObservedEvent[];
   /** unavailable: the source cannot be asked now (executor offline, Studio down, no token); expired: its evidence for
-   *  the range is gone (T4: judged by the earliest event the source still holds, not by a configured retention). */
-  missing?: { reason: "unavailable" | "expired" | "error"; message: string; earliest?: string };
+   *  the range is gone (T4: judged by the earliest event the source still holds, not by a configured retention);
+   *  incapable (S37 step 9): it cannot be asked this at all (a key it does not index); the engine skips it quietly. */
+  missing?: { reason: "unavailable" | "expired" | "error" | "incapable"; message: string; earliest?: string };
 }
 
 export interface KeyQuery { service: string; key: CorrelationKey; from: string; to: string; position?: Position }

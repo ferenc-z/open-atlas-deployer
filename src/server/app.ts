@@ -42,6 +42,7 @@ import { adoptedBody, DriftError, hasDrifted, liveDifferences, readLive, service
 import { installKey, type DraftItem } from "./services/draft.ts";
 import { serviceStatus, thresholdsOf, timeline } from "./services/status.ts";
 import { alertView, check, health, parseThresholds, RULES, THRESHOLDS } from "./services/rules.ts";
+import { mountCases, withAnalysis } from "./services/cases.ts";
 import { TakeoverError, type Takeover } from "./services/takeover.ts";
 import { investigate, InvestigateError } from "./services/investigate.ts";
 import { acceptSamples, watchList } from "./services/watch.ts";
@@ -115,6 +116,8 @@ export interface Dependencies {
   e2eTrace?: E2eTraceSource;
   /** S37 step 8 (Q6): the sentence-to-conditions converter (a one-shot OMA session of the Deploy Assistant). */
   traceNl?: import("./services/trace/nl.ts").NlConverter;
+  /** S37 step 9: the AI analysis of the service pages and the cases; without it the pages offer no AI. */
+  analyst?: import("./services/cases.ts").Analyst;
 }
 
 const reject = (c: Context, status: 400 | 401 | 403 | 404 | 409 | 429 | 503, code: string, message: string, details: string[] = []) =>
@@ -1367,7 +1370,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     if (state !== undefined && state !== "open" && state !== "resolved") return reject(c, 400, "alerts/state", "state is open or resolved.");
     const limit = c.req.query("limit") ? Number(c.req.query("limit")) : 200;
     return c.json({
-      alerts: store.serviceAlerts({ service: id, ...(state ? { state } : {}), limit }).map(alertView),
+      alerts: withAnalysis(store, store.serviceAlerts({ service: id, ...(state ? { state } : {}), limit }).map(alertView)),
       rules: RULES, thresholds: { ...thresholdsOf(store, id, s.profile), info: THRESHOLDS },
       canEdit: p.permissions.includes("admin") && !isKey(p),
     });
@@ -1393,6 +1396,8 @@ export function createApp({ config, store, sessions, observer, deployments, vers
       throw e;
     }
   });
+  // S37 step 9 (§4.4): cases — "Let the AI analyse", the follow-up questions, the outcome; CRIT alerts' own analysis.
+  mountCases(api, { store, authenticate, reject, registered: registeredService, actorOf, ...(deps.analyst ? { analyst: deps.analyst } : {}) });
   api.get("/api/services/:id/events", async (c) => {
     const p = await authenticate(c, "view");
     if (p instanceof Response) return p;
@@ -1485,8 +1490,8 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     if (!["open", "resolved", "all"].includes(state)) return reject(c, 400, "alerts/state", "state is open, resolved or all.");
     const since = c.req.query("since") ?? new Date(Date.now() - 86_400_000).toISOString();
     const services = new Map([...store.standalones(), ...store.clusters()].map((x) => [x.id, { kind: x.kind, environment: x.environment, profile: x.profile }] as const));
-    const alerts = store.serviceAlerts({ ...(state === "all" ? { since } : { state: state as "open" | "resolved" }), limit: Number(c.req.query("limit") ?? 500) })
-      .filter((a) => services.has(a.service)).map((a) => ({ ...alertView(a), ...services.get(a.service)! }));
+    const alerts = withAnalysis(store, store.serviceAlerts({ ...(state === "all" ? { since } : { state: state as "open" | "resolved" }), limit: Number(c.req.query("limit") ?? 500) })
+      .filter((a) => services.has(a.service)).map((a) => ({ ...alertView(a), ...services.get(a.service)! })));
     return c.json({ alerts, open: alerts.filter((a) => a.state === "open").length, rules: RULES });
   });
   api.post("/api/services/drafts", async (c) => {

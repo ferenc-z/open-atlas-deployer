@@ -12,6 +12,10 @@ How to look into the NiFi clusters and standalone instances the Deployer manages
 | Question | Tool | Notes |
 |---|---|---|
 | What is there, which version, how many up | `list_service_clusters` | one row per cluster or standalone; ids for everything below |
+| What needs doing on one service now | `get_service_health {id}` | **start here**: verdict, to-dos worst first (rule, severity, since, member, evidence, template cause, actions), one row per node, preventive risks |
+| Why did it misbehave in a window | `investigate_service {id, member?, from?, to?, focus?}` | the Deployer's evidence cards (restarts and OOM, bulletins by component, new or surging log patterns, metrics off the day-before baseline, changes in the 24 h before), weighted high to none; take a to-do's `member`, `since` and `rule` as `focus` |
+| Where did a piece of business data go | `trace_business_data {id, file_name? / email_from? / email_subject?, business?, from?, to?}` | across services by the business models; verdict completed / failed / stuck / handover-lost / insufficient with where it stopped. Prefer it to raw provenance when the person speaks of a file, an email or a business |
+| Has this happened before | `list_service_cases {id, rule?}` | earlier AI analyses with the **outcome people wrote**; cite a matching one |
 | One service now: members, running or not, as of when, cluster connection, certificates | `get_cluster_status {id}` | `members[].key` is the member key the other tools take; `state` lost = its executor is offline, unknown = no recent sample |
 | What is wrong now | `list_alerts` (all services) or `list_alerts {id}` | open first; CRIT before WARN; `member` `*` = the whole service |
 | What happened before | `list_events {id, from?, to?}` | restarts, disconnects, version changes, threshold changes, alerts; **look at what changed just before a problem** |
@@ -46,6 +50,25 @@ How to look into the NiFi clusters and standalone instances the Deployer manages
 - **A FlowFile did not arrive / 文件没到下游**: `search_provenance` by its `uuid` (or `field: Filename`) in the hour around when it should have arrived → the last event says where it stopped (`DROP`/`EXPIRE` = removed, `ROUTE` with relationship `failure` = a processor failed it, no event after the last component = still queued there) → `get_lineage` with the event's `node` for clones, splits and merges → the logs (`search_logs` around that event's time, the component's id as query) and `get_bulletins` of that component. Provenance is read from NiFi through the Deployer's service executor (not Studio); at most 100 events per search, so narrow by time or field when `limitReached`. `get_provenance_event` gives the FlowFile's attributes (the monitoring identity may view the data; `attributesHidden` only where a NiFi does not grant it), with secret-looking values hidden; content is never read.
 - **Certificates**: `get_cluster_status` lists every certificate with its expiry; renewals are done by operations.
 - **"Why is this setting different on node2"**: `diff_service_config` → `lookup_property` for the key (scope cluster means the nodes must agree).
+
+## Bulletins: node events or a processor failing
+
+- A bulletin whose category or source is `FLOW_CONTROLLER` (or the cluster coordinator) is a **node connection event**: a node disconnected, reconnected, missed heartbeats, the coordinator changed. Count it as a node or cluster problem (look at `get_cluster_status`, `list_events`, the ZooKeeper and heartbeat log lines), never as a processor error.
+- A processor's (or port's, controller service's) error has that component as its source, with its id and group: that is the flow failing. `investigate_service`'s bulletin card groups both by source; say which kind each is.
+
+## Service case (the pages' "Let the AI analyse", a CRIT alert)
+
+The first message holds the evidence (an investigation, a trace answer, or an alert with its investigation) and earlier cases of the same service and rule. Then:
+
+1. Read the cards by weight (high first; the weight is a priority, not a verdict) or the trace's verdict and where it stopped. Use `get_service_health`, `investigate_service`, `trace_business_data`, `search_logs` and the others only for what the evidence leaves open; keep the windows tight.
+2. If an earlier case matches (same rule, same node or component, same pattern), say so and use what its outcome says people found.
+3. Separate what the evidence shows from what you infer; when it does not show the cause, say so and lower the confidence.
+4. Change nothing. A configuration change you may draft (`draft_service_config`, see below) and put in `proposals` as `{"kind": "config", "draft": "<id>"}`; a start, stop or restart you only propose (`{"kind": "restart", "members": ["<member key>"]}`): the page shows it as a card that opens the plan on the Changes tab, where a person confirms it.
+5. End with the single JSON block the message asks for (`cause`, `evidence`, `next`, `confidence`, `proposals`), the strings in Chinese. Follow-up questions in the same session: answer in Markdown, briefly, no JSON needed.
+
+## Turning a sentence into trace conditions
+
+When asked to turn a person's sentence into trace conditions (the Data trace page), reply with **only** the JSON block asked for: no tools, no text before or after. The message gives the current time and a calendar of the days around it, worked out by the Deployer: read dates from it, do not work out weekdays yourself.
 
 ## Changing a configuration
 

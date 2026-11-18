@@ -1,11 +1,12 @@
 // S37 step 4 (pages-rethink §3, §4.3): the "Investigate" tab. A starting point (a to-do, an alert, or a node and a
 // window chosen by hand) runs GET /api/services/:id/investigate; the evidence comes back as cards worked out by the
-// Deployer (no AI: step 9 adds "Let the AI analyse"). Each item opens to its raw content (log lines, bulletin messages,
+// Deployer (no AI until a person presses "Let the AI analyse", step 9: CaseBox.tsx). Each item opens to its raw content (log lines, bulletin messages,
 // events, the curve against the same hours a day before) and, for a component, links into NiFi with it selected.
 
 import { useCallback, useEffect, useState } from "react";
 import * as api from "./api.ts";
 import type { AlertView, EvidenceCard, EvidenceItem, Investigation, ServiceHealth } from "./api.ts";
+import { AnalyseBox, EarlierCases, type PlanChange } from "./CaseBox.tsx";
 import { LineChart } from "./Charts.tsx";
 import { ago, when } from "./svc.tsx";
 
@@ -29,7 +30,7 @@ export function windowAround(since: string, until?: string | null, now = Date.no
 const toInput = (iso: string) => { const d = new Date(iso); return new Date(d.getTime() - d.getTimezoneOffset() * 60_000).toISOString().slice(0, 16); };
 const fromInput = (v: string) => (v ? new Date(v).toISOString() : "");
 
-export function Investigate({ s }: { s: api.ServiceStatus }) {
+export function Investigate({ s, plan, canAct }: { s: api.ServiceStatus; plan?: PlanChange; canAct?: boolean }) {
   const [start] = useState<InvestigateStart | null>(() => { const p = pending; pending = null; return p; });
   const now = Date.now();
   const [member, setMember] = useState(start?.member ?? "");
@@ -91,6 +92,9 @@ export function Investigate({ s }: { s: api.ServiceStatus }) {
       </section>
       {error && <p className="error">{error}</p>}
       {result && <Result r={result} label={label} />}
+      {result && <AnalyseBox key={`${result.from}|${result.to}|${result.member ?? ""}|${result.focus ?? ""}`} s={s} plan={plan} canAct={canAct}
+        start={() => api.startCase(s.id, { kind: "investigate", ...(result.member ? { member: result.member } : {}), from: result.from, to: result.to, ...(result.focus ? { focus: result.focus } : {}), ...(label ? { label } : {}) })} />}
+      {result && <EarlierCases service={s.id} rule={result.focus ?? undefined} />}
     </div>
   );
 }

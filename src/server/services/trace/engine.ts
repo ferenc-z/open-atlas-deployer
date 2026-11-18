@@ -110,16 +110,22 @@ export class TraceEngine {
   /** Asks the service's sources in order until one has events; the others' gaps are kept as missing. */
   private async ask(service: string, can: (a: EvidenceAdapter) => boolean, call: (a: EvidenceAdapter) => Promise<AdapterAnswer> | undefined, what: string): Promise<Asked> {
     const missing: Missing[] = [];
+    // S37 step 9: a source that cannot be asked this (e.g. a key its NiFi does not index) is skipped quietly; only when
+    // every source was such is it said.
+    const incapable: Missing[] = [];
+    let asked = 0;
     const usable = this.sources(service).filter(can);
     if (!usable.length) return { events: [], missing: [{ source: "-", reason: "incapable", message: `No evidence source of ${service} can ${what}.` }] };
     for (const a of usable) {
       let answer: AdapterAnswer | undefined;
-      try { answer = await call(a); } catch (error) { missing.push({ source: a.id, reason: "error", message: (error as Error).message }); continue; }
+      try { answer = await call(a); } catch (error) { asked++; missing.push({ source: a.id, reason: "error", message: (error as Error).message }); continue; }
       if (!answer) continue;
       if (answer.events.length) return { events: answer.events, source: a.id, missing };
+      if (answer.missing?.reason === "incapable") { incapable.push({ source: a.id, ...answer.missing }); continue; }
+      asked++;
       if (answer.missing) missing.push({ source: a.id, ...answer.missing });
     }
-    return { events: [], missing };
+    return { events: [], missing: asked ? missing : incapable };
   }
 
   private byKey(service: string, key: CorrelationKey, from: string, to: string, position?: Position) {

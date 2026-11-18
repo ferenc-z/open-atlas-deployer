@@ -16,6 +16,7 @@ import type { ServiceConfigBody } from "./services/config.ts";
 import type { ConfigFinding } from "./services/configcheck.ts";
 import type { DraftChange } from "./services/configedit.ts";
 import type { ConfigReview } from "./services/configreview.ts";
+import type { ServiceCase } from "./services/cases.ts";
 import { randomBytes } from "node:crypto";
 
 export interface Actor { id: string; via: "workbench" | "emergency" | "cli" | "key" | "service" }
@@ -185,6 +186,10 @@ CREATE TABLE IF NOT EXISTS service_trace_models (
   service TEXT PRIMARY KEY, revision INTEGER NOT NULL, body TEXT NOT NULL, saved_at TEXT NOT NULL, saved_by TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS service_trace_sources (
   service TEXT NOT NULL, source TEXT NOT NULL, body TEXT NOT NULL, saved_at TEXT NOT NULL, saved_by TEXT NOT NULL, PRIMARY KEY (service, source));
+CREATE TABLE IF NOT EXISTS service_cases (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, service TEXT NOT NULL, kind TEXT NOT NULL, rule TEXT, alert_id INTEGER UNIQUE, state TEXT NOT NULL,
+  requested_at TEXT NOT NULL, body TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS service_cases_service ON service_cases (service, rule, requested_at);
 `;
 
 /** queued: waiting for the host's executor to claim it; the rest are the executor's states. */
@@ -1776,6 +1781,49 @@ export class Store {
     this.inTransaction(() => {
       this.db.prepare("DELETE FROM service_trace_sources WHERE service = ? AND source = ?").run(service, source);
       this.insertAudit(actor, "service.trace-source.remove", service, { source });
+    });
+  }
+
+  // S37 step 9 (pages-rethink §4.4): cases — an AI analysis with the evidence it was given, the conversation after it and
+  // the outcome a person wrote. One per alert at most (alert_id is unique).
+
+  /** A new case; undefined when the alert has one already. */
+  addServiceCase(c: Omit<ServiceCase, "id">): number | undefined {
+    const r = this.db.prepare("INSERT OR IGNORE INTO service_cases (service, kind, rule, alert_id, state, requested_at, body) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .run(c.service, c.kind, c.rule, c.alertId, c.state, c.requestedAt, JSON.stringify(c));
+    return Number(r.changes) ? Number(r.lastInsertRowid) : undefined;
+  }
+
+  serviceCase(id: number): ServiceCase | null {
+    const r = this.db.prepare("SELECT id, body FROM service_cases WHERE id = ?").get(id) as Row | undefined;
+    return r ? { ...parse(r.body), id: r.id } : null;
+  }
+
+  setServiceCase(c: ServiceCase) {
+    this.db.prepare("UPDATE service_cases SET state = ?, body = ? WHERE id = ?").run(c.state, JSON.stringify(c), c.id);
+  }
+
+  /** Cases newest first: of a service, a rule, a kind, an alert, requested since. */
+  serviceCases(o: { service?: string; rule?: string; kind?: string; alertIds?: number[]; since?: string; limit?: number } = {}): ServiceCase[] {
+    const where = ["1 = 1"], args: (string | number)[] = [];
+    if (o.service) { where.push("service = ?"); args.push(o.service); }
+    if (o.rule) { where.push("rule = ?"); args.push(o.rule); }
+    if (o.kind) { where.push("kind = ?"); args.push(o.kind); }
+    if (o.alertIds) { if (!o.alertIds.length) return []; where.push(`alert_id IN (${o.alertIds.map(() => "?").join(",")})`); args.push(...o.alertIds); }
+    if (o.since) { where.push("requested_at >= ?"); args.push(o.since); }
+    args.push(Math.min(500, Math.max(1, o.limit ?? 50)));
+    return (this.db.prepare(`SELECT id, body FROM service_cases WHERE ${where.join(" AND ")} ORDER BY requested_at DESC, id DESC LIMIT ?`).all(...args) as Row[]).map((r) => ({ ...parse(r.body), id: r.id }));
+  }
+
+  runningServiceCases(): ServiceCase[] {
+    return (this.db.prepare("SELECT id, body FROM service_cases WHERE state = 'running'").all() as Row[]).map((r) => ({ ...parse(r.body), id: r.id }));
+  }
+
+  /** A person's outcome of a case, audited. */
+  setServiceCaseOutcome(c: ServiceCase, actor: Actor) {
+    this.inTransaction(() => {
+      this.setServiceCase(c);
+      this.insertAudit(actor, "service.case-outcome", c.service, { case: c.id });
     });
   }
 }

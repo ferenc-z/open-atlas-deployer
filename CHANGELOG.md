@@ -5,6 +5,21 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
 
 ## Unreleased
 
+- S37 step 9 (Q4, S9): "Let the AI analyse" on the Investigate and Data trace tabs sends the page's result (the
+  investigation worked out again compact and redacted; the trace answer trimmed and redacted) to the Deploy Assistant
+  in a background OMA session; the answer comes in three parts (likely cause, evidence, next steps) and the person can
+  ask follow-up questions in the same session. A CRIT alert opened within the hour is analysed once by itself, at most
+  3 a service an hour; the conclusion shows with the alert (`analysis` on alert views). Every analysis is a case (table
+  `service_cases`: evidence, answer, conversation, the outcome a person writes; `/api/services/:id/cases`); the prompt
+  carries the newest cases of the same service and rule, and the new read-only MCP tool `list_service_cases` reads
+  more. What the AI proposes to change is a card: a configuration draft opens on the Changes tab, a start, stop or
+  restart shows its plan there for a person to confirm. The Data trace's "Investigate" button opens the Investigate
+  tab on the node and time where the data stopped. A trace source that cannot be asked a key (provenance and a key its
+  NiFi does not index) is skipped quietly; only when no source could be asked does "insufficient evidence" say so.
+- [ ] OMA: republish the Deploy Assistant (allowed tools `get_service_health`, `investigate_service`,
+  `trace_business_data`, `list_service_cases`; prompt sections "Service case task" and "Clue from a sentence"; Skill
+  `nifi-ops` new version: the new tools, FLOW_CONTROLLER bulletins vs processor errors, the service case, sentence to
+  conditions), then point `DEPLOYER_OMA_AGENT` and the Workbench Business Agent "Deploy Assistant" at the new agent.
 - S37 step 3: a service page opens on a new Status tab: verdict, the to-do list with next-step buttons, the node strip
   (Start, Restart, Stop with a plan first), preventive risks and the newest changes and restarts, all from
   `GET /api/services/:id/health`. The Business model tab is read-only for non-admins (`canEdit` in the model response).

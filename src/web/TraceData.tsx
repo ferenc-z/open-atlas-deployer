@@ -7,8 +7,10 @@
 // names and the time are sent); the conditions fill the fields below, nothing is traced until the person presses Trace.
 // Without an answer in 5 seconds the form is simply what is there.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import * as api from "./api.ts";
+import { AnalyseBox, type PlanChange } from "./CaseBox.tsx";
+import { investigateFrom, windowAround } from "./Investigate.tsx";
 import type { HandoverResult, NlConditions, ServiceStatus, StepResult, TraceInput, TraceResult, Verdict, VerdictAction } from "./api.ts";
 import { when } from "./svc.tsx";
 
@@ -36,7 +38,9 @@ async function nifiLink(service: string, component: string): Promise<string> {
   return u.toString();
 }
 
-export function DataTrace({ s, open }: { s: ServiceStatus; open: (tab: string) => void }) {
+type Act = { plan?: PlanChange | undefined; canAct?: boolean | undefined };
+
+export function DataTrace({ s, open, plan, canAct }: { s: ServiceStatus; open: (tab: string) => void } & Act) {
   const [businesses, setBusinesses] = useState<{ id: string; name: string }[]>([]);
   const [sentence, setSentence] = useState("");
   const [nl, setNl] = useState<{ state: "asking" } | { state: "done"; ms: number } | { state: "fallback"; reason: string } | undefined>();
@@ -120,29 +124,34 @@ export function DataTrace({ s, open }: { s: ServiceStatus; open: (tab: string) =
         {businesses.length === 0 && <p className="muted small">This service has no business model yet (Business model tab); the trace can only look for the clue at the places other services' models lead to.</p>}
       </section>
       {error && <p className="error">{error}</p>}
-      {answer && <Answer s={s} a={answer} open={open} />}
+      {answer && <Answer s={s} a={answer} open={open} plan={plan} canAct={canAct} />}
     </div>
   );
 }
 
-function Answer({ s, a, open }: { s: ServiceStatus; a: api.TraceAnswer; open: (tab: string) => void }) {
+function Answer({ s, a, open, plan, canAct }: { s: ServiceStatus; a: api.TraceAnswer; open: (tab: string) => void } & Act) {
   return (
     <>
       {a.notFound && <section className="card"><p><span className={`badge ${a.notFound.insufficient ? "info" : "warn"}`}>{a.notFound.insufficient ? "Insufficient evidence" : "Not found"}</span> {a.notFound.message}</p>
-        {a.notFound.missing.map((m, i) => <p key={i} className="muted small">{m.source}: {m.message}</p>)}</section>}
+        {a.notFound.missing.map((m, i) => <p key={i} className="muted small">{m.source}: {m.message}</p>)}
+        <AnalyseBox s={s} plan={plan} canAct={canAct} start={() => api.startCase(s.id, { kind: "trace", answer: a })} /></section>}
       {a.traces.length > 1 && <p className="muted small">{a.traces.length} traces match{a.truncated ? " (more were left out: narrow the time range or the clues)" : ""}; the newest first.</p>}
-      {a.traces.map((t, i) => <TraceCard key={`${t.start.key.value}-${i}`} s={s} t={t} open={open} first={i === 0} />)}
+      {a.traces.map((t, i) => <TraceCard key={`${t.start.key.value}-${i}`} s={s} t={t} open={open} first={i === 0} a={a} plan={plan} canAct={canAct} />)}
       {a.notes.length > 0 && <ul className="muted small">{a.notes.map((n, i) => <li key={i}>{n}</li>)}</ul>}
     </>
   );
 }
 
-function TraceCard({ s, t, open, first }: { s: ServiceStatus; t: TraceResult; open: (tab: string) => void; first: boolean }) {
+function TraceCard({ s, t, open, first, a, plan, canAct }: { s: ServiceStatus; t: TraceResult; open: (tab: string) => void; first: boolean; a: api.TraceAnswer } & Act) {
   const v = t.verdict;
+  // The node where the data stopped (or was last seen), for the Investigate tab.
+  const seg = t.segments.find((x) => x.service === v.service && x.business === v.business) ?? t.segments.at(-1);
+  const steps = seg?.steps ?? [];
+  const node = [...steps.filter((x) => x.step === v.step), ...[...steps].reverse()].flatMap((x) => x.events).find((e) => e.ref?.node)?.ref?.node;
   return (
     <details className="card trace-card" open={first}>
       <summary><span className={`badge ${KIND_TONE[v.kind]}`}>{v.kind}</span>{v.inferred && <span className="badge info" title="Matched by file name and time, not by an id the evidence confirms">inferred</span>} <b>{t.start.entry}</b> <span className="muted small">{t.start.key.name} = {t.start.key.value} · {when(t.start.at)}</span></summary>
-      <VerdictBox s={s} v={v} open={open} />
+      <VerdictBox s={s} v={v} open={open} node={node} analyse={<AnalyseBox s={s} plan={plan} canAct={canAct} start={() => api.startCase(s.id, { kind: "trace", answer: { ...a, traces: [t], truncated: false }, label: `Data trace ${t.start.key.value}: ${v.kind}` })} />} />
       {t.segments.map((seg, i) => {
         const here = seg.service === v.service && seg.business === v.business && v.kind !== "completed";
         // After an inferred hand-over, everything further on rests on the guess.
@@ -159,7 +168,15 @@ function TraceCard({ s, t, open, first }: { s: ServiceStatus; t: TraceResult; op
   );
 }
 
-function VerdictBox({ s, v, open }: { s: ServiceStatus; v: Verdict; open: (tab: string) => void }) {
+/** S37 step 9: the Investigate tab of the service where the data stopped, on that node (when it can be told) around that time. */
+async function investigateAt(s: ServiceStatus, service: string, at: string, node: string | undefined, open: (tab: string) => void) {
+  const st = service === s.id ? s : await api.serviceStatus(service).catch(() => undefined);
+  const m = node && st?.members.find((x) => x.key === node || `${x.nodeAddress ?? x.host}:${x.ports.https ?? x.ports.http ?? ""}` === node || x.nodeAddress === node || x.host === node);
+  investigateFrom({ ...(m ? { member: m.key } : {}), ...windowAround(at), label: `Data trace stopped${node ? ` on ${node}` : ""} at ${when(at)}` });
+  if (service === s.id) open("investigate"); else openService(service, "investigate");
+}
+
+function VerdictBox({ s, v, open, node, analyse }: { s: ServiceStatus; v: Verdict; open: (tab: string) => void; node?: string | undefined; analyse?: ReactNode }) {
   const [note, setNote] = useState("");
   const c = v.context;
   return (
@@ -177,11 +194,11 @@ function VerdictBox({ s, v, open }: { s: ServiceStatus; v: Verdict; open: (tab: 
       <div className="row wrap">
         {(v.actions ?? []).map((a, i) => <ActionButton key={i} a={a} s={s} open={open} onNote={setNote} />)}
         {v.service && v.at && (
-          <button onClick={() => (v.service === s.id ? open("logs") : openService(v.service, "logs"))}>Look into this node at that time → Logs</button>
+          <button onClick={() => void investigateAt(s, v.service!, v.at!, node, open)}>Investigate {node ? `node ${node}` : v.service} at that time</button>
         )}
       </div>
-      {v.service && v.at && <p className="muted small">The Investigate page is not available yet, so this goes to Logs: set the time range around {when(v.at)}.</p>}
       {note && <p className="error small">{note}</p>}
+      {analyse}
     </div>
   );
 }

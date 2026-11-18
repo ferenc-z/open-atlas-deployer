@@ -151,6 +151,9 @@ export class ProvenanceAdapter implements EvidenceAdapter {
 /** Why provenance could not be read, as an answer's missing part. */
 function failure(service: string, error: unknown): NonNullable<AdapterAnswer["missing"]> {
   const message = (error as Error)?.message ?? String(error);
+  // S37 step 9: a key this NiFi does not index (e.g. e2e_trace's file_name) is not a gap in the evidence: the engine skips
+  // this source quietly and says so only when no source could be asked.
+  if (/is not searchable on this NiFi/.test(message)) return { reason: "incapable", message: `Provenance of ${service}: ${message}` };
   if (error instanceof LogsError && (error.status === 409 || error.code === "provenance/timeout" || error.code === "provenance/busy"))
     return { reason: "unavailable", message: `Provenance of ${service} cannot be read now: ${message}` };
   return { reason: "error", message: `Provenance of ${service}: ${message}` };

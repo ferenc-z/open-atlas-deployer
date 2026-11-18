@@ -12,6 +12,8 @@ import { Deployments } from "./deploy.ts";
 import { Diagnoser } from "./diagnose.ts";
 import { Keys } from "./keys.ts";
 import { OmaSessions } from "./oma.ts";
+import { Analyst } from "./services/cases.ts";
+import { investigate } from "./services/investigate.ts";
 import { NlConverter } from "./services/trace/nl.ts";
 import { Briefs, collectFacts } from "./brief.ts";
 import { Drift } from "./drift.ts";
@@ -110,7 +112,10 @@ const configReview = box && config.omaUrl && config.omaApiKeyFile && config.omaA
 // §16.3: the changes of services, driven from the database: what was running when this process started finishes its member and waits for a person.
 const serviceChanges = new ServiceChanges({ store, handoff: deployments.handoff, box });
 serviceChanges.recover();
-const app = createApp({ config, store, takeover, changes: serviceChanges, ...(configReview ? { configReview } : {}), ...(briefWriter ? { traceNl: new NlConverter(briefWriter) } : {}), graph: nifiOpsGraph, sessions: new WorkbenchSessions(config.workbenchUrl), observer, deployments, versions, env, peer, onboarding, drift, briefs, keys, workbench, workbenchKey, deployerSettings,
+// S37 step 9 (§4.4): "Let the AI analyse", follow-up questions and the CRIT alerts' own analysis, through the Deploy
+// Assistant with its Vault (it reads more through the Deployer's read-only tools).
+const analyst = briefWriter ? new Analyst(store, briefWriter, (id, ask) => investigate(store, (host) => deployments.handoff.executor(host, "service"), id, ask)) : undefined;
+const app = createApp({ config, store, takeover, changes: serviceChanges, ...(configReview ? { configReview } : {}), ...(briefWriter ? { traceNl: new NlConverter(briefWriter) } : {}), ...(analyst ? { analyst } : {}), graph: nifiOpsGraph, sessions: new WorkbenchSessions(config.workbenchUrl), observer, deployments, versions, env, peer, onboarding, drift, briefs, keys, workbench, workbenchKey, deployerSettings,
   // D45: the image sets DEPLOYER_RESTART_BY_EXIT; the container's restart policy starts it again with the new settings.
   ...(process.env.DEPLOYER_RESTART_BY_EXIT === "true" ? { restart: () => setTimeout(() => { store.close(); process.exit(75); }, 300) } : {}) });
 // Job records follow the executor's status files even while nobody has the page open.
@@ -120,7 +125,9 @@ setInterval(() => {
   diagnoser?.poll().catch((error) => console.error("diagnose:", error));
   onboarding.poll().catch((error) => console.error("assessments:", error));
   configReview?.poll().catch((error) => console.error("config review:", error));
+  analyst?.poll().catch((error) => console.error("cases:", error));
 }, 2_000).unref();
+setInterval(() => { analyst?.autoAlerts().catch((error) => console.error("cases (alerts):", error)); }, 30_000).unref();
 setInterval(() => { briefs.tick().catch((error) => console.error("brief:", error)); }, 60_000).unref();
 setInterval(() => { drift.check().catch((error) => console.error("drift:", error)); }, 10 * 60_000).unref();
 // §15.3: the services' 5-minute rollups as each bucket ends, and the hourly cleanup (raw 2 days, rollups 30 days).

@@ -63,6 +63,12 @@ export function App() {
     openPlan: (app: string, version: string, pinFrom?: string) => { setPanel({ kind: "deploy", app, initial: { version, ...(pinFrom ? { pinFrom } : {}) } }); setTab("status"); },
     openServiceChange: (id: string, draft: string) => { setService(id); setServiceDraft({ draft, at: Date.now() }); setTab("services"); },
   }), []);
+  // S37 step 9: an AI case's configuration draft card opens the draft on its service's Changes tab, as the Assistant's card does.
+  useEffect(() => {
+    const on = (e: Event) => { const d = (e as CustomEvent<{ id: string; draft: string }>).detail; actions.openServiceChange(d.id, d.draft); };
+    window.addEventListener("oa:open-service-draft", on);
+    return () => window.removeEventListener("oa:open-service-draft", on);
+  }, [actions]);
   // §15 (D41): until setup is complete, Setup is the only page.
   const [setup, setSetup] = useState<SetupStatus | undefined>();
   const load = useCallback(() => {

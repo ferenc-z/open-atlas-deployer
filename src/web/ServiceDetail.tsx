@@ -26,13 +26,13 @@ type Tab = { id: string; label: string; shown: (l: Loaded) => boolean; render: (
 
 const TABS: Tab[] = [
   { id: "status", label: "Status", shown: () => true, render: (l) => <ServiceNow s={l.s} canAct={Boolean(l.cfg?.canDraft) && !l.desk.active} plan={(r) => l.desk.plan(r)} open={l.open} /> },
-  { id: "investigate", label: "Investigate", shown: (l) => l.s.members.length > 0, render: (l) => <Investigate s={l.s} /> },
+  { id: "investigate", label: "Investigate", shown: (l) => l.s.members.length > 0, render: (l) => <Investigate s={l.s} plan={(r) => l.desk.plan(r)} canAct={Boolean(l.cfg?.canDraft) && !l.desk.active} /> },
   { id: "overview", label: "Overview", shown: () => true, render: (l) => <Overview {...l} /> },
   { id: "metrics", label: "Metrics", shown: (l) => l.s.members.some((m) => m.live), render: (l) => <Metrics s={l.s} /> },
   { id: "logs", label: "Logs", shown: (l) => l.s.members.length > 0, render: (l) => <Logs s={l.s} /> },
   { id: "trace", label: "FlowFile trace", shown: (l) => l.s.members.length > 0, render: (l) => <FlowFileTrace s={l.s} /> },
   { id: "trace-model", label: "Business model", shown: () => true, render: (l) => <TraceModelEditor s={l.s} /> },
-  { id: "data-trace", label: "Data trace", shown: () => true, render: (l) => <DataTrace s={l.s} open={l.open} /> },
+  { id: "data-trace", label: "Data trace", shown: () => true, render: (l) => <DataTrace s={l.s} open={l.open} plan={(r) => l.desk.plan(r)} canAct={Boolean(l.cfg?.canDraft) && !l.desk.active} /> },
   { id: "events", label: "Events and alerts", shown: () => true, render: (l) => <EventsAndAlerts s={l.s} /> },
   { id: "nodes", label: "Nodes", shown: () => true, render: (l) => <Nodes {...l} /> },
   { id: "configuration", label: "Configuration", shown: () => true, render: (l) => <ServiceConfig cfg={l.cfg} status={l.s} drafts={l.drafts} onReview={() => l.open("changes")} /> },

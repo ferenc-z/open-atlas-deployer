@@ -4,7 +4,8 @@
 
 import { useCallback, useEffect, useState } from "react";
 import * as api from "./api.ts";
-import type { AlertView, GlobalAlert, RegisteredService, ServiceStatus, Thresholds, ThresholdsView, TimelineEvent } from "./api.ts";
+import type { AlertAnalysis, AlertView, GlobalAlert, RegisteredService, ServiceStatus, Thresholds, ThresholdsView, TimelineEvent } from "./api.ts";
+import { CaseView } from "./CaseBox.tsx";
 import { ask } from "./Confirm.tsx";
 import { ago, when } from "./svc.tsx";
 
@@ -29,11 +30,21 @@ export function AlertTable({ alerts, onOpen, resolved = false }: { alerts: (Aler
           <td>{a.label}</td>
           {onOpen && <td><button className="link mono" onClick={() => onOpen(a.service)}>{a.service}</button>{"environment" in a && <span className="muted small"> {a.environment.toUpperCase()}</span>}</td>}
           <td className="mono small">{a.memberLabel ?? <span className="muted">whole service</span>}</td>
-          <td className="small">{a.text}</td>
+          <td className="small">{a.text}{a.analysis && <AlertCase service={a.service} analysis={a.analysis} />}</td>
           <td className="muted small" title={`Opened ${when(a.openedAt)}${a.resolvedAt ? `, resolved ${when(a.resolvedAt)}` : ""}`}>{resolved && a.resolvedAt ? ago(a.resolvedAt) : ago(a.openedAt)}</td>
         </tr>
       ))}</tbody>
     </table>
+  );
+}
+
+/** S37 step 9 (S9): a CRIT alert's own analysis, written back to it; opens to the whole case (follow-up, outcome). */
+function AlertCase({ service, analysis }: { service: string; analysis: AlertAnalysis }) {
+  return (
+    <details className="alert-case">
+      <summary><span className="badge info">AI</span> {analysis.state === "running" ? <span className="muted">analysing…</span> : analysis.cause ?? <span className="muted">no answer</span>}</summary>
+      <CaseView service={service} id={analysis.case} />
+    </details>
   );
 }
 
