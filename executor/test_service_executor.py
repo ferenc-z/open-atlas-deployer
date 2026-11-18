@@ -860,7 +860,7 @@ class RestTrimTest(unittest.TestCase):
         self.assertEqual(sx.trim_bulletins(json.loads(recorded("1.12.1", f"flow/bulletin-board?limit={sx.BULLETINS}")[1])), [])
         for version in ("1.12.1", "2.0.0", "2.5.0-cluster"):
             self.assertEqual(sx.trim_backpressure(json.loads(recorded(version, "flow/process-groups/root/status?recursive=true")[1])),
-                             {"connections": 0, "full": 0, "maxPercent": 0, "top": []}, "the lab's flows are empty")
+                             {"connections": 0, "full": 0, "maxPercent": 0, "top": [], "notRunning": []}, "the lab's flows are empty")
 
     def test_back_pressure_of_nested_groups(self):
         conn = lambda i, count, size: {"connectionStatusSnapshot": {"id": i, "name": f"c{i}", "sourceName": "a", "destinationName": "b", "percentUseCount": count, "percentUseBytes": size, "flowFilesQueued": count * 100, "bytesQueued": 1, "queued": "text"}}
@@ -873,7 +873,18 @@ class RestTrimTest(unittest.TestCase):
         self.assertEqual([c["id"] for c in sx.trim_backpressure(tree, top=2)["top"]], [2, 4], "only the fullest N")
         self.assertEqual(sx.trim_backpressure(tree, top=1)["full"], 2, "the count covers every connection, not only the N")
         self.assertNotIn("queued", bp["top"][0], "only numbers and names")
-        self.assertEqual(sx.trim_backpressure({}), {"connections": 0, "full": 0, "maxPercent": 0, "top": []})
+        self.assertEqual(sx.trim_backpressure({}), {"connections": 0, "full": 0, "maxPercent": 0, "top": [], "notRunning": []})
+
+    def test_back_pressure_names_ids_and_processors_not_running(self):
+        # S37 step 6 (T11): a stuck trace looks its connection up by ids and asks whether the component runs.
+        proc = lambda i, state: {"processorStatusSnapshot": {"id": i, "name": i, "runStatus": state, "flowFilesIn": 3}}
+        tree = {"processGroupStatus": {"aggregateSnapshot": {"name": "root", "connectionStatusSnapshots": [
+            {"connectionStatusSnapshot": {"id": "c1", "sourceId": "p-a", "destinationId": "p-b", "percentUseCount": 40, "flowFilesQueued": 4000}}],
+            "processorStatusSnapshots": [proc("p-a", "Running"), proc("p-b", "Stopped")],
+            "processGroupStatusSnapshots": [{"processGroupStatusSnapshot": {"name": "g", "processorStatusSnapshots": [proc("p-c", "Invalid")]}}]}}}
+        bp = sx.trim_backpressure(tree)
+        self.assertEqual((bp["top"][0]["sourceId"], bp["top"][0]["destinationId"]), ("p-a", "p-b"))
+        self.assertEqual(bp["notRunning"], [{"id": "p-b", "name": "p-b", "runStatus": "Stopped"}, {"id": "p-c", "name": "p-c", "runStatus": "Invalid"}])
 
     def test_keytool_listings_of_both_store_types(self):
         jks = sx.parse_keytool((NIFI_DATA / "1.12.1-keytool-truststore-jks.txt").read_text())

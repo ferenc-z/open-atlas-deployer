@@ -47,7 +47,7 @@ export function TraceModelEditor({ s }: { s: ServiceStatus }) {
         <h3>Evidence sources</h3>
         <label className="field">In order of preference
           <input value={model.sources.join(", ")} onChange={(e) => edit((m) => { m.sources = e.target.value.split(",").map((x) => x.trim()).filter(Boolean); })} placeholder="e.g. e2e_trace, provenance" />
-          <span className="muted small">Asked in this order; when one has nothing for a step the next one is asked. Available in this Deployer: {view.sources.length ? view.sources.join(", ") : "none yet"}.</span>
+          <span className="muted small">Asked in this order; when one has nothing for a step the next one is asked. Leave it empty to let the Deployer choose: sources searchable by business keys first, provenance filling the gaps. Available in this Deployer: {view.sources.length ? view.sources.join(", ") : "none yet"}.</span>
         </label>
       </section>
       {model.businesses.map((b, i) => (

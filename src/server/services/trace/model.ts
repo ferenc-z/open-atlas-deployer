@@ -39,7 +39,8 @@ export interface Step {
   id: string;
   name: string;
   position: Position;
-  /** How long data may stay in this step (or wait before the next) before it counts as stuck; default 900 s. */
+  /** How long data may stay in this step (or wait before the next) before it counts as stuck; without it a source's
+   *  allowance (e2e_trace: the step's P95) or the default 600 s (T10). */
   maxSeconds?: number;
 }
 
@@ -47,13 +48,15 @@ export interface Business { id: string; name: string; match: Condition[]; steps:
 
 export interface TraceModel {
   service: string;
-  /** Evidence sources this service is traced with, in order of preference (adapter ids, e.g. "e2e_trace", "provenance"). */
+  /** Evidence sources this service is traced with, in order of preference (adapter ids, e.g. "e2e_trace", "provenance").
+   *  Optional (T9): left out or empty, the engine picks by the adapters' capabilities for the service — those asked by
+   *  named business keys first, provenance filling the gaps. */
   sources: string[];
   businesses: Business[];
 }
 export interface StoredTraceModel { model: TraceModel; revision: number; savedAt: string; savedBy: string }
 
-export const DEFAULT_MAX_SECONDS = 900;
+export const DEFAULT_MAX_SECONDS = 600;
 const ID = /^[A-Za-z0-9_.-]{1,64}$/;
 const NAME_MAX = 200;
 const LIMITS = { businesses: 50, steps: 50, endpoints: 20, conditions: 20 };

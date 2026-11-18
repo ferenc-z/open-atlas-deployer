@@ -688,6 +688,7 @@ COLLECT_DEFAULT, COLLECT_MIN, COLLECT_MAX = 60, 30, 300
 # Back pressure (owner 2026-11-07): read less often than the rest and sent only as a summary.
 BACKPRESSURE_DEFAULT, BACKPRESSURE_MAX = 300, 3600
 BACKPRESSURE_TOP, BACKPRESSURE_TOP_MAX = 5, 50
+BACKPRESSURE_STOPPED_MAX = 50
 # Per NiFi and round, and per REST request: a NiFi that hangs costs its own sample at most this, never the others'.
 NIFI_BUDGET = 10.0
 REQUEST_TIMEOUT = 5.0
@@ -959,8 +960,10 @@ def trim_bulletins(d):
 def trim_backpressure(d, top=BACKPRESSURE_TOP):
     """Back pressure from the root process group's recursive status (§15.4 step 2), only as a summary (owner
     2026-11-07): how many connections there are, how many are at their threshold (object count or size at 100 %), the
-    fullest percentage and the fullest `top` queues that hold anything; never the whole list."""
-    conns = []
+    fullest percentage and the fullest `top` queues that hold anything; never the whole list. S37 step 6 (T11): the
+    queues name their source and destination ids, and the processors that are not running (at most
+    BACKPRESSURE_STOPPED_MAX) are listed, so a stuck trace can say whether its component runs."""
+    conns, stopped = [], []
 
     def walk(snap, group):
         if not isinstance(snap, dict):
@@ -968,7 +971,12 @@ def trim_backpressure(d, top=BACKPRESSURE_TOP):
         for c in snap.get("connectionStatusSnapshots") or []:
             c = (c or {}).get("connectionStatusSnapshot") or {}
             conns.append({"id": c.get("id"), "name": c.get("name"), "group": group, "sourceName": c.get("sourceName"), "destinationName": c.get("destinationName"),
+                          **{k: c[k] for k in ("sourceId", "destinationId") if isinstance(c.get(k), str)},
                           **_num(c, "percentUseCount", "percentUseBytes", "flowFilesQueued", "bytesQueued")})
+        for p in snap.get("processorStatusSnapshots") or []:
+            p = (p or {}).get("processorStatusSnapshot") or {}
+            if p.get("runStatus") not in (None, "Running") and len(stopped) < BACKPRESSURE_STOPPED_MAX:
+                stopped.append({"id": p.get("id"), "name": p.get("name"), "runStatus": p.get("runStatus")})
         for g in snap.get("processGroupStatusSnapshots") or []:
             g = (g or {}).get("processGroupStatusSnapshot") or {}
             walk(g, g.get("name"))
@@ -978,7 +986,7 @@ def trim_backpressure(d, top=BACKPRESSURE_TOP):
     fill = lambda c: max(c.get("percentUseCount") or 0, c.get("percentUseBytes") or 0)
     conns.sort(key=fill, reverse=True)
     return {"connections": len(conns), "full": sum(1 for c in conns if fill(c) >= 100), "maxPercent": fill(conns[0]) if conns else 0,
-            "top": [c for c in conns[:top] if fill(c) > 0]}
+            "top": [c for c in conns[:top] if fill(c) > 0], "notRunning": stopped}
 
 
 TRIM = {"about": trim_about, "diagnostics": trim_diagnostics, "status": trim_status, "cluster": trim_cluster, "bulletins": trim_bulletins}
