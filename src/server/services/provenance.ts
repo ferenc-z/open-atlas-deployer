@@ -26,12 +26,12 @@ const NODE = /^[A-Za-z0-9_-]{1,128}$/;
 
 /** Which NiFi versions the trace was tried on (§15.5): 1.12.1, 2.0.0 and a 2.5.0 cluster; S37 step 6 (S33) opened 1.9
  *  (1.x environments are traced by provenance alone): 1.9 and later of 1.x, and 2.x. */
-export const PROVENANCE_TRIED = "1.12.1, 2.0.0 and a 2.5.0 cluster";
+export const PROVENANCE_TRIED = "1.9.2, 1.12.1, 2.0.0 and a 2.5.0 cluster";
 export function provenanceSupport(version: string): { supported: boolean; note: string } {
   const m = /^(\d+)\.(\d+)/.exec(version ?? "");
   const [major, minor] = m ? [Number(m[1]), Number(m[2])] : [0, 0];
   if ((major === 1 && minor >= 9) || major === 2)
-    return { supported: true, note: `NiFi ${version}: tried on ${PROVENANCE_TRIED}${major === 1 && minor < 12 ? "; 1.9 to 1.11 are allowed for tracing 1.x environments (S33)" : ""}.` };
+    return { supported: true, note: `NiFi ${version}: tried on ${PROVENANCE_TRIED}${major === 1 && minor < 12 ? "; 1.9 and later are allowed for tracing 1.x environments (S33)" : ""}.` };
   return { supported: false, note: `This version is not supported: the FlowFile trace was tried on NiFi ${PROVENANCE_TRIED} only (NiFi ${version || "of unknown version"}).` };
 }
 

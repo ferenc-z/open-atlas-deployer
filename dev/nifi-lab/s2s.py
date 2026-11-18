@@ -11,6 +11,7 @@ s2s.py ids        the component ids (also written to s2s.ids.json).
 s2s.py port start|stop   the receiving port on c250.
 s2s.py hide|show  a component-level "view provenance" policy on c250's port that holds nobody (hide) or its
                   removal (show): the monitor then cannot see the port's events, as if they were gone.
+s2s.py n192-setup | n192-generate   the same kind of small flow on NiFi 1.9.2 (n192), no S2S, for the 1.9 check.
 Runs as the operator (initial admin) certificate.
 """
 import json
@@ -24,7 +25,7 @@ import urllib.request
 
 LAB = os.path.expanduser("~/nifi-lab")
 PEM = f"{LAB}/certs/pem"
-N112, C250 = "https://localhost:18443/nifi-api", "https://localhost:18445/nifi-api"
+N112, C250, N192 = "https://localhost:18443/nifi-api", "https://localhost:18445/nifi-api", "https://localhost:18447/nifi-api"
 N112_DN = "CN=n112.lab, OU=NIFI"
 IDS = f"{LAB}/s2s.ids.json"
 
@@ -154,5 +155,21 @@ if __name__ == "__main__":
         run(C250, "input-ports", ids()["c250Port"], "RUNNING" if sys.argv[2] == "start" else "STOPPED")
     elif cmd in ("hide", "show"):
         hide(cmd == "hide")
+    elif cmd == "n192-setup":
+        # NiFi 1.9.2 (n192): GenerateFlowFile "n192 gen" -> UpdateAttribute "n192 rename" (filename n192-<time>.csv, success auto-terminated).
+        f = flow(N192)
+        root = f["id"]
+        got = {"n192Gen": proc(N192, root, "n192 gen", "org.apache.nifi.processors.standard.GenerateFlowFile", {"File Size": "100B", "Data Format": "Text"}, period="300 sec"),
+               "n192Rename": proc(N192, root, "n192 rename", "org.apache.nifi.processors.attributes.UpdateAttribute", {"filename": "n192-${now():format('yyyyMMdd-HHmmss')}.csv"}, auto=["success"])}
+        connect(N192, root, {"id": got["n192Gen"], "groupId": root, "type": "PROCESSOR"}, {"id": got["n192Rename"], "groupId": root, "type": "PROCESSOR"}, ["success"])
+        run(N192, "processors", got["n192Rename"], "RUNNING")
+        json.dump({**ids(), **got}, open(IDS, "w"), indent=1)
+        print(json.dumps(got, indent=1))
+    elif cmd == "n192-generate":
+        gid = ids()["n192Gen"]
+        run(N192, "processors", gid, "RUNNING")
+        time.sleep(2)
+        run(N192, "processors", gid, "STOPPED")
+        print("one FlowFile generated on n192 at", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
     else:
         print(json.dumps(ids(), indent=1))
