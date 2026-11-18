@@ -5,6 +5,9 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
 
 ## Unreleased
 
+- S37 step 3: a service page opens on a new Status tab: verdict, the to-do list with next-step buttons, the node strip
+  (Start, Restart, Stop with a plan first), preventive risks and the newest changes and restarts, all from
+  `GET /api/services/:id/health`. The Business model tab is read-only for non-admins (`canEdit` in the model response).
 - S37 step 2: `GET /api/services/:id/health` and the MCP tool `get_service_health` give a service's to-do list (rule,
   severity CRIT/WARN/INFO, since, member, evidence, template cause, actions), a verdict and one row per node. Two new
   findings-only rules: collection incomplete (REST reading not ok, or a member not found in NiFi's node list) and

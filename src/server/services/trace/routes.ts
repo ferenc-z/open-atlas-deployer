@@ -66,7 +66,7 @@ export function mountTrace(api: Hono, d: TraceDeps) {
     const mine = (r: { service: string }) => r.service === id;
     return c.json({
       model: stored ? { ...emptyModel(id), ...(stored.body as object), service: id } : emptyModel(id),
-      revision: stored?.revision ?? 0, savedAt: stored?.savedAt ?? null, savedBy: stored?.savedBy ?? null,
+      revision: stored?.revision ?? 0, savedAt: stored?.savedAt ?? null, savedBy: stored?.savedBy ?? null, canEdit: p.permissions.includes("admin"),
       health: { dangling: dangling(models).filter(mine), links: links(models).filter((l) => l.from.service === id || l.to.service === id) },
       sources: [...d.adapters.keys()],
     });

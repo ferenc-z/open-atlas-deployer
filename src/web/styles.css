@@ -507,3 +507,7 @@ button.change-now.state-paused { color: var(--warn); border-color: var(--warn); 
   .svc-summary-main { flex: 1 1 100%; }
   .svc-summary-actions { flex-wrap: wrap; }
 }
+
+/* S37 step 3 (T15): the business model for someone who is not an admin: shown, not editable, and no edit buttons. */
+fieldset.model-fields { border: 0; padding: 0; margin: 0; min-width: 0; display: grid; gap: 1rem; }
+fieldset.model-fields:disabled button { display: none; }

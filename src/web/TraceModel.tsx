@@ -41,9 +41,10 @@ export function TraceModelEditor({ s }: { s: ServiceStatus }) {
       <p className="muted small">
         How business data goes through this service, for the data trace. Define only this service's own part: each business has steps bound to a place in NiFi,
         entries where its data comes in and exits where it leaves. An exit is joined to another service's entry when both name the same channel (Site-to-Site:
-        the receiving service and its input port; MQ: exchange and routing key), so no model refers to another. Saving needs an admin.
+        the receiving service and its input port; MQ: exchange and routing key), so no model refers to another.
       </p>
       <Health view={view} />
+      <fieldset className="model-fields" disabled={!view.canEdit}>
       <section className="card">
         <h3>Evidence sources</h3>
         <label className="field">In order of preference
@@ -55,10 +56,13 @@ export function TraceModelEditor({ s }: { s: ServiceStatus }) {
       {model.businesses.map((b, i) => (
         <BusinessCard key={i} s={s} b={b} onChange={(fn) => edit((m) => fn(m.businesses[i]!))} onRemove={() => edit((m) => { m.businesses.splice(i, 1); })} />
       ))}
+      </fieldset>
       <div className="row wrap">
-        <button type="button" onClick={() => edit((m) => { m.businesses.push(newBusiness(m.businesses.length + 1)); })}>Add business</button>
-        <button type="button" className="primary" disabled={busy || !dirty} onClick={() => void save()}>{busy ? "Saving…" : "Save model"}</button>
-        <button type="button" disabled={busy || !dirty} onClick={() => { setModel(structuredClone(view.model)); setError(undefined); }}>Discard changes</button>
+        {view.canEdit ? <>
+          <button type="button" onClick={() => edit((m) => { m.businesses.push(newBusiness(m.businesses.length + 1)); })}>Add business</button>
+          <button type="button" className="primary" disabled={busy || !dirty} onClick={() => void save()}>{busy ? "Saving…" : "Save model"}</button>
+          <button type="button" disabled={busy || !dirty} onClick={() => { setModel(structuredClone(view.model)); setError(undefined); }}>Discard changes</button>
+        </> : <span className="muted small">Only Workbench admins change the business model.</span>}
         <span className="muted small">Revision {view.revision}{view.savedAt ? `, saved ${when(view.savedAt)}${view.savedBy ? ` by ${view.savedBy}` : ""}` : ""}{dirty ? " · unsaved changes" : ""}</span>
         {saved && <span className="ok small">{saved}</span>}
       </div>

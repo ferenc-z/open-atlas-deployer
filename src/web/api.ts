@@ -381,7 +381,7 @@ export const bulletinsBetween = (id: string, from: string, to: string, limit = 2
 export type { TraceModel, Business, Step, Endpoint, Condition, Channel, CueMapping } from "../server/services/trace/model.ts";
 export type { Dangling, Link } from "../server/services/trace/channels.ts";
 export type TraceModelHealth = { dangling: import("../server/services/trace/channels.ts").Dangling[]; links: import("../server/services/trace/channels.ts").Link[] };
-export type TraceModelView = { model: import("../server/services/trace/model.ts").TraceModel; revision: number; savedAt: string | null; savedBy: string | null; health: TraceModelHealth; sources: string[] };
+export type TraceModelView = { model: import("../server/services/trace/model.ts").TraceModel; revision: number; savedAt: string | null; savedBy: string | null; canEdit: boolean; health: TraceModelHealth; sources: string[] };
 export type FlowComponent = { kind: "process-group" | "input-port" | "output-port" | "processor"; id: string; name: string | null; groupId: string | null; groupName: string | null };
 export const traceModel = (id: string) => call<TraceModelView>("GET", provPath(id, "/trace-model"));
 export const saveTraceModel = (id: string, model: unknown, revision: number) => call<{ revision: number; health: TraceModelHealth }>("PUT", provPath(id, "/trace-model"), { model, revision });
@@ -394,3 +394,7 @@ export const saveE2eSource = (id: string, graph: string, token?: string) => call
 export const removeE2eSource = (id: string) => call<TraceSourcesView>("DELETE", provPath(id, "/trace-sources/e2e_trace"));
 export const checkE2eSource = (id: string) => call<E2eCheck>("POST", provPath(id, "/trace-sources/e2e_trace/check"), {});
 export const importE2eModel = (id: string) => call<{ model: import("../server/services/trace/model.ts").TraceModel; revision: number; imported: string[]; replaced: string[]; notes: string[] }>("POST", provPath(id, "/trace-model/import-e2e"), {});
+
+// S37 step 3: the Status tab renders this as it is (the to-do engine, rules.ts health()).
+export type { ServiceHealth, Todo, TodoAction } from "../server/services/rules.ts";
+export const serviceHealth = (id: string) => call<import("../server/services/rules.ts").ServiceHealth>("GET", `services/${encodeURIComponent(id)}/health`);
