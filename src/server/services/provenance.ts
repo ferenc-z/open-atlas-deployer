@@ -117,10 +117,11 @@ export class ServiceProvenance {
   }
 
   /** One nifi-provenance job, on the first usable member that answers (the next one when a member fails). */
-  private async ask(id: string, request: Record<string, unknown>): Promise<{ body: Any; member: LogMember }> {
+  private async ask(id: string, request: Record<string, unknown>, anyVersion = false): Promise<{ body: Any; member: LogMember }> {
     const s = this.service(id);
     const support = provenanceSupport(s.version);
-    if (!support.supported) throw new LogsError(409, "provenance/unsupported", support.note);
+    // T14: the component search reads only the flow's structure (flow/search-results, there on every version).
+    if (!support.supported && !anyVersion) throw new LogsError(409, "provenance/unsupported", support.note);
     const usable = s.members.filter((m) => m.executor.online && m.canProvenance);
     if (!usable.length) {
       const m = s.members[0];
@@ -207,9 +208,10 @@ export class ServiceProvenance {
     return body;
   }
 
-  /** S37 step 5: components found by name or id (NiFi's flow search), for a trace model step's position. */
+  /** S37 step 5: components found by name or id (NiFi's flow search), for a trace model step's position; not held to
+   *  provenanceSupport() (T14: it reads the flow's structure only). */
   async flowSearch(id: string, q: string): Promise<Any> {
-    const { body, member } = await this.ask(id, { op: "flow-search", q });
+    const { body, member } = await this.ask(id, { op: "flow-search", q }, true);
     return { ...body, via: { member: member.key, label: member.label } };
   }
 }

@@ -105,6 +105,12 @@ test("a standalone's events are its own; two queries per service at a time; jobs
   const unsupported = lab(KINDS, "1.11.4");
   assert.equal(unsupported.prov.info("c250").supported, false);
   await assert.rejects(unsupported.prov.search("c250", { uuid: UUID, maxResults: 100, ...WINDOW }), /not supported/);
+  // T14: the component search reads the flow's structure only; a version the trace was not tried on still has it.
+  const found = unsupported.prov.flowSearch("c250", "Fetch");
+  const job = await unsupported.claim();
+  assert.equal(job.op, "flow-search");
+  unsupported.answer(job.id, { op: "flow-search", q: "Fetch", results: [], truncated: false });
+  assert.deepEqual((await found).results, []);
   assert.throws(() => x.prov.info("nope"), /No standalone instance or cluster/);
   assert.throws(() => old.handoff.submit("nifi-provenance-x", { kind: "nifi-provenance", member: "local:/lab/n112" }, "local", "service"), /nifi-provenance@1/);
 });
