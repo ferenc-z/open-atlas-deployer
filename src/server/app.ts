@@ -47,6 +47,8 @@ import { acceptSamples, watchList } from "./services/watch.ts";
 import { FIELDS, ingest, metrics, RANGES, trend, type Field, type Range } from "./services/metrics.ts";
 import { DOWNLOAD_MAX, LogsError, parseSearch, ServiceLogs } from "./services/logs.ts";
 import { parseLineage, parseProvenance, ServiceProvenance } from "./services/provenance.ts";
+import type { EvidenceAdapter } from "./services/trace/events.ts";
+import { mountTrace } from "./services/trace/routes.ts";
 import { checkNginx, graphServices, NifiOpsGraph } from "./services/graph-publish.ts";
 import { checkNginxUrl } from "./services/graph.ts";
 import { streamSSE } from "hono/streaming";
@@ -97,6 +99,8 @@ export interface Dependencies {
   logs?: ServiceLogs;
   /** Phase 2 step 7 (S28): provenance through the service executors (tests pass their own timings). */
   provenance?: ServiceProvenance;
+  /** S37 step 5: the business data trace's evidence source adapters by id (steps 6 and 7 add provenance and e2e_trace). */
+  traceAdapters?: Map<string, EvidenceAdapter>;
   /** Phase 2 step 6: the nifi-ops Studio graph, published after takeovers and nginx address changes. */
   graph?: NifiOpsGraph;
   /** How the Deployer checks an nginx address (tests pass a fake). */
@@ -1264,6 +1268,8 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     if (!/^\d{1,15}$/.test(c.req.param("eventId"))) return reject(c, 400, "provenance/event", "The event id is a number.");
     return c.json(await provenance.event(c.req.param("id"), eventId, c.req.query("node") || undefined));
   });
+  // S37 step 5 (§4.2.0): the business data trace — a service's model, position search, trace_business_data.
+  mountTrace(api, { store, provenance, authenticate, reject, registered: registeredService, actorOf, adapters: deps.traceAdapters ?? new Map() });
   // Phase 2 step 4 (§9.3, §15.3): a service's logs, read through its members' service executors (deploy-viewer, §13):
   // the members with their log directories and the WARN/ERROR summary; a member's files; a search of all (or some)
   // members in parallel, merged by time; a member's files as a tar.gz; following one file (SSE, shared per file).

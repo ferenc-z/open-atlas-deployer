@@ -181,6 +181,8 @@ CREATE INDEX IF NOT EXISTS service_log_counts_at ON service_log_counts (service,
 CREATE TABLE IF NOT EXISTS service_graph_runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, by TEXT NOT NULL, reason TEXT NOT NULL, graph TEXT, services TEXT NOT NULL,
   state TEXT NOT NULL, message TEXT NOT NULL, detail TEXT);
+CREATE TABLE IF NOT EXISTS service_trace_models (
+  service TEXT PRIMARY KEY, revision INTEGER NOT NULL, body TEXT NOT NULL, saved_at TEXT NOT NULL, saved_by TEXT NOT NULL);
 `;
 
 /** queued: waiting for the host's executor to claim it; the rest are the executor's states. */
@@ -1715,6 +1717,29 @@ export class Store {
       this.insertAudit(actor, "service.thresholds", service, { from: was, to: overrides });
       const text = Object.keys(overrides).length ? `Alert thresholds set: ${Object.entries(overrides).map(([k, v]) => `${k} ${v}`).join(", ")}` : "Alert thresholds back to the profile's defaults";
       this.insertServiceEvent({ service, member: null, at: this.stamp(), kind: "thresholds", detail: { text, by: actor.id } });
+    });
+  }
+
+  /** S37 step 5 (§4.2.0 T1): a service's business process model (services/trace/model.ts), one row per service. */
+  traceModel(service: string): { body: unknown; revision: number; savedAt: string; savedBy: string } | null {
+    const r = this.db.prepare("SELECT * FROM service_trace_models WHERE service = ?").get(service) as Row | undefined;
+    return r ? { body: parse(r.body), revision: r.revision, savedAt: r.saved_at, savedBy: r.saved_by } : null;
+  }
+
+  traceModels(): { service: string; body: unknown }[] {
+    return (this.db.prepare("SELECT service, body FROM service_trace_models ORDER BY service").all() as Row[]).map((r) => ({ service: r.service, body: parse(r.body) }));
+  }
+
+  /** Saves a model over the revision the editor started from (0: none yet); another save in between is refused. */
+  saveTraceModel(service: string, body: unknown, base: number, actor: Actor): number {
+    return this.inTransaction(() => {
+      const was = this.db.prepare("SELECT revision FROM service_trace_models WHERE service = ?").get(service) as Row | undefined;
+      if ((was?.revision ?? 0) !== base) throw new StoreError("trace-model/stale", `The model was saved by someone else in the meantime (revision ${was?.revision}); reload it.`);
+      const revision = base + 1;
+      this.db.prepare("INSERT INTO service_trace_models (service, revision, body, saved_at, saved_by) VALUES (?, ?, ?, ?, ?) ON CONFLICT(service) DO UPDATE SET revision = excluded.revision, body = excluded.body, saved_at = excluded.saved_at, saved_by = excluded.saved_by")
+        .run(service, revision, JSON.stringify(body), this.stamp(), actor.id);
+      this.insertAudit(actor, "service.trace-model", service, { revision });
+      return revision;
     });
   }
 }

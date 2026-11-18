@@ -15,6 +15,11 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   `nifi.selfNodeId`; the Deployer reads the node by that id (the Metrics tab, live states, a rolling restart's
   "node connected" check). With an older executor it matches port and address as before, now case-insensitively,
   and a point it cannot match carries `_unmatched`.
+- S37 step 5 (S38): the business data trace's core. A service's page has a "Business model" tab: businesses with
+  match rules, ordered steps bound to a NiFi component (found by name through the service executor; executor 0.9.4
+  adds the read-only `flow-search` op), entry and exit endpoints by channel (S2S, MQ, external) and on entries which
+  field a clue is searched by. Exits join other services' entries with the same channel; unmatched ones show as
+  dangling. `POST /api/services/:id/trace-business-data` runs the trace engine; no evidence source is connected yet.
 
 ### After upgrading
 

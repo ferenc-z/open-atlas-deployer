@@ -376,3 +376,13 @@ export const searchProvenance = (id: string, q: ProvenanceSearchAsk) => call<Pro
 export const lineage = (id: string, q: { uuid?: string; eventId?: number; direction?: string; node?: string }) => call<LineageResult>("POST", provPath(id, "/lineage"), q);
 export const provenanceEvent = (id: string, eventId: number, node?: string) => call<{ event: ProvEvent; member: string | null }>("GET", provPath(id, `/provenance/events/${eventId}${node ? `?node=${encodeURIComponent(node)}` : ""}`));
 export const bulletinsBetween = (id: string, from: string, to: string, limit = 200) => call<{ bulletins: ServiceBulletin[] }>("GET", `services/${encodeURIComponent(id)}/bulletins?limit=${limit}&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`);
+
+// S37 step 5 (§4.2.0): a service's business process model for the data trace.
+export type { TraceModel, Business, Step, Endpoint, Condition, Channel, CueMapping } from "../server/services/trace/model.ts";
+export type { Dangling, Link } from "../server/services/trace/channels.ts";
+export type TraceModelHealth = { dangling: import("../server/services/trace/channels.ts").Dangling[]; links: import("../server/services/trace/channels.ts").Link[] };
+export type TraceModelView = { model: import("../server/services/trace/model.ts").TraceModel; revision: number; savedAt: string | null; savedBy: string | null; health: TraceModelHealth; sources: string[] };
+export type FlowComponent = { kind: "process-group" | "input-port" | "output-port" | "processor"; id: string; name: string | null; groupId: string | null; groupName: string | null };
+export const traceModel = (id: string) => call<TraceModelView>("GET", provPath(id, "/trace-model"));
+export const saveTraceModel = (id: string, model: unknown, revision: number) => call<{ revision: number; health: TraceModelHealth }>("PUT", provPath(id, "/trace-model"), { model, revision });
+export const searchPositions = (id: string, q: string) => call<{ results: FlowComponent[]; truncated: boolean }>("GET", provPath(id, `/trace-model/positions?q=${encodeURIComponent(q)}`));
