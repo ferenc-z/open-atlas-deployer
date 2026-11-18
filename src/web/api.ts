@@ -405,3 +405,9 @@ export const investigateService = (id: string, q: { member?: string | undefined;
   const qs = new URLSearchParams(Object.entries(q).filter((e): e is [string, string] => typeof e[1] === "string" && e[1] !== ""));
   return call<import("../server/services/investigate.ts").Investigation>("GET", `services/${encodeURIComponent(id)}/investigate?${qs}`);
 };
+// S37 step 8: the Data trace tab (the engine's answer as it is) and the sentence-to-conditions suggestion (Q6).
+export type { TraceAnswer, TraceResult, Segment, StepResult, Verdict, VerdictAction, HandoverResult, StuckContext } from "../server/services/trace/engine.ts";
+export type { NlConditions } from "../server/services/trace/nl.ts";
+export type TraceInput = { business?: string; fileName?: string; emailFrom?: string; emailSubject?: string; from?: string; to?: string };
+export const traceBusinessData = (id: string, q: TraceInput) => call<import("../server/services/trace/engine.ts").TraceAnswer>("POST", provPath(id, "/trace-business-data"), q);
+export const traceParse = (id: string, text: string) => call<{ conditions: import("../server/services/trace/nl.ts").NlConditions; ms: number } | { fallback: string; ms: number }>("POST", provPath(id, "/trace-parse"), { text, utcOffsetMinutes: -new Date().getTimezoneOffset() });

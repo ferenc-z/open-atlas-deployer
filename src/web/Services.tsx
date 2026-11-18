@@ -36,13 +36,20 @@ const where = (m: { host: string; ports: { https?: number | null; http?: number 
 export function ServicesPage({ onTakeover, isAdmin, initialOpen, initialDraft }: { onTakeover: () => void; isAdmin: boolean; initialOpen?: string; initialDraft?: string }) {
   const [list, setList] = useState<{ standalones: RegisteredService[]; clusters: RegisteredService[] } | undefined>();
   const [open, setOpen] = useState<string | undefined>(initialOpen);
+  const [openTab, setOpenTab] = useState<string | undefined>();
   usePageFocus("service", open);
+  // S37 step 8: the Data trace sends the person to another service's tab (its Business model, its Logs).
+  useEffect(() => {
+    const on = (e: Event) => { const d = (e as CustomEvent<{ id: string; tab: string }>).detail; if (d.id !== open) { setOpenTab(d.tab); setOpen(d.id); } };
+    window.addEventListener("oa:open-service", on);
+    return () => window.removeEventListener("oa:open-service", on);
+  }, [open]);
   const [layout, setLayoutState] = useState<Layout>(savedLayout);
   const [error, setError] = useState("");
   const refresh = useCallback(() => { api.services().then(setList, (e: Error) => setError(e.message)); }, []);
   useEffect(() => { refresh(); const t = setInterval(refresh, 15_000); return () => clearInterval(t); }, [refresh]);
   const setLayout = (l: Layout) => { setLayoutState(l); try { localStorage.setItem(LAYOUT_KEY, l); } catch { /* per-viewer convenience only */ } };
-  if (open) return <ServiceDetail key={open} id={open} isAdmin={isAdmin} {...(initialDraft && open === initialOpen ? { initialDraft } : {})} onBack={() => { setOpen(undefined); refresh(); }} />;
+  if (open) return <ServiceDetail key={open} id={open} isAdmin={isAdmin} {...(initialDraft && open === initialOpen ? { initialDraft } : {})} {...(openTab ? { initialTab: openTab } : {})} onBack={() => { setOpen(undefined); refresh(); }} />;
   if (!list) return error ? <p className="error">{error}</p> : <p className="muted">Loading…</p>;
   const all = [...list.clusters, ...list.standalones];
   const envs = [...ENVIRONMENTS, ...new Set(all.map((s) => s.environment.toUpperCase()).filter((e) => !ENVIRONMENTS.includes(e)))];

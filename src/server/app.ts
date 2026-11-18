@@ -113,6 +113,8 @@ export interface Dependencies {
   nginxFetcher?: typeof fetch;
   /** S37 step 7: the e2e_trace evidence source (tests pass one with a fake data plane). */
   e2eTrace?: E2eTraceSource;
+  /** S37 step 8 (Q6): the sentence-to-conditions converter (a one-shot OMA session of the Deploy Assistant). */
+  traceNl?: import("./services/trace/nl.ts").NlConverter;
 }
 
 const reject = (c: Context, status: 400 | 401 | 403 | 404 | 409 | 429 | 503, code: string, message: string, details: string[] = []) =>
@@ -1287,7 +1289,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
   if (!deps.traceAdapters.has(E2E_ID)) deps.traceAdapters.set(E2E_ID, e2eTrace.adapter);
   mountE2eTrace(api, { store, source: e2eTrace, authenticate, reject, registered: registeredService, actorOf });
   // S37 step 5 (§4.2.0): the business data trace — a service's model, position search, trace_business_data.
-  mountTrace(api, { store, provenance, authenticate, reject, registered: registeredService, actorOf, adapters: deps.traceAdapters ?? new Map<string, EvidenceAdapter>([[PROVENANCE_SOURCE, new ProvenanceAdapter(provenance)]]) });
+  mountTrace(api, { store, provenance, authenticate, reject, registered: registeredService, actorOf, adapters: deps.traceAdapters ?? new Map<string, EvidenceAdapter>([[PROVENANCE_SOURCE, new ProvenanceAdapter(provenance)]]), ...(deps.traceNl ? { nl: deps.traceNl } : {}) });
   // Phase 2 step 4 (§9.3, §15.3): a service's logs, read through its members' service executors (deploy-viewer, §13):
   // the members with their log directories and the WARN/ERROR summary; a member's files; a search of all (or some)
   // members in parallel, merged by time; a member's files as a tar.gz; following one file (SSE, shared per file).

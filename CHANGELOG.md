@@ -51,6 +51,14 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   from a to-do (the Status tab's "Investigate" now opens it), an alert, or a node and a window. Same body from
   `GET /api/services/:id/investigate` and the MCP tool `investigate_service` (compact, redacted; not in the Deploy
   Assistant's whitelist yet, step 9). Bulletins now keep their component and process group ids.
+- S37 step 8: a service's Data trace tab for "my data did not arrive". Clues (business, file name, email sender and
+  subject, a time range, the last 24 hours by default) give the end-to-end steps across services, each with state, node,
+  time, evidence source, "inferred" where it is a guess and the allowed time; the step where the data stopped is
+  highlighted, the verdict's message, its queue / back pressure / downstream context and its actions are buttons (edit
+  the other service's model, Open in NiFi), and evidence cards link into NiFi. A sentence in the box on top is read into
+  the conditions by a one-shot Deploy Assistant session (only the sentence, the business names and the time go out; no
+  answer in 5 seconds means the plain form). New read-only MCP tool `trace_business_data` (not on the Assistant's
+  allow-list until step 9).
 
 ### After upgrading
 
