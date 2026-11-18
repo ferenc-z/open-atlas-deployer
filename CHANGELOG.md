@@ -10,7 +10,6 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   findings-only rules: collection incomplete (REST reading not ok, or a member not found in NiFi's node list) and
   preventive risk (disk full in days, heap baseline rising, a certificate expiring within 90 days). The tool is not
   in the Deploy Assistant's whitelist yet (step 9).
-
 - D52: the Onboarding Assessor's `draft_*` tools answer with a receipt (`{ok, operation, target, changes}`) instead
   of the whole assessment, which made OMA fail with a context-too-large harness error. New read-only tool
   `get_draft` (draft, manifest, findings); `draft_env_key` takes `keys` to write several env keys in one call
