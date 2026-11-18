@@ -46,6 +46,7 @@ export const SETTINGS: SettingDef[] = [
   { key: "DEPLOYER_OMA_BUILDER_KEY_FILE", kind: "secret", group: "OMA", help: "The key for OMA's Builder MCP." },
   { key: "DEPLOYER_STUDIO_BUILDER_URL", kind: "url", group: "Studio", help: "Studio's Builder MCP, for deploying Studio graphs." },
   { key: "DEPLOYER_STUDIO_TOKEN_FILE", kind: "secret", group: "Studio", help: "Studio workspace token (oaw_v1., read and write)." },
+  { key: "DEPLOYER_STUDIO_DATA_URL", kind: "url", group: "Studio", help: "Studio's data plane MCP (…:9632/mcp), read with each service's graph token for the e2e_trace run records." },
   { key: "DEPLOYER_NIFI_OPS_GRAPH", kind: "text", group: "Studio", help: "The Studio graph the Deployer publishes its NiFi services to (name, or workspace/name).", default: "nifi-ops" },
   { key: "DEPLOYER_UAT_URL", kind: "url", group: "Promotion", help: "PROD only: UAT's Deployer as this one reaches it." },
   { key: "DEPLOYER_UAT_KEY_FILE", kind: "secret", group: "Promotion", help: "PROD only: the read-only key UAT's Deployer gave this one." },

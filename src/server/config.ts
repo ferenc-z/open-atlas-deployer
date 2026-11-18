@@ -43,6 +43,8 @@ export interface Config {
   /** Studio Builder MCP and the workspace token (oaw_v1., read + write) for studio-graph. */
   studioBuilderUrl?: string;
   studioTokenFile?: TokenSource;
+  /** S37 step 7 (T8): Studio's data plane MCP (…:9632/mcp), read with each service's graph token (e2e_trace). */
+  studioDataUrl?: string;
   /** Service ops §9.4: the nifi-ops graph's name in Studio (name or workspace/name); default nifi-ops. */
   nifiOpsGraph?: string;
   /** OMA Builder MCP and its key for oma-agent; OMA's API and key to archive older agents (optional). */
@@ -105,6 +107,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, tokens: Record<
     ...(env.DEPLOYER_WORKBENCH_API_KEY_FILE ? { workbenchApiKeyFile: resolve(env.DEPLOYER_WORKBENCH_API_KEY_FILE) } : {}),
     ...(env.DEPLOYER_STUDIO_BUILDER_URL ? { studioBuilderUrl: env.DEPLOYER_STUDIO_BUILDER_URL } : {}),
     ...(token("DEPLOYER_STUDIO_TOKEN_FILE") ? { studioTokenFile: token("DEPLOYER_STUDIO_TOKEN_FILE") } : {}),
+    ...(env.DEPLOYER_STUDIO_DATA_URL ? { studioDataUrl: env.DEPLOYER_STUDIO_DATA_URL } : {}),
     ...(env.DEPLOYER_NIFI_OPS_GRAPH ? { nifiOpsGraph: env.DEPLOYER_NIFI_OPS_GRAPH } : {}),
     ...(env.DEPLOYER_OMA_BUILDER_URL ? { omaBuilderUrl: env.DEPLOYER_OMA_BUILDER_URL } : {}),
     ...(token("DEPLOYER_OMA_BUILDER_KEY_FILE") ? { omaBuilderKeyFile: token("DEPLOYER_OMA_BUILDER_KEY_FILE") } : {}),

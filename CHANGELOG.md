@@ -34,6 +34,13 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   processor runs; a dangling exit names the model that lacks the entry; an external exit or entry says where NiFi's
   part ends. Service executor 0.9.4: provenance with attributes and the `oldest` op, back pressure names queue ends
   and processors not running.
+- S37 step 7: the e2e_trace evidence source. A service gets it when an admin sets a Studio Graph and a graph token
+  in the Business model tab (pasted, or issued through the Builder MCP; kept sealed); the Deployer reads the run
+  records through Studio's data plane (new setting `DEPLOYER_STUDIO_DATA_URL`) with the graph's saved queries only,
+  always with a time range. MQ hops follow `correlation_id`; a step missing from the run records while a later one
+  is there is reported as incomplete, so the next source is asked. A worker's historical P95 (7 days, 20 runs, at
+  least 60 s) is its allowed time. "Import businesses from e2e_trace" turns schedule_header/schedule_detail into
+  businesses in the editor. The graph's contract and saved queries: `src/server/services/trace/e2e-graph.ts`.
 
 ### After upgrading
 

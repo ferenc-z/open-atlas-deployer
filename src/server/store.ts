@@ -183,6 +183,8 @@ CREATE TABLE IF NOT EXISTS service_graph_runs (
   state TEXT NOT NULL, message TEXT NOT NULL, detail TEXT);
 CREATE TABLE IF NOT EXISTS service_trace_models (
   service TEXT PRIMARY KEY, revision INTEGER NOT NULL, body TEXT NOT NULL, saved_at TEXT NOT NULL, saved_by TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS service_trace_sources (
+  service TEXT NOT NULL, source TEXT NOT NULL, body TEXT NOT NULL, saved_at TEXT NOT NULL, saved_by TEXT NOT NULL, PRIMARY KEY (service, source));
 `;
 
 /** queued: waiting for the host's executor to claim it; the rest are the executor's states. */
@@ -1740,6 +1742,27 @@ export class Store {
         .run(service, revision, JSON.stringify(body), this.stamp(), actor.id);
       this.insertAudit(actor, "service.trace-model", service, { revision });
       return revision;
+    });
+  }
+
+  /** S37 step 7 (T8, T9): how a service reaches an evidence source (e2e_trace: the Graph and its sealed graph token). */
+  traceSource(service: string, source: string): { body: unknown; savedAt: string; savedBy: string } | null {
+    const r = this.db.prepare("SELECT * FROM service_trace_sources WHERE service = ? AND source = ?").get(service, source) as Row | undefined;
+    return r ? { body: parse(r.body), savedAt: r.saved_at, savedBy: r.saved_by } : null;
+  }
+
+  setTraceSource(service: string, source: string, body: unknown, actor: Actor) {
+    this.inTransaction(() => {
+      this.db.prepare("INSERT INTO service_trace_sources (service, source, body, saved_at, saved_by) VALUES (?, ?, ?, ?, ?) ON CONFLICT(service, source) DO UPDATE SET body = excluded.body, saved_at = excluded.saved_at, saved_by = excluded.saved_by")
+        .run(service, source, JSON.stringify(body), this.stamp(), actor.id);
+      this.insertAudit(actor, "service.trace-source", service, { source });
+    });
+  }
+
+  removeTraceSource(service: string, source: string, actor: Actor) {
+    this.inTransaction(() => {
+      this.db.prepare("DELETE FROM service_trace_sources WHERE service = ? AND source = ?").run(service, source);
+      this.insertAudit(actor, "service.trace-source.remove", service, { source });
     });
   }
 }

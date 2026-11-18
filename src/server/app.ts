@@ -52,6 +52,10 @@ import { mountTrace } from "./services/trace/routes.ts";
 import { PROVENANCE_SOURCE, ProvenanceAdapter } from "./services/trace/provenance-adapter.ts";
 import { checkNginx, graphServices, NifiOpsGraph } from "./services/graph-publish.ts";
 import { checkNginxUrl } from "./services/graph.ts";
+import { E2E_ID, E2eTraceSource } from "./services/trace/e2e-trace.ts";
+import { mountE2eTrace } from "./services/trace/e2e-routes.ts";
+import { McpClient } from "./mcp-client.ts";
+import { readToken } from "./versions.ts";
 import { streamSSE } from "hono/streaming";
 import { DEPLOYER_VERSION } from "./version.ts";
 import { validateEnvironment } from "./environment.ts";
@@ -106,6 +110,8 @@ export interface Dependencies {
   graph?: NifiOpsGraph;
   /** How the Deployer checks an nginx address (tests pass a fake). */
   nginxFetcher?: typeof fetch;
+  /** S37 step 7: the e2e_trace evidence source (tests pass one with a fake data plane). */
+  e2eTrace?: E2eTraceSource;
 }
 
 const reject = (c: Context, status: 400 | 401 | 403 | 404 | 409 | 429 | 503, code: string, message: string, details: string[] = []) =>
@@ -1269,6 +1275,15 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     if (!/^\d{1,15}$/.test(c.req.param("eventId"))) return reject(c, 400, "provenance/event", "The event id is a number.");
     return c.json(await provenance.event(c.req.param("id"), eventId, c.req.query("node") || undefined));
   });
+  // S37 step 7 (T8, T9): the e2e_trace evidence source through Studio's data plane, configured per service; registered
+  // with the trace adapters unless the caller brought its own of that id.
+  const e2eTrace = deps.e2eTrace ?? new E2eTraceSource({
+    store, ...(takeover?.box ? { box: takeover.box } : {}), ...(config.studioDataUrl ? { dataUrl: config.studioDataUrl } : {}),
+    ...(config.studioBuilderUrl && config.studioTokenFile ? { builder: new McpClient(config.studioBuilderUrl, () => ({ authorization: `Bearer ${readToken(config.studioTokenFile)}` })) } : {}),
+  });
+  deps.traceAdapters ??= new Map();
+  if (!deps.traceAdapters.has(E2E_ID)) deps.traceAdapters.set(E2E_ID, e2eTrace.adapter);
+  mountE2eTrace(api, { store, source: e2eTrace, authenticate, reject, registered: registeredService, actorOf });
   // S37 step 5 (§4.2.0): the business data trace — a service's model, position search, trace_business_data.
   mountTrace(api, { store, provenance, authenticate, reject, registered: registeredService, actorOf, adapters: deps.traceAdapters ?? new Map<string, EvidenceAdapter>([[PROVENANCE_SOURCE, new ProvenanceAdapter(provenance)]]) });
   // Phase 2 step 4 (§9.3, §15.3): a service's logs, read through its members' service executors (deploy-viewer, §13):
