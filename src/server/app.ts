@@ -1281,7 +1281,8 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     store, ...(takeover?.box ? { box: takeover.box } : {}), ...(config.studioDataUrl ? { dataUrl: config.studioDataUrl } : {}),
     ...(config.studioBuilderUrl && config.studioTokenFile ? { builder: new McpClient(config.studioBuilderUrl, () => ({ authorization: `Bearer ${readToken(config.studioTokenFile)}` })) } : {}),
   });
-  deps.traceAdapters ??= new Map();
+  // Without adapters from the caller, both built-in sources (provenance, e2e_trace) are registered.
+  deps.traceAdapters ??= new Map<string, EvidenceAdapter>([[PROVENANCE_SOURCE, new ProvenanceAdapter(provenance)]]);
   if (!deps.traceAdapters.has(E2E_ID)) deps.traceAdapters.set(E2E_ID, e2eTrace.adapter);
   mountE2eTrace(api, { store, source: e2eTrace, authenticate, reject, registered: registeredService, actorOf });
   // S37 step 5 (§4.2.0): the business data trace — a service's model, position search, trace_business_data.

@@ -116,3 +116,13 @@ test("the engine traces through the adapter: n112 by file name, over S2S to c250
   tr = await run({ n112, c250: [] });
   assert.equal(tr.verdict.kind, "handover-lost", tr.verdict.message);
 });
+
+test("S37 step 7: a worker position (imported from e2e_trace) is the components named after the worker", async () => {
+  const CID = "11111111-0000-4000-8000-0000000000f1";
+  const ev = (eventId: number, name: string) => ({ eventId, eventType: "ATTRIBUTES_MODIFIED", componentId: `id-${name}`, componentType: "UpdateAttribute", componentName: name, flowFileUuid: RECV, at: T(1), attributes: { correlation_id: CID } });
+  const a = new ProvenanceAdapter(fakeProv({ c250: [ev(1, "mail_reader"), ev(2, "pdf_parser"), ev(3, "msg.erp_pusher")] }).prov, () => NOW.getTime());
+  const by = (id: string, name?: string) => a.byKey({ service: "c250", key: { name: "correlation_id", value: CID }, ...W, position: { kind: "worker", id, ...(name ? { name } : {}) } });
+  assert.deepEqual((await by("pdf_parser")).events.map((e) => e.position.name), ["pdf_parser"]);
+  assert.deepEqual((await by("erp_pusher", "msg.erp_pusher")).events.map((e) => e.position.name), ["msg.erp_pusher"]);
+  assert.equal((await by("nobody")).events.length, 0);
+});

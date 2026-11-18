@@ -39,7 +39,11 @@ export function stateOf(e: Any): EventState {
 }
 
 const kindOf = (t: unknown): Position["kind"] => (/input port/i.test(String(t)) ? "input-port" : /output port/i.test(String(t)) ? "output-port" : "processor");
-const at = (p: Position) => (e: Any) => (p.kind === "process-group" ? e.groupId === p.id : e.componentId === p.id);
+// S37 step 7: an e2e_trace worker (a step imported from schedule_detail) has no component id; its events are the
+// components named after the worker (id = worker name, name = its message name).
+const at = (p: Position) => (e: Any) => (p.kind === "process-group" ? e.groupId === p.id
+  : p.kind === "worker" ? e.componentName === p.id || (p.name !== undefined && e.componentName === p.name)
+  : e.componentId === p.id);
 /** The FlowFile id a RECEIVE names as its source ("urn:nifi:<uuid>" over S2S). */
 export const sourceId = (e: Any) => String(e.sourceSystemFlowFileId ?? "").replace(/^urn:nifi:/, "") || null;
 
