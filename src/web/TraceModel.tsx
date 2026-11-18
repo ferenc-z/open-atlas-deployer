@@ -7,6 +7,7 @@ import { useEffect, useState } from "react";
 import * as api from "./api.ts";
 import type { Business, Channel, Condition, Endpoint, FlowComponent, ServiceStatus, Step, TraceModel, TraceModelView } from "./api.ts";
 import { when } from "./svc.tsx";
+import { ask } from "./Confirm.tsx";
 
 const KINDS = ["process-group", "input-port", "output-port", "processor", "worker"] as const;
 const OPS = ["equals", "prefix", "regex", "exists"] as const;
@@ -49,6 +50,7 @@ export function TraceModelEditor({ s }: { s: ServiceStatus }) {
           <input value={model.sources.join(", ")} onChange={(e) => edit((m) => { m.sources = e.target.value.split(",").map((x) => x.trim()).filter(Boolean); })} placeholder="e.g. e2e_trace, provenance" />
           <span className="muted small">Asked in this order; when one has nothing for a step the next one is asked. Available in this Deployer: {view.sources.length ? view.sources.join(", ") : "none yet"}.</span>
         </label>
+        <E2eSource s={s} onImported={(m) => { setModel(m); setSaved(""); }} />
       </section>
       {model.businesses.map((b, i) => (
         <BusinessCard key={i} s={s} b={b} onChange={(fn) => edit((m) => fn(m.businesses[i]!))} onRemove={() => edit((m) => { m.businesses.splice(i, 1); })} />
@@ -74,6 +76,59 @@ function Health({ view }: { view: TraceModelView }) {
       {links.length > 0 && <ul className="small">{links.map((l) => <li key={`${l.channel}-${l.from.service}-${l.from.endpoint}-${l.to.service}-${l.to.endpoint}`}><span className="badge ok">joined</span> {l.from.service} / {l.from.business} exit {l.from.endpoint} → {l.to.service} / {l.to.business} entry {l.to.endpoint} <span className="mono muted">{l.channel}</span></li>)}</ul>}
       {dangling.length > 0 && <ul className="small">{dangling.map((d) => <li key={`${d.side}-${d.business}-${d.endpoint}`}><span className="badge warn">dangling</span> {d.business}: {d.message}</li>)}</ul>}
     </section>
+  );
+}
+
+/** S37 step 7 (T8, T9, T15): the e2e_trace source of this service — a Studio Graph and its graph token (kept sealed by
+ *  the Deployer) — and the import of the schedule definitions into the editor (T6; saved with "Save model"). */
+function E2eSource({ s, onImported }: { s: ServiceStatus; onImported: (m: TraceModel) => void }) {
+  const [v, setV] = useState<api.TraceSourcesView | undefined>();
+  const [graph, setGraph] = useState("");
+  const [token, setToken] = useState("");
+  const [note, setNote] = useState<{ ok: boolean; text: string; list?: string[] } | undefined>();
+  const [busy, setBusy] = useState(false);
+  useEffect(() => { api.traceSources(s.id).then((x) => { setV(x); setGraph(x.e2e_trace?.graph ?? ""); }, (e: Error) => setNote({ ok: false, text: e.message })); }, [s.id]);
+  if (!v) return note ? <p className="error small">{note.text}</p> : null;
+  const run = async (fn: () => Promise<void>) => { setBusy(true); setNote(undefined); try { await fn(); } catch (e) { setNote({ ok: false, text: (e as Error).message }); } finally { setBusy(false); } };
+  const save = () => run(async () => {
+    const r = await api.saveE2eSource(s.id, graph.trim(), token.trim() || undefined);
+    setV(r); setToken("");
+    setNote({ ok: r.check.ok, text: `${r.issued ? "A graph token was issued and saved. " : "Saved. "}${r.check.message}` });
+  });
+  const remove = () => run(async () => {
+    if (!(await ask(`Remove the e2e_trace source of ${s.id}? Its graph token is deleted from the Deployer (not revoked in Studio).`, { confirm: "Remove", danger: true }))) return;
+    setV(await api.removeE2eSource(s.id)); setNote({ ok: true, text: "Removed." });
+  });
+  const check = () => run(async () => { const c = await api.checkE2eSource(s.id); setNote({ ok: c.ok, text: c.message }); });
+  const importModel = () => run(async () => {
+    const r = await api.importE2eModel(s.id);
+    onImported(r.model);
+    setNote({ ok: true, text: `Imported into the editor (not saved yet): ${r.imported.length} new, ${r.replaced.length} replaced. Review it and press Save model.`, list: r.notes });
+  });
+  const cfg = v.e2e_trace;
+  return (
+    <div className="card small">
+      <h4>e2e_trace run records (Studio)</h4>
+      <p className="muted">
+        {cfg ? <>Read through Studio graph <span className="mono">{cfg.graph}</span>, set {when(cfg.savedAt)} by {cfg.savedBy}. This service can be traced by correlation_id, file name and mail fields.</>
+          : "Not set up: this service has no e2e_trace source, only what NiFi itself records."}
+      </p>
+      {v.prerequisites.length > 0 && <ul className="warn">{v.prerequisites.map((p) => <li key={p}>{p}</li>)}</ul>}
+      {v.canEdit ? <>
+        <div className="row wrap">
+          <label className="field">Graph<input className="mono" value={graph} onChange={(e) => setGraph(e.target.value)} placeholder="workspace/graph" aria-label="Studio graph" /></label>
+          <label className="field">Graph token<input type="password" autoComplete="off" value={token} onChange={(e) => setToken(e.target.value)} placeholder={cfg ? "unchanged" : "oat_v1.…"} aria-label="Graph token" />
+            <span className="muted">{v.canIssue ? "Leave empty to have one issued with the Deployer's Studio workspace token." : "Paste a token issued for this graph in Studio."}</span></label>
+        </div>
+        <div className="row wrap">
+          <button type="button" disabled={busy || !graph.trim() || (!token.trim() && !v.canIssue) || v.prerequisites.length > 0} onClick={() => void save()}>{busy ? "Working…" : cfg ? "Save source" : "Set up source"}</button>
+          {cfg && <button type="button" disabled={busy} onClick={() => void check()}>Check</button>}
+          {cfg && <button type="button" disabled={busy} onClick={() => void importModel()}>Import businesses from e2e_trace</button>}
+          {cfg && <button type="button" className="link danger" disabled={busy} onClick={() => void remove()}>remove source</button>}
+        </div>
+      </> : <><p className="muted">Only Workbench admins change the evidence sources.</p>{cfg && <button type="button" disabled={busy} onClick={() => void check()}>Check</button>}</>}
+      {note && <div className={note.ok ? "ok" : "error"}><p>{note.text}</p>{note.list && note.list.length > 0 && <ul className="muted">{note.list.map((n) => <li key={n}>{n}</li>)}</ul>}</div>}
+    </div>
   );
 }
 

@@ -64,3 +64,11 @@ export interface EvidenceAdapter {
 
 /** Whether an adapter can be asked by this key name. */
 export const canByKey = (c: Capabilities, name: string) => c.byKey === "*" || c.byKey.includes(name);
+
+/** S37 step 6 (T10): a step's allowed time can come from a source that knows better than a fixed value (e2e_trace:
+ *  the step's historical P95). An adapter that implements `allowance` answers in seconds, or undefined (no opinion);
+ *  the model's own maxSeconds for the step still wins, and without either the engine's default applies. */
+export interface AllowanceQuery { service: string; business: string; step: string; position: Position }
+export interface EvidenceAdapter {
+  allowance?(q: AllowanceQuery): Promise<number | undefined>;
+}

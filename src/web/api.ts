@@ -386,3 +386,11 @@ export type FlowComponent = { kind: "process-group" | "input-port" | "output-por
 export const traceModel = (id: string) => call<TraceModelView>("GET", provPath(id, "/trace-model"));
 export const saveTraceModel = (id: string, model: unknown, revision: number) => call<{ revision: number; health: TraceModelHealth }>("PUT", provPath(id, "/trace-model"), { model, revision });
 export const searchPositions = (id: string, q: string) => call<{ results: FlowComponent[]; truncated: boolean }>("GET", provPath(id, `/trace-model/positions?q=${encodeURIComponent(q)}`));
+// S37 step 7 (T6, T8, T9): the e2e_trace evidence source of a service (a Studio Graph and its graph token) and the model import.
+export type E2eCheck = { ok: boolean; schedules?: number; message: string };
+export type TraceSourcesView = { canEdit: boolean; prerequisites: string[]; canIssue: boolean; e2e_trace: { graph: string; savedAt: string; savedBy: string } | null };
+export const traceSources = (id: string) => call<TraceSourcesView>("GET", provPath(id, "/trace-sources"));
+export const saveE2eSource = (id: string, graph: string, token?: string) => call<TraceSourcesView & { issued: boolean; check: E2eCheck }>("PUT", provPath(id, "/trace-sources/e2e_trace"), { graph, ...(token ? { token } : {}) });
+export const removeE2eSource = (id: string) => call<TraceSourcesView>("DELETE", provPath(id, "/trace-sources/e2e_trace"));
+export const checkE2eSource = (id: string) => call<E2eCheck>("POST", provPath(id, "/trace-sources/e2e_trace/check"), {});
+export const importE2eModel = (id: string) => call<{ model: import("../server/services/trace/model.ts").TraceModel; revision: number; imported: string[]; replaced: string[]; notes: string[] }>("POST", provPath(id, "/trace-model/import-e2e"), {});
