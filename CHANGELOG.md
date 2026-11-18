@@ -25,6 +25,15 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   adds the read-only `flow-search` op), entry and exit endpoints by channel (S2S, MQ, external) and on entries which
   field a clue is searched by. Exits join other services' entries with the same channel; unmatched ones show as
   dangling. `POST /api/services/:id/trace-business-data` runs the trace engine; no evidence source is connected yet.
+- S37 step 6: NiFi provenance is the trace's first evidence source, for every NiFi version: a file found by name at an
+  entry, followed step by step and over S2S (the receiver's RECEIVE names the sender's FlowFile as its source; when it
+  cannot be paired, the same file name within 2 minutes, marked inferred), "expired" judged by each node's oldest
+  event. The provenance search and the trace now accept NiFi 1.9 and later of 1.x (S33); the component search for
+  model positions works on any version. A model may leave its sources out (provenance then, after any source asked by
+  business keys); steps get 600 s by default; a stuck verdict says the queue, back pressure and whether the next
+  processor runs; a dangling exit names the model that lacks the entry; an external exit or entry says where NiFi's
+  part ends. Service executor 0.9.4: provenance with attributes and the `oldest` op, back pressure names queue ends
+  and processors not running.
 
 ### After upgrading
 

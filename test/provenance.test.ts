@@ -46,8 +46,8 @@ test("requests are checked: a time range always, a UUID or a field and value, at
 });
 
 test("the versions tried are supported; others are said to be not", () => {
-  for (const v of ["1.12.1", "1.28.1", "2.0.0", "2.5.0"]) assert.equal(provenanceSupport(v).supported, true, v);
-  for (const v of ["1.11.4", "3.0.0", ""]) assert.match(provenanceSupport(v).note, /not supported/, v);
+  for (const v of ["1.9.2", "1.11.4", "1.12.1", "1.28.1", "2.0.0", "2.5.0"]) assert.equal(provenanceSupport(v).supported, true, v);
+  for (const v of ["1.8.0", "0.7.4", "3.0.0", ""]) assert.match(provenanceSupport(v).note, /not supported/, v);
 });
 
 test("a cluster is searched as a whole through one member; events get their member; the next member when one fails", async () => {
@@ -102,9 +102,15 @@ test("a standalone's events are its own; two queries per service at a time; jobs
   assert.equal(old.prov.info("n112").ready, false);
   assert.match(old.prov.info("n112").members[0]!.reason!, /nifi-provenance@1/);
   await assert.rejects(old.prov.search("n112", { uuid: UUID, maxResults: 100, ...WINDOW }), (err: Error & { code?: string }) => err.code === "executor/unsupported");
-  const unsupported = lab(KINDS, "1.11.4");
+  const unsupported = lab(KINDS, "1.8.0");
   assert.equal(unsupported.prov.info("c250").supported, false);
   await assert.rejects(unsupported.prov.search("c250", { uuid: UUID, maxResults: 100, ...WINDOW }), /not supported/);
+  // T14: the component search reads the flow's structure only; a version the trace was not tried on still has it.
+  const found = unsupported.prov.flowSearch("c250", "Fetch");
+  const job = await unsupported.claim();
+  assert.equal(job.op, "flow-search");
+  unsupported.answer(job.id, { op: "flow-search", q: "Fetch", results: [], truncated: false });
+  assert.deepEqual((await found).results, []);
   assert.throws(() => x.prov.info("nope"), /No standalone instance or cluster/);
   assert.throws(() => old.handoff.submit("nifi-provenance-x", { kind: "nifi-provenance", member: "local:/lab/n112" }, "local", "service"), /nifi-provenance@1/);
 });

@@ -10,6 +10,7 @@ import type { ServiceProvenance } from "../provenance.ts";
 import { dangling, links } from "./channels.ts";
 import { TraceEngine, type TraceQuery } from "./engine.ts";
 import type { EvidenceAdapter } from "./events.ts";
+import { stuckContextFrom } from "./flowstate.ts";
 import { CUES, emptyModel, parseModel, type TraceModel } from "./model.ts";
 
 type Reject = (c: Context, status: 400 | 401 | 403 | 404 | 409 | 429 | 503, code: string, message: string, details?: string[]) => Response;
@@ -52,7 +53,7 @@ export function parseTraceQuery(service: string, body: unknown, now = new Date()
 }
 
 export function mountTrace(api: Hono, d: TraceDeps) {
-  const engine = new TraceEngine({ models: () => allModels(d.store), adapters: d.adapters });
+  const engine = new TraceEngine({ models: () => allModels(d.store), adapters: d.adapters, stuckContext: stuckContextFrom(d.store) });
   const unknown = (c: Context, id: string) => d.reject(c, 404, "service/unknown", `No standalone instance or cluster ${id}.`);
 
   api.get("/api/services/:id/trace-model", async (c) => {
