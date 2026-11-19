@@ -8,7 +8,6 @@
 import { useCallback, useEffect, useState } from "react";
 import * as api from "./api.ts";
 import type { CaseProposal, ChangeKind, ServiceCase } from "./api.ts";
-import { ask } from "./Confirm.tsx";
 import { Markdown } from "./Markdown.tsx";
 import { ago, when } from "./svc.tsx";
 
@@ -30,28 +29,6 @@ function useCase(service: string, id: number | undefined) {
     return () => clearInterval(t);
   }, [c?.state, load]);
   return { c, setC, error, setError };
-}
-
-/** The button and, once pressed, the case. `start` makes the case from what the page shows. */
-export function AnalyseBox({ s, start, plan, canAct, label = "Let the AI analyse" }: { s: api.ServiceStatus; start: () => Promise<ServiceCase>; plan?: PlanChange | undefined; canAct?: boolean; label?: string }) {
-  const [id, setId] = useState<number | undefined>();
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-  const go = async () => {
-    if (id !== undefined && !(await ask("Ask the assistant again? The earlier analysis stays as a case of this service.", { confirm: "Analyse again" }))) return;
-    setBusy(true); setError("");
-    try { setId((await start()).id); } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
-  };
-  return (
-    <section className="card ai-case">
-      <div className="row wrap">
-        <button className="primary" disabled={busy} onClick={() => void go()}>{busy ? "Asking…" : id === undefined ? label : "Analyse again"}</button>
-        <span className="muted small">Sends this page's result (secrets hidden) to the Deploy Assistant. It may read more with read-only tools and changes nothing; what it proposes, you confirm.</span>
-      </div>
-      {error && <p className="error small">{error}</p>}
-      {id !== undefined && <CaseView key={id} service={s.id} id={id} plan={plan} canAct={canAct} />}
-    </section>
-  );
 }
 
 /** One case: the three-part answer, the cards, the conversation, the outcome. */
@@ -137,22 +114,3 @@ function ProposalCard({ service, p, plan, canAct }: { service: string; p: CasePr
   );
 }
 
-/** Earlier cases of the service (and rule): the runbook the assistant reads too. */
-export function EarlierCases({ service, rule }: { service: string; rule?: string | undefined }) {
-  const [cases, setCases] = useState<Awaited<ReturnType<typeof api.serviceCases>>["cases"]>([]);
-  useEffect(() => { api.serviceCases(service, { ...(rule ? { rule } : {}), limit: 10 }).then((r) => setCases(r.cases), () => setCases([])); }, [service, rule]);
-  if (!cases.length) return null;
-  return (
-    <details className="card">
-      <summary><b>Earlier cases</b> <span className="muted small">{cases.length}{rule ? ` of ${rule}` : ""}</span></summary>
-      <ul className="small">
-        {cases.map((c) => (
-          <li key={c.id}>
-            <span className="muted">#{c.id} {when(c.requestedAt)} · {c.kind}{c.rule ? ` · ${c.rule}` : ""}</span> {c.answer?.cause ?? c.error ?? "(no answer)"}
-            {c.outcome && <div>Outcome: {c.outcome.text} <span className="muted">— {c.outcome.by}</span></div>}
-          </li>
-        ))}
-      </ul>
-    </details>
-  );
-}

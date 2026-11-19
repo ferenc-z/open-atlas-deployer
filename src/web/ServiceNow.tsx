@@ -9,7 +9,6 @@ import type { ServiceHealth, Todo, TodoAction } from "./api.ts";
 import { Timeline } from "./Alerts.tsx";
 import { STATE, ago, fmtNumber, when } from "./svc.tsx";
 import type { ChangeKind } from "./api.ts";
-import { investigateFrom, windowAround } from "./Investigate.tsx";
 
 type Props = { s: api.ServiceStatus; canAct: boolean; plan: (r: { kind: ChangeKind; members: string[] }) => void; open: (tab: string) => void };
 
@@ -19,7 +18,7 @@ const VERDICT = {
   critical: { label: "Critical", tone: "bad", text: "" },
 } as const;
 const SEV: Record<Todo["severity"], { label: string; tone: string }> = { CRIT: { label: "Critical", tone: "bad" }, WARN: { label: "Warning", tone: "warn" }, INFO: { label: "Notice", tone: "info" } };
-// What the Timeline calls a change or a restart (the rest of it stays in the Toolbox).
+// What the Timeline calls a change or a restart.
 const CHANGES = new Set(["process-restarted", "node-stopped", "node-started", "version-changed", "config-saved", "config-applied", "config-rolled-back", "change-started", "change-finished", "change-stopped", "change-paused", "change-resumed"]);
 const CONTROL = new Set<string>(["start", "stop", "restart"]);
 
@@ -113,9 +112,6 @@ function ActionButton({ t, a, canAct, plan, open }: { t: Todo; a: TodoAction; ca
       if (!canAct || !CONTROL.has(action) || typeof target.member !== "string") return null;
       return <button onClick={() => plan({ kind: action as ChangeKind, members: [target.member as string] })} title="Shows a plan first">{a.label}</button>;
     }
-    // S37 step 4: the Investigate tab, on this to-do's member and a window from half an hour before it started.
-    case "investigate": return <button onClick={() => { investigateFrom({ member: typeof target.member === "string" ? target.member : t.member !== "*" ? t.member : undefined, ...windowAround(t.since), focus: t.rule, label: `To-do ${t.rule}${t.memberLabel ? ` on ${t.memberLabel}` : ""}` }); open("investigate"); }}>{a.label}</button>;
-    case "metrics": return <button onClick={() => open("metrics")}>{a.label}</button>;
     case "draft-config": case "config-diff": return <button onClick={() => open("configuration")}>{a.label}</button>;
     default: return null;
   }

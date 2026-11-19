@@ -1,27 +1,18 @@
 // A registered service's page (S23), the same frame for a standalone instance and a cluster: a summary line that
 // stays the same in every phase (name, up, findings, soonest certificate; version, environment, ZooKeeper,
-// configuration revision; the NiFi UI on the right), then, since S37 step 10 (pages-rethink §3), four work areas and a
-// toolbox: Status (default), Data trace (with the business model as a second view), Investigate, Configuration and
-// changes (start/stop, changes, configuration on one tab) and the Toolbox (logs, FlowFile trace, raw metrics, alerts
-// and the full timeline). The tabs of the old layout (overview, nodes, events, metrics, logs, trace, trace-model,
-// configuration, changes) still open, redirected by resolveTab().
-// The configuration and its open drafts are held here: the Configuration and Changes sections share them.
+// configuration revision; the NiFi UI on the right), then two tabs: Status (default) and Configuration and changes
+// (start/stop, changes, configuration on one tab). The pages of S37 were pruned after the owner turned them down
+// (pages-rethink §9.2): resolveTab() sends every id of a removed page to Status.
 
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import * as api from "./api.ts";
-import type { Field, MemberStatus, MetricsView, Range, ServiceBulletin, ServiceConfigView, ServiceStatus } from "./api.ts";
-import { LineChart, type Series } from "./Charts.tsx";
+import type { MemberStatus, ServiceBulletin, ServiceConfigView, ServiceStatus } from "./api.ts";
 import { memberName, ServiceChanges, useChanges, useDrafts, type ChangeDesk, type Drafts } from "./ServiceChanges.tsx";
 import { ServiceConfig } from "./ServiceConfig.tsx";
 import { ask } from "./Confirm.tsx";
-import { Logs } from "./Logs.tsx";
-import { FlowFileTrace } from "./Trace.tsx";
-import { TraceModelEditor } from "./TraceModel.tsx";
-import { DataTrace } from "./TraceData.tsx";
 import { NginxAddress } from "./Nginx.tsx";
 import { ServiceNow } from "./ServiceNow.tsx";
-import { Investigate } from "./Investigate.tsx";
-import { AlertBadge, EventsAndAlerts } from "./Alerts.tsx";
+import { AlertBadge } from "./Alerts.tsx";
 import { ago, CertBadge, certTone, ConfCell, daysLeft, daysText, fmtBytes, fmtNumber, memberKey, serviceName, SEVERITY, STATE, StatusNotes, UpBadge, webPort, when } from "./svc.tsx";
 
 type Loaded = { s: ServiceStatus; cfg: ServiceConfigView | null | undefined; reload: () => void; drafts: Drafts; desk: ChangeDesk; saved: () => void; open: (tab: string) => void; sub: string | undefined };
@@ -30,20 +21,15 @@ type Tab = { id: string; label: string; shown: (l: Loaded) => boolean; render: (
 /** The tab ids of the old layout and where they went (a tab, and the part of it to show). Any link, `initialTab` or
  *  `oa:open-service` event that still names one of these lands in the new place. */
 const LEGACY: Record<string, { tab: string; sub?: string }> = {
-  overview: { tab: "status" }, nodes: { tab: "status" },
-  events: { tab: "tools", sub: "alerts" }, metrics: { tab: "tools", sub: "metrics" }, logs: { tab: "tools", sub: "logs" }, trace: { tab: "tools", sub: "trace" },
-  "trace-model": { tab: "data-trace", sub: "model" },
   configuration: { tab: "config", sub: "configuration" }, changes: { tab: "config", sub: "changes" },
 };
-/** "tools:logs" names a tab and its part; a legacy id is looked up. */
-export const resolveTab = (id: string): { tab: string; sub?: string } => { const at = id.indexOf(":"); return LEGACY[id] ?? (at > 0 ? { tab: id.slice(0, at), sub: id.slice(at + 1) } : { tab: id }); };
+/** An id of a page that no longer exists (overview, nodes, events, metrics, logs, trace, trace-model, data-trace,
+ *  investigate, tools, "tools:logs", …) lands on Status; "config" and the two old configuration ids are kept. */
+export const resolveTab = (id: string): { tab: string; sub?: string } => LEGACY[id] ?? (id === "config" ? { tab: "config" } : { tab: "status" });
 
 const TABS: Tab[] = [
   { id: "status", label: "Status", shown: () => true, render: (l) => <><ServiceNow s={l.s} canAct={Boolean(l.cfg?.canDraft) && !l.desk.active} plan={(r) => l.desk.plan(r)} open={l.open} /><StatusDetails {...l} /></> },
-  { id: "data-trace", label: "Data trace", shown: () => true, render: (l) => <DataTraceHome {...l} /> },
-  { id: "investigate", label: "Investigate", shown: (l) => l.s.members.length > 0, render: (l) => <Investigate s={l.s} plan={(r) => l.desk.plan(r)} canAct={Boolean(l.cfg?.canDraft) && !l.desk.active} /> },
   { id: "config", label: "Configuration and changes", shown: () => true, render: (l) => <ConfigAndChanges {...l} /> },
-  { id: "tools", label: "Toolbox", shown: () => true, render: (l) => <Toolbox {...l} /> },
 ];
 
 /** How a member is named on the charts: a node by address and port, a standalone by host. */
@@ -56,12 +42,6 @@ export function ServiceDetail({ id, isAdmin, initialDraft, initialTab, onBack }:
   const [tab, setTab] = useState(first.tab);
   const [sub, setSub] = useState<string | undefined>(first.sub);
   const go = useCallback((target: string) => { const r = resolveTab(target); setTab(r.tab); setSub(r.sub); }, []);
-  // S37 step 8: another page (the Data trace) asks for a tab of this service.
-  useEffect(() => {
-    const on = (e: Event) => { const d = (e as CustomEvent<{ id: string; tab: string }>).detail; if (d.id === id) go(d.tab); };
-    window.addEventListener("oa:open-service", on);
-    return () => window.removeEventListener("oa:open-service", on);
-  }, [id, go]);
   const [error, setError] = useState("");
   const load = useCallback(() => { api.serviceStatus(id).then(setS, (e: Error) => setError(e.message)); }, [id]);
   useEffect(() => { load(); const t = setInterval(load, 10_000); return () => clearInterval(t); }, [load]);
@@ -116,29 +96,9 @@ export function ServiceDetail({ id, isAdmin, initialDraft, initialTab, onBack }:
         </div>
       </section>
       <div className="subtabs" role="tablist">
-        {tabs.map((t) => <button key={t.id} role="tab" aria-selected={t.id === current.id} className={t.id === current.id ? "active" : t.id === "tools" ? "toolbox-tab" : ""} onClick={() => go(t.id)}>{t.label}{t.id === "config" && driftCount > 0 && <span className="badge warn" title="Files on the hosts are not what is kept">{driftCount}</span>}{t.id === "config" && desk.active && <span className={`badge ${desk.active.state === "running" ? "info" : "bad"}`}>{desk.active.state}</span>}</button>)}
+        {tabs.map((t) => <button key={t.id} role="tab" aria-selected={t.id === current.id} className={t.id === current.id ? "active" : ""} onClick={() => go(t.id)}>{t.label}{t.id === "config" && driftCount > 0 && <span className="badge warn" title="Files on the hosts are not what is kept">{driftCount}</span>}{t.id === "config" && desk.active && <span className={`badge ${desk.active.state === "running" ? "info" : "bad"}`}>{desk.active.state}</span>}</button>)}
       </div>
       {current.render(loaded)}
-    </>
-  );
-}
-
-/** A second level inside a tab: the buttons, and which one is shown. */
-function SubTabs({ items, current, onPick, label }: { items: { id: string; label: string }[]; current: string; onPick: (id: string) => void; label: string }) {
-  return (
-    <div className="subtabs inline" role="tablist" aria-label={label}>
-      {items.map((i) => <button key={i.id} role="tab" aria-selected={i.id === current} className={i.id === current ? "active" : ""} onClick={() => onPick(i.id)}>{i.label}</button>)}
-    </div>
-  );
-}
-
-// Data trace: the trace itself, and the business model it runs on (a second view, not a tab of its own: owner to confirm).
-function DataTraceHome(l: Loaded) {
-  const view = l.sub === "model" ? "model" : "trace";
-  return (
-    <>
-      <SubTabs label="Data trace views" current={view} onPick={(id) => l.open(id === "model" ? "trace-model" : "data-trace")} items={[{ id: "trace", label: "Trace" }, { id: "model", label: "Business model" }]} />
-      {view === "model" ? <TraceModelEditor s={l.s} /> : <DataTrace s={l.s} open={l.open} plan={(r) => l.desk.plan(r)} canAct={Boolean(l.cfg?.canDraft) && !l.desk.active} />}
     </>
   );
 }
@@ -149,32 +109,11 @@ function ConfigAndChanges(l: Loaded) {
   return (
     <>
       <section id="cfg-control"><NodeControls s={l.s} cfg={l.cfg} desk={l.desk} reload={l.reload} /></section>
-      {l.cfg && <section id="cfg-changes"><h2>Changes</h2><ServiceChanges s={l.s} cfg={l.cfg} drafts={l.drafts} desk={l.desk} onSaved={l.saved} onEdit={() => l.open("configuration")} onLogs={() => l.open("logs")} /></section>}
+      {l.cfg && <section id="cfg-changes"><h2>Changes</h2><ServiceChanges s={l.s} cfg={l.cfg} drafts={l.drafts} desk={l.desk} onSaved={l.saved} onEdit={() => l.open("configuration")} /></section>}
       <section id="cfg-configuration"><h2>Configuration</h2><ServiceConfig cfg={l.cfg} status={l.s} drafts={l.drafts} onReview={() => l.open("changes")} /></section>
     </>
   );
 }
-
-// The Toolbox: the full tools the work areas draw their evidence from.
-function Toolbox(l: Loaded) {
-  const items = [
-    ...(l.s.members.length > 0 ? [{ id: "logs", label: "Logs" }, { id: "trace", label: "FlowFile trace" }] : []),
-    ...(l.s.members.some((m) => m.live) ? [{ id: "metrics", label: "Metrics" }] : []),
-    { id: "alerts", label: "Alerts and timeline" },
-  ];
-  const current = items.find((i) => i.id === l.sub)?.id ?? items[0]!.id;
-  return (
-    <>
-      <p className="muted small">The full tools behind the other tabs: follow, search and download logs, look up a FlowFile (by UUID too), the raw metric charts, and the alerts with their thresholds and the whole timeline.</p>
-      <SubTabs label="Toolbox" current={current} onPick={(id) => l.open(`tools:${id}`)} items={items} />
-      {current === "logs" && <Logs s={l.s} />}
-      {current === "trace" && <FlowFileTrace s={l.s} />}
-      {current === "metrics" && <Metrics s={l.s} />}
-      {current === "alerts" && <EventsAndAlerts s={l.s} />}
-    </>
-  );
-}
-
 
 const everyText = (seconds: number) => (seconds % 60 === 0 ? `${seconds / 60} min` : `${seconds} s`);
 
@@ -279,53 +218,6 @@ function Certificates({ s }: { s: ServiceStatus }) {
           );
         })}</tbody>
       </table>
-    </div>
-  );
-}
-
-// Metrics (§15.3): one chart per number, a line per node, over 1 hour / 6 hours / 2 days (raw samples) or 30 days (5-minute rollups).
-const RANGES: { id: Range; label: string }[] = [{ id: "1h", label: "1 hour" }, { id: "6h", label: "6 hours" }, { id: "2d", label: "2 days" }, { id: "30d", label: "30 days" }];
-// sparse: read only every few minutes (back pressure), so the points that have it are joined and the gaps skipped.
-const CHARTS: { group: string; charts: { field: Field; title: string; max?: number; note?: string; sparse?: boolean }[] }[] = [
-  { group: "JVM", charts: [{ field: "heapPct", title: "Heap used", max: 100 }, { field: "heapUsed", title: "Heap used (bytes)" }, { field: "gcMsPerMin", title: "GC time" }, { field: "threads", title: "JVM threads" }] },
-  { group: "Flow", charts: [{ field: "queuedCount", title: "Queued flowfiles" }, { field: "queuedBytes", title: "Queued bytes" }, { field: "bpFull", title: "Connections at back pressure", note: "No back pressure read in this range (it is read every 5 minutes by default)", sparse: true }, { field: "bpMaxPct", title: "Fullest queue", max: 100, note: "No back pressure read in this range", sparse: true }, { field: "activeThreads", title: "Active threads" }] },
-  { group: "Repositories", charts: [{ field: "repoContentPct", title: "Content repository disk", max: 100 }, { field: "repoFlowfilePct", title: "FlowFile repository disk", max: 100 }, { field: "repoProvenancePct", title: "Provenance repository disk", max: 100 }] },
-  { group: "Host", charts: [{ field: "cpuPct", title: "Process CPU (100 % = one core)" }, { field: "rss", title: "Process RSS" }, { field: "load1", title: "Host load (1 min)" }, { field: "memPct", title: "Host memory used", max: 100 }, { field: "diskPct", title: "Fullest disk", max: 100 }] },
-];
-
-function Metrics({ s }: { s: ServiceStatus }) {
-  const [range, setRange] = useState<Range>("1h");
-  const [view, setView] = useState<MetricsView | undefined>();
-  const [error, setError] = useState("");
-  const load = useCallback(() => { api.serviceMetrics(s.id, range).then((v) => { setView(v); setError(""); }, (e: Error) => setError(e.message)); }, [s.id, range]);
-  useEffect(() => { setView(undefined); load(); const t = setInterval(load, 30_000); return () => clearInterval(t); }, [load]);
-  const from = view ? Date.parse(view.from) : 0, to = view ? Date.parse(view.to) : 0;
-  const series = (f: Field, sparse = false): Series[] => !view ? [] : s.members.map((m) => {
-    const got = view.members.find((x) => x.member === m.key);
-    const at = got ? got.at.map((a) => Date.parse(a)) : [], values = got?.values[f] ?? [];
-    if (!sparse) return { name: memberLabel(s, m), at, values };
-    const keep = values.map((v, i) => (v === null ? -1 : i)).filter((i) => i >= 0);
-    return { name: memberLabel(s, m), at: keep.map((i) => at[i]!), values: keep.map((i) => values[i]!) };
-  });
-  return (
-    <div className="panel">
-      <div className="range-bar">
-        <div className="subtabs inline" role="tablist" aria-label="Time range">
-          {RANGES.map((r) => <button key={r.id} role="tab" aria-selected={range === r.id} className={range === r.id ? "active" : ""} onClick={() => setRange(r.id)}>{r.label}</button>)}
-        </div>
-        {view && <span className="muted small">{view.source === "samples" ? `From the raw samples (kept 2 days), averaged over ${view.step >= 60 ? `${Math.round(view.step / 60)} min` : `${view.step} s`}` : `From the 5-minute rollups (kept 30 days), averaged over ${Math.round(view.step / 3600)} h`}. Sampled every {s.summary.period} s.</span>}
-      </div>
-      {error && <p className="error">{error}</p>}
-      {!view && !error && <p className="muted">Loading…</p>}
-      {view && CHARTS.map((g) => (
-        <section key={g.group} className="chart-section">
-          <h3>{g.group}</h3>
-          <div className="charts">{g.charts.map((c) => (
-            <LineChart key={c.field} title={c.title} unit={view.fields[c.field].unit} series={series(c.field, c.sparse)} from={from} to={to} {...(c.max ? { max: c.max } : {})} {...(c.note ? { note: c.note } : {})} />
-          ))}</div>
-        </section>
-      ))}
-      {view && <p className="muted small">Back pressure is read every {everyText(s.summary.backpressure?.everySeconds ?? 300)} (the service executor's EXECUTOR_BACKPRESSURE_SECONDS), not every sample; its points are joined.{s.kind === "cluster" ? " It is flow-wide (the root group's status), so every node shows the same. A node's queue and active threads are its share in the coordinator's view." : ""}</p>}
     </div>
   );
 }

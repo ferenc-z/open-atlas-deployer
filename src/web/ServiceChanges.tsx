@@ -683,7 +683,7 @@ function ChangeActions({ c, s, desk, onBusy }: { c: ServiceChangeView; s: Servic
 }
 
 /** One change: how far it got, what stopped it, and for the one holding the service, the buttons. */
-function ChangeRun({ c, s, desk, canSteer, onLogs }: { c: ServiceChangeView; s: ServiceStatus; desk: ChangeDesk; canSteer: boolean; onLogs: () => void }) {
+function ChangeRun({ c, s, desk, canSteer }: { c: ServiceChangeView; s: ServiceStatus; desk: ChangeDesk; canSteer: boolean }) {
   const [error, setError] = useState("");
   const st = CHANGE_STATE[c.state] ?? { label: c.state, tone: "muted" };
   const steps: Steps = c.steps ?? [];
@@ -722,13 +722,12 @@ function ChangeRun({ c, s, desk, canSteer, onLogs }: { c: ServiceChangeView; s: 
             </tr>
           ))}</tbody>
         </table>
-        <p className="muted small">What NiFi itself said is on the <button className="link" onClick={onLogs}>Logs (Toolbox)</button>.</p>
       </details>}
     </section>
   );
 }
 
-function ChangeHistory({ s, desk, canSteer, onLogs }: { s: ServiceStatus; desk: ChangeDesk; canSteer: boolean; onLogs: () => void }) {
+function ChangeHistory({ s, desk, canSteer }: { s: ServiceStatus; desk: ChangeDesk; canSteer: boolean }) {
   const [shown, setShown] = useState<string | null>(null);
   const [detail, setDetail] = useState<ServiceChangeView | undefined>();
   useEffect(() => {
@@ -757,12 +756,12 @@ function ChangeHistory({ s, desk, canSteer, onLogs }: { s: ServiceStatus; desk: 
           );
         })}</tbody>
       </table>}
-      {detail && <ChangeRun c={detail} s={s} desk={desk} canSteer={canSteer} onLogs={onLogs} />}
+      {detail && <ChangeRun c={detail} s={s} desk={desk} canSteer={canSteer} />}
     </section>
   );
 }
 
-export function ServiceChanges({ s, cfg, drafts, desk, onSaved, onEdit, onLogs }: { s: ServiceStatus; cfg: ServiceConfigView; drafts: Drafts; desk: ChangeDesk; onSaved: () => void; onEdit: () => void; onLogs: () => void }) {
+export function ServiceChanges({ s, cfg, drafts, desk, onSaved, onEdit }: { s: ServiceStatus; cfg: ServiceConfigView; drafts: Drafts; desk: ChangeDesk; onSaved: () => void; onEdit: () => void }) {
   const { refresh } = drafts;
   useEffect(refresh, [refresh]);
   const current = drafts.active;
@@ -771,12 +770,12 @@ export function ServiceChanges({ s, cfg, drafts, desk, onSaved, onEdit, onLogs }
     <>
       <p className="muted small page-note">Drafts become revisions here, and a revision is kept until it is applied. Only a plan you confirm changes a host.</p>
       {desk.asked && <PlanPanel key={JSON.stringify(desk.asked)} s={s} desk={desk} request={desk.asked} canSteer={cfg.canDraft} />}
-      {desk.active && <ChangeRun c={desk.active} s={s} desk={desk} canSteer={cfg.canDraft} onLogs={onLogs} />}
+      {desk.active && <ChangeRun c={desk.active} s={s} desk={desk} canSteer={cfg.canDraft} />}
       {!desk.active && !desk.asked && cfg.canDraft && notApplied.length > 0 && <div className="banner info inline pending-bar">
         <span>r{cfg.revision} is saved but not on the hosts yet: {notApplied.length} file{notApplied.length > 1 ? "s" : ""}{s.kind === "cluster" ? ` on ${new Set(notApplied.map((x) => x.member)).size} node${new Set(notApplied.map((x) => x.member)).size > 1 ? "s" : ""}` : ""}.</span>
         <button className="primary" onClick={() => desk.plan({ kind: "apply", revision: cfg.revision })}>Plan applying r{cfg.revision}</button>
       </div>}
-      <ChangeHistory s={s} desk={desk} canSteer={cfg.canDraft} onLogs={onLogs} />
+      <ChangeHistory s={s} desk={desk} canSteer={cfg.canDraft} />
       <Drift s={s} cfg={cfg} desk={desk} onSaved={onSaved} />
       <section className="panel">
         <h3>Drafts</h3>

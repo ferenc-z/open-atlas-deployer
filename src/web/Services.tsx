@@ -15,7 +15,6 @@ import { CertBadge, ConfCell, confElsewhere, DifferenceBadge, memberKey, members
 import { Sparkline } from "./Charts.tsx";
 import { AlertBadge } from "./Alerts.tsx";
 import { usePageFocus } from "./focus.ts";
-import { investigateFrom, windowAround } from "./Investigate.tsx";
 
 type Problem = { message: string; details: string[] };
 const problemOf = (e: unknown): Problem => ({ message: (e as Error).message, details: (e as api.ApiError).details ?? [] });
@@ -121,7 +120,7 @@ function OpsQueue({ desk, onOpen }: { desk: api.OpsDesk; onOpen: (id: string, ta
             {t.memberLabel && <span className="mono small">{t.memberLabel}</span>}
           </div>
           <p className="small">{t.cause}</p>
-          <div className="row wrap"><button onClick={() => onOpen(t.service)}>Open</button><button onClick={() => { investigateFrom({ member: t.member !== "*" ? t.member : undefined, ...windowAround(t.since), focus: t.rule, label: `To-do ${t.rule}${t.memberLabel ? ` on ${t.memberLabel}` : ""}` }); onOpen(t.service, "investigate"); }}>Investigate</button></div>
+          <div className="row wrap"><button onClick={() => onOpen(t.service)}>Open</button></div>
         </li>
       ))}</ul>}
       {todos.length > 30 && <p className="muted small">The worst 30 of {todos.length}; the rest are on each service's Status.</p>}

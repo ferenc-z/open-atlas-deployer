@@ -4,9 +4,8 @@
 
 import { useCallback, useEffect, useState } from "react";
 import * as api from "./api.ts";
-import type { AlertAnalysis, AlertView, GlobalAlert, RegisteredService, ServiceStatus, Thresholds, ThresholdsView, TimelineEvent } from "./api.ts";
+import type { AlertAnalysis, AlertView, GlobalAlert, RegisteredService, TimelineEvent } from "./api.ts";
 import { CaseView } from "./CaseBox.tsx";
-import { ask } from "./Confirm.tsx";
 import { ago, when } from "./svc.tsx";
 
 export const LEVEL: Record<string, { tone: string; title: string }> = {
@@ -76,106 +75,6 @@ export function Timeline({ events }: { events: TimelineEvent[] }) {
   );
 }
 
-/** The Overview's problem area: the open alerts (none: says so). */
-export function OpenAlerts({ s }: { s: ServiceStatus }) {
-  const [alerts, setAlerts] = useState<AlertView[] | undefined>();
-  useEffect(() => { api.serviceAlerts(s.id).then((r) => setAlerts(r.alerts.filter((a) => a.state === "open")), () => setAlerts([])); }, [s.id, s.summary.asOf, s.summary.alerts.open]);
-  if (!alerts) return null;
-  return (
-    <div>
-      <h3>Problems</h3>
-      {alerts.length ? <AlertTable alerts={alerts} /> : <p className="muted small"><span className="badge ok">No open alerts</span> The health rules run as samples come in and once a minute.</p>}
-    </div>
-  );
-}
-
-// The Events and alerts tab.
-export function EventsAndAlerts({ s }: { s: ServiceStatus }) {
-  const [data, setData] = useState<Awaited<ReturnType<typeof api.serviceAlerts>> | undefined>();
-  const [events, setEvents] = useState<TimelineEvent[] | undefined>();
-  const [error, setError] = useState("");
-  const load = useCallback(() => {
-    api.serviceAlerts(s.id).then((d) => { setData(d); setError(""); }, (e: Error) => setError(e.message));
-    api.serviceEvents(s.id).then((r) => setEvents(r.events), () => setEvents([]));
-  }, [s.id]);
-  useEffect(() => { load(); const t = setInterval(load, 15_000); return () => clearInterval(t); }, [load]);
-  if (!data) return error ? <p className="error">{error}</p> : <p className="muted">Loading…</p>;
-  const open = data.alerts.filter((a) => a.state === "open");
-  const resolved = data.alerts.filter((a) => a.state === "resolved").slice(0, 50);
-  return (
-    <div className="panel">
-      <div>
-        <h3>Open alerts</h3>
-        <p className="muted small">At most one per rule and node (or for the whole service); it closes by itself when the rule no longer holds. A rule that cannot tell (no fresh sample) leaves its alert as it is. Not pushed anywhere (S13).</p>
-        {open.length ? <AlertTable alerts={open} /> : <p className="muted small"><span className="badge ok">None</span></p>}
-      </div>
-      <div>
-        <h3>Timeline</h3>
-        {events ? <Timeline events={events} /> : <p className="muted">Loading…</p>}
-      </div>
-      {resolved.length > 0 && <details>
-        <summary><strong>Resolved alerts</strong> <span className="muted small">{resolved.length} most recent</span></summary>
-        <AlertTable alerts={resolved} resolved />
-      </details>}
-      <ThresholdForm id={s.id} view={data.thresholds} rules={data.rules} canEdit={data.canEdit} onSaved={load} />
-    </div>
-  );
-}
-
-function ThresholdForm({ id, view, rules, canEdit, onSaved }: { id: string; view: ThresholdsView; rules: Awaited<ReturnType<typeof api.serviceAlerts>>["rules"]; canEdit: boolean; onSaved: () => void }) {
-  const keys = Object.keys(view.info) as (keyof Thresholds)[];
-  const initial = () => Object.fromEntries(keys.map((k) => [k, String(view.effective[k])])) as Record<keyof Thresholds, string>;
-  const [values, setValues] = useState(initial);
-  const [error, setError] = useState<{ message: string; details: string[] } | undefined>();
-  useEffect(() => setValues(initial()), [view]); // eslint-disable-line react-hooks/exhaustive-deps
-  const changed = keys.filter((k) => values[k] !== String(view.effective[k]));
-  const save = async (asked: Partial<Record<keyof Thresholds, number | null>>, question: string) => {
-    if (!(await ask(question, { confirm: "Save the thresholds" }))) return;
-    setError(undefined);
-    api.putThresholds(id, asked).then(onSaved, (e: api.ApiError) => setError({ message: e.message, details: e.details ?? [] }));
-  };
-  const submit = () => {
-    const asked = Object.fromEntries(keys.map((k) => [k, values[k].trim() === "" ? null : Number(values[k])])) as Partial<Record<keyof Thresholds, number | null>>;
-    save(asked, `Change ${changed.map((k) => `${view.info[k].label} to ${values[k] || `the default (${view.defaults[k]})`}`).join(", ")}? The alerts of ${id} follow at once.`);
-  };
-  const reset = () => save({}, `Put every threshold of ${id} back to the profile's defaults?`);
-  const byRule = [...new Set(keys.map((k) => view.info[k].rule))];
-  return (
-    <div>
-      <h3>Thresholds</h3>
-      <p className="muted small">The profile gives the defaults; an admin can change them for this service only (kept in its thresholds column, audited, and on the timeline). Rules without a number here (executor lost aside: process down, node disconnected, no coordinator, versions differ, no monitor certificate, certificate unreadable, no samples) open as soon as a fresh sample shows them. Leave a field empty for the default.</p>
-      <table className="edit thresholds">
-        <thead><tr><th>Rule</th><th>Threshold</th><th>Value</th><th>Default</th></tr></thead>
-        <tbody>{byRule.map((rule) => keys.filter((k) => view.info[k].rule === rule).map((k, i, all) => {
-          const info = view.info[k];
-          const overridden = k in view.overrides;
-          return (
-            <tr key={k}>
-              {i === 0 && <td rowSpan={all.length}><strong>{rules[rule]?.label ?? rule}</strong> {rules[rule]?.levels.map((l) => <LevelBadge key={l} level={l} />)}<br /><span className="small muted">{rules[rule]?.description}</span></td>}
-              <td><span>{info.label}</span> <span className="mono small muted">{k}</span><br /><span className="small muted">{info.description} ({info.min}–{info.max} {info.unit})</span></td>
-              <td className="nowrap">
-                {canEdit
-                  ? <input className="mono" type="number" min={info.min} max={info.max} step="1" value={values[k]} placeholder={String(view.defaults[k])} onChange={(e) => setValues({ ...values, [k]: e.target.value })} style={{ width: 90 }} aria-label={info.label} />
-                  : <span className="mono">{view.effective[k]}</span>} <span className="muted small">{info.unit}</span>
-                {overridden && <span className="badge info" title="Set for this service">set</span>}
-              </td>
-              <td className="mono small muted">{view.defaults[k]}</td>
-            </tr>
-          );
-        }))}</tbody>
-      </table>
-      {error && <div className="error">{error.message}{error.details.length > 0 && <ul>{error.details.map((d) => <li key={d}>{d}</li>)}</ul>}</div>}
-      {canEdit
-        ? <div className="row">
-            <button className="primary" disabled={!changed.length} onClick={submit}>Save {changed.length ? `${changed.length} change${changed.length > 1 ? "s" : ""}` : ""}</button>
-            {changed.length > 0 && <button onClick={() => setValues(initial())}>Undo</button>}
-            {Object.keys(view.overrides).length > 0 && <button className="link" onClick={reset}>Back to the defaults</button>}
-          </div>
-        : <p className="muted small">Only Workbench admins change thresholds.</p>}
-    </div>
-  );
-}
-
 // The sidebar's Alerts: every service's open alerts, and what closed in the last day.
 export function AlertsPage({ onOpen }: { onOpen: (service: string) => void }) {
   const [data, setData] = useState<{ alerts: GlobalAlert[]; open: number } | undefined>();
@@ -188,7 +87,7 @@ export function AlertsPage({ onOpen }: { onOpen: (service: string) => void }) {
   return (
     <>
       <div className="toolbar"><h1>Alerts</h1><span className="muted">{open.length} open · {open.filter((a) => a.level === "CRIT").length} critical</span><span className="spacer" /><button onClick={load}>Refresh</button></div>
-      <p className="muted page-note">The managed services' health rules (§9.2), checked in this Deployer as samples come in and once a minute. Shown here and on each service's page only; nothing is pushed. Thresholds are in each service's Toolbox (Alerts and timeline).</p>
+      <p className="muted page-note">The managed services' health rules (§9.2), checked in this Deployer as samples come in and once a minute. Shown here and on each service's page only; nothing is pushed.</p>
       {error && <p className="error">{error}</p>}
       <section className="card">
         <h2>Open</h2>

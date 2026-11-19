@@ -313,42 +313,20 @@ export const reviewDraft = (id: string) => call<ServiceDraft>("POST", drafts(`/$
 export const discardDraft = (id: string) => call<ServiceDraft>("POST", drafts(`/${encodeURIComponent(id)}/discard`), {});
 export const confirmDraft = (id: string) => call<{ draft: ServiceDraft; registered: string[]; reads: string[] }>("POST", drafts(`/${encodeURIComponent(id)}/confirm`), {});
 // Phase 2 step 2 (§15.3): a service's numbers per member, its bulletins.
-import type { Field, MetricsView, Range } from "../server/services/metrics.ts";
-import type { ServiceBulletin, ServiceCert } from "../server/store.ts";
-export type { Field, MetricsView, Range, ServiceBulletin, ServiceCert };
-export const serviceMetrics = (id: string, range: Range, fields?: Field[]) =>
-  call<MetricsView>("GET", `services/${encodeURIComponent(id)}/metrics?range=${range}${fields ? `&fields=${fields.join(",")}` : ""}`);
+import type { ServiceBulletin } from "../server/store.ts";
+export type { ServiceBulletin };
 export const serviceBulletins = (id: string, limit = 50) => call<{ bulletins: ServiceBulletin[] }>("GET", `services/${encodeURIComponent(id)}/bulletins?limit=${limit}`);
 // Phase 2 step 3 (§15.3): alerts, the timeline, the thresholds.
 import type { RuleId } from "../server/services/rules.ts";
-import type { Thresholds } from "../server/services/profiles.ts";
 import type { TimelineEvent } from "../server/services/status.ts";
 import type { ServiceAlert } from "../server/store.ts";
-export type { RuleId, Thresholds, TimelineEvent };
+export type { RuleId, TimelineEvent };
 /** S37 step 9: a CRIT alert's own AI analysis, when one was made. */
 export interface AlertAnalysis { case: number; state: "running" | "done" | "failed"; cause: string | null; confidence: string | null }
 export type AlertView = ServiceAlert & { label: string; text: string; memberLabel: string | null; analysis?: AlertAnalysis };
 export type RuleInfo = { label: string; scope: "member" | "service"; levels: ("WARN" | "CRIT")[]; description: string };
-export type ThresholdInfo = { label: string; unit: string; min: number; max: number; rule: RuleId; description: string };
-export type ThresholdsView = { defaults: Thresholds; overrides: Partial<Thresholds>; effective: Thresholds; info: Record<keyof Thresholds, ThresholdInfo> };
-export const serviceAlerts = (id: string) => call<{ alerts: AlertView[]; rules: Record<RuleId, RuleInfo>; thresholds: ThresholdsView; canEdit: boolean }>("GET", `services/${encodeURIComponent(id)}/alerts`);
-export const serviceEvents = (id: string, limit = 200) => call<{ events: TimelineEvent[] }>("GET", `services/${encodeURIComponent(id)}/events?limit=${limit}`);
-export const putThresholds = (id: string, thresholds: Partial<Record<keyof Thresholds, number | null>>) => call<{ thresholds: ThresholdsView }>("PUT", `services/${encodeURIComponent(id)}/thresholds`, { thresholds });
 export type GlobalAlert = AlertView & { kind: "standalone" | "cluster"; environment: string; profile: string };
 export const alerts = (state: "open" | "all" = "open") => call<{ alerts: GlobalAlert[]; open: number; rules: Record<RuleId, RuleInfo> }>("GET", `alerts?state=${state}`);
-// Phase 2 step 4 (§9.3, §15.3): a service's logs through its service executors.
-import type { LogEntry, LogMember, SearchResult } from "../server/services/logs.ts";
-import type { LogPattern } from "../server/store.ts";
-export type { LogEntry, LogMember, LogPattern, SearchResult };
-export type LogFile = { name: string; size: number; modifiedAt: string; gz: boolean };
-export type LogSearch = { members?: string[]; files?: string[]; from: string; to: string; levels?: string[]; query?: string; regex?: boolean; limit?: number };
-const logsPath = (id: string, rest = "") => `services/${encodeURIComponent(id)}/logs${rest}`;
-export const serviceLogs = (id: string, hours = 24) => call<{ members: LogMember[]; hours: number; patterns: LogPattern[]; tails: { member: string; file: string; followers: number }[] }>("GET", logsPath(id, `?hours=${hours}`));
-export const logFiles = (id: string, member: string) => call<{ dir: string; files: LogFile[]; more: number }>("GET", logsPath(id, `/files?member=${encodeURIComponent(member)}`));
-export const searchLogs = (id: string, q: LogSearch) => call<SearchResult>("POST", logsPath(id, "/search"), q);
-/** Opened by the page itself (a link, an EventSource): the session cookie goes along, a GET needs no CSRF token. */
-export const logDownloadUrl = (id: string, member: string, files: string[]) => `${BASE}api/${logsPath(id, `/download?member=${encodeURIComponent(member)}&files=${files.map(encodeURIComponent).join(",")}`)}`;
-export const logTailUrl = (id: string, member: string, file: string) => `${BASE}api/${logsPath(id, `/tail?member=${encodeURIComponent(member)}&file=${encodeURIComponent(file)}`)}`;
 // Phase 2 step 6 (§9.4, §15.3): a service's nginx address for Studio's nifi-ops graph, its check, the graph's runs.
 import type { GraphRun, NginxCheck } from "../server/store.ts";
 export type { GraphRun, NginxCheck };
@@ -357,46 +335,6 @@ export const putServiceNginx = (id: string, nginxUrl: string | null) => call<{ n
 export const checkServiceNginx = (id: string) => call<{ nginxUrl: string; check: NginxCheck }>("POST", `services/${encodeURIComponent(id)}/nginx/check`);
 export const serviceGraph = () => call<GraphState>("GET", "services/graph");
 export const publishServiceGraph = () => call<GraphRun>("POST", "services/graph/publish");
-// Phase 2 step 7 (§9.5, S28): the FlowFile trace, read by the service executors from NiFi's provenance.
-import type { ProvenanceMember } from "../server/services/provenance.ts";
-export type { ProvenanceMember };
-export type ProvenanceInfo = { kind: string; version: string; supported: boolean; note: string; members: ProvenanceMember[]; ready: boolean };
-export type ProvEvent = {
-  id?: string; eventId: number; eventTime?: string; at: string | null; eventType: string; flowFileUuid: string; fileSizeBytes?: number;
-  clusterNodeId?: string; clusterNodeAddress?: string; member?: string | null; groupId?: string; componentId?: string; componentType?: string; componentName?: string;
-  relationship?: string; details?: string; eventDuration?: number; lineageDuration?: number; parentUuids?: string[]; childUuids?: string[]; transitUri?: string;
-  attributes?: { name: string; value?: string; previousValue?: string }[]; attributesHidden?: boolean;
-};
-export type ProvenanceResult = { from: string; to: string; events: ProvEvent[]; total: number; totalText?: string; limit: number; limitReached: boolean; scope: string; shiftedHours: number; notes?: string[]; errors: string[]; nifiVersion: string; via: { member: string; label: string } };
-export type LineageNode = { id: string; type: "FLOWFILE" | "EVENT"; flowFileUuid?: string; eventType?: string; at: string | null; parentUuids?: string[]; childUuids?: string[]; clusterNodeIdentifier?: string; componentId?: string; componentName?: string; componentType?: string; relationship?: string; details?: string; error?: string };
-export type LineageResult = { nodes: LineageNode[]; links: { sourceId: string; targetId: string; flowFileUuid?: string; at: string | null }[]; enriched: number; notes?: string[]; errors: string[]; direction: string };
-export type ProvenanceSearchAsk = { uuid?: string; field?: string; value?: string; from: string; to: string; maxResults?: number; node?: string };
-const provPath = (id: string, rest = "") => `services/${encodeURIComponent(id)}${rest}`;
-export const provenanceInfo = (id: string) => call<ProvenanceInfo>("GET", provPath(id, "/provenance"));
-export const provenanceOptions = (id: string) => call<{ fields: { id: string; field: string; label: string; type: string }[] }>("GET", provPath(id, "/provenance/options"));
-export const searchProvenance = (id: string, q: ProvenanceSearchAsk) => call<ProvenanceResult>("POST", provPath(id, "/provenance"), q);
-export const lineage = (id: string, q: { uuid?: string; eventId?: number; direction?: string; node?: string }) => call<LineageResult>("POST", provPath(id, "/lineage"), q);
-export const provenanceEvent = (id: string, eventId: number, node?: string) => call<{ event: ProvEvent; member: string | null }>("GET", provPath(id, `/provenance/events/${eventId}${node ? `?node=${encodeURIComponent(node)}` : ""}`));
-export const bulletinsBetween = (id: string, from: string, to: string, limit = 200) => call<{ bulletins: ServiceBulletin[] }>("GET", `services/${encodeURIComponent(id)}/bulletins?limit=${limit}&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`);
-
-// S37 step 5 (§4.2.0): a service's business process model for the data trace.
-export type { TraceModel, Business, Step, Endpoint, Condition, Channel, CueMapping } from "../server/services/trace/model.ts";
-export type { Dangling, Link } from "../server/services/trace/channels.ts";
-export type TraceModelHealth = { dangling: import("../server/services/trace/channels.ts").Dangling[]; links: import("../server/services/trace/channels.ts").Link[] };
-export type TraceModelView = { model: import("../server/services/trace/model.ts").TraceModel; revision: number; savedAt: string | null; savedBy: string | null; canEdit: boolean; health: TraceModelHealth; sources: string[] };
-export type FlowComponent = { kind: "process-group" | "input-port" | "output-port" | "processor"; id: string; name: string | null; groupId: string | null; groupName: string | null };
-export const traceModel = (id: string) => call<TraceModelView>("GET", provPath(id, "/trace-model"));
-export const saveTraceModel = (id: string, model: unknown, revision: number) => call<{ revision: number; health: TraceModelHealth }>("PUT", provPath(id, "/trace-model"), { model, revision });
-export const searchPositions = (id: string, q: string) => call<{ results: FlowComponent[]; truncated: boolean }>("GET", provPath(id, `/trace-model/positions?q=${encodeURIComponent(q)}`));
-// S37 step 7 (T6, T8, T9): the e2e_trace evidence source of a service (a Studio Graph and its graph token) and the model import.
-export type E2eCheck = { ok: boolean; schedules?: number; message: string };
-export type TraceSourcesView = { canEdit: boolean; prerequisites: string[]; canIssue: boolean; e2e_trace: { graph: string; savedAt: string; savedBy: string } | null };
-export const traceSources = (id: string) => call<TraceSourcesView>("GET", provPath(id, "/trace-sources"));
-export const saveE2eSource = (id: string, graph: string, token?: string) => call<TraceSourcesView & { issued: boolean; check: E2eCheck }>("PUT", provPath(id, "/trace-sources/e2e_trace"), { graph, ...(token ? { token } : {}) });
-export const removeE2eSource = (id: string) => call<TraceSourcesView>("DELETE", provPath(id, "/trace-sources/e2e_trace"));
-export const checkE2eSource = (id: string) => call<E2eCheck>("POST", provPath(id, "/trace-sources/e2e_trace/check"), {});
-export const importE2eModel = (id: string) => call<{ model: import("../server/services/trace/model.ts").TraceModel; revision: number; imported: string[]; replaced: string[]; notes: string[] }>("POST", provPath(id, "/trace-model/import-e2e"), {});
-
 // S37 step 3: the Status tab renders this as it is (the to-do engine, rules.ts health()).
 export type { ServiceHealth, Todo, TodoAction } from "../server/services/rules.ts";
 export type OpsDesk = import("../server/services/ops.ts").OpsDesk;
@@ -404,16 +342,6 @@ export type OpsTodo = import("../server/services/ops.ts").OpsTodo;
 export const opsDesk = () => call<OpsDesk>("GET", "services/ops");
 export const serviceHealth =(id: string) => call<import("../server/services/rules.ts").ServiceHealth>("GET", `services/${encodeURIComponent(id)}/health`);
 
-// S37 step 4: the Investigate tab's evidence (services/investigate.ts).
-export type { EvidenceCard, EvidenceItem, Investigation } from "../server/services/investigate.ts";
-export const investigateService = (id: string, q: { member?: string | undefined; from: string; to: string; focus?: string | undefined }) => {
-  const qs = new URLSearchParams(Object.entries(q).filter((e): e is [string, string] => typeof e[1] === "string" && e[1] !== ""));
-  return call<import("../server/services/investigate.ts").Investigation>("GET", `services/${encodeURIComponent(id)}/investigate?${qs}`);
-};
-// S37 step 8: the Data trace tab (the engine's answer as it is) and the sentence-to-conditions suggestion (Q6).
-export type { TraceAnswer, TraceResult, Segment, StepResult, Verdict, VerdictAction, HandoverResult, StuckContext } from "../server/services/trace/engine.ts";
-export type { NlConditions } from "../server/services/trace/nl.ts";
-export type TraceInput = { business?: string; fileName?: string; emailFrom?: string; emailSubject?: string; from?: string; to?: string };
 // S37 step 9: cases (the AI analysis, its follow-up questions, the outcome a person writes).
 export type ServiceCase = import("../server/services/cases.ts").ServiceCase;
 export type CaseProposal = import("../server/services/cases.ts").Proposal;
@@ -421,8 +349,5 @@ const casePath = (id: string, rest = "") => `services/${encodeURIComponent(id)}/
 export const serviceCases = (id: string, q: { rule?: string; kind?: string; limit?: number } = {}) =>
   call<{ enabled: boolean; cases: Omit<ServiceCase, "evidence" | "session">[] }>("GET", `${casePath(id)}?${new URLSearchParams(Object.entries(q).filter(([, v]) => v !== undefined && v !== "").map(([k, v]) => [k, String(v)]))}`);
 export const serviceCase = (id: string, kase: number) => call<ServiceCase>("GET", casePath(id, `/${kase}`));
-export const startCase = (id: string, body: { kind: "investigate"; member?: string | undefined; from: string; to: string; focus?: string | undefined; label?: string } | { kind: "trace"; answer: unknown; label?: string }) => call<ServiceCase>("POST", casePath(id), body);
 export const askCase = (id: string, kase: number, text: string) => call<ServiceCase>("POST", casePath(id, `/${kase}/messages`), { text });
 export const caseOutcome = (id: string, kase: number, text: string) => call<ServiceCase>("PUT", casePath(id, `/${kase}/outcome`), { text });
-export const traceBusinessData = (id: string, q: TraceInput) => call<import("../server/services/trace/engine.ts").TraceAnswer>("POST", provPath(id, "/trace-business-data"), q);
-export const traceParse = (id: string, text: string) => call<{ conditions: import("../server/services/trace/nl.ts").NlConditions; ms: number } | { fallback: string; ms: number }>("POST", provPath(id, "/trace-parse"), { text, utcOffsetMinutes: -new Date().getTimezoneOffset() });
