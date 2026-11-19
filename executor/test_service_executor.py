@@ -30,6 +30,8 @@ NO_ENV = {"HOME": "/nonexistent"}
 def cfg(root, **over):
     c = sx.config(environ={"EXECUTOR_WORK": str(pathlib.Path(root) / "work"), "EXECUTOR_DEPLOYER_URL": "https://deployer.test",
                            "EXECUTOR_TOKEN_FILE": str(pathlib.Path(root) / "token"), "EXECUTOR_READ_SLOTS": "2"})
+    # The recorded answers have no flow topology: the flow counts are tested on their own (FlowCountsTest).
+    c["flow_seconds"] = 0
     c.update(over)
     return c
 
@@ -3443,6 +3445,113 @@ class ReleaseTest(Base):
         self.assertEqual((status["state"], status["message"]), ("succeeded", "Executor upgraded from 0.7.9 to 0.8.0"))
         self.assertEqual((self.api.beats[-1]["executor"], self.api.beats[-1]["version"]), ("service", "0.8.0"))
         self.assertTrue(src.is_dir())
+
+
+def _e(i, name, **kw):
+    return {"id": i, "component": {"name": name, **kw}}
+
+
+def _conn(i, s, d):
+    return {"id": i, "sourceId": s, "destinationId": d}
+
+
+# A flow like the lab's (pages-rethink step 1): on root, a loose piece gen -> rename -> RPG port "orders" (to c250) and a
+# remote input port "in" -> load; group A (two pieces: a -> out port, and a lone x) and group B (in port -> b, inside a
+# child group C) linked at root by A.out -> B.in.
+FLOW_GROUPS = [
+    {"id": "root", "name": "NiFi Flow", "parent": None, "flow": {
+        "processors": [_e("p-gen", "gen"), _e("p-ren", "rename"), _e("p-load", "load")],
+        "inputPorts": [_e("ri", "in")],  # 1.x: no allowRemoteAccess, a root input port is remote
+        "remoteProcessGroups": [{"id": "rpg", "component": {"targetUris": "https://C250:18445/nifi/,https://c250b:18446/nifi",
+                                                            "contents": {"inputPorts": [{"id": "rp", "name": "orders", "connected": True}]}}}],
+        "processGroups": [{"id": "A"}, {"id": "B"}],
+        "connections": [_conn("c1", "p-gen", "p-ren"), _conn("c2", "p-ren", "rp"), _conn("c3", "ri", "p-load"), _conn("c4", "A-out", "B-in")]}},
+    {"id": "A", "name": "Group A", "parent": "root", "flow": {
+        "processors": [_e("a1", "a"), _e("a2", "x")], "outputPorts": [_e("A-out", "out")], "connections": [_conn("ca", "a1", "A-out")]}},
+    {"id": "B", "name": "Group B", "parent": "root", "flow": {
+        "inputPorts": [_e("B-in", "in", allowRemoteAccess=False)], "processGroups": [{"id": "C"}], "connections": [_conn("cb", "B-in", "C-in")]}},
+    {"id": "C", "name": "C", "parent": "B", "flow": {
+        "processors": [_e("b1", "b")], "inputPorts": [_e("C-in", "cin")], "connections": [_conn("cc", "C-in", "b1")]}},
+]
+
+
+class FlowCountsTest(unittest.TestCase):
+    def test_topology_units_fragments_links_and_s2s(self):
+        body, helper = sx.build_topology("root", "NiFi Flow", FLOW_GROUPS)
+        groups = {g["id"]: g for g in body["groups"]}
+        self.assertEqual([g["id"] for g in body["groups"]], ["root", "A", "B"], "the root canvas first, then by name")
+        self.assertEqual([(f["key"], f["names"], f["starts"]) for f in groups["root"]["fragments"]], [("p-gen", ["gen", "rename"], 1), ("p-load", ["load"], 1)])
+        self.assertEqual(groups["root"]["fragments"][0]["s2sOut"], ["https://c250:18445/nifi#orders"])
+        self.assertEqual(groups["root"]["fragments"][1]["remoteIn"], ["in"])
+        self.assertEqual([(f["names"], f["outputs"]) for f in groups["A"]["fragments"]], [(["a"], ["out"]), (["x"], [])], "two pieces (A7 ②)")
+        self.assertEqual([(f["names"], f["inputs"], f["starts"]) for f in groups["B"]["fragments"]], [(["b"], ["in"], 0)], "a child group's components count to B")
+        self.assertEqual(body["links"], [{"connection": "c4", "from": {"group": "A", "fragment": "A-out", "port": "out"}, "to": {"group": "B", "fragment": "B-in", "port": "in"}}])
+        self.assertEqual(body["s2sIn"], [{"id": "ri", "name": "in", "group": "root", "fragment": "p-load"}])
+        self.assertEqual(body["s2sOut"][0]["targets"], ["https://c250:18445/nifi", "https://c250b:18446/nifi"])
+        self.assertEqual((helper["s2sOut"]["https://c250:18445/nifi#orders"]["connections"], helper["s2sIn"]["ri"], helper["rootSources"], helper["rootOutConns"]),
+                         (["c2"], ["c3"], ["p-gen"], ["c2"]))
+
+    def test_counts_from_the_status_and_history_points(self):
+        body, helper = sx.build_topology("root", "NiFi Flow", FLOW_GROUPS)
+        snap = lambda key, inner, **v: {key: [{inner: v}]}
+        status = {"processGroupStatus": {"aggregateSnapshot": {
+            "id": "root", "name": "NiFi Flow",
+            **snap("processorStatusSnapshots", "processorStatusSnapshot", id="p-gen", flowFilesOut=4, bytesOut=40),
+            "inputPortStatusSnapshots": [{"portStatusSnapshot": {"id": "ri", "flowFilesIn": 2, "flowFilesOut": 2, "bytesIn": 20, "bytesOut": 20}}],
+            "connectionStatusSnapshots": [{"connectionStatusSnapshot": {"id": "c2", "flowFilesIn": 4, "flowFilesOut": 3, "bytesIn": 40, "bytesOut": 30}}],
+            "processGroupStatusSnapshots": [{"processGroupStatusSnapshot": {"id": "A", "name": "Group A", "flowFilesIn": 0, "flowFilesReceived": 5, "flowFilesOut": 1, "flowFilesSent": 0, "bytesReceived": 50, "bytesOut": 10}},
+                                            {"processGroupStatusSnapshot": {"id": "B", "name": "Group B"}}]}}}
+        index = sx.status_index(status)
+        rows = {(r["kind"], r["ref"]): r for r in sx.flow_counts(index, body, helper)}
+        self.assertEqual((rows[("group", "A")]["flowFilesIn"], rows[("group", "A")]["flowFilesOut"], rows[("group", "A")]["bytesIn"]), (5, 1, 50))
+        self.assertEqual((rows[("group", "root")]["flowFilesIn"], rows[("group", "root")]["flowFilesOut"]), (6, 3), "remote input passed on + source processors; to the RPG port")
+        self.assertEqual((rows[("s2s-out", "https://c250:18445/nifi#orders")]["flowFilesOut"], rows[("s2s-in", "ri")]["flowFilesIn"]), (3, 2))
+        self.assertEqual(sorted(rows), sorted([("group", "A"), ("group", "B"), ("group", "root"), ("s2s-out", "https://c250:18445/nifi#orders"), ("s2s-in", "ri")]))
+        self.assertEqual(len(sx.flow_counts(index, None, None)), 2, "without a topology only the groups")
+        other = sx.status_index({"processGroupStatus": {"aggregateSnapshot": {"id": "root", "processorStatusSnapshots": [{"processorStatusSnapshot": {"id": "new"}}]}}})
+        self.assertNotEqual(index["signature"], other["signature"])
+        # A snapshot a minute; the first of each 5-minute slot, summed over the connections.
+        h = lambda *pts: {"aggregateSnapshots": [{"timestamp": t, "statusMetrics": {"inputCount": i, "outputCount": o, "inputBytes": i * 10, "outputBytes": o * 10}} for t, i, o in pts]}
+        self.assertEqual(sx.history_points([h((600_000, 1, 1), (660_000, 9, 9), (900_000, 2, 0)), h((610_000, 3, 3))]),
+                         [[600_000, 4, 4, 40, 40], [900_000, 2, 0, 20, 0]])
+
+    def test_collector_flow_every_interval_topology_on_change_history_once(self):
+        c = sx.Collector({"flow_seconds": 300, "collect_seconds": 60})
+        calls = []
+        status = {"processGroupStatus": {"aggregateSnapshot": {"id": "root", "name": "NiFi Flow", "processGroupStatusSnapshots": [
+            {"processGroupStatusSnapshot": {"id": g["id"], "name": g["name"]}} for g in FLOW_GROUPS[1:3]]}}}
+        flows = {g["id"]: {"processGroupFlow": {"breadcrumb": {"breadcrumb": {"name": g["name"]}}, "flow": g["flow"]}} for g in FLOW_GROUPS}
+        hist = {"statusHistory": {"aggregateSnapshots": [{"timestamp": 600_000, "statusMetrics": {"inputCount": 1, "outputCount": 1}}]}}
+
+        def fetch(ctx, connect, port, sni, path, timeout):
+            calls.append(path)
+            if path == "flow/process-groups/root/status?recursive=true":
+                return 200, json.dumps(status).encode()
+            if path.endswith("/status/history"):
+                return 200, json.dumps(hist).encode()
+            return 200, json.dumps(flows[path.rsplit("/", 1)[1]]).encode()
+
+        c.fetch = fetch
+        clock = [100.0]
+        real = sx.time.monotonic
+        sx.time.monotonic = lambda: clock[0]
+        w = {"member": "m", "https": {"host": "localhost", "port": 18443}, "nodeAddress": None, "flowHistory": True}
+        try:
+            first = c.flow(w, {}, object())
+            clock[0] += 60
+            between = c.flow(w, {}, object())
+            clock[0] += 240
+            second = c.flow(w, {}, object())
+        finally:
+            sx.time.monotonic = real
+        self.assertEqual(sorted(first), ["at", "counts", "everySeconds", "history", "topology"])
+        self.assertEqual([h["kind"] for h in first["history"]], ["group", "group", "s2s-out", "s2s-in"])
+        self.assertIsNone(between, "not again within the interval")
+        self.assertEqual(sorted(second), ["at", "counts", "everySeconds"], "same components: no topology walk, history only once")
+        self.assertEqual(calls.count("flow/process-groups/root/status?recursive=true"), 2)
+        self.assertEqual(sum(1 for p in calls if p.startswith("flow/process-groups/") and "status" not in p), 4, "four groups walked once")
+        self.assertIsNone(sx.Collector({"flow_seconds": 0}).flow(w, {}, object()), "0 turns it off")
+        self.assertEqual(sx.watch_entries([{"service": "s", "member": "m", "installDir": "/opt/nifi", "flowHistory": True}])[0]["flowHistory"], True)
 
 
 if __name__ == "__main__":

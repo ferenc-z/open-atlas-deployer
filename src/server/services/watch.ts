@@ -24,6 +24,8 @@ export interface WatchEntry {
   logDir: string | null;
   /** The configuration files to fingerprint (§16.3): what this member should have, so it is what the fingerprints are compared with. */
   files: { name: string; path: string }[];
+  /** pages-rethink A9: no flow counts of this service yet, so the executor reads NiFi's status history (about 24 hours) once. */
+  flowHistory: boolean;
 }
 
 /** A sample as the executor sends it (§15.3); the Deployer keeps the body as it is (step 2 takes it apart). */
@@ -56,6 +58,7 @@ export function watchList(store: Store, host: string): WatchEntry[] {
       https: { host: typeof httpsHost === "string" ? httpsHost : null, port: m.ports?.https ?? null },
       nodeAddress: m.nodeAddress ?? null, logDir: typeof logs === "string" ? logs : null,
       files: store.serviceMemberFiles(service).filter((f) => f.member === installKey(m)).map((f) => ({ name: f.file, path: f.path })),
+      flowHistory: !store.hasFlowCounts(service),
     };
   };
   return [

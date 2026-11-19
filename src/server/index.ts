@@ -37,6 +37,7 @@ import { Store } from "./store.ts";
 import { WorkbenchKey } from "./workbench-key.ts";
 import { readToken, Versions, type TokenSource } from "./versions.ts";
 import { prune, rollUp } from "./services/metrics.ts";
+import { pruneFlow } from "./services/flowcounts.ts";
 import { checkAll } from "./services/rules.ts";
 
 // D45: deployer.env first (the state directory and the credential key come only from there), then what an
@@ -138,7 +139,7 @@ const serviceUpkeep = (cleanup: boolean) => {
     checkAll(store, (h) => deployments.handoff.executor(h, "service"));
     store.dropOldExecutorContent();
     deployments.handoff.expireQueued();
-    if (cleanup) prune(store, new Date());
+    if (cleanup) { prune(store, new Date()); pruneFlow(store, new Date()); }
   } catch (error) { console.error("service metrics:", error); }
 };
 setInterval(() => serviceUpkeep(false), 60_000).unref();

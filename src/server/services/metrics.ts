@@ -8,6 +8,7 @@ import type { Point, ServiceBulletin, ServiceCert, Store } from "../store.ts";
 import type { ServiceSample } from "./watch.ts";
 import { installKey, type ServiceMember } from "./draft.ts";
 import { ingestLogs } from "./logs.ts";
+import { ingestFlow } from "./flowcounts.ts";
 
 export const RAW_DAYS = 2;
 export const ROLLUP_DAYS = 30;
@@ -217,11 +218,13 @@ export function ingest(store: Store, samples: ServiceSample[]): { bulletins: num
     if (c && typeof c.readAt === "string" && store.putServiceCerts(s.service, s.member, c.readAt, certRows(c))) certs++;
     // Step 4: the log summary's patterns to service_log_patterns.
     const logs = ingestLogs(store, s);
+    // pages-rethink step 1: the flow counts and topology to service_flow_counts and service_topology.
+    ingestFlow(store, s);
     // The raw body without what went to its own tables.
     store.setServiceMemberActuals(s.service, s.member, fingerprintsOf(s), s.at);
     const { certs: _c, files: _f, ...rest } = s;
     const nifi = rest.nifi as Any | undefined;
-    kept.push({ ...rest, ...(nifi ? { nifi: { ...nifi, bulletins: undefined } } : {}), ...(logs ? { logs } : {}), point } as ServiceSample & { point: Point });
+    kept.push({ ...rest, ...(nifi ? { nifi: { ...nifi, bulletins: undefined, flowCounts: undefined } } : {}), ...(logs ? { logs } : {}), point } as ServiceSample & { point: Point });
   }
   store.addServiceSamples(kept);
   return { bulletins, certs };

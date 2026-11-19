@@ -151,6 +151,19 @@ CREATE TABLE IF NOT EXISTS service_samples (
 CREATE INDEX IF NOT EXISTS service_samples_at ON service_samples (service, member, at);
 CREATE TABLE IF NOT EXISTS service_rollups (
   service TEXT NOT NULL, member TEXT NOT NULL, bucket TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY (service, member, bucket));
+-- pages-rethink §10.2.4 step 1: flow counts, a row per 5-minute bucket, group or S2S port (30 days); source nifi-history:
+-- filled in from NiFi's own status history when the service was taken over.
+CREATE TABLE IF NOT EXISTS service_flow_counts (
+  service TEXT NOT NULL, bucket TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  ref TEXT NOT NULL,
+  name TEXT NOT NULL, flowfiles_in INTEGER NOT NULL, flowfiles_out INTEGER NOT NULL,
+  bytes_in INTEGER NOT NULL, bytes_out INTEGER NOT NULL, source TEXT NOT NULL,
+  PRIMARY KEY (service, kind, ref, bucket));
+CREATE INDEX IF NOT EXISTS service_flow_counts_at ON service_flow_counts (service, bucket);
+-- Step 1: the topology under root (groups, ports, links between groups, RPGs), a row only when its hash changed (30 days).
+CREATE TABLE IF NOT EXISTS service_topology (
+  service TEXT NOT NULL, taken_at TEXT NOT NULL, hash TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY (service, taken_at));
 CREATE TABLE IF NOT EXISTS service_bulletins (
   service TEXT NOT NULL, member TEXT NOT NULL, node TEXT NOT NULL, bulletin_id INTEGER NOT NULL, at TEXT NOT NULL, level TEXT,
   category TEXT, source TEXT, source_type TEXT, message TEXT, received_at TEXT NOT NULL);
@@ -1583,6 +1596,70 @@ export class Store {
     return out;
   }
 
+  // pages-rethink §10.2 step 1: flow counts and topology snapshots.
+
+  /** Adds flow counts; a sample's row replaces what the bucket had, NiFi's history only fills buckets that have none. */
+  putFlowCounts(rows: FlowCountRow[]) {
+    if (!rows.length) return;
+    const replace = this.db.prepare(`INSERT INTO service_flow_counts (service, bucket, kind, ref, name, flowfiles_in, flowfiles_out, bytes_in, bytes_out, source)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (service, kind, ref, bucket) DO UPDATE SET name = excluded.name, flowfiles_in = excluded.flowfiles_in,
+        flowfiles_out = excluded.flowfiles_out, bytes_in = excluded.bytes_in, bytes_out = excluded.bytes_out, source = excluded.source`);
+    const fill = this.db.prepare(`INSERT OR IGNORE INTO service_flow_counts (service, bucket, kind, ref, name, flowfiles_in, flowfiles_out, bytes_in, bytes_out, source)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    this.inTransaction(() => {
+      for (const r of rows) (r.source === "sample" ? replace : fill).run(r.service, r.bucket, r.kind, r.ref, r.name, r.flowfilesIn, r.flowfilesOut, r.bytesIn, r.bytesOut, r.source);
+    });
+  }
+
+  flowCounts(service: string, from: string, to: string): FlowCountRow[] {
+    return (this.db.prepare("SELECT * FROM service_flow_counts WHERE service = ? AND bucket >= ? AND bucket < ? ORDER BY bucket, kind, ref").all(service, from, to) as Row[]).map((r) => ({
+      service: r.service, bucket: r.bucket, kind: r.kind, ref: r.ref, name: r.name, flowfilesIn: r.flowfiles_in, flowfilesOut: r.flowfiles_out,
+      bytesIn: r.bytes_in, bytesOut: r.bytes_out, source: r.source,
+    }));
+  }
+
+  /** Per kind and ref since a time: the sums, how many buckets, the first and the last bucket. */
+  flowCountTotals(service: string, since: string): { kind: string; ref: string; name: string; flowfilesIn: number; flowfilesOut: number; buckets: number; first: string; last: string }[] {
+    return (this.db.prepare(`SELECT kind, ref, MAX(name) AS name, SUM(flowfiles_in) AS fin, SUM(flowfiles_out) AS fout, COUNT(*) AS n, MIN(bucket) AS first, MAX(bucket) AS last
+      FROM service_flow_counts WHERE service = ? AND bucket >= ? GROUP BY kind, ref ORDER BY kind, ref`).all(service, since) as Row[])
+      .map((r) => ({ kind: r.kind, ref: r.ref, name: r.name, flowfilesIn: r.fin, flowfilesOut: r.fout, buckets: r.n, first: r.first, last: r.last }));
+  }
+
+  hasFlowCounts(service: string): boolean {
+    return Boolean(this.db.prepare("SELECT 1 FROM service_flow_counts WHERE service = ? LIMIT 1").get(service));
+  }
+
+  /** Keeps a topology snapshot when its hash differs from the newest one; true when it was added. */
+  putTopology(service: string, takenAt: string, hash: string, body: unknown): boolean {
+    const last = this.latestTopology(service);
+    if (last && (last.hash === hash || last.takenAt >= takenAt)) return false;
+    this.db.prepare("INSERT OR IGNORE INTO service_topology (service, taken_at, hash, body) VALUES (?, ?, ?, ?)").run(service, takenAt, hash, JSON.stringify(body));
+    return true;
+  }
+
+  latestTopology(service: string, at?: string): { takenAt: string; hash: string; body: unknown } | undefined {
+    const r = (at
+      ? this.db.prepare("SELECT * FROM service_topology WHERE service = ? AND taken_at <= ? ORDER BY taken_at DESC LIMIT 1").get(service, at)
+      : this.db.prepare("SELECT * FROM service_topology WHERE service = ? ORDER BY taken_at DESC LIMIT 1").get(service)) as Row | undefined;
+    return r ? { takenAt: r.taken_at, hash: r.hash, body: JSON.parse(r.body) } : undefined;
+  }
+
+  topologies(service: string, since: string): { takenAt: string; hash: string }[] {
+    return (this.db.prepare("SELECT taken_at, hash FROM service_topology WHERE service = ? AND taken_at >= ? ORDER BY taken_at").all(service, since) as Row[])
+      .map((r) => ({ takenAt: r.taken_at, hash: r.hash }));
+  }
+
+  /** Step 1 retention (30 days): counts before a time; topology snapshots before it except each service's newest. */
+  pruneFlowData(before: string): { counts: number; topologies: number } {
+    const out = { counts: 0, topologies: 0 };
+    this.inTransaction(() => {
+      out.counts = Number(this.db.prepare("DELETE FROM service_flow_counts WHERE bucket < ?").run(before).changes);
+      out.topologies = Number(this.db.prepare(`DELETE FROM service_topology WHERE taken_at < ?
+        AND taken_at < (SELECT MAX(taken_at) FROM service_topology t WHERE t.service = service_topology.service)`).run(before).changes);
+    });
+    return out;
+  }
+
   // Phase 2 step 4 (§15.3): the WARN/ERROR summary of each member's nifi-app.log, by pattern (level, logger, message
   // template, exception), with the first and the newest sample (cut and with secrets hidden by the executor), and
   // the counts per 5-minute bucket for the rules.
@@ -1846,4 +1923,9 @@ export interface LogPattern { member: string; pattern: string; level: string; lo
 /** A sample's flat numbers (services/metrics.ts). */
 export type Point = Record<string, number | null>;
 export interface ServiceBulletin { service: string; member: string; node: string; id: number; at: string; level: string | null; category: string | null; source: string | null; sourceType: string | null; message: string | null; sourceId?: string; groupId?: string }
+/** pages-rethink §10.2.4 step 1: one row of service_flow_counts (ref: group id; s2s-out "<target uri>#<port name>"; s2s-in the input port id). */
+export interface FlowCountRow {
+  service: string; bucket: string; kind: "group" | "s2s-out" | "s2s-in"; ref: string; name: string;
+  flowfilesIn: number; flowfilesOut: number; bytesIn: number; bytesOut: number; source: "sample" | "nifi-history";
+}
 export interface ServiceCert { member: string; store: string; path: string | null; type: string | null; alias: string | null; chain: number | null; subject: string | null; issuer: string | null; notBefore: string | null; notAfter: string | null; readAt: string; error: string | null }
