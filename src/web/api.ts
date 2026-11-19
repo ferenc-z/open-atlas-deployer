@@ -9,6 +9,7 @@ import type { SetupStatus, SetupStep } from "../server/setup.ts";
 import type { AiItem, AiStatus, AiUse } from "../server/setup-ai.ts";
 import type { SettingRow } from "../server/deployer-settings.ts";
 import { makeFlowClient } from "./flow-client.ts";
+import { makeOpsClient } from "./ops-client.ts";
 
 export type { SettingRow };
 export type { AiItem, AiStatus, AiUse, AuditEntry, EnvironmentStatus, Manifest, Principal, RegisteredApp, SetupStatus, SetupStep };
@@ -313,21 +314,6 @@ export const reassessDraft = (id: string) => call<ServiceDraft>("POST", drafts(`
 export const reviewDraft = (id: string) => call<ServiceDraft>("POST", drafts(`/${encodeURIComponent(id)}/review`), {});
 export const discardDraft = (id: string) => call<ServiceDraft>("POST", drafts(`/${encodeURIComponent(id)}/discard`), {});
 export const confirmDraft = (id: string) => call<{ draft: ServiceDraft; registered: string[]; reads: string[] }>("POST", drafts(`/${encodeURIComponent(id)}/confirm`), {});
-// Phase 2 step 2 (§15.3): a service's numbers per member, its bulletins.
-import type { ServiceBulletin } from "../server/store.ts";
-export type { ServiceBulletin };
-export const serviceBulletins = (id: string, limit = 50) => call<{ bulletins: ServiceBulletin[] }>("GET", `services/${encodeURIComponent(id)}/bulletins?limit=${limit}`);
-// Phase 2 step 3 (§15.3): alerts, the timeline, the thresholds.
-import type { RuleId } from "../server/services/rules.ts";
-import type { TimelineEvent } from "../server/services/status.ts";
-import type { ServiceAlert } from "../server/store.ts";
-export type { RuleId, TimelineEvent };
-/** S37 step 9: a CRIT alert's own AI analysis, when one was made. */
-export interface AlertAnalysis { case: number; state: "running" | "done" | "failed"; cause: string | null; confidence: string | null }
-export type AlertView = ServiceAlert & { label: string; text: string; memberLabel: string | null; analysis?: AlertAnalysis };
-export type RuleInfo = { label: string; scope: "member" | "service"; levels: ("WARN" | "CRIT")[]; description: string };
-export type GlobalAlert = AlertView & { kind: "standalone" | "cluster"; environment: string; profile: string };
-export const alerts = (state: "open" | "all" = "open") => call<{ alerts: GlobalAlert[]; open: number; rules: Record<RuleId, RuleInfo> }>("GET", `alerts?state=${state}`);
 // Phase 2 step 6 (§9.4, §15.3): a service's nginx address for Studio's nifi-ops graph, its check, the graph's runs.
 import type { GraphRun, NginxCheck } from "../server/store.ts";
 export type { GraphRun, NginxCheck };
@@ -336,22 +322,10 @@ export const putServiceNginx = (id: string, nginxUrl: string | null) => call<{ n
 export const checkServiceNginx = (id: string) => call<{ nginxUrl: string; check: NginxCheck }>("POST", `services/${encodeURIComponent(id)}/nginx/check`);
 export const serviceGraph = () => call<GraphState>("GET", "services/graph");
 export const publishServiceGraph = () => call<GraphRun>("POST", "services/graph/publish");
-// S37 step 3: the Status tab renders this as it is (the to-do engine, rules.ts health()).
-export type { ServiceHealth, Todo, TodoAction } from "../server/services/rules.ts";
-export type OpsDesk = import("../server/services/ops.ts").OpsDesk;
-export type OpsTodo = import("../server/services/ops.ts").OpsTodo;
-export const opsDesk = () => call<OpsDesk>("GET", "services/ops");
-export const serviceHealth =(id: string) => call<import("../server/services/rules.ts").ServiceHealth>("GET", `services/${encodeURIComponent(id)}/health`);
-
-// S37 step 9: cases (the AI analysis, its follow-up questions, the outcome a person writes).
-export type ServiceCase = import("../server/services/cases.ts").ServiceCase;
-export type CaseProposal = import("../server/services/cases.ts").Proposal;
-const casePath = (id: string, rest = "") => `services/${encodeURIComponent(id)}/cases${rest}`;
-export const serviceCases = (id: string, q: { rule?: string; kind?: string; limit?: number } = {}) =>
-  call<{ enabled: boolean; cases: Omit<ServiceCase, "evidence" | "session">[] }>("GET", `${casePath(id)}?${new URLSearchParams(Object.entries(q).filter(([, v]) => v !== undefined && v !== "").map(([k, v]) => [k, String(v)]))}`);
-export const serviceCase = (id: string, kase: number) => call<ServiceCase>("GET", casePath(id, `/${kase}`));
-export const askCase = (id: string, kase: number, text: string) => call<ServiceCase>("POST", casePath(id, `/${kase}/messages`), { text });
-export const caseOutcome = (id: string, kase: number, text: string) => call<ServiceCase>("PUT", casePath(id, `/${kase}/outcome`), { text });
-
 // Step 6b: the flow pages (pages-rethink 10.2.2 items 6, 7, 8). flows-data.ts decides whether the pages use these or the sample data.
 export const flowClient = makeFlowClient(call);
+
+// Step 6a: the overview and the service page (items 1-5, 9, 10). ops-data.ts decides whether the pages use these or the sample data.
+export const opsClient = makeOpsClient(call);
+/** A to-do's set-threshold action (admin): the same call as the old thresholds form. */
+export const putThresholds = (id: string, overrides: Record<string, number>) => call<unknown>("PUT", `services/${encodeURIComponent(id)}/thresholds`, { thresholds: overrides });

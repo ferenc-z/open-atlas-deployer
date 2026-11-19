@@ -1,0 +1,114 @@
+/* The overview and the service's Health tab (prototype Main.dc.html, Service.dc.html), on top of flows.css (the .fl root gives the
+   page its width, the pills, cards and buttons). Scoped under .ops. */
+.fl.ops-wide { max-width: 1280px; }
+.ops .tone-text-failing { color: #B3261E; }
+.ops .tone-text-attention { color: #8A5300; }
+.ops .tone-text-healthy { color: #1E6B34; }
+.ops .tone-text-unknown { color: #4F4F4B; }
+.ops .ops-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; display: inline-block; margin-right: 6px; }
+.ops .fl-pill.big { display: inline-flex; align-items: center; }
+.ops .ops-big { display: inline-flex; align-items: center; gap: 12px; font-weight: 700; }
+
+/* Screen 1 */
+.ops .ov-head { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 16px; }
+.ops .ov-counts { margin: 0; font-size: 18px; }
+.ops .ov-check { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; font-size: 14px; color: #5B5B57; }
+.ops .ov-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 520px), 1fr)); gap: 16px; }
+.ops a.ov-card { display: flex; flex-direction: column; gap: 16px; padding: 20px 22px; background: #fff; border: 1px solid #E3E3DE; border-top: 6px solid #D6D6D0; border-radius: 12px; color: inherit; }
+.ops a.ov-card:hover { border-color: #9AA3B5; color: inherit; }
+.ops a.ov-card.edge-failing { border-top-color: #B3261E; }
+.ops a.ov-card.edge-attention { border-top-color: #C98A1B; }
+.ops a.ov-card.edge-healthy { border-top-color: #CFE3D5; }
+.ops .ov-card-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px; }
+.ops .ov-name { font-size: 20px; font-weight: 700; }
+.ops .ov-lines { display: flex; flex-direction: column; gap: 10px; }
+.ops .ov-line { display: flex; align-items: flex-start; gap: 12px; }
+.ops .ov-kind { flex: 0 0 auto; width: 104px; font-size: 13px; color: #5B5B57; padding-top: 5px; }
+.ops .ov-line .fl-pill { flex: 0 0 auto; }
+.ops .ov-text { font-size: 15px; line-height: 1.5; padding-top: 2px; min-width: 0; }
+.ops .ov-next { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 14px; border-top: 1px solid #EFEFEA; font-size: 14px; }
+.ops .ov-open { color: #1F4FB8; font-weight: 600; white-space: nowrap; }
+
+/* Screen 2 */
+.ops .sv-two { display: flex; flex-wrap: wrap; gap: 16px; }
+.ops .sv-card { min-width: 0; background: #fff; border: 2px solid #C9C9C2; border-radius: 12px; padding: 20px 22px; display: flex; flex-direction: column; gap: 14px; }
+.ops .sv-card.edge-failing { border-color: #B3261E; }
+.ops .sv-card.edge-attention { border-color: #C98A1B; }
+.ops .sv-card.edge-healthy { border-color: #9CCBAA; }
+.ops .sv-machine { flex: 3 1 420px; }
+.ops .sv-business { flex: 2 1 340px; }
+.ops .sv-title { display: flex; align-items: center; gap: 10px; }
+.ops .sv-title b { font-size: 14px; color: #5B5B57; }
+.ops .sv-title span { font-size: 12px; color: #5B5B57; }
+.ops .sv-sentence { margin: 0; font-size: 17px; line-height: 1.5; }
+.ops .sv-checks { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 200px), 1fr)); gap: 8px; }
+.ops .sv-check { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border-radius: 8px; }
+.ops .sv-check.tone-failing { background: #FDECEA; }
+.ops .sv-check.tone-attention { background: #FFF1D6; }
+.ops .sv-check.tone-healthy { background: #F2F7F3; }
+.ops .sv-check.tone-unknown { background: #EEEEEA; }
+.ops .sv-check .mark { flex: 0 0 auto; width: 20px; font-weight: 700; }
+.ops .sv-check div { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.ops .sv-check small { font-size: 13px; color: #5B5B57; }
+.ops .sv-check strong { font-size: 14px; }
+.ops .sv-members { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 13px; color: #5B5B57; }
+.ops .sv-flows { display: flex; flex-direction: column; gap: 4px; }
+.ops a.sv-flow { display: flex; align-items: flex-start; gap: 10px; min-height: 44px; padding: 8px 10px; border-radius: 8px; color: inherit; }
+.ops a.sv-flow:hover { background: #F6F6F3; color: inherit; }
+.ops .sv-flow .dot { flex: 0 0 auto; width: 10px; height: 10px; margin-top: 6px; border-radius: 50%; }
+.ops .sv-flow .dot.d-failing { background: #B3261E; }
+.ops .sv-flow .dot.d-attention { background: #C98A1B; }
+.ops .sv-flow .dot.d-healthy { background: #2E8B4E; }
+.ops .sv-flow .dot.d-unknown { background: #8A8A84; }
+.ops .sv-flow .body { flex: 1 1 auto; display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.ops .sv-flow .name { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.ops .sv-flow .name b { font-size: 15px; }
+.ops .sv-flow .text { font-size: 14px; color: #3C3C39; line-height: 1.5; }
+.ops .sv-foot { font-size: 13px; color: #5B5B57; padding-top: 10px; border-top: 1px solid #EFEFEA; }
+.ops .sv-plain { background: #fff; border: 1px solid #E3E3DE; border-radius: 12px; padding: 20px 22px; display: flex; flex-direction: column; gap: 12px; }
+.ops .sv-plain-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
+.ops .sv-plain-head .meta { font-size: 13px; color: #5B5B57; margin-left: 10px; }
+.ops .sv-summary { margin: 0; font-size: 16px; line-height: 1.7; white-space: pre-line; }
+.ops .sv-looked { display: flex; flex-direction: column; gap: 6px; padding: 12px 14px; background: #F6F6F3; border-radius: 8px; }
+.ops .sv-looked b { font-size: 13px; color: #5B5B57; }
+.ops .sv-looked span { font-size: 14px; color: #3C3C39; }
+.ops .sv-todo { background: #fff; border: 1px solid #E3E3DE; border-radius: 12px; padding: 18px 20px; display: flex; flex-direction: column; gap: 10px; }
+.ops .sv-todo-title { display: flex; align-items: baseline; gap: 10px; }
+.ops .sv-todo-title .n { flex: 0 0 auto; font-size: 13px; font-weight: 700; }
+.ops .sv-todo-title .n.failing { color: #B3261E; }
+.ops .sv-todo-title .n.attention { color: #8A5300; }
+.ops .sv-todo-title span:last-child { font-size: 16px; font-weight: 600; line-height: 1.5; }
+.ops .sv-todo p { margin: 0 0 0 20px; font-size: 14px; color: #3C3C39; line-height: 1.6; }
+.ops .sv-todo .acts { margin-left: 20px; display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.ops .sv-todo .ok { margin-left: 20px; padding: 10px 12px; border-radius: 8px; background: #E6F4EA; color: #1E6B34; font-size: 14px; font-weight: 600; display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+.ops a.fl-btn { text-decoration: none; }
+.ops .fl-linkbtn { border: 0; background: none; padding: 0 4px; font: inherit; font-size: 13px; color: #1F4FB8; cursor: pointer; }
+.ops .fl-linkbtn:hover { color: #163A88; text-decoration: underline; }
+.ops .sv-head { display: flex; flex-direction: column; gap: 6px; }
+.ops .sv-head .line { display: flex; flex-wrap: wrap; align-items: baseline; gap: 12px; }
+.ops .sv-head .acts { display: flex; flex-wrap: wrap; gap: 8px; }
+.ops .sv-tabs { display: flex; gap: 4px; margin-top: 8px; border-bottom: 1px solid #E3E3DE; }
+.ops .sv-tabs button { padding: 10px 14px; font: inherit; font-size: 15px; background: none; border: 0; border-bottom: 3px solid transparent; color: #5B5B57; cursor: pointer; }
+.ops .sv-tabs button[aria-selected="true"] { font-weight: 600; color: #1B1B1B; border-bottom-color: #1B1B1B; }
+
+/* The Ask AI button and the dialog */
+.ask-fab { position: fixed; right: 24px; bottom: 24px; z-index: 15; display: inline-flex; align-items: center; gap: 8px; height: 52px; padding: 0 20px; border-radius: 999px; border: none; background: #1F4FB8; color: #fff; font: inherit; font-size: 15px; font-weight: 600; cursor: pointer; box-shadow: 0 6px 20px rgba(20, 20, 19, .22); }
+.ask-fab:hover { background: #163A88; }
+.assistant-try { padding: 10px 12px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+.assistant-try b { font-weight: 600; color: var(--muted); }
+.assistant-try button { text-align: left; min-height: 36px; padding: 6px 10px; border-radius: 10px; border: 1px solid #E3E3DE; background: #F9F9F7; color: #1B1B1B; font: inherit; font-size: 13px; cursor: pointer; }
+.assistant-try .copied { color: #1E6B34; font-size: 12px; }
+dialog.ops-dialog { border: 0; border-radius: 14px; padding: 0; width: min(620px, calc(100% - 32px)); color: #1B1B1B; font-family: Inter, "Noto Sans SC", system-ui, sans-serif; }
+dialog.ops-dialog::backdrop { background: rgba(20, 20, 19, .45); }
+dialog.ops-dialog .body { padding: 24px; display: flex; flex-direction: column; gap: 16px; }
+dialog.ops-dialog h2 { margin: 0; font-size: 20px; }
+dialog.ops-dialog table { width: 100%; border-collapse: collapse; font-size: 14px; border: 1px solid #E3E3DE; }
+dialog.ops-dialog th { text-align: left; background: #F6F6F3; color: #5B5B57; font-weight: 400; padding: 10px 12px; }
+dialog.ops-dialog td { padding: 10px 12px; border-top: 1px solid #E3E3DE; vertical-align: top; }
+dialog.ops-dialog td small { display: block; font-size: 12px; color: #5B5B57; }
+dialog.ops-dialog .next { display: flex; flex-direction: column; gap: 6px; font-size: 14px; color: #3C3C39; line-height: 1.6; }
+dialog.ops-dialog .acts { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 10px; }
+dialog.ops-dialog .btn { height: 44px; padding: 0 18px; border-radius: 8px; border: 1px solid #C9C9C2; background: #fff; color: #1B1B1B; font: inherit; cursor: pointer; }
+dialog.ops-dialog .btn.primary { border-color: #1B1B1B; background: #1B1B1B; color: #fff; font-weight: 600; }
+dialog.ops-dialog .btn:disabled { opacity: .5; cursor: default; }
+dialog.ops-dialog .err { padding: 10px 12px; border-radius: 8px; background: #FDECEA; color: #B3261E; font-size: 14px; }

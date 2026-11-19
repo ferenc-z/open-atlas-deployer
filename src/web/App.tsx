@@ -6,11 +6,11 @@ import { EnvPage } from "./Env.tsx";
 import { Artifacts } from "./Artifacts.tsx";
 import { PageFocus, usePageFocus, type SetFocus } from "./focus.ts";
 import { AssistantPanel, KeysPage } from "./Assistant.tsx";
+import { contextPage, SUGGESTIONS } from "./ask-ai.ts";
 import { OnboardingPage } from "./Onboarding.tsx";
 import { BriefCard, DriftBanner } from "./Brief.tsx";
 import { HostsPage } from "./Hosts.tsx";
 import { ServicesPage, TakeoverPage } from "./Services.tsx";
-import { AlertsPage, ServiceHealthCard } from "./Alerts.tsx";
 import { IngressPage } from "./Ingress.tsx";
 import { Platform } from "./Platform.tsx";
 import { SettingsPage } from "./Settings.tsx";
@@ -20,7 +20,7 @@ import { FlowsPage } from "./FlowsPage.tsx";
 import { FlowDetailPage } from "./FlowDetailPage.tsx";
 import { flowHref, parseFlowRoute, type FlowRoute } from "./flow-routes.ts";
 
-type Tab = "setup" | "status" | "history" | "hosts" | "settings" | "env" | "registry" | "onboarding" | "ingress" | "keys" | "audit" | "services" | "takeover" | "alerts" | "flows" | "flow";
+type Tab = "setup" | "status" | "history" | "hosts" | "settings" | "env" | "registry" | "onboarding" | "ingress" | "keys" | "audit" | "services" | "takeover" | "flows" | "flow";
 type Panel = { kind: "deploy"; app: string; initial?: { version: string; pinFrom?: string } } | { kind: "job"; id: string } | undefined;
 
 const VERDICT: Record<string, { label: string; tone: string }> = {
@@ -66,12 +66,6 @@ export function App() {
     openPlan: (app: string, version: string, pinFrom?: string) => { setPanel({ kind: "deploy", app, initial: { version, ...(pinFrom ? { pinFrom } : {}) } }); setTab("status"); },
     openServiceChange: (id: string, draft: string) => { setService(id); setServiceDraft({ draft, at: Date.now() }); setTab("services"); },
   }), []);
-  // S37 step 9: an AI case's configuration draft card opens the draft on its service's Changes tab, as the Assistant's card does.
-  useEffect(() => {
-    const on = (e: Event) => { const d = (e as CustomEvent<{ id: string; draft: string }>).detail; actions.openServiceChange(d.id, d.draft); };
-    window.addEventListener("oa:open-service-draft", on);
-    return () => window.removeEventListener("oa:open-service-draft", on);
-  }, [actions]);
   // Step 6b: the flow pages are hash routes (#/flows/<service>, #/flow/<flow>?service=): the service page links to them, and
   // they can ask for the Ask AI panel to open (oa:open-assistant).
   const [flowRoute, setFlowRoute] = useState<FlowRoute | null>(() => parseFlowRoute(location.hash));
@@ -109,7 +103,7 @@ export function App() {
   return (
     <PageFocus.Provider value={setFocus}>
     <div className="shell">
-      <Sidebar principal={p} environment={me.environment} tab={shown} setTab={go} setupOnly={setupOnly} onSignedOut={load} assistant={assistant} toggleAssistant={() => setAssistant(!assistant)} />
+      <Sidebar principal={p} environment={me.environment} tab={shown} setTab={go} setupOnly={setupOnly} onSignedOut={load} />
       <div className="content">
         {p.via === "emergency" && (setupOnly
           ? <div className="banner bad">First setup with the emergency account. Once Workbench is deployed and answers, this account stops working by itself: sign in with Workbench's initial admin then. Every action is audited.</div>
@@ -119,11 +113,10 @@ export function App() {
         {p.actAs && <div className="banner info">{p.actAs.administrator} is using Workbench as {p.displayName}, so permissions here are also those of {p.displayName}.</div>}
         <main>
           {shown === "setup" && <SetupPage workbenchUrl={me.workbenchUrl} onChanged={setupChanged} onGo={go} />}
-          {shown === "status" && <><SetupLine status={setup} onOpen={() => go("setup")} /><DriftBanner /><Status services={<ServiceHealthCard onServices={() => go("services")} onAlerts={() => go("alerts")} />} panel={panel} setPanel={setPanel} isAdmin={p.permissions.includes("admin")} canRegenerate={p.permissions.includes("deploy-uat") || p.permissions.includes("deploy-prod")} onAssessment={(id) => { setPanel(undefined); setAssessment(id); setTab("onboarding"); }} /></>}
+          {shown === "status" && <><SetupLine status={setup} onOpen={() => go("setup")} /><DriftBanner /><Status panel={panel} setPanel={setPanel} isAdmin={p.permissions.includes("admin")} canRegenerate={p.permissions.includes("deploy-uat") || p.permissions.includes("deploy-prod")} onAssessment={(id) => { setPanel(undefined); setAssessment(id); setTab("onboarding"); }} /></>}
           {shown === "history" && <HistoryPage onBack={(j) => { setPanel({ kind: "deploy", app: j.app, initial: { version: j.version, pinFrom: j.id } }); setTab("status"); }} />}
           {shown === "hosts" && <HostsPage isAdmin={p.permissions.includes("admin")} />}
           {shown === "services" && <ServicesPage key={`${service ?? ""}:${serviceDraft?.at ?? ""}`} onTakeover={() => go("takeover")} isAdmin={p.permissions.includes("admin")} {...(service ? { initialOpen: service } : {})} {...(serviceDraft ? { initialDraft: serviceDraft.draft } : {})} />}
-          {shown === "alerts" && <AlertsPage onOpen={openService} />}
           {shown === "flows" && flowRoute?.kind === "flows" && <FlowsPage service={flowRoute.service} isAdmin={p.permissions.includes("admin")} onBack={() => { go("services"); openService(flowRoute.service); }} />}
           {shown === "flow" && flowRoute?.kind === "flow" && <FlowDetailPage key={`${flowRoute.flow}:${flowRoute.service ?? ""}`} flow={flowRoute.flow} {...(flowRoute.service ? { service: flowRoute.service } : {})} isAdmin={p.permissions.includes("admin")} onBack={(s) => { go("services"); openService(s); }} onOpenFlow={(f, s) => { location.hash = flowHref(f, s); }} />}
           {shown === "takeover" && <TakeoverPage isAdmin={p.permissions.includes("admin")} onRegistered={() => go("services")} />}
@@ -136,29 +129,27 @@ export function App() {
           {shown === "audit" && p.permissions.includes("admin") && <Audit />}
         </main>
       </div>
-      {assistant && <AssistantPanel workbenchUrl={me.workbenchUrl} {...(me.environment ? { environment: me.environment } : {})} page={shown} {...(panel?.kind === "deploy" ? { app: panel.app } : {})} focus={focus} actions={actions} onClose={() => setAssistant(false)} onSetup={() => go("setup")} />}
+      {/* Ask AI: the one entrance, a button at the bottom right and the Assistant beside the page (prototype README "AI 入口只有一个"). */}
+      {!assistant && p.via === "workbench" && !setupOnly && (
+        <button type="button" className="ask-fab" onClick={() => setAssistant(true)} title="Ask the AI about this page">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z" /></svg>
+          Ask AI
+        </button>
+      )}
+      {assistant && <AssistantPanel workbenchUrl={me.workbenchUrl} {...(me.environment ? { environment: me.environment } : {})} page={contextPage(shown)} suggestions={SUGGESTIONS[shown] ?? []} {...(panel?.kind === "deploy" ? { app: panel.app } : {})} focus={focus} actions={actions} onClose={() => { setAssistant(false); window.dispatchEvent(new Event("oa:assistant-closed")); }} onSetup={() => go("setup")} />}
     </div>
     </PageFocus.Provider>
   );
 }
 
 /** D33: navigation down the left, in three groups; on a phone it folds into a menu button. */
-function Sidebar({ principal, environment, tab, setTab, setupOnly, onSignedOut, assistant, toggleAssistant }: { principal: Principal; environment?: string; tab: Tab; setTab: (t: Tab) => void; setupOnly: boolean; onSignedOut: () => void; assistant: boolean; toggleAssistant: () => void }) {
+function Sidebar({ principal, environment, tab, setTab, setupOnly, onSignedOut }: { principal: Principal; environment?: string; tab: Tab; setTab: (t: Tab) => void; setupOnly: boolean; onSignedOut: () => void }) {
   const [open, setOpen] = useState(false);
-  // The open alerts' count beside Alerts (phase 2 step 3).
-  const [alerts, setAlerts] = useState<{ open: number; crit: number } | undefined>();
-  useEffect(() => {
-    if (setupOnly) return;
-    const load = () => api.alerts("open").then((a) => setAlerts({ open: a.open, crit: a.alerts.filter((x) => x.level === "CRIT").length }), () => setAlerts(undefined));
-    load();
-    const t = setInterval(load, 30_000);
-    return () => clearInterval(t);
-  }, [setupOnly]);
   const groups: [string, [Tab, string][]][] = setupOnly ? [["First setup", [["setup", "Setup"]]]] : [
     ["Deploy", [["status", "Overview"], ["history", "Deploy history"], ["hosts", "Hosts"], ["settings", "Environment settings"]]],
     ["Apps", [["registry", "Apps & manifests"], ["onboarding", "Onboarding & assessments"], ["env", "Environment variables"], ["ingress", "Ingress"]]],
     // S3: managed services (NiFi) have their own pages, apart from the apps.
-    ["Services", [["services", "Instances & clusters"], ["alerts", "Alerts"], ["takeover", "Takeover"]]],
+    ["Services", [["services", "Managed services"], ["takeover", "Takeover"]]],
     ["Admin", [["keys", "API keys"], ...(principal.permissions.includes("admin") ? [["audit", "Audit"] as [Tab, string]] : [])]],
   ];
   const prod = environment?.toLowerCase() === "prod";
@@ -174,7 +165,7 @@ function Sidebar({ principal, environment, tab, setTab, setupOnly, onSignedOut, 
           <div key={title} className="group">
             <div className="group-title">{title}</div>
             <div className="group-items">
-              {items.map(([id, label]) => <button key={id} className={tab === id ? "active" : ""} onClick={() => { setTab(id); setOpen(false); }}>{label}{id === "alerts" && alerts?.open ? <span className={`badge ${alerts.crit ? "bad" : "warn"} nav-count`}>{alerts.open}</span> : null}</button>)}
+              {items.map(([id, label]) => <button key={id} className={tab === id ? "active" : ""} onClick={() => { setTab(id); setOpen(false); }}>{label}</button>)}
             </div>
           </div>
         ))}
@@ -182,7 +173,6 @@ function Sidebar({ principal, environment, tab, setTab, setupOnly, onSignedOut, 
       <div className="who">
         <span title={principal.groups.join(", ") || "No groups"}>{principal.displayName}</span>
         <span className="muted">{principal.isAdmin ? "Admin" : principal.groups.filter((g) => g.startsWith("deploy-")).join(" · ")}</span>
-        {principal.via === "workbench" && !setupOnly && <button className={assistant ? "active" : ""} onClick={toggleAssistant}>Ask the assistant</button>}
         {principal.via === "emergency" && <button className="link" onClick={() => api.emergencyLogout().then(onSignedOut)}>Sign out</button>}
       </div>
     </aside>
@@ -260,7 +250,7 @@ function Forbidden({ message }: { message: string }) {
   );
 }
 
-function Status({ panel, setPanel, isAdmin, canRegenerate, onAssessment, services }: { services?: React.ReactNode; panel: Panel; setPanel: (p: Panel) => void; isAdmin: boolean; canRegenerate: boolean; onAssessment: (id: string) => void }) {
+function Status({ panel, setPanel, isAdmin, canRegenerate, onAssessment }: { panel: Panel; setPanel: (p: Panel) => void; isAdmin: boolean; canRegenerate: boolean; onAssessment: (id: string) => void }) {
   const [data, setData] = useState<StatusView | undefined>();
   const [error, setError] = useState("");
   const [open, setOpen] = useState<Record<string, boolean>>({});
@@ -281,7 +271,6 @@ function Status({ panel, setPanel, isAdmin, canRegenerate, onAssessment, service
         <button onClick={refresh}>Refresh</button>
       </div>
       <Platform />
-      {services}
       <BriefCard canRegenerate={canRegenerate} />
       {data.peer && "error" in data.peer && <p className="banner warn">Cannot check the UAT records: {data.peer.error}. Only officially released versions can be deployed, or an admin can skip the promotion rule.</p>}
       {panel?.kind === "deploy" && <DeployPanel key={`${panel.app}-${panel.initial?.version ?? ""}-${panel.initial?.pinFrom ?? ""}`} app={panel.app} isAdmin={isAdmin} {...(panel.initial ? { initial: panel.initial } : {})} onClose={() => setPanel(undefined)} onJob={(id) => setPanel({ kind: "job", id })} onAssessment={onAssessment} />}
