@@ -985,7 +985,7 @@ def trim_backpressure(d, top=BACKPRESSURE_TOP):
         for c in snap.get("connectionStatusSnapshots") or []:
             c = (c or {}).get("connectionStatusSnapshot") or {}
             conns.append({"id": c.get("id"), "name": c.get("name"), "group": group, "sourceName": c.get("sourceName"), "destinationName": c.get("destinationName"),
-                          **{k: c[k] for k in ("sourceId", "destinationId") if isinstance(c.get(k), str)},
+                          **{k: c[k] for k in ("sourceId", "destinationId", "groupId") if isinstance(c.get(k), str)},
                           **_num(c, "percentUseCount", "percentUseBytes", "flowFilesQueued", "bytesQueued")})
         for p in snap.get("processorStatusSnapshots") or []:
             p = (p or {}).get("processorStatusSnapshot") or {}
@@ -1148,6 +1148,11 @@ def build_topology(root_id, root_name, groups):
             helper["rootSources"].append(i)
     body = {"root": {"id": root_id, "name": root_name or root_id}, "groups": body_groups, "links": body_links,
             "s2sIn": s2s_in, "s2sOut": sorted(s2s_out.values(), key=lambda o: (o["ref"], o["group"], o["fragment"] or ""))}
+    # Ops step 3b (B3): where a bulletin's, a provenance event's or a queue's component is. nested: a group deeper than
+    # root's children -> its unit; split: in a unit of several fragments, each processor -> its fragment.
+    body["nested"] = {gid: unit_of(gid) for gid in sorted(parent) if gid != root_id and parent.get(gid) not in (None, root_id)}
+    multi = {u for u, fs in units.items() if len(fs) > 1}
+    body["split"] = {i: frag_of[i] for i in sorted(frag_of) if nodes[i]["unit"] in multi and nodes[i]["kind"] == "processor"}
     return body, helper
 
 

@@ -15,7 +15,10 @@ import { OmaSessions } from "./oma.ts";
 import { Analyst } from "./services/cases.ts";
 import { investigate } from "./services/investigate.ts";
 import { Briefs, collectFacts } from "./brief.ts";
-import { opsDesk } from "./services/ops.ts";
+import { servicesOverview } from "./services/page-views.ts";
+import { BusinessScanner, businessCheckAll, SCAN_MINUTES } from "./services/business.ts";
+import { ServiceLogs } from "./services/logs.ts";
+import { ServiceProvenance } from "./services/provenance.ts";
 import { Drift } from "./drift.ts";
 import { environmentStatus, hostStateOf } from "./observe.ts";
 import { Onboarding } from "./onboarding.ts";
@@ -101,7 +104,7 @@ const drift = new Drift(store, deployments, (host) => deployments.handoff.report
 const briefWriter = config.omaUrl && config.omaApiKeyFile && config.omaAgent
   ? new OmaSessions({ url: config.omaUrl, keyFile: config.omaApiKeyFile, agent: config.omaAgent, ...(config.omaEnvironment ? { environment: config.omaEnvironment } : {}), vaults: config.omaVaults, ...(config.omaApplicationId ? { application: config.omaApplicationId } : {}) })
   : undefined;
-const briefs = new Briefs(store, () => collectFacts({ store, deployments, status: statusOf, versions, ...(peer.configured ? { peer: () => peer.status() } : {}), drift: () => drift.check(), ops: () => opsDesk(store, (host) => deployments.handoff.executor(host, "service")) }), briefWriter, { hour: config.briefHour });
+const briefs = new Briefs(store, () => collectFacts({ store, deployments, status: statusOf, versions, ...(peer.configured ? { peer: () => peer.status() } : {}), drift: () => drift.check(), ops: () => servicesOverview(store, (host) => deployments.handoff.executor(host, "service")) }), briefWriter, { hour: config.briefHour });
 // Service ops §6: taking over discovered NiFi (drafts, confirmation); the AI review uses the Onboarding Assessor.
 const takeover = new Takeover({ store, handoff: deployments.handoff, box, oma: assessor, environment: () => deployments.environment().env.name, hosts: () => hostIds(deployments.environment().env) });
 // Phase 2 step 6: the nifi-ops Studio graph, published through the same Builder MCP as studio-graph.
@@ -116,7 +119,11 @@ serviceChanges.recover();
 // S37 step 9 (§4.4): "Let the AI analyse", follow-up questions and the CRIT alerts' own analysis, through the Deploy
 // Assistant with its Vault (it reads more through the Deployer's read-only tools).
 const analyst = briefWriter ? new Analyst(store, briefWriter, (id, ask) => investigate(store, (host) => deployments.handoff.executor(host, "service"), id, ask)) : undefined;
-const app = createApp({ config, store, takeover, changes: serviceChanges, ...(configReview ? { configReview } : {}), ...(analyst ? { analyst } : {}), graph: nifiOpsGraph, sessions: new WorkbenchSessions(config.workbenchUrl), observer, deployments, versions, env, peer, onboarding, drift, briefs, keys, workbench, workbenchKey, deployerSettings,
+// Ops step 3b: provenance made here so the business scan (data dropped, failure, invalid) shares it with the pages.
+const serviceLogs = new ServiceLogs(store, deployments.handoff);
+const serviceProvenance = new ServiceProvenance(store, deployments.handoff, serviceLogs);
+const businessScanner = new BusinessScanner(store, serviceProvenance);
+const app = createApp({ config, store, takeover, changes: serviceChanges, ...(configReview ? { configReview } : {}), ...(analyst ? { analyst } : {}), graph: nifiOpsGraph, logs: serviceLogs, provenance: serviceProvenance, sessions: new WorkbenchSessions(config.workbenchUrl), observer, deployments, versions, env, peer, onboarding, drift, briefs, keys, workbench, workbenchKey, deployerSettings,
   // D45: the image sets DEPLOYER_RESTART_BY_EXIT; the container's restart policy starts it again with the new settings.
   ...(process.env.DEPLOYER_RESTART_BY_EXIT === "true" ? { restart: () => setTimeout(() => { store.close(); process.exit(75); }, 300) } : {}) });
 // Job records follow the executor's status files even while nobody has the page open.
@@ -137,6 +144,8 @@ const serviceUpkeep = (cleanup: boolean) => {
     rollUp(store, new Date());
     // §15.3: the rules once a minute too, for what sends nothing (an executor gone, samples overdue).
     checkAll(store, (h) => deployments.handoff.executor(h, "service"));
+    // Ops step 3b: the business light's bulletins, queues, S2S hand-overs and error groups.
+    businessCheckAll(store);
     store.dropOldExecutorContent();
     deployments.handoff.expireQueued();
     if (cleanup) { prune(store, new Date()); pruneFlow(store, new Date()); }
@@ -145,6 +154,8 @@ const serviceUpkeep = (cleanup: boolean) => {
 setInterval(() => serviceUpkeep(false), 60_000).unref();
 setInterval(() => serviceUpkeep(true), 60 * 60_000).unref();
 setTimeout(() => serviceUpkeep(true), 30_000).unref();
+// Ops step 3b: the provenance scan of every service with businesses (B3 data dropped, processing failed, invalid data).
+setInterval(() => { businessScanner.tick().catch((error) => console.error("business scan:", error)); }, SCAN_MINUTES * 60_000).unref();
 
 serve({ fetch: app.fetch, hostname: config.bind, port: config.port }, (info) => {
   console.log(`Open Atlas Deployer on http://${info.address}:${info.port}${config.basePath}/ (Workbench ${config.workbenchUrl})`);

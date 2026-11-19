@@ -9,12 +9,13 @@ import type { DriftItem } from "./drift.ts";
 import type { EnvironmentStatus } from "./observe.ts";
 import { sessionOutcome, type OmaSessions } from "./oma.ts";
 import type { PeerStatus } from "./peer.ts";
-import type { OpsDesk } from "./services/ops.ts";
+import { LIGHT_ORDER } from "./services/ops-types.ts";
+import type { ServicesOverview } from "./services/page-views.ts";
 import type { Store } from "./store.ts";
 import type { Versions } from "./versions.ts";
 
 /** The brief's facts, from what the status page, the versions list, UAT and the drift check already know. */
-export async function collectFacts(d: { store: Store; deployments: Deployments; status: () => Promise<EnvironmentStatus>; versions: Pick<Versions, "list">; peer?: () => Promise<PeerStatus>; drift: () => Promise<DriftItem[]>; ops?: () => OpsDesk; now?: () => number }): Promise<BriefFacts> {
+export async function collectFacts(d: { store: Store; deployments: Deployments; status: () => Promise<EnvironmentStatus>; versions: Pick<Versions, "list">; peer?: () => Promise<PeerStatus>; drift: () => Promise<DriftItem[]>; ops?: () => ServicesOverview; now?: () => number }): Promise<BriefFacts> {
   const now = d.now?.() ?? Date.now();
   const status = await d.status();
   const { deployed } = d.deployments.environment();
@@ -38,8 +39,11 @@ export async function collectFacts(d: { store: Store; deployments: Deployments; 
   let nifi: BriefFacts["nifi"];
   if (d.ops) {
     try {
-      const desk = d.ops();
-      nifi = { services: desk.services.map((s) => ({ id: s.id, verdict: s.verdict, sentence: s.sentence })), todos: desk.queue.slice(0, 10).map((t) => ({ service: t.service, rule: t.rule, severity: t.severity, since: t.since, member: t.memberLabel, cause: t.cause })), todoCount: desk.queue.length };
+      const o = d.ops();
+      nifi = {
+        services: o.services.map((s) => ({ id: s.id, verdict: LIGHT_ORDER[s.machine.light] <= LIGHT_ORDER[s.business.light] ? s.machine.light : s.business.light, machine: s.machine.light, business: s.business.light, sentence: `${s.machine.sentence} ${s.business.sentence}` })),
+        todos: [], todoCount: o.services.reduce((n, s) => n + s.todoCount, 0),
+      };
     } catch { nifi = undefined; }
   }
   return {
@@ -61,7 +65,8 @@ export interface BriefFacts {
   failed: { job: string; app: string; version: string; state: string; message: string | null; diagnosis: string | null }[];
   waiting: { job: string; app: string; version: string; step: string }[];
   /** The managed NiFi services: a verdict sentence each, and the worst to-dos (todoCount of them in all) of the ops desk. */
-  nifi?: { services: { id: string; verdict: string; sentence: string }[]; todos: { service: string; rule: string; severity: string; since: string; member: string | null; cause: string }[]; todoCount: number };
+  /** Ops step 3b: from the services overview; verdict is the worse of the two lights. todos: step 4's to-dos (none yet). */
+  nifi?: { services: { id: string; verdict: string; machine?: string; business?: string; sentence: string }[]; todos: { service: string; rule: string; severity: string; since: string; member: string | null; cause: string }[]; todoCount: number };
 }
 
 export interface Brief {

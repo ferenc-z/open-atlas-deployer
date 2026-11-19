@@ -41,8 +41,9 @@ import { ChangeError, changeView as serviceChangeView, checkContextOf, planView,
 import { adoptedBody, DriftError, hasDrifted, liveDifferences, readLive, serviceDrift, type LiveReadOptions } from "./services/configdrift.ts";
 import { installKey, type DraftItem } from "./services/draft.ts";
 import { serviceStatus, thresholdsOf, timeline } from "./services/status.ts";
-import { alertView, check, health, parseThresholds, RULES, THRESHOLDS } from "./services/rules.ts";
-import { opsDesk } from "./services/ops.ts";
+import { check, parseThresholds, THRESHOLDS } from "./services/rules.ts";
+import { mountPages } from "./services/page-routes.ts";
+import type { PageSources } from "./services/page-views.ts";
 import { mountCases, withAnalysis } from "./services/cases.ts";
 import { TakeoverError, type Takeover } from "./services/takeover.ts";
 import { investigate, InvestigateError } from "./services/investigate.ts";
@@ -118,6 +119,8 @@ export interface Dependencies {
   e2eTrace?: E2eTraceSource;
   /** S37 step 9: the AI analysis of the service pages and the cases; without it the pages offer no AI. */
   analyst?: import("./services/cases.ts").Analyst;
+  /** Ops step 3b: the to-dos and analyses the overview and the service page show (steps 4 and 5 wire them; none until then). */
+  pageSources?: PageSources;
 }
 
 const reject = (c: Context, status: 400 | 401 | 403 | 404 | 409 | 429 | 503, code: string, message: string, details: string[] = []) =>
@@ -794,12 +797,8 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     throw error;
   };
   const noTakeover = (c: Context) => reject(c, 503, "takeover/off", "Taking over services is not set up in this Deployer.");
-  // S37 step 10: the ops desk, every service's to-dos in one queue worst first and a sentence per service (same health()).
-  api.get("/api/services/ops", async (c) => {
-    const p = await authenticate(c, "view");
-    if (p instanceof Response) return p;
-    return c.json(opsDesk(store, (host) => handoff.executor(host, "service")));
-  });
+  // Ops step 3b (§10.2.2 #1, #2, #8): the services overview, a service's page, a business's detail (before /api/services/:id).
+  mountPages(api, { store, executor: (host) => handoff.executor(host, "service"), authenticate, reject, ...(deps.pageSources ? { sources: deps.pageSources } : {}) });
   api.get("/api/services", async (c) => {
     const p = await authenticate(c, "view");
     if (p instanceof Response) return p;
@@ -1315,30 +1314,8 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     if ("error" in q) return reject(c, 400, "logs/search", q.error);
     return c.json(await serviceLogs.search(c.req.param("id"), q));
   });
-  // Phase 2 step 3 (§15.3): a service's alerts (open first, then resolved; state=open|resolved, limit), with the rules and
-  // the thresholds in effect; its timeline; an admin's threshold overrides; every service's alerts.
-  api.get("/api/services/:id/alerts", async (c) => {
-    const p = await authenticate(c, "view");
-    if (p instanceof Response) return p;
-    const id = c.req.param("id");
-    const s = registeredService(id);
-    if (!s) return reject(c, 404, "service/unknown", `No standalone instance or cluster ${id}.`);
-    const state = c.req.query("state");
-    if (state !== undefined && state !== "open" && state !== "resolved") return reject(c, 400, "alerts/state", "state is open or resolved.");
-    const limit = c.req.query("limit") ? Number(c.req.query("limit")) : 200;
-    return c.json({
-      alerts: withAnalysis(store, store.serviceAlerts({ service: id, ...(state ? { state } : {}), limit }).map(alertView)),
-      rules: RULES, thresholds: { ...thresholdsOf(store, id, s.profile), info: THRESHOLDS },
-      canEdit: p.permissions.includes("admin") && !isKey(p),
-    });
-  });
-  // S37 step 2 (pages-rethink §4.1): the to-do list, the verdict and the node strip (get_service_health).
-  api.get("/api/services/:id/health", async (c) => {
-    const p = await authenticate(c, "view");
-    if (p instanceof Response) return p;
-    const h = health(store, (host) => handoff.executor(host, "service"), c.req.param("id"));
-    return h ? c.json(h) : reject(c, 404, "service/unknown", `No standalone instance or cluster ${c.req.param("id")}.`);
-  });
+  // Ops step 3b (§10.2.5): GET alerts and health are gone; the overview and the service page (page-routes.ts) took over.
+  // The timeline and an admin's threshold overrides stay.
   // S37 step 4 (pages-rethink §4.3): the investigation's evidence over a window (investigate_service). Raw for the page;
   // the MCP tool asks compact=1 and redacts.
   api.get("/api/services/:id/investigate", async (c) => {
@@ -1438,18 +1415,6 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     const p = await authenticate(c, "admin");
     if (p instanceof Response) return p;
     return c.json(await graph.publish("published again by hand", actorOf(p)));
-  });
-  // Every service's open alerts, and with state=all also those resolved in the last day (since=ISO for longer).
-  api.get("/api/alerts", async (c) => {
-    const p = await authenticate(c, "view");
-    if (p instanceof Response) return p;
-    const state = c.req.query("state") ?? "open";
-    if (!["open", "resolved", "all"].includes(state)) return reject(c, 400, "alerts/state", "state is open, resolved or all.");
-    const since = c.req.query("since") ?? new Date(Date.now() - 86_400_000).toISOString();
-    const services = new Map([...store.standalones(), ...store.clusters()].map((x) => [x.id, { kind: x.kind, environment: x.environment, profile: x.profile }] as const));
-    const alerts = withAnalysis(store, store.serviceAlerts({ ...(state === "all" ? { since } : { state: state as "open" | "resolved" }), limit: Number(c.req.query("limit") ?? 500) })
-      .filter((a) => services.has(a.service)).map((a) => ({ ...alertView(a), ...services.get(a.service)! })));
-    return c.json({ alerts, open: alerts.filter((a) => a.state === "open").length, rules: RULES });
   });
   api.post("/api/services/drafts", async (c) => {
     const p = await authenticate(c, "admin");

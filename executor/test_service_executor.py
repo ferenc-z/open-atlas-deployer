@@ -3490,6 +3490,9 @@ class FlowCountsTest(unittest.TestCase):
         self.assertEqual(body["s2sOut"][0]["targets"], ["https://c250:18445/nifi", "https://c250b:18446/nifi"])
         self.assertEqual((helper["s2sOut"]["https://c250:18445/nifi#orders"]["connections"], helper["s2sIn"]["ri"], helper["rootSources"], helper["rootOutConns"]),
                          (["c2"], ["c3"], ["p-gen"], ["c2"]))
+        # Ops step 3b: a deeper group's unit, and each processor's piece in a unit of several pieces.
+        self.assertEqual(body["nested"], {"C": "B"})
+        self.assertEqual(body["split"], {"a1": "A-out", "a2": "a2", "p-gen": "p-gen", "p-load": "p-load", "p-ren": "p-gen"})
 
     def test_counts_from_the_status_and_history_points(self):
         body, helper = sx.build_topology("root", "NiFi Flow", FLOW_GROUPS)
