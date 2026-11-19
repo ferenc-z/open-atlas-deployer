@@ -59,6 +59,10 @@ export interface OpsReads {
   analysisRecord(service: string): AnalysisRecord | null;
   /** The flows page's intro the AI wrote (record analysis.intro), newest first; null: none yet. */
   intro(service: string): string | null;
+  /** §10.2.2 #1: the newest check-up round over all services (analyses sharing a run): running while any is, failed when any failed. */
+  lastCheckup(): { at: string; trigger: AnalysisTrigger; state: AnalysisState } | null;
+  /** A round is running (the overview's Check now is greyed). */
+  running(): boolean;
 }
 export function opsReads(store: Store, now: () => Date = () => new Date()): OpsReads {
   return {
@@ -73,6 +77,14 @@ export function opsReads(store: Store, now: () => Date = () => new Date()): OpsR
       }
       return null;
     },
+    lastCheckup: () => {
+      const run = store.analysisRun();
+      if (!run.length) return null;
+      const state: AnalysisState = run.some((a) => a.state === "running") ? "running" : run.some((a) => a.state === "failed") ? "failed" : "done";
+      const first = run.reduce((x, y) => (x.startedAt <= y.startedAt ? x : y));
+      return { at: first.startedAt, trigger: first.trigger, state };
+    },
+    running: () => store.analysisRun().some((a) => a.state === "running"),
   };
 }
 

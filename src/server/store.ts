@@ -2044,6 +2044,12 @@ export class Store {
     return (this.db.prepare("SELECT * FROM service_analyses WHERE service = ? ORDER BY started_at DESC, id DESC LIMIT ?").all(service, Math.min(200, Math.max(1, limit))) as Row[]).map(toAnalysis);
   }
 
+  /** The newest analyses of one check-up round (run), or of the newest round when none is given. */
+  analysisRun(run?: string): AnalysisRecord[] {
+    const id = run ?? (this.db.prepare("SELECT run FROM service_analyses WHERE run IS NOT NULL ORDER BY started_at DESC, id DESC LIMIT 1").get() as Row | undefined)?.run;
+    return id ? (this.db.prepare("SELECT * FROM service_analyses WHERE run = ? ORDER BY service").all(id) as Row[]).map(toAnalysis) : [];
+  }
+
   /** An analysis's outcome (state, session, end, body, error). */
   setAnalysis(a: Pick<AnalysisRecord, "id" | "state" | "session" | "finishedAt" | "body" | "error">) {
     this.db.prepare("UPDATE service_analyses SET state = ?, session = ?, finished_at = ?, body = ?, error = ? WHERE id = ?")

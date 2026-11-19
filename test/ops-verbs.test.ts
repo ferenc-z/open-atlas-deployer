@@ -186,6 +186,7 @@ test("record: the Assistant saves to-dos only; the check-up writes the analysis,
   assert.equal(reads.intro("n1"), "按 root 下的组分。");
   assert.deepEqual(reads.todos("n1").map((x) => x.severity), ["failing", "attention"], "failing first");
   assert.equal(reads.todoCount("n1"), 2);
+  assert.deepEqual([reads.lastCheckup()?.trigger, reads.lastCheckup()?.state, reads.running()], ["schedule", "done", false], "the round run-1, finished by record");
   const described = (await t.tool("dpc_checkup", "describe", { service: "n1" })).value;
   assert.equal(described.analysis.id, fresh.analysis);
   assert.equal(described.todos[0].title, "磁盘快满");
