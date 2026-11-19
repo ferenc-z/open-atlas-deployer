@@ -3499,12 +3499,13 @@ class FlowCountsTest(unittest.TestCase):
             **snap("processorStatusSnapshots", "processorStatusSnapshot", id="p-gen", flowFilesOut=4, bytesOut=40),
             "inputPortStatusSnapshots": [{"portStatusSnapshot": {"id": "ri", "flowFilesIn": 2, "flowFilesOut": 2, "bytesIn": 20, "bytesOut": 20}}],
             "connectionStatusSnapshots": [{"connectionStatusSnapshot": {"id": "c2", "flowFilesIn": 4, "flowFilesOut": 3, "bytesIn": 40, "bytesOut": 30}}],
-            "processGroupStatusSnapshots": [{"processGroupStatusSnapshot": {"id": "A", "name": "Group A", "flowFilesIn": 0, "flowFilesReceived": 5, "flowFilesOut": 1, "flowFilesSent": 0, "bytesReceived": 50, "bytesOut": 10}},
+            "processGroupStatusSnapshots": [{"processGroupStatusSnapshot": {"id": "A", "name": "Group A", "flowFilesIn": 0, "flowFilesReceived": 5, "flowFilesOut": 1, "flowFilesSent": 0, "bytesReceived": 50, "bytesOut": 10, "flowFilesTransferred": 12}},
                                             {"processGroupStatusSnapshot": {"id": "B", "name": "Group B"}}]}}}
         index = sx.status_index(status)
         rows = {(r["kind"], r["ref"]): r for r in sx.flow_counts(index, body, helper)}
         self.assertEqual((rows[("group", "A")]["flowFilesIn"], rows[("group", "A")]["flowFilesOut"], rows[("group", "A")]["bytesIn"]), (5, 1, 50))
         self.assertEqual((rows[("group", "root")]["flowFilesIn"], rows[("group", "root")]["flowFilesOut"]), (6, 3), "remote input passed on + source processors; to the RPG port")
+        self.assertEqual((rows[("group", "A")]["transferred"], rows[("group", "B")]["transferred"], rows[("group", "root")]["transferred"]), (12, 0, 4), "§10.3: moved inside the unit")
         self.assertEqual((rows[("s2s-out", "https://c250:18445/nifi#orders")]["flowFilesOut"], rows[("s2s-in", "ri")]["flowFilesIn"]), (3, 2))
         self.assertEqual(sorted(rows), sorted([("group", "A"), ("group", "B"), ("group", "root"), ("s2s-out", "https://c250:18445/nifi#orders"), ("s2s-in", "ri")]))
         self.assertEqual(len(sx.flow_counts(index, None, None)), 2, "without a topology only the groups")
@@ -3513,7 +3514,8 @@ class FlowCountsTest(unittest.TestCase):
         # A snapshot a minute; the first of each 5-minute slot, summed over the connections.
         h = lambda *pts: {"aggregateSnapshots": [{"timestamp": t, "statusMetrics": {"inputCount": i, "outputCount": o, "inputBytes": i * 10, "outputBytes": o * 10}} for t, i, o in pts]}
         self.assertEqual(sx.history_points([h((600_000, 1, 1), (660_000, 9, 9), (900_000, 2, 0)), h((610_000, 3, 3))]),
-                         [[600_000, 4, 4, 40, 40], [900_000, 2, 0, 20, 0]])
+                         [[600_000, 4, 4, 40, 40, 0], [900_000, 2, 0, 20, 0, 0]])
+        self.assertEqual(sx.history_points([{"aggregateSnapshots": [{"timestamp": 600_000, "statusMetrics": {"flowFilesTransferred": 7}}]}]), [[600_000, 0, 0, 0, 0, 7]])
 
     def test_collector_flow_every_interval_topology_on_change_history_once(self):
         c = sx.Collector({"flow_seconds": 300, "collect_seconds": 60})

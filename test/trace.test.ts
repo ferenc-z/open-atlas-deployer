@@ -188,7 +188,7 @@ test("a dangling exit makes the trace insufficient (the model is incomplete), no
   assert.match(tr.verdict.message, /model is incomplete/);
 });
 
-test("the model is checked as a whole; storage keeps revisions and refuses a stale save", () => {
+test("the model is checked as a whole; storage keeps revisions and refuses a stale publish", () => {
   const good = { sources: ["a"], businesses: models()[0]!.businesses };
   assert.ok("model" in parseModel("n112", good));
   const bad = parseModel("n112", { businesses: [{ id: "x y", name: "", steps: [{ id: "s", name: "S", position: { kind: "funnel", id: "" } }], entries: [{ id: "e", step: "nope", channel: { type: "s2s" }, cues: [{ cue: "subject", key: "" }] }],
@@ -198,11 +198,13 @@ test("the model is checked as a whole; storage keeps revisions and refuses a sta
   for (const want of [/businesses\[0\]\.id/, /name is required/, /position\.kind/, /position\.id/, /entries\[0\]\.step/, /channel\.port/, /cues\[0\]\.cue/, /routingKey/, /regular expression/]) assert.match(text, want);
   const store = new Store(":memory:");
   const actor = { id: "admin", via: "cli" } as const;
-  assert.equal(store.saveTraceModel("n112", good, 0, actor), 1);
-  assert.equal(store.saveTraceModel("n112", good, 1, actor), 2);
-  assert.throws(() => store.saveTraceModel("n112", good, 1, actor), /saved by someone else/);
-  assert.equal(store.traceModel("n112")?.revision, 2);
-  assert.deepEqual(store.traceModels().map((m) => m.service), ["n112"]);
+  const v2 = { version: 2 as const, service: "n112", sources: ["a"], segments: [] };
+  assert.equal(store.flowTransaction(() => store.insertFlowModel("n112", 0, v2, "ai", actor, [])), 1);
+  assert.equal(store.insertFlowModel("n112", 1, v2, "ai", actor, []), 2);
+  assert.throws(() => store.insertFlowModel("n112", 1, v2, "ai", actor, []), /at revision 2, not 1/);
+  assert.equal(store.flowModel("n112")?.revision, 2);
+  assert.equal(store.flowModel("n112", 1)?.revision, 1);
+  assert.deepEqual(store.flowModels().map((m) => m.service), ["n112"]);
 });
 
 test("trace_business_data's conditions: a clue required, the last 24 hours by default, at most 31 days", () => {

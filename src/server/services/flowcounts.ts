@@ -62,12 +62,12 @@ export function flowRows(service: string, flow: Any): FlowCountRow[] {
   const at = Date.parse(flow?.at);
   const row = (bucket: string, c: Any, v: number[], source: FlowCountRow["source"]): FlowCountRow => ({
     service, bucket, kind: c.kind, ref: String(c.ref).slice(0, 1000), name: String(c.name ?? c.ref).slice(0, 500),
-    flowfilesIn: int(v[0]), flowfilesOut: int(v[1]), bytesIn: int(v[2]), bytesOut: int(v[3]), source,
+    flowfilesIn: int(v[0]), flowfilesOut: int(v[1]), bytesIn: int(v[2]), bytesOut: int(v[3]), transferred: int(v[4]), source,
   });
   const ok = (c: Any) => c && KINDS.has(c.kind) && typeof c.ref === "string" && c.ref;
   if (!Number.isNaN(at) && Array.isArray(flow?.counts)) {
     const bucket = bucketOfWindow(at);
-    for (const c of flow.counts) if (ok(c)) rows.push(row(bucket, c, [c.flowFilesIn, c.flowFilesOut, c.bytesIn, c.bytesOut], "sample"));
+    for (const c of flow.counts) if (ok(c)) rows.push(row(bucket, c, [c.flowFilesIn, c.flowFilesOut, c.bytesIn, c.bytesOut, c.transferred], "sample"));
   }
   if (Array.isArray(flow?.history)) {
     for (const h of flow.history) {

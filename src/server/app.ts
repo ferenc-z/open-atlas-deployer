@@ -56,7 +56,9 @@ import { PROVENANCE_SOURCE, ProvenanceAdapter } from "./services/trace/provenanc
 import { checkNginx, graphServices, NifiOpsGraph } from "./services/graph-publish.ts";
 import { checkNginxUrl } from "./services/graph.ts";
 import { E2E_ID, E2eTraceSource } from "./services/trace/e2e-trace.ts";
-import { mountE2eTrace } from "./services/trace/e2e-routes.ts";
+import { e2eImport, mountE2eTrace } from "./services/trace/e2e-routes.ts";
+import { mountFlows } from "./services/flow-routes.ts";
+import type { ModelDeps } from "./services/flowmodel.ts";
 import { McpClient } from "./mcp-client.ts";
 import { readToken } from "./versions.ts";
 import { DEPLOYER_VERSION } from "./version.ts";
@@ -1292,6 +1294,10 @@ export function createApp({ config, store, sessions, observer, deployments, vers
   mountE2eTrace(api, { store, source: e2eTrace, authenticate, reject, registered: registeredService, actorOf });
   // S37 step 5 (§4.2.0): the business data trace — a service's model, position search, trace_business_data.
   mountTrace(api, { store, provenance, authenticate, reject, registered: registeredService, actorOf, adapters: deps.traceAdapters ?? new Map<string, EvidenceAdapter>([[PROVENANCE_SOURCE, new ProvenanceAdapter(provenance)]]) });
+  // pages-rethink §10.2 step 2: the business model v2 and its gate (run_model / publish_model, registered as MCP verbs
+  // in step 4), the flows page and a person's actions on a business. The gate's to-dos wait for step 4's table.
+  const flowModelDeps: ModelDeps = { store, e2e: (id) => e2eImport(e2eTrace)(id) };
+  mountFlows(api, { store, model: flowModelDeps, authenticate, reject, registered: registeredService, actorOf });
   // Phase 2 step 4 (§9.3, §15.3): a service's logs, read through its members' service executors (deploy-viewer, §13): the
   // last lines of a member's file and a search of all (or some) members in parallel, merged by time (both the AI reads
   // through the MCP tools; the page for them was removed, pages-rethink §9.2).

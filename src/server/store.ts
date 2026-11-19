@@ -18,6 +18,11 @@ import type { DraftChange } from "./services/configedit.ts";
 import type { ConfigReview } from "./services/configreview.ts";
 import type { ServiceCase } from "./services/cases.ts";
 import { randomBytes } from "node:crypto";
+import { migrateV1, type ModelV2 } from "./services/trace/model.ts";
+import type { FlowStatus, GateVerdict } from "./services/ops-types.ts";
+
+/** A business id (§10.2.4: flw_ + random). */
+export const newFlowId = () => `flw_${randomBytes(6).toString("hex")}`;
 
 export interface Actor { id: string; via: "workbench" | "emergency" | "cli" | "key" | "service" }
 
@@ -158,7 +163,7 @@ CREATE TABLE IF NOT EXISTS service_flow_counts (
   kind TEXT NOT NULL,
   ref TEXT NOT NULL,
   name TEXT NOT NULL, flowfiles_in INTEGER NOT NULL, flowfiles_out INTEGER NOT NULL,
-  bytes_in INTEGER NOT NULL, bytes_out INTEGER NOT NULL, source TEXT NOT NULL,
+  bytes_in INTEGER NOT NULL, bytes_out INTEGER NOT NULL, source TEXT NOT NULL, transferred INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (service, kind, ref, bucket));
 CREATE INDEX IF NOT EXISTS service_flow_counts_at ON service_flow_counts (service, bucket);
 -- Step 1: the topology under root (groups, ports, links between groups, RPGs), a row only when its hash changed (30 days).
@@ -195,8 +200,26 @@ CREATE INDEX IF NOT EXISTS service_log_counts_at ON service_log_counts (service,
 CREATE TABLE IF NOT EXISTS service_graph_runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, by TEXT NOT NULL, reason TEXT NOT NULL, graph TEXT, services TEXT NOT NULL,
   state TEXT NOT NULL, message TEXT NOT NULL, detail TEXT);
-CREATE TABLE IF NOT EXISTS service_trace_models (
-  service TEXT PRIMARY KEY, revision INTEGER NOT NULL, body TEXT NOT NULL, saved_at TEXT NOT NULL, saved_by TEXT NOT NULL);
+-- pages-rethink §10.2.4 step 2: the business model v2, a full body per service and revision (older ones kept as history);
+-- service_trace_models (v1) is migrated into it as revision 1 and dropped.
+CREATE TABLE IF NOT EXISTS flow_models (
+  service TEXT NOT NULL, revision INTEGER NOT NULL, body TEXT NOT NULL, source TEXT NOT NULL,
+  published_at TEXT NOT NULL, published_by TEXT NOT NULL, gate TEXT NOT NULL,
+  PRIMARY KEY (service, revision));
+-- A business (it may span services): what a person owns is here, the AI's model never overwrites it.
+CREATE TABLE IF NOT EXISTS flows (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, name_by TEXT NOT NULL, status TEXT NOT NULL,
+  summary TEXT NOT NULL, reason TEXT, risks TEXT NOT NULL DEFAULT '[]', pending TEXT,
+  stuck_attention_s INTEGER, stuck_failing_s INTEGER, stuck_by TEXT, stuck_basis TEXT,
+  created_at TEXT NOT NULL, confirmed_at TEXT, confirmed_by TEXT, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS flow_segments (
+  flow TEXT NOT NULL REFERENCES flows(id) ON DELETE CASCADE, seq INTEGER NOT NULL, service TEXT NOT NULL, segment TEXT NOT NULL,
+  PRIMARY KEY (flow, seq));
+CREATE INDEX IF NOT EXISTS flow_segments_service ON flow_segments (service);
+CREATE TABLE IF NOT EXISTS flow_changes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, flow TEXT, service TEXT NOT NULL, at TEXT NOT NULL, by TEXT NOT NULL,
+  kind TEXT NOT NULL, text TEXT NOT NULL, revision INTEGER, verdict TEXT);
+CREATE INDEX IF NOT EXISTS flow_changes_flow ON flow_changes (flow, at);
 CREATE TABLE IF NOT EXISTS service_trace_sources (
   service TEXT NOT NULL, source TEXT NOT NULL, body TEXT NOT NULL, saved_at TEXT NOT NULL, saved_by TEXT NOT NULL, PRIMARY KEY (service, source));
 CREATE TABLE IF NOT EXISTS service_cases (
@@ -383,6 +406,30 @@ export class Store {
       SELECT service, NULL, saved_at, 'config-imported', json_object('text', 'Configuration revision ' || revision || ' imported from the hosts', 'by', saved_by, 'revision', revision)
       FROM service_configs c WHERE source = 'import'
       AND NOT EXISTS (SELECT 1 FROM service_events e WHERE e.service = c.service AND e.kind = 'config-imported' AND json_extract(e.detail, '$.revision') = c.revision)`);
+    // §10.2.4 step 1 added the counts; §10.3: the FlowFiles moved inside a group.
+    if (!(this.db.prepare("PRAGMA table_info(service_flow_counts)").all() as Row[]).some((c) => c.name === "transferred")) this.db.exec("ALTER TABLE service_flow_counts ADD COLUMN transferred INTEGER NOT NULL DEFAULT 0");
+    this.migrateTraceModels();
+  }
+
+  /** §10.2.4 step 2: each v1 model (service_trace_models) becomes flow_models revision 1 (source migrated), every
+   *  business a proposed business of its own; then the v1 table goes. */
+  private migrateTraceModels() {
+    if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'service_trace_models'").get()) return;
+    this.inTransaction(() => {
+      for (const r of this.db.prepare("SELECT * FROM service_trace_models ORDER BY service").all() as Row[]) {
+        if (this.db.prepare("SELECT 1 FROM flow_models WHERE service = ?").get(r.service)) continue;
+        const { model, flows } = migrateV1(r.service, parse(r.body), () => newFlowId());
+        this.db.prepare("INSERT INTO flow_models (service, revision, body, source, published_at, published_by, gate) VALUES (?, 1, ?, 'migrated', ?, ?, '[]')")
+          .run(r.service, JSON.stringify(model), r.saved_at, r.saved_by);
+        for (const f of flows) {
+          this.db.prepare("INSERT INTO flows (id, name, name_by, status, summary, created_at, updated_at) VALUES (?, ?, 'ai', 'proposed', '', ?, ?)").run(f.id, f.name, r.saved_at, r.saved_at);
+          this.db.prepare("INSERT INTO flow_segments (flow, seq, service, segment) VALUES (?, 0, ?, ?)").run(f.id, r.service, f.segment);
+          this.db.prepare("INSERT INTO flow_changes (flow, service, at, by, kind, text, revision, verdict) VALUES (?, ?, ?, 'ai', 'found', ?, 1, NULL)")
+            .run(f.id, r.service, this.stamp(), `从旧的业务模型迁移（业务 ${f.segment}），等 AI 补上所在的流程组、人确认。`);
+        }
+      }
+      this.db.exec("DROP TABLE service_trace_models");
+    });
   }
 
   close() { this.db.close(); }
@@ -1601,28 +1648,28 @@ export class Store {
   /** Adds flow counts; a sample's row replaces what the bucket had, NiFi's history only fills buckets that have none. */
   putFlowCounts(rows: FlowCountRow[]) {
     if (!rows.length) return;
-    const replace = this.db.prepare(`INSERT INTO service_flow_counts (service, bucket, kind, ref, name, flowfiles_in, flowfiles_out, bytes_in, bytes_out, source)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (service, kind, ref, bucket) DO UPDATE SET name = excluded.name, flowfiles_in = excluded.flowfiles_in,
-        flowfiles_out = excluded.flowfiles_out, bytes_in = excluded.bytes_in, bytes_out = excluded.bytes_out, source = excluded.source`);
-    const fill = this.db.prepare(`INSERT OR IGNORE INTO service_flow_counts (service, bucket, kind, ref, name, flowfiles_in, flowfiles_out, bytes_in, bytes_out, source)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    const replace = this.db.prepare(`INSERT INTO service_flow_counts (service, bucket, kind, ref, name, flowfiles_in, flowfiles_out, bytes_in, bytes_out, transferred, source)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (service, kind, ref, bucket) DO UPDATE SET name = excluded.name, flowfiles_in = excluded.flowfiles_in,
+        flowfiles_out = excluded.flowfiles_out, bytes_in = excluded.bytes_in, bytes_out = excluded.bytes_out, transferred = excluded.transferred, source = excluded.source`);
+    const fill = this.db.prepare(`INSERT OR IGNORE INTO service_flow_counts (service, bucket, kind, ref, name, flowfiles_in, flowfiles_out, bytes_in, bytes_out, transferred, source)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     this.inTransaction(() => {
-      for (const r of rows) (r.source === "sample" ? replace : fill).run(r.service, r.bucket, r.kind, r.ref, r.name, r.flowfilesIn, r.flowfilesOut, r.bytesIn, r.bytesOut, r.source);
+      for (const r of rows) (r.source === "sample" ? replace : fill).run(r.service, r.bucket, r.kind, r.ref, r.name, r.flowfilesIn, r.flowfilesOut, r.bytesIn, r.bytesOut, r.transferred ?? 0, r.source);
     });
   }
 
   flowCounts(service: string, from: string, to: string): FlowCountRow[] {
     return (this.db.prepare("SELECT * FROM service_flow_counts WHERE service = ? AND bucket >= ? AND bucket < ? ORDER BY bucket, kind, ref").all(service, from, to) as Row[]).map((r) => ({
       service: r.service, bucket: r.bucket, kind: r.kind, ref: r.ref, name: r.name, flowfilesIn: r.flowfiles_in, flowfilesOut: r.flowfiles_out,
-      bytesIn: r.bytes_in, bytesOut: r.bytes_out, source: r.source,
+      bytesIn: r.bytes_in, bytesOut: r.bytes_out, transferred: r.transferred ?? 0, source: r.source,
     }));
   }
 
   /** Per kind and ref since a time: the sums, how many buckets, the first and the last bucket. */
-  flowCountTotals(service: string, since: string): { kind: string; ref: string; name: string; flowfilesIn: number; flowfilesOut: number; buckets: number; first: string; last: string }[] {
-    return (this.db.prepare(`SELECT kind, ref, MAX(name) AS name, SUM(flowfiles_in) AS fin, SUM(flowfiles_out) AS fout, COUNT(*) AS n, MIN(bucket) AS first, MAX(bucket) AS last
+  flowCountTotals(service: string, since: string): { kind: string; ref: string; name: string; flowfilesIn: number; flowfilesOut: number; transferred: number; buckets: number; first: string; last: string }[] {
+    return (this.db.prepare(`SELECT kind, ref, MAX(name) AS name, SUM(flowfiles_in) AS fin, SUM(flowfiles_out) AS fout, SUM(transferred) AS moved, COUNT(*) AS n, MIN(bucket) AS first, MAX(bucket) AS last
       FROM service_flow_counts WHERE service = ? AND bucket >= ? GROUP BY kind, ref ORDER BY kind, ref`).all(service, since) as Row[])
-      .map((r) => ({ kind: r.kind, ref: r.ref, name: r.name, flowfilesIn: r.fin, flowfilesOut: r.fout, buckets: r.n, first: r.first, last: r.last }));
+      .map((r) => ({ kind: r.kind, ref: r.ref, name: r.name, flowfilesIn: r.fin, flowfilesOut: r.fout, transferred: r.moved ?? 0, buckets: r.n, first: r.first, last: r.last }));
   }
 
   hasFlowCounts(service: string): boolean {
@@ -1817,28 +1864,85 @@ export class Store {
     });
   }
 
-  /** S37 step 5 (§4.2.0 T1): a service's business process model (services/trace/model.ts), one row per service. */
-  traceModel(service: string): { body: unknown; revision: number; savedAt: string; savedBy: string } | null {
-    const r = this.db.prepare("SELECT * FROM service_trace_models WHERE service = ?").get(service) as Row | undefined;
-    return r ? { body: parse(r.body), revision: r.revision, savedAt: r.saved_at, savedBy: r.saved_by } : null;
+  // pages-rethink §10.2.4 step 2: the business model v2 (flow_models), the businesses (flows, flow_segments) and their
+  // history (flow_changes). services/flowmodel.ts decides; these only read and write.
+
+  /** A service's newest model (or a given revision). */
+  flowModel(service: string, revision?: number): StoredFlowModel | null {
+    const r = (revision === undefined
+      ? this.db.prepare("SELECT * FROM flow_models WHERE service = ? ORDER BY revision DESC LIMIT 1").get(service)
+      : this.db.prepare("SELECT * FROM flow_models WHERE service = ? AND revision = ?").get(service, revision)) as Row | undefined;
+    return r ? toFlowModel(r) : null;
   }
 
-  traceModels(): { service: string; body: unknown }[] {
-    return (this.db.prepare("SELECT service, body FROM service_trace_models ORDER BY service").all() as Row[]).map((r) => ({ service: r.service, body: parse(r.body) }));
+  /** Every service's newest model. */
+  flowModels(): StoredFlowModel[] {
+    return (this.db.prepare("SELECT m.* FROM flow_models m WHERE revision = (SELECT MAX(revision) FROM flow_models x WHERE x.service = m.service) ORDER BY service").all() as Row[]).map(toFlowModel);
   }
 
-  /** Saves a model over the revision the editor started from (0: none yet); another save in between is refused. */
-  saveTraceModel(service: string, body: unknown, base: number, actor: Actor): number {
-    return this.inTransaction(() => {
-      const was = this.db.prepare("SELECT revision FROM service_trace_models WHERE service = ?").get(service) as Row | undefined;
-      if ((was?.revision ?? 0) !== base) throw new StoreError("trace-model/stale", `The model was saved by someone else in the meantime (revision ${was?.revision}); reload it.`);
-      const revision = base + 1;
-      this.db.prepare("INSERT INTO service_trace_models (service, revision, body, saved_at, saved_by) VALUES (?, ?, ?, ?, ?) ON CONFLICT(service) DO UPDATE SET revision = excluded.revision, body = excluded.body, saved_at = excluded.saved_at, saved_by = excluded.saved_by")
-        .run(service, revision, JSON.stringify(body), this.stamp(), actor.id);
-      this.insertAudit(actor, "service.trace-model", service, { revision });
-      return revision;
-    });
+  /** Adds the next revision over `base` (0: none yet); another publish in between is refused. Call inside flowTransaction. */
+  insertFlowModel(service: string, base: number, model: ModelV2, source: "ai" | "e2e_trace" | "migrated", actor: Actor, gate: unknown): number {
+    const was = (this.db.prepare("SELECT MAX(revision) AS r FROM flow_models WHERE service = ?").get(service) as Row | undefined)?.r ?? 0;
+    if (was !== base) throw new StoreError("flow-model/stale", `${service}'s model is at revision ${was}, not ${base}: read it again (describe) and redo the draft on it.`);
+    const revision = base + 1;
+    this.db.prepare("INSERT INTO flow_models (service, revision, body, source, published_at, published_by, gate) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .run(service, revision, JSON.stringify(model), source, this.stamp(), actor.id, JSON.stringify(gate));
+    this.insertAudit(actor, "service.flow-model", service, { revision, source });
+    return revision;
   }
+
+  flowTransaction<T>(work: () => T): T { return this.inTransaction(work); }
+
+  flow(id: string): FlowRecord | null {
+    const r = this.db.prepare("SELECT * FROM flows WHERE id = ?").get(id) as Row | undefined;
+    return r ? toFlow(r) : null;
+  }
+
+  /** The businesses with a segment in a service (or all of them). */
+  flows(service?: string): FlowRecord[] {
+    return (service
+      ? this.db.prepare("SELECT * FROM flows WHERE id IN (SELECT flow FROM flow_segments WHERE service = ?) ORDER BY created_at, rowid").all(service)
+      : this.db.prepare("SELECT * FROM flows ORDER BY created_at, rowid").all()).map((r) => toFlow(r as Row));
+  }
+
+  /** Inserts or replaces a business row. */
+  putFlow(f: FlowRecord) {
+    this.db.prepare(`INSERT INTO flows (id, name, name_by, status, summary, reason, risks, pending, stuck_attention_s, stuck_failing_s, stuck_by, stuck_basis, created_at, confirmed_at, confirmed_by, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET name = excluded.name, name_by = excluded.name_by, status = excluded.status,
+        summary = excluded.summary, reason = excluded.reason, risks = excluded.risks, pending = excluded.pending, stuck_attention_s = excluded.stuck_attention_s,
+        stuck_failing_s = excluded.stuck_failing_s, stuck_by = excluded.stuck_by, stuck_basis = excluded.stuck_basis, confirmed_at = excluded.confirmed_at,
+        confirmed_by = excluded.confirmed_by, updated_at = excluded.updated_at`)
+      .run(f.id, f.name, f.nameBy, f.status, f.summary, f.reason, JSON.stringify(f.risks), f.pending ? JSON.stringify(f.pending) : null,
+        f.stuck?.attentionS ?? null, f.stuck?.failingS ?? null, f.stuck?.by ?? null, f.stuck?.basis ?? null, f.createdAt, f.confirmedAt, f.confirmedBy, this.stamp());
+  }
+
+  deleteFlow(id: string) { this.db.prepare("DELETE FROM flows WHERE id = ?").run(id); }
+
+  /** A business's segments in order (upstream first). */
+  flowSegments(flow: string): { seq: number; service: string; segment: string }[] {
+    return (this.db.prepare("SELECT seq, service, segment FROM flow_segments WHERE flow = ? ORDER BY seq").all(flow) as Row[]).map((r) => ({ seq: r.seq, service: r.service, segment: r.segment }));
+  }
+
+  /** Replaces a business's segments in one service, keeping the other services' (renumbered in the order given). */
+  setFlowSegments(flow: string, ordered: { service: string; segment: string }[]) {
+    this.db.prepare("DELETE FROM flow_segments WHERE flow = ?").run(flow);
+    ordered.forEach((s, seq) => this.db.prepare("INSERT INTO flow_segments (flow, seq, service, segment) VALUES (?, ?, ?, ?)").run(flow, seq, s.service, s.segment));
+  }
+
+  addFlowChange(c: Omit<FlowChange, "id" | "at">) {
+    this.db.prepare("INSERT INTO flow_changes (flow, service, at, by, kind, text, revision, verdict) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(c.flow, c.service, this.stamp(), c.by, c.kind, c.text, c.revision, c.verdict);
+  }
+
+  /** Newest first: a business's history, or a service's. */
+  flowChanges(o: { flow?: string; service?: string; limit?: number }): FlowChange[] {
+    const where = o.flow ? "flow = ?" : "service = ?";
+    return (this.db.prepare(`SELECT * FROM flow_changes WHERE ${where} ORDER BY id DESC LIMIT ?`).all(o.flow ?? o.service ?? "", Math.min(500, o.limit ?? 50)) as Row[])
+      .map((r) => ({ id: r.id, flow: r.flow ?? null, service: r.service, at: r.at, by: r.by, kind: r.kind, text: r.text, revision: r.revision ?? null, verdict: r.verdict ?? null }));
+  }
+
+  /** A person's change to a business, audited (FlowAction, §10.2.2 #7). */
+  auditFlow(actor: Actor, flow: string, action: string) { this.insertAudit(actor, `service.flow.${action}`, flow, {}); }
 
   /** S37 step 7 (T8, T9): how a service reaches an evidence source (e2e_trace: the Graph and its sealed graph token). */
   traceSource(service: string, source: string): { body: unknown; savedAt: string; savedBy: string } | null {
@@ -1926,6 +2030,30 @@ export interface ServiceBulletin { service: string; member: string; node: string
 /** pages-rethink §10.2.4 step 1: one row of service_flow_counts (ref: group id; s2s-out "<target uri>#<port name>"; s2s-in the input port id). */
 export interface FlowCountRow {
   service: string; bucket: string; kind: "group" | "s2s-out" | "s2s-in"; ref: string; name: string;
-  flowfilesIn: number; flowfilesOut: number; bytesIn: number; bytesOut: number; source: "sample" | "nifi-history";
+  flowfilesIn: number; flowfilesOut: number; bytesIn: number; bytesOut: number;
+  /** §10.3: FlowFiles moved inside the group (0 for the S2S rows). */
+  transferred: number;
+  source: "sample" | "nifi-history";
 }
+/** §10.2.4 step 2: a stored v2 model revision. gate: the checks it was published with. */
+export interface StoredFlowModel { service: string; revision: number; model: ModelV2; source: "ai" | "e2e_trace" | "migrated"; publishedAt: string; publishedBy: string; gate: unknown }
+const toFlowModel = (r: Row): StoredFlowModel => ({ service: r.service, revision: r.revision, model: JSON.parse(r.body), source: r.source, publishedAt: r.published_at, publishedBy: r.published_by, gate: parse(r.gate) });
+/** A change the gate held for a person (A8): the draft's segments of this service it would apply, those it removes. */
+export interface FlowPending {
+  id: string; kind: "new" | "gone" | "merge" | "split" | "cross-service"; text: string; service: string; at: string;
+  segments: unknown[]; remove: string[]; notes: unknown[];
+}
+export interface FlowRecord {
+  id: string; name: string; nameBy: "ai" | "person"; status: FlowStatus; summary: string; reason: string | null;
+  risks: { text: string; component?: string }[]; pending: FlowPending | null;
+  stuck: { attentionS: number; failingS: number; by: "ai" | "person"; basis: string } | null;
+  createdAt: string; confirmedAt: string | null; confirmedBy: string | null; updatedAt: string;
+}
+const toFlow = (r: Row): FlowRecord => ({
+  id: r.id, name: r.name, nameBy: r.name_by, status: r.status, summary: r.summary, reason: r.reason ?? null, risks: parse(r.risks) ?? [], pending: parse(r.pending),
+  stuck: r.stuck_attention_s && r.stuck_failing_s ? { attentionS: r.stuck_attention_s, failingS: r.stuck_failing_s, by: r.stuck_by ?? "ai", basis: r.stuck_basis ?? "" } : null,
+  createdAt: r.created_at, confirmedAt: r.confirmed_at ?? null, confirmedBy: r.confirmed_by ?? null, updatedAt: r.updated_at,
+});
+export type FlowChangeKind = "found" | "updated" | "confirmed" | "renamed" | "stuck" | "split-asked" | "not-right" | "ignored" | "watched" | "rejected";
+export interface FlowChange { id: number; flow: string | null; service: string; at: string; by: string; kind: FlowChangeKind; text: string; revision: number | null; verdict: GateVerdict | null }
 export interface ServiceCert { member: string; store: string; path: string | null; type: string | null; alias: string | null; chain: number | null; subject: string | null; issuer: string | null; notBefore: string | null; notAfter: string | null; readAt: string; error: string | null }

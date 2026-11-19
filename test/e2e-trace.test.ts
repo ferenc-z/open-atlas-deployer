@@ -9,7 +9,8 @@ import type { Context } from "hono";
 import type { Permission, Principal } from "../src/server/auth.ts";
 import { SecretBox } from "../src/server/secretbox.ts";
 import { Store } from "../src/server/store.ts";
-import { mountE2eTrace } from "../src/server/services/trace/e2e-routes.ts";
+import { e2eImport, mountE2eTrace } from "../src/server/services/trace/e2e-routes.ts";
+import { publishModel } from "../src/server/services/flowmodel.ts";
 import { E2E_SAVED_QUERIES, e2eTraceContract } from "../src/server/services/trace/e2e-graph.ts";
 import { businessesFrom, E2eTraceSource, E2E_ID, recordEvent } from "../src/server/services/trace/e2e-trace.ts";
 import { TraceEngine } from "../src/server/services/trace/engine.ts";
@@ -236,13 +237,14 @@ function routes(builder?: { call(name: string, args: Record<string, unknown>): P
   mountTrace(api, { ...common, provenance: {} as never, adapters: new Map([[E2E_ID, source.adapter]]) });
   const call = async (method: string, path: string, body?: unknown, as = "admin") => {
     const r = await api.request(path, { method, headers: { "content-type": "application/json", "x-as": as }, ...(body !== undefined ? { body: JSON.stringify(body) } : {}) });
-    return { status: r.status, body: await r.json() as any };
+    const text = await r.text();
+    return { status: r.status, body: (r.headers.get("content-type")?.includes("json") ? JSON.parse(text) : text) as any };
   };
-  return { store, call };
+  return { store, call, source };
 }
 
 test("e2e_trace routes: an admin sets the Graph and token (sealed), viewers read only; the imported model is saved and edited like a hand-made one", async () => {
-  const { store, call } = routes();
+  const { store, call, source } = routes();
   const viewer = await call("GET", "/api/services/c250/trace-sources", undefined, "viewer");
   assert.equal(viewer.status, 200);
   assert.deepEqual([viewer.body.canEdit, viewer.body.e2e_trace, viewer.body.canIssue], [false, null, false]);
@@ -257,19 +259,27 @@ test("e2e_trace routes: an admin sets the Graph and token (sealed), viewers read
   assert.ok(!kept.includes("test-graph-token"), "the token is kept sealed");
   assert.equal((await call("GET", "/api/services/n999/trace-sources")).status, 404);
 
-  // Import → store the model → read it back.
-  assert.equal((await call("POST", "/api/services/c250/trace-model/import-e2e", {}, "viewer")).status, 403);
-  const imported = await call("POST", "/api/services/c250/trace-model/import-e2e", {});
-  assert.equal(imported.status, 200);
-  assert.deepEqual([imported.body.revision, imported.body.imported], [0, ["schedule-101", "schedule-102"]]);
-  // The import only proposes a model (nothing hand-edits it any more: the PUT was removed, §9.2); keep it the way the AI
-  // tools will, through the store, and read it back.
-  const model = imported.body.model;
-  model.businesses[0].steps[1].name = "Parse the PDF";
-  model.businesses[0].steps[1].maxSeconds = 120;
-  assert.equal(store.saveTraceModel("c250", { sources: model.sources, businesses: model.businesses }, 0, { id: "admin", via: "cli" }), 1);
-  const back = await call("GET", "/api/services/c250/trace-model", undefined, "viewer");
-  assert.deepEqual([back.body.revision, back.body.model.businesses[0].steps[1].name, back.body.model.businesses[0].steps[1].maxSeconds], [1, "Parse the PDF", 120]);
+  // ops step 2: the import route and GET trace-model are gone; publish_model with source e2e_trace takes the schedules
+  // (steps, entries, match) and the AI's draft only places them. What the AI wrote in their steps is not kept.
+  assert.equal((await call("POST", "/api/services/c250/trace-model/import-e2e", {})).status, 404);
+  assert.equal((await call("GET", "/api/services/c250/trace-model", undefined, "viewer")).status, 404);
+  const placed = { version: 2, sources: [], segments: ["schedule-101", "schedule-102"].map((id, i) => ({
+    id, flow: `new:s${i}`, group: { id: `pg-${i}`, name: `group ${i}` }, slice: "*", role: "segment",
+    steps: [{ id: "x", name: "made up", position: { kind: "worker", id: "x" } }], entries: [{ id: "e", step: "x", channel: { type: "external", system: "x" } }], exits: [] })) };
+  const deps = { store, e2e: e2eImport(source), now: () => NOW };
+  const ai = { id: "assistant", via: "key" } as const;
+  await assert.rejects(publishModel(deps, { service: "c250", base: 0, model: { ...placed, segments: placed.segments.slice(0, 1) }, note: "e2e", source: "e2e_trace", actor: ai }), /Place every e2e_trace schedule: .*schedule-102/);
+  await assert.rejects(publishModel({ store }, { service: "c250", base: 0, model: placed, note: "e2e", source: "e2e_trace", actor: ai }), /no e2e_trace source/);
+  const got = await publishModel(deps, { service: "c250", base: 0, model: placed, note: "e2e", source: "e2e_trace", actor: ai });
+  assert.equal(got.verdict, "needs-confirmation", "a first model's businesses are new: a person confirms them");
+  const stored = store.flowModel("c250")!;
+  assert.deepEqual([stored.revision, stored.source, stored.model.sources], [1, "e2e_trace", ["e2e_trace", "provenance"]]);
+  assert.deepEqual(stored.model.segments.map((s) => [s.id, s.origin, s.steps.map((x) => x.id), s.group.id]), [["schedule-101", "e2e_trace", WORKERS, "pg-0"], ["schedule-102", "e2e_trace", ["sftp_fetcher", "order_loader"], "pg-1"]]);
+  assert.deepEqual(store.flows("c250").map((f) => [f.name, f.status]), [["group 0", "proposed"], ["group 1", "proposed"]]);
+  // The AI publishing on its own later keeps e2e_trace's steps; it may move the segment.
+  const again = await publishModel(deps, { service: "c250", base: 1, actor: ai, note: "move", model: { ...stored.model, segments: stored.model.segments.map((s) => ({ ...s, steps: [{ id: "x", name: "x", position: { kind: "worker", id: "x" } }], entries: [{ id: "e", step: "x", channel: { type: "external", system: "x" } }] })) } });
+  assert.equal(again.verdict, "published");
+  assert.deepEqual(store.flowModel("c250")!.model.segments[0]!.steps.map((x) => x.id), WORKERS);
   const traced = await call("POST", "/api/services/c250/trace-business-data", { fileName: "INV-B-001.pdf", from: ago(86400), to: NOW.toISOString() }, "viewer");
   assert.equal(traced.body.traces[0].verdict.kind, "failed");
 

@@ -178,3 +178,143 @@ export function matches(conds: Condition[] | undefined, attrs: Record<string, st
 }
 
 export const emptyModel = (service: string): TraceModel => ({ service, sources: [], businesses: [] });
+
+// pages-rethink §10.2.4 / §10.3 (ops step 2): the business model v2. A service's model is its segments: each one is a
+// v1 business (match, steps, entries, exits) placed on a group under root (and on one connected slice of it), either a
+// segment of a business (flow) or a shared step. The business itself — its name, whether a person confirmed it, its
+// stuck times — lives in the flows table, never in the body; `flow` only says which business a segment belongs to.
+// Exits name the component and relationship the data leaves by (DROP probe, §10.1: a DROP at an exit is a normal
+// end, anywhere else data was dropped). Step.maxSeconds is gone: stuck times are the business's (B4).
+
+/** A segment not placed on a group yet (migrated from v1): the gate's coverage asks for its group. */
+export const UNPLACED = "-";
+/** slice of a segment that is the whole group. */
+export const WHOLE = "*";
+export const SEGMENT_ROLES = ["segment", "shared"] as const;
+export type SegmentRole = (typeof SEGMENT_ROLES)[number];
+/** A business id (flows.id) or, in a draft, "new:<key>" for a business it proposes. */
+export const FLOW_KEY = /^(flw_[a-z0-9]{6,32}|new:[A-Za-z0-9_.-]{1,64})$/;
+
+export interface Exit extends Endpoint {
+  /** The component the data leaves the segment by (an RPG port's upstream processor, a Put*, the last processor). */
+  component: string;
+  /** Its relationship; none: any relationship of the component is this exit. */
+  relationship?: string;
+}
+export interface Segment extends Business {
+  /** role "segment": the business it belongs to; "shared": none. */
+  flow?: string;
+  group: { id: string; name: string };
+  /** The connected slice of the group (TopologyFragment.key), WHOLE for all of it (§10.3). */
+  slice: string;
+  role: SegmentRole;
+  /** Imported from e2e_trace's schedules: its steps, entries and match are e2e_trace's, the AI only places it. */
+  origin?: "e2e_trace";
+  exits: Exit[];
+}
+export interface ModelV2 { version: 2; service: string; sources: string[]; segments: Segment[] }
+/** What the AI says about a business when it publishes (kept in the flows table, not in the model body). */
+export interface FlowNote {
+  flow: string; name?: string; summary?: string; reason?: string | null;
+  risks?: { text: string; component?: string }[];
+  stuck?: { attentionMinutes: number; failingMinutes: number; basis: string };
+  /** A7 ④: the AI thinks nothing needs watching here (only for businesses no person confirmed). */
+  ignore?: boolean;
+}
+export interface ModelDraft extends ModelV2 { flows?: FlowNote[] }
+
+export const emptyModelV2 = (service: string): ModelV2 => ({ version: 2, service, sources: [], segments: [] });
+/** The engine reads v1 businesses; a v2 segment is one. */
+export const toTraceModel = (m: ModelV2): TraceModel => ({ service: m.service, sources: m.sources, businesses: m.segments });
+export const STUCK_MINUTES_MAX = 30 * 24 * 60;
+
+/** Checks a v2 model (a draft from the AI, or the e2e import placed by it); every problem is listed. */
+export function parseModelV2(service: string, body: unknown): { model: ModelV2; notes: FlowNote[] } | { errors: string[] } {
+  const errors: string[] = [];
+  const b = (body && typeof body === "object" ? body : {}) as Any;
+  if (b.version !== 2) errors.push("version is 2.");
+  const sources = Array.isArray(b.sources) ? b.sources : [];
+  if (b.sources !== undefined && !Array.isArray(b.sources)) errors.push("sources is a list of evidence source ids.");
+  for (const [i, s] of sources.entries()) if (typeof s !== "string" || !ID.test(s)) errors.push(`sources[${i}] is an evidence source id.`);
+  const list = Array.isArray(b.segments) ? b.segments : [];
+  if (!Array.isArray(b.segments)) errors.push("segments is a list.");
+  if (list.length > LIMITS.businesses * 4) errors.push(`At most ${LIMITS.businesses * 4} segments.`);
+  const segments: Segment[] = [];
+  const ids = new Set<string>(), places = new Set<string>();
+  for (const [i, raw] of list.entries()) {
+    const at = `segments[${i}]`;
+    const s = (raw ?? {}) as Any;
+    const role: SegmentRole = SEGMENT_ROLES.includes(s.role) ? s.role : "segment";
+    if (s.role !== undefined && !SEGMENT_ROLES.includes(s.role)) errors.push(`${at}.role is segment or shared.`);
+    const base = business({ ...s, name: text(s.name) ? s.name : s.group?.name ?? s.id }, at, errors);
+    if (typeof s.flow === "string" && s.flow !== "" && !FLOW_KEY.test(s.flow)) errors.push(`${at}.flow is a business id (flw_…) or new:<key>.`);
+    if (role === "segment" && !(typeof s.flow === "string" && FLOW_KEY.test(s.flow))) errors.push(`${at}.flow: a segment belongs to a business (flw_… or new:<key>).`);
+    if (role === "shared" && s.flow) errors.push(`${at}.flow: a shared step belongs to no business.`);
+    if (!text(s.group?.id, 128)) errors.push(`${at}.group.id is the process group's id.`);
+    if (!text(s.group?.name)) errors.push(`${at}.group.name is the process group's name.`);
+    const slice = s.slice === undefined ? WHOLE : s.slice;
+    if (!text(slice, 128)) errors.push(`${at}.slice is the slice's key, or ${WHOLE} for the whole group.`);
+    const group = { id: String(s.group?.id ?? "").trim(), name: String(s.group?.name ?? "").trim() };
+    const place = `${group.id}\0${slice}`;
+    if (group.id && group.id !== UNPLACED) {
+      if (places.has(place)) errors.push(`${at}: group ${group.id} slice ${slice} has two segments.`);
+      places.add(place);
+    }
+    if (ids.has(base.id)) errors.push(`${at}.id ${base.id} is used twice.`);
+    ids.add(base.id);
+    const exits: Exit[] = base.exits.map((e, j) => {
+      const r = (Array.isArray(s.exits) ? s.exits[j] : {}) as Any;
+      if (!text(r?.component, 128)) errors.push(`${at}.exits[${j}].component is the id of the component the data leaves by.`);
+      if (r?.relationship !== undefined && r.relationship !== null && !text(r.relationship, 128)) errors.push(`${at}.exits[${j}].relationship is a relationship name.`);
+      return { ...e, component: String(r?.component ?? "").trim(), ...(text(r?.relationship, 128) ? { relationship: String(r.relationship).trim() } : {}) };
+    });
+    segments.push({
+      ...base, steps: base.steps.map(({ maxSeconds: _m, ...step }) => step), exits,
+      ...(role === "segment" && typeof s.flow === "string" ? { flow: s.flow } : {}),
+      group, slice: String(slice ?? WHOLE).trim(), role, ...(s.origin === "e2e_trace" ? { origin: "e2e_trace" as const } : {}),
+    });
+  }
+  const notes: FlowNote[] = [];
+  for (const [i, n] of (Array.isArray(b.flows) ? b.flows : []).entries()) {
+    const at = `flows[${i}]`;
+    if (typeof n?.flow !== "string" || !FLOW_KEY.test(n.flow)) { errors.push(`${at}.flow is a business id or new:<key>.`); continue; }
+    const note: FlowNote = { flow: n.flow };
+    if (n.name !== undefined) { if (!text(n.name)) errors.push(`${at}.name is at most ${NAME_MAX} characters.`); else note.name = n.name.trim(); }
+    if (n.summary !== undefined) { if (!text(n.summary, 500)) errors.push(`${at}.summary is at most 500 characters.`); else note.summary = n.summary.trim(); }
+    if (n.reason !== undefined) { if (n.reason !== null && !text(n.reason, 1000)) errors.push(`${at}.reason is at most 1000 characters.`); else note.reason = n.reason === null ? null : n.reason.trim(); }
+    if (n.risks !== undefined) {
+      if (!Array.isArray(n.risks) || n.risks.length > 20 || n.risks.some((r: Any) => !text(r?.text, 500))) errors.push(`${at}.risks is at most 20 {text, component?}.`);
+      else note.risks = n.risks.map((r: Any) => ({ text: r.text.trim(), ...(text(r.component, 128) ? { component: r.component.trim() } : {}) }));
+    }
+    if (n.stuck !== undefined) {
+      const a = n.stuck?.attentionMinutes, f = n.stuck?.failingMinutes;
+      const ok = (v: unknown) => Number.isInteger(v) && (v as number) >= 1 && (v as number) <= STUCK_MINUTES_MAX;
+      if (!ok(a) || !ok(f) || a >= f) errors.push(`${at}.stuck: attentionMinutes < failingMinutes, whole minutes up to 30 days.`);
+      else if (!text(n.stuck.basis, 300)) errors.push(`${at}.stuck.basis says what the values are based on.`);
+      else note.stuck = { attentionMinutes: a, failingMinutes: f, basis: n.stuck.basis.trim() };
+    }
+    if (n.ignore !== undefined) note.ignore = n.ignore === true;
+    notes.push(note);
+  }
+  return errors.length ? { errors } : { model: { version: 2, service, sources, segments }, notes };
+}
+
+/** §10.2.4: a v1 model (service_trace_models) as v2 revision 1: every business a segment of its own business, placed
+ *  on the process group its steps name when they do (else UNPLACED, for the AI to place); an exit leaves by its step's
+ *  component. */
+export function migrateV1(service: string, body: unknown, flowId: (i: number) => string): { model: ModelV2; flows: { id: string; name: string; segment: string }[] } {
+  const b = (body && typeof body === "object" ? body : {}) as Any;
+  const flows: { id: string; name: string; segment: string }[] = [];
+  const segments: Segment[] = (Array.isArray(b.businesses) ? b.businesses : []).filter((x: Any) => x && typeof x.id === "string").map((x: Any, i: number) => {
+    const steps = (Array.isArray(x.steps) ? x.steps : []).map(({ maxSeconds: _m, ...s }: Any) => s) as Step[];
+    const pg = steps.find((s) => s.position?.kind === "process-group");
+    const id = flowId(i);
+    flows.push({ id, name: String(x.name ?? x.id), segment: x.id });
+    return {
+      id: x.id, name: String(x.name ?? x.id), match: Array.isArray(x.match) ? x.match : [], steps, entries: Array.isArray(x.entries) ? x.entries : [],
+      exits: (Array.isArray(x.exits) ? x.exits : []).map((e: Any) => ({ ...e, component: steps.find((s) => s.id === e.step)?.position?.id ?? UNPLACED })),
+      flow: id, group: pg ? { id: pg.position.id, name: pg.position.name ?? pg.name } : { id: UNPLACED, name: String(x.name ?? x.id) }, slice: WHOLE, role: "segment",
+    } as Segment;
+  });
+  return { model: { version: 2, service, sources: Array.isArray(b.sources) ? b.sources.filter((s: unknown) => typeof s === "string") : [], segments }, flows };
+}

@@ -1159,7 +1159,9 @@ def flow_counts(index, topology, helper):
     """The counts of one round (NiFi's 5-minute window ending now): each group under root (in = through its input ports
     and received, out = through its output ports and sent), the root canvas' own components when they do something
     (in = what its remote input ports passed on and its source processors made, out = what went to RPG ports), each S2S
-    ref's connections into the RPG ports and each remote input port."""
+    ref's connections into the RPG ports and each remote input port. transferred (§10.3): the FlowFiles moved inside the
+    unit (a group's flowFilesTransferred; the root canvas' processors' out), so a group that makes and ends its own data
+    is not taken for one without traffic."""
     root, comps = index["root"], index["comps"]
     out = []
     for x in root.get("processGroupStatusSnapshots") or []:
@@ -1167,7 +1169,8 @@ def flow_counts(index, topology, helper):
         if isinstance(g.get("id"), str):
             out.append({"kind": "group", "ref": g["id"], "name": g.get("name") or g["id"],
                         "flowFilesIn": _n(g, "flowFilesIn", "flowFilesReceived"), "flowFilesOut": _n(g, "flowFilesOut", "flowFilesSent"),
-                        "bytesIn": _n(g, "bytesIn", "bytesReceived"), "bytesOut": _n(g, "bytesOut", "bytesSent")})
+                        "bytesIn": _n(g, "bytesIn", "bytesReceived"), "bytesOut": _n(g, "bytesOut", "bytesSent"),
+                        "transferred": _n(g, "flowFilesTransferred")})
     if topology is None:
         return out
     snap = lambda i: comps.get(i, (None, {}))[1]
@@ -1176,7 +1179,8 @@ def flow_counts(index, topology, helper):
         outs = [snap(c) for c in helper["rootOutConns"]]
         out.append({"kind": "group", "ref": topology["root"]["id"], "name": topology["root"]["name"],
                     "flowFilesIn": sum(_n(s, "flowFilesOut") for s in ins), "flowFilesOut": sum(_n(s, "flowFilesOut") for s in outs),
-                    "bytesIn": sum(_n(s, "bytesOut") for s in ins), "bytesOut": sum(_n(s, "bytesOut") for s in outs)})
+                    "bytesIn": sum(_n(s, "bytesOut") for s in ins), "bytesOut": sum(_n(s, "bytesOut") for s in outs),
+                    "transferred": sum(_n((x or {}).get("processorStatusSnapshot") or {}, "flowFilesOut") for x in root.get("processorStatusSnapshots") or [])})
     for ref, o in sorted(helper["s2sOut"].items()):
         ss = [snap(c) for c in o["connections"]]
         out.append({"kind": "s2s-out", "ref": ref, "name": o["name"], "flowFilesIn": sum(_n(s, "flowFilesIn") for s in ss), "flowFilesOut": sum(_n(s, "flowFilesOut") for s in ss),
@@ -1190,8 +1194,8 @@ def flow_counts(index, topology, helper):
 
 def history_points(histories):
     """NiFi's status history (a snapshot a minute, each NiFi's rolling 5-minute window) as one point per 5 minutes:
-    [timestamp ms, flowfiles in, flowfiles out, bytes in, bytes out], the first snapshot of each 5-minute slot, summed
-    over the histories given (an S2S ref's several connections)."""
+    [timestamp ms, flowfiles in, flowfiles out, bytes in, bytes out, transferred], the first snapshot of each 5-minute
+    slot, summed over the histories given (an S2S ref's several connections; transferred only a group's history has)."""
     slots = {}
     for h in histories:
         firsts = {}
@@ -1200,8 +1204,8 @@ def history_points(histories):
             if isinstance(t, (int, float)) and int(t) // FIVE_MINUTES_MS not in firsts:
                 firsts[int(t) // FIVE_MINUTES_MS] = (int(t), m)
         for slot, (t, m) in firsts.items():
-            p = slots.setdefault(slot, [t, 0, 0, 0, 0])
-            for k, key in enumerate(("inputCount", "outputCount", "inputBytes", "outputBytes"), 1):
+            p = slots.setdefault(slot, [t, 0, 0, 0, 0, 0])
+            for k, key in enumerate(("inputCount", "outputCount", "inputBytes", "outputBytes", "flowFilesTransferred"), 1):
                 p[k] += _n(m, key)
     return [slots[k] for k in sorted(slots)]
 

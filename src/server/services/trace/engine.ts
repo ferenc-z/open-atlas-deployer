@@ -54,6 +54,8 @@ export interface EngineDeps {
   now?: () => Date;
   /** T11: the queue and downstream state of a stuck step (flowstate.ts reads the collected samples). */
   stuckContext?: (q: StuckAsk) => StuckContext | undefined | Promise<StuckContext | undefined>;
+  /** B4 (ops step 2): the business's own stuck time ("attention") for a segment, in seconds; it wins over the rest. */
+  stuckSeconds?: (service: string, segment: string) => number | undefined;
 }
 
 /** T9: the sources of a model that names none — every adapter that can answer for the service, those asked by named
@@ -90,6 +92,8 @@ export class TraceEngine {
 
   /** T10: the step's own maxSeconds, else the first source's allowance (e2e_trace: its P95), else the default. */
   private async allowed(service: string, b: Business, step: Step): Promise<{ seconds: number; by: string }> {
+    const own = this.deps.stuckSeconds?.(service, b.id);
+    if (own && own > 0) return { seconds: own, by: "business" };
     if (step.maxSeconds) return { seconds: step.maxSeconds, by: "model" };
     for (const a of this.sources(service)) {
       if (!a.allowance) continue;

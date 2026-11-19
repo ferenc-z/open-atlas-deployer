@@ -53,7 +53,7 @@ export interface SkeletonInput {
   /** host:port (lower case) this service answers S2S on. */
   addresses: string[];
   topology: Topology | null;
-  /** Per group id: in + out over the last IDLE_DAYS days and the first bucket counted. */
+  /** Per group id: in + out + transferred (§10.3) over the last IDLE_DAYS days and the first bucket counted. */
   traffic: Map<string, { total: number; first: string }>;
 }
 
@@ -249,7 +249,7 @@ export function skeletonOf(store: Store, now: Date, only?: string[]): Skeleton {
   }
   const since = new Date(now.getTime() - IDLE_DAYS * DAY).toISOString();
   const inputs: SkeletonInput[] = [...new Set(members.map((x) => x.service))].map((id) => {
-    const recent = new Map(store.flowCountTotals(id, since).filter((r) => r.kind === "group").map((r) => [r.ref, r.flowfilesIn + r.flowfilesOut]));
+    const recent = new Map(store.flowCountTotals(id, since).filter((r) => r.kind === "group").map((r) => [r.ref, r.flowfilesIn + r.flowfilesOut + r.transferred]));
     return {
       id, addresses: [...(addresses.get(id) ?? [])],
       topology: (store.latestTopology(id)?.body as Topology | undefined) ?? null,
