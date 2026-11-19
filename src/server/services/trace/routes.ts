@@ -1,18 +1,17 @@
-// S37 step 5: the business data trace's HTTP side — a service's model (read: deploy-viewer; save: admin), the
-// components a step's position can be picked from (a name search on the service's NiFi through its executor), and
-// trace_business_data (structured conditions in, the engine's verdicts out). Evidence source adapters are registered
-// by steps 6 (provenance) and 7 (e2e_trace); until then a trace says which sources it is missing.
+// S37 step 5: the business data trace's HTTP side. A service's model is read here (deploy-viewer); it is written by the e2e_trace
+// import (e2e-routes.ts) and, from S38 on, by the AI through MCP tools (pages-rethink §9.1 A4, A9): the hand-edit PUT, the
+// position search and the sentence-to-conditions route were removed (§9.2). trace_business_data takes structured
+// conditions and returns the engine's verdicts; evidence source adapters are registered in app.ts.
 
 import type { Context, Hono } from "hono";
 import type { Permission, Principal } from "../../auth.ts";
-import { StoreError, type Actor, type Store } from "../../store.ts";
+import type { Actor, Store } from "../../store.ts";
 import type { ServiceProvenance } from "../provenance.ts";
 import { dangling, links } from "./channels.ts";
 import { TraceEngine, type TraceQuery } from "./engine.ts";
 import type { EvidenceAdapter } from "./events.ts";
 import { stuckContextFrom } from "./flowstate.ts";
-import { CUES, emptyModel, parseModel, type TraceModel } from "./model.ts";
-import type { NlConverter } from "./nl.ts";
+import { CUES, emptyModel, type TraceModel } from "./model.ts";
 
 type Reject = (c: Context, status: 400 | 401 | 403 | 404 | 409 | 429 | 503, code: string, message: string, details?: string[]) => Response;
 export interface TraceDeps {
@@ -23,8 +22,6 @@ export interface TraceDeps {
   registered: (id: string) => unknown;
   actorOf: (p: Principal) => Actor;
   adapters: Map<string, EvidenceAdapter>;
-  /** S37 step 8 (Q6): one sentence to conditions through a one-shot OMA session; without it the page offers only the form. */
-  nl?: NlConverter;
 }
 
 export const TRACE_SPAN_DAYS = 31;
@@ -75,36 +72,6 @@ export function mountTrace(api: Hono, d: TraceDeps) {
     });
   });
 
-  api.put("/api/services/:id/trace-model", async (c) => {
-    const p = await d.authenticate(c, "admin");
-    if (p instanceof Response) return p;
-    const id = c.req.param("id");
-    if (!d.registered(id)) return unknown(c, id);
-    const body = (await c.req.json().catch(() => null)) as { model?: unknown; revision?: unknown } | null;
-    if (!body || !Number.isInteger(body.revision)) return d.reject(c, 400, "trace-model/invalid", "Send {model, revision}: revision is the one the editor loaded (0 for a new model).");
-    const got = parseModel(id, body.model);
-    if ("errors" in got) return d.reject(c, 400, "trace-model/invalid", `The model has ${got.errors.length} problem(s).`, got.errors);
-    try {
-      const revision = d.store.saveTraceModel(id, { sources: got.model.sources, businesses: got.model.businesses }, body.revision as number, d.actorOf(p));
-      const models = allModels(d.store);
-      return c.json({ revision, health: { dangling: dangling(models).filter((x) => x.service === id), links: links(models).filter((l) => l.from.service === id || l.to.service === id) } });
-    } catch (error) {
-      if (error instanceof StoreError) return d.reject(c, 409, error.code, error.message);
-      throw error;
-    }
-  });
-
-  // A step's position picked by name: NiFi's own component search, through a member's service executor.
-  api.get("/api/services/:id/trace-model/positions", async (c) => {
-    const p = await d.authenticate(c, "view");
-    if (p instanceof Response) return p;
-    const id = c.req.param("id");
-    if (!d.registered(id)) return unknown(c, id);
-    const q = (c.req.query("q") ?? "").trim();
-    if (!q || q.length > 100) return d.reject(c, 400, "trace-model/search", "q is 1 to 100 characters of a component's name or id.");
-    return c.json(await d.provenance.flowSearch(id, q));
-  });
-
   // trace_business_data (§4.2): the skeleton the page (step 8) and the MCP tool share.
   api.post("/api/services/:id/trace-business-data", async (c) => {
     const p = await d.authenticate(c, "view");
@@ -114,20 +81,5 @@ export function mountTrace(api: Hono, d: TraceDeps) {
     const q = parseTraceQuery(id, await c.req.json().catch(() => ({})));
     if ("error" in q) return d.reject(c, 400, "trace/query", q.error);
     return c.json(await engine.trace(q));
-  });
-
-  // S37 step 8 (Q6): a sentence to conditions. Always 200: `conditions` (a suggestion for the form) or `fallback` (why the
-  // person fills the form instead). Only the sentence, the business list and the time go to the Assistant.
-  api.post("/api/services/:id/trace-parse", async (c) => {
-    const p = await d.authenticate(c, "view");
-    if (p instanceof Response) return p;
-    const id = c.req.param("id");
-    if (!d.registered(id)) return unknown(c, id);
-    const body = (await c.req.json().catch(() => null)) as { text?: unknown; utcOffsetMinutes?: unknown } | null;
-    if (!body || typeof body.text !== "string" || !body.text.trim()) return d.reject(c, 400, "trace/parse", "Send {text, utcOffsetMinutes?}: the sentence to read.");
-    if (!d.nl) return c.json({ fallback: "The Deploy Assistant is not configured here; fill in the form.", ms: 0 });
-    const offset = typeof body.utcOffsetMinutes === "number" && Math.abs(body.utcOffsetMinutes) <= 14 * 60 ? Math.round(body.utcOffsetMinutes) : -new Date().getTimezoneOffset();
-    const businesses = (d.store.traceModel(id)?.body as { businesses?: { id: string; name: string }[] } | undefined)?.businesses?.map((b) => ({ id: b.id, name: b.name })) ?? [];
-    return c.json(await d.nl.convert(id, body.text, businesses, offset));
   });
 }

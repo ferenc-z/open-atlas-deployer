@@ -1,9 +1,8 @@
 // Service ops §9.3, §15.3 (phase 2 step 4): a service's logs. The service executor sums each watched NiFi's
 // nifi-app.log WARN/ERROR entries by pattern into its samples (ingestLogs keeps them, with 5-minute counts for the
-// rules); everything else is read on demand on the executor's read channel: log-read (list, lines, search, download;
-// the lines and the archive come over the content channel, never into the job's status) and log-tail (§15.2 P7: up
-// to 120 seconds, followed by inode and offset; its chunks reach the page over SSE, and while someone still follows a
-// new tail carries on from the cursor the last one ended at; one tail per node and file, shared by everyone following).
+// rules); everything else is read on demand on the executor's read channel: log-read (lines, search; the lines come
+// over the content channel, never into the job's status). The executor's log-tail and download modes stay in the executor; the
+// Deployer no longer calls them (the page that used them was removed, pages-rethink §9.2).
 // The executor reads only below the log directories of what it watches (realpath compared, links out refused).
 
 import { newJobId, type ExecutorInfo, type Handoff } from "../handoff.ts";
@@ -18,8 +17,8 @@ export const LOG_LEVELS = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL"] a
 export type LogLevel = (typeof LOG_LEVELS)[number];
 /** §15.3: a search returns at most 5000 lines per node; a download at most 50 MiB; a tail runs 120 seconds at most. */
 export const SEARCH_LIMIT = 5000;
+/** The content channel's ceiling (the executor's answers come over it; checked in app.ts). */
 export const DOWNLOAD_MAX = 50 << 20;
-export const TAIL_SECONDS = 120;
 const BUCKET_MS = 5 * 60_000;
 
 export const bucketOf = (iso: string) => new Date(Math.floor(Date.parse(iso) / BUCKET_MS) * BUCKET_MS).toISOString().replace(".000Z", "Z");
@@ -99,17 +98,12 @@ export function parseSearch(body: unknown, now = new Date()): SearchQuery | { er
   return out;
 }
 
-type TailEvent = Record<string, unknown> & { type: "lines" | "state" };
-type Listener = (e: TailEvent) => void;
-interface Tail { key: string; service: string; member: string; host: string; file: string; listeners: Set<Listener>; job: string | null; cursor: { inode: number; offset: number } | null; recent: string; jobs: number; retry: NodeJS.Timeout | null }
-
 export class ServiceLogs {
-  private tails = new Map<string, Tail>();
   private store: Store;
   private handoff: Handoff;
-  private opts: { waitMs?: number; pollMs?: number; tailSeconds?: number; retryMs?: number };
+  private opts: { waitMs?: number; pollMs?: number };
 
-  constructor(store: Store, handoff: Handoff, opts: { waitMs?: number; pollMs?: number; tailSeconds?: number; retryMs?: number } = {}) {
+  constructor(store: Store, handoff: Handoff, opts: { waitMs?: number; pollMs?: number } = {}) {
     this.store = store;
     this.handoff = handoff;
     this.opts = opts;
@@ -166,11 +160,6 @@ export class ServiceLogs {
     return { result: (status.result ?? {}) as Any, content: content?.data, truncated: content?.truncated ?? false };
   }
 
-  async files(id: string, key: string): Promise<{ dir: string; files: { name: string; size: number; modifiedAt: string; gz: boolean }[]; more: number }> {
-    const { content } = await this.read(this.member(id, key), { mode: "list" });
-    return JSON.parse(content?.toString("utf8") ?? "{}");
-  }
-
   /** The last lines of one file (lines ≤ 5000). */
   async lines(id: string, key: string, file: string, lines: number): Promise<{ file: string; lines: string[] }> {
     const { content } = await this.read(this.member(id, key), { mode: "lines", file, lines });
@@ -199,83 +188,5 @@ export class ServiceLogs {
     }));
     const entries = done.flatMap((d) => d.entries).sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : a.label < b.label ? -1 : a.label > b.label ? 1 : 0));
     return { from: q.from, to: q.to, entries, members: done.map((d) => d.summary) };
-  }
-
-  /** One member's files as a tar.gz (at most 50 MiB). */
-  async download(id: string, key: string, files: string[]): Promise<{ name: string; data: Buffer; result: Any }> {
-    const m = this.member(id, key);
-    if (!files.length || files.length > 500 || !files.every((f) => /^[^/\0]{1,255}$/.test(f))) throw new LogsError(400, "logs/files", "files are log file names in the log directory (no paths).");
-    const { content, result, truncated } = await this.read(m, { mode: "download", files, maxBytes: DOWNLOAD_MAX, timeoutSeconds: 110 });
-    if (!content || truncated) throw new LogsError(503, "logs/download", `${m.label}: the archive did not arrive whole; choose fewer files.`);
-    const stamp = new Date().toISOString().replace(/[-:]/g, "").slice(0, 15);
-    const name = `${id}-${m.label.replace(/[^A-Za-z0-9._-]+/g, "_")}-logs-${stamp}.tar.gz`;
-    return { name, data: content, result };
-  }
-
-  /** Follows one member's file (§15.2 P7): the listener gets the lines as they come (first the recent ones), and the
-   *  state; the returned function stops listening. One tail per member and file, shared. */
-  tail(id: string, key: string, file: string, listener: Listener): () => void {
-    if (!/^[^/\0]{1,255}$/.test(file) || file.endsWith(".gz")) throw new LogsError(400, "logs/file", "file is the name of a growing log file in the log directory (not a .gz).");
-    const m = this.member(id, key);
-    this.usable(m, "log-tail");
-    const k = `${id}\0${key}\0${file}`;
-    let t = this.tails.get(k);
-    if (!t) {
-      t = { key: k, service: id, member: key, host: m.host, file, listeners: new Set(), job: null, cursor: null, recent: "", jobs: 0, retry: null };
-      this.tails.set(k, t);
-    }
-    t.listeners.add(listener);
-    if (!t.job && !t.retry) this.start(t);
-    listener({ type: "state", state: "following", job: t.job, followers: t.listeners.size, tails: t.jobs });
-    if (t.recent) listener({ type: "lines", text: t.recent, backlog: true });
-    const tail = t;
-    return () => { tail.listeners.delete(listener); };
-  }
-
-  /** How many tails run (tests and the page's notes). */
-  tailing(): { service: string; member: string; file: string; followers: number; job: string | null }[] {
-    return [...this.tails.values()].map((t) => ({ service: t.service, member: t.member, file: t.file, followers: t.listeners.size, job: t.job }));
-  }
-
-  private broadcast(t: Tail, e: TailEvent) {
-    for (const l of t.listeners) { try { l(e); } catch { /* a listener that went away */ } }
-  }
-
-  private start(t: Tail) {
-    t.retry = null;
-    if (!t.listeners.size) { this.tails.delete(t.key); return; }
-    const seconds = this.opts.tailSeconds ?? TAIL_SECONDS;
-    const id = newJobId("log-tail");
-    try {
-      const executor = this.executor(t.host);
-      if (!executor.online) throw new LogsError(409, "logs/executor-offline", executor.reason ?? `The service executor on ${t.host} is offline.`);
-      this.handoff.submit(id, { kind: "log-tail", member: t.member, file: t.file, seconds, timeoutSeconds: seconds + 10, ...(t.cursor ? { cursor: t.cursor } : { lines: 100 }) }, t.host, "service");
-    } catch (error) {
-      this.broadcast(t, { type: "state", state: "error", message: (error as Error).message });
-      t.retry = setTimeout(() => this.start(t), this.opts.retryMs ?? 5000);
-      t.retry.unref?.();
-      return;
-    }
-    t.job = id;
-    t.jobs++;
-    if (t.jobs > 1) this.broadcast(t, { type: "state", state: "renewed", job: id, followers: t.listeners.size, tails: t.jobs });
-    this.handoff.onChunk(id, (chunk) => {
-      if (typeof chunk.inode === "number" && typeof chunk.offset === "number") t.cursor = { inode: chunk.inode, offset: chunk.offset };
-      const text = typeof chunk.text === "string" ? chunk.text : "";
-      if (text) t.recent = (t.recent + text).slice(-64 * 1024);
-      if (text || chunk.rotated) this.broadcast(t, { type: "lines", text, ...(chunk.rotated ? { rotated: chunk.rotated } : {}), ...(chunk.first ? { first: true } : {}) });
-      return t.listeners.size > 0;
-    });
-    void this.handoff.awaitJob(id, (seconds + 60) * 1000, this.opts.pollMs ?? 1000, true).then((status) => {
-      this.handoff.onChunk(id, null);
-      t.job = null;
-      const r = (status?.result ?? {}) as Any;
-      if (status?.state === "succeeded" && typeof r.inode === "number" && typeof r.offset === "number") t.cursor = { inode: r.inode, offset: r.offset };
-      if (!t.listeners.size) { this.tails.delete(t.key); return; }
-      if (status?.state === "succeeded") { this.start(t); return; }
-      this.broadcast(t, { type: "state", state: "error", message: status ? `${status.state}: ${status.message ?? ""}` : `The tail ${id} did not end in time.` });
-      t.retry = setTimeout(() => this.start(t), this.opts.retryMs ?? 5000);
-      t.retry.unref?.();
-    });
   }
 }

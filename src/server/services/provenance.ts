@@ -207,11 +207,6 @@ export class ServiceProvenance {
     return { ...body, via: { member: member.key, label: member.label }, member: this.memberOf(s.members, body.event?.clusterNodeAddress) };
   }
 
-  async options(id: string): Promise<Any> {
-    const { body } = await this.ask(id, { op: "search-options" });
-    return body;
-  }
-
   /** S37 step 5: components found by name or id (NiFi's flow search), for a trace model step's position; not held to
    *  provenanceSupport() (T14: it reads the flow's structure only). */
   async flowSearch(id: string, q: string): Promise<Any> {

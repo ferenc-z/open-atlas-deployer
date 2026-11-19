@@ -2539,17 +2539,6 @@ test("phase 2 step 4: a service's logs over the API: members and summary, files,
     throw new Error("no job came");
   };
 
-  const overview = await (await t.request("/api/services/flow/logs", { as: "viewer" })).json();
-  assert.deepEqual(overview.members.map((m: { key: string; label: string; logDir: string; canTail: boolean }) => [m.key, m.label, m.logDir, m.canTail]), [["app2:/opt/a", "node-8443:8443", "/opt/a/logs", true], ["app2:/opt/b", "node-9443:9443", "/opt/b/logs", true]]);
-  assert.deepEqual(overview.patterns, []);
-  assert.equal((await t.request("/api/services/none/logs", { as: "viewer" })).status, 404);
-  assert.equal((await t.request("/api/services/flow/logs", { as: "nobody" })).status, 403);
-
-  const files = t.request("/api/services/flow/logs/files?member=app2:/opt/a", { as: "viewer" });
-  const listJob = await answer(() => ({ content: JSON.stringify({ dir: "/opt/a/logs", files: [{ name: "nifi-app.log", size: 10, modifiedAt: "2026-11-06T01:00:00Z", gz: false }], more: 0 }), result: { mode: "list", files: 1 } }));
-  assert.deepEqual([listJob.kind, listJob.mode, listJob.member], ["log-read", "list", "app2:/opt/a"]);
-  assert.deepEqual((await (await files).json()).files.map((f: { name: string }) => f.name), ["nifi-app.log"]);
-
   assert.equal((await post(t, "/api/services/flow/logs/search", "viewer", { regex: true, query: "(" })).status, 400);
   const search = post(t, "/api/services/flow/logs/search", "viewer", { query: "boom", from: "2026-11-06T00:00:00Z", to: "2026-11-06T02:00:00Z" });
   const entry = (at: string) => ({ file: "nifi-app.log", at, local: at, level: "ERROR", logger: "o.a.n.X", thread: "t", text: `boom ${at}` });
@@ -2558,37 +2547,6 @@ test("phase 2 step 4: a service's logs over the API: members and summary, files,
   await answer((job) => ({ content: JSON.stringify({ entries: [entry(at(job))], truncated: null }), result: { mode: "search", entries: 1 } }));
   const found = await (await search).json();
   assert.deepEqual(found.entries.map((e: { label: string; at: string }) => [e.label, e.at]), [["node-9443:9443", "2026-11-06T01:00:01.000Z"], ["node-8443:8443", "2026-11-06T01:00:02.000Z"]]);
-
-  const download = t.request("/api/services/flow/logs/download?member=app2:/opt/b&files=nifi-app.log,nifi-bootstrap.log", { as: "viewer" });
-  const dl = await answer(() => ({ content: Buffer.from([0x1f, 0x8b, 1, 2, 3]), result: { mode: "download", files: ["nifi-app.log", "nifi-bootstrap.log"], bytes: 5 } }));
-  assert.deepEqual([dl.mode, dl.files, dl.maxBytes], ["download", ["nifi-app.log", "nifi-bootstrap.log"], 50 << 20]);
-  const got = await download;
-  assert.equal(got.headers.get("content-type"), "application/gzip");
-  assert.match(got.headers.get("content-disposition") ?? "", /attachment; filename="flow-node-9443_9443-logs-\d{8}T\d{6}\.tar\.gz"/);
-  assert.deepEqual([...new Uint8Array(await got.arrayBuffer())], [0x1f, 0x8b, 1, 2, 3]);
-  assert.equal(t.store.listAudit(5, { action: "service.logs.download" }).length, 1, "a download is audited");
-  const refused = t.request("/api/services/flow/logs/download?member=app2:/opt/b&files=x.log", { as: "viewer" });
-  await answer(() => ({ state: "refused", message: "x.log is not in the log directory /opt/b/logs" }));
-  const r = await refused;
-  assert.deepEqual([r.status, (await r.json()).message], [400, "node-9443:9443: x.log is not in the log directory /opt/b/logs"]);
-  assert.equal((await t.request("/api/services/flow/logs/download?member=app2:/opt/b&files=../x", { as: "viewer" })).status, 400);
-
-  // A tail as Server-Sent Events: the executor's chunks reach the page; the answer to a chunk says whether anyone follows.
-  const res = await t.request("/api/services/flow/logs/tail?member=app2:/opt/a&file=nifi-app.log", { as: "viewer" });
-  assert.equal(res.headers.get("content-type"), "text/event-stream");
-  const reader = res.body!.getReader();
-  const tail = (await (await call("/executor/v1/jobs/next", service)).json()).job;
-  assert.deepEqual([tail.kind, tail.member, tail.seconds], ["log-tail", "app2:/opt/a", 120]);
-  const chunk = await call(`/executor/v1/jobs/${tail.id}/chunk`, service, { method: "POST", body: JSON.stringify({ seq: 1, inode: 3, offset: 9, text: "hello\n", first: true }) });
-  assert.deepEqual(await chunk.json(), { ok: true, stop: false });
-  let text = "";
-  while (!text.includes("hello")) text += new TextDecoder().decode((await reader.read()).value);
-  assert.match(text, /event: lines\ndata: \{"type":"lines","text":"hello\\n","first":true\}/);
-  await reader.cancel();
-  await new Promise((r) => setTimeout(r, 20));
-  assert.deepEqual(await (await call(`/executor/v1/jobs/${tail.id}/chunk`, service, { method: "POST", body: JSON.stringify({ seq: 2, inode: 3, offset: 9, text: "" }) })).json(), { ok: true, stop: true }, "the page went away");
-  assert.equal((await call(`/executor/v1/jobs/${tail.id}/chunk`, "dpe_nope", { method: "POST", body: "{}" })).status, 401);
-  assert.equal((await t.request("/api/services/flow/logs/tail?member=app2:/opt/a&file=old.log.gz", { as: "viewer" })).status, 400);
 });
 
 test("phase 2 step 5: the read-only service tools over /mcp: metrics, alerts, events, bulletins, logs, configuration, node diff, property catalog; logs and bulletins redacted", async () => {

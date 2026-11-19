@@ -59,7 +59,6 @@ import { E2E_ID, E2eTraceSource } from "./services/trace/e2e-trace.ts";
 import { mountE2eTrace } from "./services/trace/e2e-routes.ts";
 import { McpClient } from "./mcp-client.ts";
 import { readToken } from "./versions.ts";
-import { streamSSE } from "hono/streaming";
 import { DEPLOYER_VERSION } from "./version.ts";
 import { validateEnvironment } from "./environment.ts";
 import { applyPatch, changedPaths, PatchError } from "./jsonpatch.ts";
@@ -115,8 +114,6 @@ export interface Dependencies {
   nginxFetcher?: typeof fetch;
   /** S37 step 7: the e2e_trace evidence source (tests pass one with a fake data plane). */
   e2eTrace?: E2eTraceSource;
-  /** S37 step 8 (Q6): the sentence-to-conditions converter (a one-shot OMA session of the Deploy Assistant). */
-  traceNl?: import("./services/trace/nl.ts").NlConverter;
   /** S37 step 9: the AI analysis of the service pages and the cases; without it the pages offer no AI. */
   analyst?: import("./services/cases.ts").Analyst;
 }
@@ -1262,11 +1259,6 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     if (p instanceof Response) return p;
     return c.json(provenance.info(c.req.param("id")));
   });
-  api.get("/api/services/:id/provenance/options", async (c) => {
-    const p = await authenticate(c, "view");
-    if (p instanceof Response) return p;
-    return c.json(await provenance.options(c.req.param("id")));
-  });
   api.post("/api/services/:id/provenance", async (c) => {
     const p = await authenticate(c, "view");
     if (p instanceof Response) return p;
@@ -1299,25 +1291,10 @@ export function createApp({ config, store, sessions, observer, deployments, vers
   if (!deps.traceAdapters.has(E2E_ID)) deps.traceAdapters.set(E2E_ID, e2eTrace.adapter);
   mountE2eTrace(api, { store, source: e2eTrace, authenticate, reject, registered: registeredService, actorOf });
   // S37 step 5 (§4.2.0): the business data trace — a service's model, position search, trace_business_data.
-  mountTrace(api, { store, provenance, authenticate, reject, registered: registeredService, actorOf, adapters: deps.traceAdapters ?? new Map<string, EvidenceAdapter>([[PROVENANCE_SOURCE, new ProvenanceAdapter(provenance)]]), ...(deps.traceNl ? { nl: deps.traceNl } : {}) });
-  // Phase 2 step 4 (§9.3, §15.3): a service's logs, read through its members' service executors (deploy-viewer, §13):
-  // the members with their log directories and the WARN/ERROR summary; a member's files; a search of all (or some)
-  // members in parallel, merged by time; a member's files as a tar.gz; following one file (SSE, shared per file).
-  api.get("/api/services/:id/logs", async (c) => {
-    const p = await authenticate(c, "view");
-    if (p instanceof Response) return p;
-    const id = c.req.param("id");
-    const members = serviceLogs.members(id);
-    if (!members) return reject(c, 404, "service/unknown", `No standalone instance or cluster ${id}.`);
-    const hours = Math.min(720, Math.max(1, Number(c.req.query("hours") ?? 24) || 24));
-    const since = new Date(Date.now() - hours * 3600_000).toISOString();
-    return c.json({ members, hours, patterns: store.serviceLogPatterns(id, { since, limit: Number(c.req.query("limit") ?? 100) || 100 }), tails: serviceLogs.tailing().filter((t) => t.service === id) });
-  });
-  api.get("/api/services/:id/logs/files", async (c) => {
-    const p = await authenticate(c, "view");
-    if (p instanceof Response) return p;
-    return c.json(await serviceLogs.files(c.req.param("id"), c.req.query("member") ?? ""));
-  });
+  mountTrace(api, { store, provenance, authenticate, reject, registered: registeredService, actorOf, adapters: deps.traceAdapters ?? new Map<string, EvidenceAdapter>([[PROVENANCE_SOURCE, new ProvenanceAdapter(provenance)]]) });
+  // Phase 2 step 4 (§9.3, §15.3): a service's logs, read through its members' service executors (deploy-viewer, §13): the
+  // last lines of a member's file and a search of all (or some) members in parallel, merged by time (both the AI reads
+  // through the MCP tools; the page for them was removed, pages-rethink §9.2).
   api.get("/api/services/:id/logs/lines", async (c) => {
     const p = await authenticate(c, "view");
     if (p instanceof Response) return p;
@@ -1331,39 +1308,6 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     const q = parseSearch(await c.req.json().catch(() => ({})));
     if ("error" in q) return reject(c, 400, "logs/search", q.error);
     return c.json(await serviceLogs.search(c.req.param("id"), q));
-  });
-  api.get("/api/services/:id/logs/download", async (c) => {
-    const p = await authenticate(c, "view");
-    if (p instanceof Response) return p;
-    const id = c.req.param("id"), member = c.req.query("member") ?? "";
-    const files = (c.req.query("files") ?? "nifi-app.log").split(",").filter(Boolean);
-    const got = await serviceLogs.download(id, member, files);
-    store.audit(actorOf(p), "service.logs.download", id, { member, files: got.result.files ?? files, bytes: got.data.length });
-    return c.body(new Uint8Array(got.data), 200, { "content-type": "application/gzip", "content-disposition": `attachment; filename="${got.name}"`, "cache-control": "no-store" });
-  });
-  // §15.2 P7: Server-Sent Events of one member's file: "lines" (text; first the recent lines, backlog) and "state".
-  api.get("/api/services/:id/logs/tail", async (c) => {
-    const p = await authenticate(c, "view");
-    if (p instanceof Response) return p;
-    const id = c.req.param("id"), member = c.req.query("member") ?? "", file = c.req.query("file") || "nifi-app.log";
-    const events: { event: string; data: string }[] = [];
-    let wake: (() => void) | null = null;
-    // Checked before the stream starts, so a refusal is an ordinary error answer.
-    const stop = serviceLogs.tail(id, member, file, (e) => { events.push({ event: e.type, data: JSON.stringify(e) }); wake?.(); });
-    c.header("x-accel-buffering", "no");
-    c.header("cache-control", "no-store");
-    return streamSSE(c, async (stream) => {
-      let open = true;
-      stream.onAbort(() => { open = false; stop(); wake?.(); });
-      try {
-        while (open) {
-          while (events.length) await stream.writeSSE(events.shift()!);
-          await new Promise<void>((resolve) => { const t = setTimeout(resolve, 15_000); wake = () => { clearTimeout(t); resolve(); }; });
-          wake = null;
-          if (open && !events.length) await stream.writeSSE({ event: "ping", data: "{}" });
-        }
-      } finally { stop(); }
-    });
   });
   // Phase 2 step 3 (§15.3): a service's alerts (open first, then resolved; state=open|resolved, limit), with the rules and
   // the thresholds in effect; its timeline; an admin's threshold overrides; every service's alerts.

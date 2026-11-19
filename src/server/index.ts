@@ -14,7 +14,6 @@ import { Keys } from "./keys.ts";
 import { OmaSessions } from "./oma.ts";
 import { Analyst } from "./services/cases.ts";
 import { investigate } from "./services/investigate.ts";
-import { NlConverter } from "./services/trace/nl.ts";
 import { Briefs, collectFacts } from "./brief.ts";
 import { opsDesk } from "./services/ops.ts";
 import { Drift } from "./drift.ts";
@@ -116,7 +115,7 @@ serviceChanges.recover();
 // S37 step 9 (§4.4): "Let the AI analyse", follow-up questions and the CRIT alerts' own analysis, through the Deploy
 // Assistant with its Vault (it reads more through the Deployer's read-only tools).
 const analyst = briefWriter ? new Analyst(store, briefWriter, (id, ask) => investigate(store, (host) => deployments.handoff.executor(host, "service"), id, ask)) : undefined;
-const app = createApp({ config, store, takeover, changes: serviceChanges, ...(configReview ? { configReview } : {}), ...(briefWriter ? { traceNl: new NlConverter(briefWriter) } : {}), ...(analyst ? { analyst } : {}), graph: nifiOpsGraph, sessions: new WorkbenchSessions(config.workbenchUrl), observer, deployments, versions, env, peer, onboarding, drift, briefs, keys, workbench, workbenchKey, deployerSettings,
+const app = createApp({ config, store, takeover, changes: serviceChanges, ...(configReview ? { configReview } : {}), ...(analyst ? { analyst } : {}), graph: nifiOpsGraph, sessions: new WorkbenchSessions(config.workbenchUrl), observer, deployments, versions, env, peer, onboarding, drift, briefs, keys, workbench, workbenchKey, deployerSettings,
   // D45: the image sets DEPLOYER_RESTART_BY_EXIT; the container's restart policy starts it again with the new settings.
   ...(process.env.DEPLOYER_RESTART_BY_EXIT === "true" ? { restart: () => setTimeout(() => { store.close(); process.exit(75); }, 300) } : {}) });
 // Job records follow the executor's status files even while nobody has the page open.

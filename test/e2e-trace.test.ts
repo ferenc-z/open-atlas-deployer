@@ -257,21 +257,19 @@ test("e2e_trace routes: an admin sets the Graph and token (sealed), viewers read
   assert.ok(!kept.includes("test-graph-token"), "the token is kept sealed");
   assert.equal((await call("GET", "/api/services/n999/trace-sources")).status, 404);
 
-  // Import → the editor's PUT → change a step → PUT again.
+  // Import → store the model → read it back.
   assert.equal((await call("POST", "/api/services/c250/trace-model/import-e2e", {}, "viewer")).status, 403);
   const imported = await call("POST", "/api/services/c250/trace-model/import-e2e", {});
   assert.equal(imported.status, 200);
   assert.deepEqual([imported.body.revision, imported.body.imported], [0, ["schedule-101", "schedule-102"]]);
-  const first = await call("PUT", "/api/services/c250/trace-model", { model: imported.body.model, revision: 0 });
-  assert.equal(first.status, 200, JSON.stringify(first.body));
-  const edited = structuredClone(imported.body.model);
-  edited.businesses[0].steps[1].name = "Parse the PDF";
-  edited.businesses[0].steps[1].maxSeconds = 120;
-  const second = await call("PUT", "/api/services/c250/trace-model", { model: edited, revision: 1 });
-  assert.equal(second.status, 200);
+  // The import only proposes a model (nothing hand-edits it any more: the PUT was removed, §9.2); keep it the way the AI
+  // tools will, through the store, and read it back.
+  const model = imported.body.model;
+  model.businesses[0].steps[1].name = "Parse the PDF";
+  model.businesses[0].steps[1].maxSeconds = 120;
+  assert.equal(store.saveTraceModel("c250", { sources: model.sources, businesses: model.businesses }, 0, { id: "admin", via: "cli" }), 1);
   const back = await call("GET", "/api/services/c250/trace-model", undefined, "viewer");
-  assert.deepEqual([back.body.revision, back.body.model.businesses[0].steps[1].name, back.body.model.businesses[0].steps[1].maxSeconds], [2, "Parse the PDF", 120]);
-  // The trace through the route reads the e2e_trace source the service now has.
+  assert.deepEqual([back.body.revision, back.body.model.businesses[0].steps[1].name, back.body.model.businesses[0].steps[1].maxSeconds], [1, "Parse the PDF", 120]);
   const traced = await call("POST", "/api/services/c250/trace-business-data", { fileName: "INV-B-001.pdf", from: ago(86400), to: NOW.toISOString() }, "viewer");
   assert.equal(traced.body.traces[0].verdict.kind, "failed");
 
