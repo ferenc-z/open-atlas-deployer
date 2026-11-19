@@ -70,7 +70,20 @@ export async function runHostOperation(operation: string, payload: Payload, acti
   return { ok: false, outcome: "Not handled" };
 }
 
-export function AssistantPanel({ workbenchUrl, environment, page, app, focus = {}, actions, onClose, onSetup }: { workbenchUrl: string; environment?: string; page: string; app?: string; focus?: Record<string, string>; actions: HostActions; onClose: () => void; onSetup?: () => void }) {
+/** "Try asking": examples for this page. The chat cannot be pre-filled (the embed protocol has only a context), so a click copies the question. */
+function TryAsking({ items }: { items: string[] }) {
+  const [copied, setCopied] = useState<string | undefined>();
+  const copy = (q: string) => { navigator.clipboard?.writeText(q).then(() => setCopied(q), () => undefined); };
+  return (
+    <div className="assistant-try">
+      <b>Try asking</b>
+      {items.map((q) => <button key={q} type="button" onClick={() => copy(q)} title="Copies the question: paste it into the box below">{q}</button>)}
+      {copied && <span className="copied">Copied. Paste it into the box below.</span>}
+    </div>
+  );
+}
+
+export function AssistantPanel({ workbenchUrl, environment, page, app, focus = {}, suggestions = [], actions, onClose, onSetup }: { workbenchUrl: string; environment?: string; page: string; app?: string; focus?: Record<string, string>; suggestions?: string[]; actions: HostActions; onClose: () => void; onSetup?: () => void }) {
   const frame = useRef<HTMLIFrameElement>(null);
   const base = new URL(workbenchUrl, window.location.href);
   const origin = base.origin;
@@ -126,15 +139,15 @@ export function AssistantPanel({ workbenchUrl, environment, page, app, focus = {
       {mode !== "collapsed" && <div className="assistant-backdrop" onClick={() => setMode("collapsed")} />}
       <aside className={`assistant ${mode}${dragging ? " dragging" : ""}`} style={{ "--assistant-width": `${width}px` } as CSSProperties}>
         {mode === "collapsed" ? (
-          <button className="assistant-strip" onClick={() => setMode("normal")} title="Show the Deploy Assistant" aria-label="Show the Deploy Assistant">
-            <span>Deploy Assistant</span>
+          <button className="assistant-strip" onClick={() => setMode("normal")} title="Show Ask AI" aria-label="Show Ask AI">
+            <span>Ask AI</span>
           </button>
         ) : (
           <>
             {mode === "normal" && <div className="assistant-resizer" onPointerDown={drag} title="Drag to resize" aria-hidden="true" />}
             <div className="toolbar">
-              <strong>Deploy Assistant</strong>
-              <span className="muted">Reads and proposes; changes run through cards</span>
+              <strong>Ask AI</strong>
+              <span className="muted">Knows which page you are on; it reads and proposes, changes run through cards</span>
               <button className="link" onClick={() => setMode("collapsed")} title="Fold into a strip; the conversation stays">Collapse</button>
               <button className="link wide-only" onClick={() => setMode(mode === "expanded" ? "normal" : "expanded")}>{mode === "expanded" ? "Restore" : "Expand"}</button>
               <button className="link" onClick={onClose}>Close</button>
@@ -142,6 +155,7 @@ export function AssistantPanel({ workbenchUrl, environment, page, app, focus = {
           </>
         )}
         {mode !== "collapsed" && <AiMissing use="assistant" what="The Deploy Assistant" {...(onSetup ? { onSetup } : {})} />}
+        {mode !== "collapsed" && suggestions.length > 0 && <TryAsking items={suggestions} />}
         {!ready && slow && mode !== "collapsed" && (
           <div className="assistant-hint">
             <p>The assistant has not loaded from Workbench ({origin}). The frame stays blank when Workbench is unreachable or this browser does not trust its certificate.</p>
