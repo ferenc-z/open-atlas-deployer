@@ -13,6 +13,7 @@ import { StoreError, type Actor, type FlowRecord, type Store } from "../store.ts
 import type { Topology } from "./flowcounts.ts";
 import { draftFromSkeleton, gateRejected, ModelError, publishModel, runModel, parseDraft, type ModelDeps } from "./flowmodel.ts";
 import { flowCard } from "./flow-views.ts";
+import type { BusinessLightView, FlowRow } from "./business.ts";
 import type { Anomaly, FlowStatus, Light, UnknownReason } from "./ops-types.ts";
 import { provenanceSupport } from "./provenance.ts";
 import { machineLight } from "./rules.ts";
@@ -24,10 +25,7 @@ import { UNPLACED } from "./trace/model.ts";
 type Reject = (c: Context, status: 400 | 401 | 403 | 404 | 409 | 429 | 503, code: string, message: string, details?: string[]) => Response;
 type Call = (p: Principal, spec: { method: "GET" | "POST" | "PUT" | "DELETE"; path: string; body?: unknown }) => Promise<{ status: number; body: any }>;
 
-/** §10.2.2: a business row and the business light, until step 3b's (BusinessHooks) replace the stand-in here. */
-export interface FlowRow { id: string; name: string; status: FlowStatus; light: Light; sentence: string; services: string[]; anomalies: Anomaly[] }
-export interface BusinessLightView { light: Light; reason?: UnknownReason; sentence: string; flows: FlowRow[]; toConfirm: number }
-/** Step 3b plugs its business light and business detail in here (联调); without them describe uses the stand-ins below. */
+/** Step 3b's business light and business detail (page-views.ts opsBusinessHooks); without them describe uses the stand-ins below. */
 export interface BusinessHooks {
   business?: (service: string, now: Date) => BusinessLightView;
   flowDetail?: (flow: string, service: string, now: Date) => unknown;

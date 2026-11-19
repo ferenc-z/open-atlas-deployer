@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { createApp } from "../src/server/app.ts";
+import { opsBusinessHooks, opsPageSources } from "../src/server/services/page-views.ts";
 import { hashPassword, permissionsFor, verifyPassword, WorkbenchSessions } from "../src/server/auth.ts";
 import type { Config } from "../src/server/config.ts";
 import type { Environment } from "../src/compose/generate.ts";
@@ -166,7 +167,7 @@ function setup(options: SetupOptions = {}) {
   const deployerSettings = new DeployerSettings(store, box, options.deployerEnv ?? {});
   const restarts = { count: 0 };
   const takeover = new Takeover({ store, handoff, box, environment: () => deployments.environment().env.name, hosts: () => hostIds(deployments.environment().env), readTimeoutMs: 5000, pollMs: 5 });
-  const app = createApp({ config, store, takeover, sessions, observer, deployments, versions, env, workbench: workbenchAdmin, workbenchKey, deployerSettings, restart: () => { restarts.count++; }, ...(phase5 ? { omaFetcher: phase5.fetcher } : {}), ...(peer ? { peer } : {}), ...(keys ? { keys } : {}), ...(onboarding ? { onboarding } : {}), ...(options.graph ? { graph: options.graph(store) } : {}), ...(options.nginxFetcher ? { nginxFetcher: options.nginxFetcher } : {}) });
+  const app = createApp({ config, store, pageSources: opsPageSources(store), businessHooks: opsBusinessHooks(store), takeover, sessions, observer, deployments, versions, env, workbench: workbenchAdmin, workbenchKey, deployerSettings, restart: () => { restarts.count++; }, ...(phase5 ? { omaFetcher: phase5.fetcher } : {}), ...(peer ? { peer } : {}), ...(keys ? { keys } : {}), ...(onboarding ? { onboarding } : {}), ...(options.graph ? { graph: options.graph(store) } : {}), ...(options.nginxFetcher ? { nginxFetcher: options.nginxFetcher } : {}) });
   const request = (path: string, init: RequestInit & { as?: string; cookie?: string } = {}) => {
     const headers = new Headers(init.headers);
     const cookies = [init.as ? `${SESSION}=${init.as}` : "", init.cookie ?? ""].filter(Boolean).join("; ");
@@ -2495,9 +2496,15 @@ test("§15.2 P5, §15.3: a service executor's heartbeat reply carries its watch 
   // Step 3: the rules run as samples come in. app2:/opt/a's newest sample is old and its executor online for long: no samples.
   t.store.setServiceFact("flow", "app2:/opt/a", "onlineSince", `${DAY}T00:00:00Z`);
   await send(service, [sample("app2:/opt/a", `${DAY}T01:05:00Z`)]);
-  const a = await (await t.request("/api/services/flow/alerts", { as: "viewer" })).json();
-  assert.deepEqual([a.canEdit, a.thresholds.effective.certWarnDays, a.thresholds.info.certWarnDays.unit, a.rules.process.levels], [false, 30, "days", ["WARN", "CRIT"]]);
-  assert.deepEqual(a.alerts.map((x: { rule: string; member: string; state: string; level: string }) => [x.rule, x.member, x.state, x.level]), [["collection", "app2:/opt/a", "open", "WARN"]]);
+  // Ops step 3b: GET alerts is gone; the service page shows the machine light's rows.
+  assert.equal((await t.request("/api/services/flow/alerts", { as: "viewer" })).status, 404);
+  assert.deepEqual(t.store.serviceAlerts({ service: "flow", limit: 10 }).map((x) => [x.rule, x.member, x.state, x.level]), [["collection", "app2:/opt/a", "open", "WARN"]]);
+  const pg = await (await t.request("/api/services/flow/page", { as: "viewer" })).json();
+  assert.deepEqual([pg.service.id, pg.machine.checks.length, pg.business.light, pg.analysis, pg.todos], ["flow", 6, "unknown", null, []]);
+  assert.equal((await t.request("/api/services/none/page", { as: "viewer" })).status, 404);
+  const ov = await (await t.request("/api/services/overview", { as: "viewer" })).json();
+  assert.deepEqual(ov.services.map((x: { id: string }) => x.id).sort(), ["flow", "n200"]);
+  assert.equal((await t.request("/api/flows/flw_none", { as: "viewer" })).status, 404);
   assert.equal((await (await t.request("/api/services", { as: "viewer" })).json()).clusters[0].status.alerts.open, 1, "the card's alert count");
   const ev = await (await t.request("/api/services/flow/events", { as: "viewer" })).json();
   assert.deepEqual(ev.events.map((e: { kind: string }) => e.kind), ["alert-opened", "taken-over"]);
@@ -2507,10 +2514,7 @@ test("§15.2 P5, §15.3: a service executor's heartbeat reply carries its watch 
   const okPut = await put(t, "/api/services/flow/thresholds", "admin", { thresholds: { certWarnDays: 400 } });
   assert.deepEqual([okPut.status, (await okPut.json()).thresholds.overrides], [200, { certWarnDays: 400 }]);
   assert.equal((await put(t, "/api/services/none/thresholds", "admin", { thresholds: {} })).status, 404);
-  const all = await (await t.request("/api/alerts", { as: "viewer" })).json();
-  assert.deepEqual(all.alerts.map((x: { service: string; environment: string; kind: string; label: string }) => [x.service, x.environment, x.kind, x.label]), [["flow", "uat", "cluster", "Collection"]]);
-  assert.equal(all.open, 1);
-  assert.equal((await t.request("/api/alerts?state=nope", { as: "viewer" })).status, 400);
+  assert.equal((await t.request("/api/alerts", { as: "viewer" })).status, 404);
 });
 
 test("phase 2 step 4: a service's logs over the API: members and summary, files, search, download, a tail as SSE, the executor's content and chunks", async () => {

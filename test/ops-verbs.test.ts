@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { createApp } from "../src/server/app.ts";
+import { opsBusinessHooks, opsPageSources } from "../src/server/services/page-views.ts";
 import { permissionsFor, WorkbenchSessions, type Principal } from "../src/server/auth.ts";
 import type { Config } from "../src/server/config.ts";
 import { Deployments } from "../src/server/deploy.ts";
@@ -53,7 +54,7 @@ function setup() {
   const deployments = new Deployments(store, handoff, observer, environmentFile, {});
   const keys = { resolve: async (bearer: string) => KEYS[bearer] } as unknown as Keys;
   const env = new EnvManager(store, deployments, new Schemas(undefined, join(dir, "templates"), fetcher), box, "compare");
-  const app = createApp({ config, store, keys, sessions: new WorkbenchSessions(config.workbenchUrl, fetcher), observer, deployments, versions: new Versions(undefined, fetcher), env, workbench: new WorkbenchAdmin(config.workbenchUrl, () => "", fetcher) });
+  const app = createApp({ config, store, pageSources: opsPageSources(store), businessHooks: opsBusinessHooks(store), keys, sessions: new WorkbenchSessions(config.workbenchUrl, fetcher), observer, deployments, versions: new Versions(undefined, fetcher), env, workbench: new WorkbenchAdmin(config.workbenchUrl, () => "", fetcher) });
   // n1: Ingest -> Load (one business), Reports on its own; an hour of counts.
   store.addStandalone({ kind: "standalone", id: "n1", service: "nifi", profile: "nifi-1.x", version: "1.12.1", webUrl: null, member: { host: "local", installDir: "/lab/n1", serviceUser: "nifi", startEnvironment: null, ports: { https: 18443 }, discovery: null } } as never, "uat", { id: "admin", via: "cli" });
   const bucket = new Date(Date.now() - 30 * 60_000).toISOString();
@@ -211,4 +212,20 @@ test("the to-do buttons: done or not needed (admin), Apply only from the page an
   const applied = await t.call("POST", `/api/todos/${change}/draft`, { as: "admin" }, {});
   assert.equal(applied.status, 404, "the draft route answers as the person: n1 has no configuration here");
   assert.equal((await applied.json()).error, "service-config/none");
+});
+
+test("steps 3b + 4 wired: describe shows the real business light; the service page shows service_todos", async () => {
+  const t = setup();
+  const flow = "flw_wired";
+  t.store.putFlow({ id: flow, name: "Invoices", nameBy: "person", status: "confirmed", summary: "in → out", reason: null, risks: [], pending: null, stuck: null, createdAt: "2026-11-19T09:00:00Z", confirmedAt: "2026-11-19T09:30:00Z", confirmedBy: "admin", updatedAt: "2026-11-19T09:30:00Z" } as never);
+  t.store.setFlowSegments(flow, [{ service: "n1", segment: "A" }]);
+  t.store.noteFlowAnomaly({ flow, service: "n1", ref: "p-db", anomaly: "processor-error", light: "attention", at: new Date().toISOString(), count: 1, detail: { segment: "A", component: "p-db" } });
+  const business = (await t.tool("dps_assistant", "describe", { service: "n1" })).value.business;
+  assert.deepEqual([business.light, business.flows.map((f: { id: string; light: string }) => [f.id, f.light])], ["attention", [[flow, "attention"]]], "3b's light, not the stand-in's unknown");
+
+  t.store.upsertTodo({ service: "n1", flow: null, source: "chat", key: "heap", severity: "attention", title: "Raise the heap", detail: "d", action: null, analysis: null }, "x");
+  const page = await (await t.call("GET", "/api/services/n1/page", { as: "viewer" })).json() as { todos: { title: string }[]; business: { light: string } };
+  assert.deepEqual([page.todos.map((x) => x.title), page.business.light], [["Raise the heap"], "attention"]);
+  const overview = await (await t.call("GET", "/api/services/overview", { as: "viewer" })).json() as { services: { id: string; todoCount: number }[] };
+  assert.equal(overview.services.find((s) => s.id === "n1")?.todoCount, 1);
 });

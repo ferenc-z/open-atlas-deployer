@@ -18,7 +18,7 @@ import type { DraftChange } from "./services/configedit.ts";
 import type { ConfigReview } from "./services/configreview.ts";
 import { randomBytes } from "node:crypto";
 import { migrateV1, type ModelV2 } from "./services/trace/model.ts";
-import type { AnalysisState, AnalysisTrigger, FlowStatus, GateVerdict, Light, TodoAction, TodoSource, TodoState } from "./services/ops-types.ts";
+import type { AnalysisState, AnalysisTrigger, Anomaly, FlowStatus, GateVerdict, Light, TodoAction, TodoSource, TodoState } from "./services/ops-types.ts";
 
 /** A business id (§10.2.4: flw_ + random). */
 export const newFlowId = () => `flw_${randomBytes(6).toString("hex")}`;
@@ -219,6 +219,13 @@ CREATE TABLE IF NOT EXISTS flow_changes (
   id INTEGER PRIMARY KEY AUTOINCREMENT, flow TEXT, service TEXT NOT NULL, at TEXT NOT NULL, by TEXT NOT NULL,
   kind TEXT NOT NULL, text TEXT NOT NULL, revision INTEGER, verdict TEXT);
 CREATE INDEX IF NOT EXISTS flow_changes_flow ON flow_changes (flow, at);
+-- §10.2.4 step 3: a business's anomalies (B3), opened and closed like service_alerts; ref: the component or group id.
+CREATE TABLE IF NOT EXISTS flow_anomalies (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, flow TEXT NOT NULL, service TEXT NOT NULL, ref TEXT NOT NULL,
+  anomaly TEXT NOT NULL, light TEXT NOT NULL, state TEXT NOT NULL,
+  first_at TEXT NOT NULL, last_at TEXT NOT NULL, count INTEGER NOT NULL, detail TEXT NOT NULL, closed_at TEXT);
+CREATE UNIQUE INDEX IF NOT EXISTS flow_anomalies_open ON flow_anomalies (flow, service, ref, anomaly) WHERE state = 'open';
+CREATE INDEX IF NOT EXISTS flow_anomalies_at ON flow_anomalies (flow, first_at);
 CREATE TABLE IF NOT EXISTS service_trace_sources (
   service TEXT NOT NULL, source TEXT NOT NULL, body TEXT NOT NULL, saved_at TEXT NOT NULL, saved_by TEXT NOT NULL, PRIMARY KEY (service, source));
 CREATE TABLE IF NOT EXISTS service_cases (
@@ -1571,6 +1578,13 @@ export class Store {
     return r ? { member: r.member, at: r.at, backpressure: JSON.parse(r.bp) } : undefined;
   }
 
+  /** Ops step 3b (B3 stuck): every back pressure reading of a service at or after a time, oldest first. */
+  serviceBackpressures(service: string, since: string): { member: string; at: string; backpressure: Record<string, unknown> }[] {
+    return (this.db.prepare(`SELECT member, at, json_extract(body, '$.nifi.backpressure') AS bp FROM service_samples
+      WHERE service = ? AND at >= ? AND json_extract(body, '$.nifi.backpressure') IS NOT NULL ORDER BY at, rowid`).all(service, since) as Row[])
+      .map((r) => ({ member: r.member, at: r.at, backpressure: JSON.parse(r.bp) }));
+  }
+
   /** The members with samples at or after a time, with their oldest such sample. */
   sampledMembers(since: string): { service: string; member: string; first: string }[] {
     return (this.db.prepare("SELECT service, member, MIN(at) AS first FROM service_samples WHERE at >= ? AND point IS NOT NULL GROUP BY service, member").all(since) as Row[])
@@ -1958,6 +1972,34 @@ export class Store {
       .map((r) => ({ id: r.id, flow: r.flow ?? null, service: r.service, at: r.at, by: r.by, kind: r.kind, text: r.text, revision: r.revision ?? null, verdict: r.verdict ?? null }));
   }
 
+  /** Step 3b: an anomaly seen (again). Opens one, or adds `count` to the open one and moves its last time, light and detail. */
+  noteFlowAnomaly(a: { flow: string; service: string; ref: string; anomaly: Anomaly; light: Light; at: string; count: number; detail: Record<string, unknown>; replace?: boolean }) {
+    const open = this.db.prepare("SELECT id, count, last_at FROM flow_anomalies WHERE flow = ? AND service = ? AND ref = ? AND anomaly = ? AND state = 'open'").get(a.flow, a.service, a.ref, a.anomaly) as Row | undefined;
+    if (open) {
+      this.db.prepare("UPDATE flow_anomalies SET light = ?, last_at = ?, count = ?, detail = ? WHERE id = ?")
+        .run(a.light, a.at > open.last_at ? a.at : open.last_at, a.replace ? a.count : open.count + a.count, JSON.stringify(a.detail), open.id);
+    } else {
+      this.db.prepare("INSERT INTO flow_anomalies (flow, service, ref, anomaly, light, state, first_at, last_at, count, detail) VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)")
+        .run(a.flow, a.service, a.ref, a.anomaly, a.light, a.at, a.at, a.count, JSON.stringify(a.detail));
+    }
+  }
+
+  closeFlowAnomaly(id: number, at: string) { this.db.prepare("UPDATE flow_anomalies SET state = 'closed', closed_at = ? WHERE id = ? AND state = 'open'").run(at, id); }
+
+  /** Open anomalies of a service (or of every service), or a business's anomalies since a time (open and closed, newest first). */
+  flowAnomalies(o: { service?: string; flow?: string; state?: "open"; since?: string; limit?: number }): FlowAnomaly[] {
+    const where: string[] = [], args: string[] = [];
+    if (o.service) { where.push("service = ?"); args.push(o.service); }
+    if (o.flow) { where.push("flow = ?"); args.push(o.flow); }
+    if (o.state) { where.push("state = ?"); args.push(o.state); }
+    if (o.since) { where.push("(last_at >= ? OR state = 'open')"); args.push(o.since); }
+    return (this.db.prepare(`SELECT * FROM flow_anomalies ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY id DESC LIMIT ?`).all(...args, Math.min(5000, o.limit ?? 1000)) as Row[])
+      .map((r) => ({ id: r.id, flow: r.flow, service: r.service, ref: r.ref, anomaly: r.anomaly, light: r.light, state: r.state, firstAt: r.first_at, lastAt: r.last_at, count: r.count, detail: parse(r.detail) ?? {}, closedAt: r.closed_at ?? null }));
+  }
+
+  /** Closed anomalies older than a time go (30 days, with the other flow data). */
+  pruneFlowAnomalies(before: string): number { return Number(this.db.prepare("DELETE FROM flow_anomalies WHERE state = 'closed' AND closed_at < ?").run(before).changes); }
+
   /** A person's change to a business, audited (FlowAction, §10.2.2 #7). */
   auditFlow(actor: Actor, flow: string, action: string) { this.insertAudit(actor, `service.flow.${action}`, flow, {}); }
 
@@ -2123,6 +2165,11 @@ const toFlow = (r: Row): FlowRecord => ({
   stuck: r.stuck_attention_s && r.stuck_failing_s ? { attentionS: r.stuck_attention_s, failingS: r.stuck_failing_s, by: r.stuck_by ?? "ai", basis: r.stuck_basis ?? "" } : null,
   createdAt: r.created_at, confirmedAt: r.confirmed_at ?? null, confirmedBy: r.confirmed_by ?? null, updatedAt: r.updated_at,
 });
-export type FlowChangeKind = "found" | "updated" | "confirmed" | "renamed" | "stuck" | "split-asked" | "not-right" | "ignored" | "watched" | "rejected";
+/** §10.2.4 step 3: one row of flow_anomalies. */
+export interface FlowAnomaly {
+  id: number; flow: string; service: string; ref: string; anomaly: Anomaly; light: Light; state: "open" | "closed";
+  firstAt: string; lastAt: string; count: number; detail: Record<string, unknown>; closedAt: string | null;
+}
+export type FlowChangeKind ="found" | "updated" | "confirmed" | "renamed" | "stuck" | "split-asked" | "not-right" | "ignored" | "watched" | "rejected";
 export interface FlowChange { id: number; flow: string | null; service: string; at: string; by: string; kind: FlowChangeKind; text: string; revision: number | null; verdict: GateVerdict | null }
 export interface ServiceCert { member: string; store: string; path: string | null; type: string | null; alias: string | null; chain: number | null; subject: string | null; issuer: string | null; notBefore: string | null; notAfter: string | null; readAt: string; error: string | null }

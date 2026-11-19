@@ -5,7 +5,7 @@ import { test } from "node:test";
 import type { ExecutorInfo } from "../src/server/handoff.ts";
 import { ingest } from "../src/server/services/metrics.ts";
 import { check, health, machineLight, preventive } from "../src/server/services/rules.ts";
-import { opsDesk } from "../src/server/services/ops.ts";
+import { servicePage, servicesOverview } from "../src/server/services/page-views.ts";
 import { NIFI_THRESHOLDS } from "../src/server/services/profiles.ts";
 import type { ServiceSample } from "../src/server/services/watch.ts";
 import { Store } from "../src/server/store.ts";
@@ -134,19 +134,28 @@ test("an expired or close certificate is the certificate check's CRIT to-do, not
   store.close();
 });
 
-test("ops desk: one queue worst first and one sentence per service, from the same health()", () => {
+test("services overview and service page (step 3b): both lights per card, the page's machine light is health()'s; no to-dos or analysis until step 4", () => {
   const now = { t: new Date("2026-11-06T12:00:10Z") };
   const store = lab(now);
   ingest(store, both("2026-11-06T12:00:00Z"));
-  let desk = opsDesk(store, () => online, now.t);
-  assert.deepEqual(desk.queue, []);
-  assert.deepEqual(desk.services.map((x) => [x.id, x.verdict, x.sentence]), [["c250", "ok", "Normal. Nothing needs doing."]]);
+  let o = servicesOverview(store, () => online, {}, now.t);
+  assert.deepEqual(o.services.map((x) => [x.id, x.label, x.machine.light, x.business.light, x.business.reason, x.business.flowCount, x.todoCount]), [["c250", "NiFi 2.5.0 · cluster, 2 nodes", "healthy", "unknown", "no-evidence", 0, 0]]);
+  assert.equal(o.lastCheckup, null);
+  assert.equal(o.running, false);
+  assert.equal("aiHasPlan" in o.services[0]!, false, "no to-do source: no claim either way");
   ingest(store, [sample(KEY1, "2026-11-06T12:00:05Z"), sample(KEY2, "2026-11-06T12:00:05Z", { running: false })]);
-  desk = opsDesk(store, () => online, now.t);
+  o = servicesOverview(store, () => online, { todos: { open: () => [] }, analyses: { latest: () => null, lastCheckup: () => null, running: () => true, nextCheckAt: () => "2026-11-06T16:00:00Z" } }, now.t);
+  assert.equal(o.services[0]!.machine.light, "failing");
+  assert.equal(o.services[0]!.nextCheckAt, "2026-11-06T16:00:00Z");
+  assert.equal(o.services[0]!.aiHasPlan, false);
+  assert.equal(o.running, true);
+  const page = servicePage(store, () => online, "c250", {}, now.t)!;
   const h = health(store, () => online, "c250", now.t)!;
-  assert.equal(desk.services[0]!.verdict, "critical");
-  assert.deepEqual(desk.queue.map((x) => x.id), h.todos.map((x) => x.id));
-  assert.ok(desk.queue.every((x) => x.service === "c250"));
-  assert.match(desk.services[0]!.sentence, /^Critical: /);
+  assert.deepEqual(page.machine, h.machine);
+  assert.deepEqual(page.business, h.business);
+  assert.deepEqual(page.service, { id: "c250", kind: "cluster", environment: "uat", label: "NiFi 2.5.0 · cluster, 2 nodes", webUrl: "https://localhost:18445/nifi" });
+  assert.deepEqual([page.analysis, page.todos], [null, []]);
+  assert.deepEqual(page.config, { revision: null, lastChange: null, activeChange: null, drift: false });
+  assert.equal(servicePage(store, () => online, "nope", {}, now.t), undefined);
   store.close();
 });

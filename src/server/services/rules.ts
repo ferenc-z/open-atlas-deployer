@@ -22,6 +22,7 @@ import { serviceStatus, thresholdsOf, type MemberStatus, type ServiceStatus } fr
 import { bucketOf } from "./logs.ts";
 import { memberDrift } from "./configdrift.ts";
 import { LIGHT_ORDER, type Light, type MachineCheck } from "./ops-types.ts";
+import { businessLight, type BusinessLightView } from "./business.ts";
 
 /** The six checks and configuration drift (an alert, not a check: P2). */
 export type RuleId = MachineCheck | "config-drift";
@@ -611,8 +612,10 @@ export interface ServiceHealth {
   verdict: "ok" | "attention" | "critical";
   counts: Record<Severity, number>;
   todos: Todo[];
-  /** Step 3a (C1): the machine light, six rows. The business light is step 3b's. */
+  /** Step 3a (C1): the machine light, six rows. */
   machine: MachineLightView;
+  /** Step 3b (B3): the business light, a row per business (queues count only as "stuck"). */
+  business: BusinessLightView;
   /** One row per member: the node strip. */
   members: { key: string; label: string; state: string; connection: string | null; heapPct: number | null; queuedCount: number | null; version: string | null }[];
 }
@@ -629,6 +632,7 @@ export function health(store: Store, executor: (host: string) => ExecutorInfo, i
   return {
     service: id, asOf: now.toISOString(), verdict: counts.CRIT ? "critical" : list.length ? "attention" : "ok", counts, todos: list,
     machine: machineOf(store, s, t, now, result),
+    business: businessLight(store, id),
     members: s.members.map((m) => ({ key: m.key, label: memberName(s, m), state: m.state, connection: m.live?.connection ?? null, heapPct: m.live?.point?.heapPct ?? null, queuedCount: m.live?.point?.queuedCount ?? null, version: m.live?.version ?? null })),
   };
 }

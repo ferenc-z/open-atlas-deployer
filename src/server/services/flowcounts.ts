@@ -32,6 +32,10 @@ export interface Topology {
   links: { connection: string; from: TopologyEnd; to: TopologyEnd }[];
   s2sIn: { id: string; name: string; group: string; fragment: string | null }[];
   s2sOut: { ref: string; name: string; targets: string[]; group: string; fragment: string | null }[];
+  /** Step 3b (executors from ops step 3b on; older ones leave it out): a group deeper than root's children -> its unit (group under root, or root's id). */
+  nested?: Record<string, string>;
+  /** Step 3b: in a unit of several fragments, a processor's id -> its fragment key. */
+  split?: Record<string, string>;
 }
 
 type Any = Record<string, any>;
@@ -90,5 +94,7 @@ export function ingestFlow(store: Store, sample: ServiceSample): { counts: numbe
 }
 
 export function pruneFlow(store: Store, now: Date) {
-  return store.pruneFlowData(new Date(now.getTime() - FLOW_DAYS * DAY).toISOString());
+  const before = new Date(now.getTime() - FLOW_DAYS * DAY).toISOString();
+  store.pruneFlowAnomalies(before);
+  return store.pruneFlowData(before);
 }

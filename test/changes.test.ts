@@ -1878,7 +1878,7 @@ test("removing a service: an admin in a browser, the watch list drops it, NiFi a
   assert.equal(t.store.serviceUsing("local", "/opt/a"), undefined, "the installation can be taken over again");
   assert.equal(t.store.serviceUsing("local", "/opt/solo"), "solo");
   assert.equal(t.store.serviceAlerts({ service: "flow", state: "open" }).length, 0, "its alerts are closed");
-  assert.equal((await (await t.call("GET", "/api/alerts", { as: "viewer" })).json()).open, 0);
+  assert.deepEqual((await (await t.call("GET", "/api/services/overview", { as: "viewer" })).json()).services.map((s: { id: string }) => s.id), ["solo"]);
 
   // NiFi and its files: no job went to an executor, nothing was written.
   assert.deepEqual(t.w.calls, []);
