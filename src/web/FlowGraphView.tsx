@@ -4,8 +4,8 @@
 // scrolls sideways only (the height follows the diagram).
 
 import { useEffect, useId, useMemo, useState } from "react";
-import type { FlowGraph, Light } from "./flow-types.ts";
-import { EDGE_STYLE, labelLines, type EdgeKind, type Laid } from "./flowgraph.ts";
+import type { FlowGraph, Light } from "../server/services/ops-types.ts";
+import { EDGE_STYLE, type EdgeKind, type Laid } from "./flowgraph.ts";
 import { layoutFlow } from "./flowlayout.ts";
 import "./flows.css";
 
@@ -25,7 +25,7 @@ export function FlowGraphView({ graph }: { graph: FlowGraph }) {
   }, [key]);
   if (error) return <p className="fl-error">{error}</p>;
   if (!laid) return <p className="fl-muted">Drawing the diagram…</p>;
-  const names = new Map(laid.nodes.map((n) => [n.id, labelLines(n.label)[0] ?? n.id]));
+  const names = new Map(laid.nodes.map((n) => [n.id, n.label]));
   const colors = [...new Set(laid.edges.map((e) => EDGE_STYLE[e.kind].color))];
   return (
     <div className="fl-scroll" tabIndex={0} role="group" aria-label="Flow diagram, scrollable">
@@ -53,13 +53,12 @@ export function FlowGraphView({ graph }: { graph: FlowGraph }) {
             })}
           </svg>
           {laid.nodes.map((n) => {
-            const [name, ...rest] = labelLines(n.label);
             const cls = ["fl-node", n.kind === "external" ? (n.dropTarget ? "drop" : "external") : "", n.kind === "group" && n.light && n.light !== "unknown" ? n.light : ""].filter(Boolean).join(" ");
             return (
               <div key={n.id} className={cls} style={{ left: n.x, top: n.y, width: n.width, height: n.height }}>
                 <span>
-                  <b>{name}</b>
-                  {rest.map((l, i) => <span key={i}><br />{l}</span>)}
+                  <b>{n.label}</b>
+                  {n.detail && <span><br />{n.detail}</span>}
                   {n.kind === "group" && n.light && <><br /><b style={{ color: LIGHT_COLOR[n.light] }}>{LIGHT_WORD[n.light]}</b></>}
                 </span>
               </div>

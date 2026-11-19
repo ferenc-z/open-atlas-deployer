@@ -6,7 +6,7 @@
 
 import type { Actor, AnalysisRecord, Store, TodoRecord } from "../store.ts";
 import type { TodoSink } from "./flowmodel.ts";
-import type { Anomaly, AnalysisState, AnalysisTrigger, Light, TodoAction, TodoSource } from "./ops-types.ts";
+import { THRESHOLD_KEYS, type Anomaly, type AnalysisState, type AnalysisTrigger, type AnalysisView, type Lights, type TodoAction, type TodoSource, type TodoView } from "./ops-types.ts";
 import { redactStrings } from "./redact.ts";
 
 export const ANALYSIS_TRIGGERS: readonly AnalysisTrigger[] = ["schedule", "machine-red", "user-visit", "check-now", "flows-feedback"];
@@ -15,18 +15,6 @@ export const ANOMALIES: readonly Anomaly[] = ["processing-failed", "invalid-data
 export const STALE_MS = 3_600_000;
 const MAX_TODOS = 20;
 
-/** §10.2.2 #2: a to-do as the pages and describe show it. */
-export interface TodoView {
-  id: string; service: string; flow: string | null; source: TodoSource; severity: "failing" | "attention";
-  title: string; detail: string; action: TodoAction | null; createdAt: string; createdBy: string; draft: string | null;
-}
-/** §10.2.2 #2: the newest analysis. */
-export interface AnalysisView {
-  id: number; service: string; trigger: AnalysisTrigger; state: AnalysisState;
-  startedAt: string; finishedAt: string | null; stale: boolean; summary: string | null; lookedAt: string[]; error: string | null;
-}
-/** The two lights now, to tell whether an analysis is out of date. */
-export interface Lights { machine: Light; business: Light }
 
 export const todoView = (t: TodoRecord): TodoView => ({
   id: t.id, service: t.service, flow: t.flow, source: t.source, severity: t.severity, title: t.title, detail: t.detail,
@@ -121,6 +109,8 @@ export function parseTodoAction(v: unknown): TodoAction | string {
       return { kind: "member-control", label, member: v.member, action: v.action };
     case "set-threshold": {
       if (!isObj(v.overrides) || !Object.keys(v.overrides).length || !Object.values(v.overrides).every((x) => typeof x === "number" && Number.isFinite(x))) return "set-threshold: overrides maps threshold names to numbers";
+      const unknown = Object.keys(v.overrides).filter((k) => !(THRESHOLD_KEYS as readonly string[]).includes(k));
+      if (unknown.length) return `set-threshold: no such threshold ${unknown.join(", ")}; the names are ${THRESHOLD_KEYS.join(", ")}`;
       return { kind: "set-threshold", label, overrides: v.overrides as Record<string, number> };
     }
     case "confirm-flows": return { kind: "confirm-flows", label };

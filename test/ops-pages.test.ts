@@ -5,7 +5,7 @@ import { contextPage, SUGGESTIONS } from "../src/web/ask-ai.ts";
 import { makeOpsClient } from "../src/web/ops-client.ts";
 import { makeMockOpsClient, sortCards } from "../src/web/ops-mock.ts";
 import { actionLabel, businessLabel, cardLight, changeRow, nextLine, summaryParts, worstLight } from "../src/web/ops-view.ts";
-import type { ServiceCard } from "../src/web/ops-page-types.ts";
+import type { ServiceCard } from "../src/server/services/ops-types.ts";
 
 test("client: each call takes the route of §10.2.2", async () => {
   const seen: string[] = [];

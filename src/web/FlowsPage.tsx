@@ -6,7 +6,7 @@ import { useCallback, useEffect, useState } from "react";
 import { ask } from "./Confirm.tsx";
 import { FlowGraphView } from "./FlowGraphView.tsx";
 import { groupsText, RenameField, StuckEditor } from "./FlowParts.tsx";
-import type { FlowAction, FlowCard, FlowsReview } from "./flow-types.ts";
+import type { FlowAction, FlowCard, FlowsReview } from "../server/services/ops-types.ts";
 import { flowHref, openAskAi } from "./flow-routes.ts";
 import { flows } from "./flows-data.ts";
 import { usePageFocus } from "./focus.ts";

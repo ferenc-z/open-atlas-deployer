@@ -14,7 +14,7 @@ import { BigLight, LightBadge } from "./OpsParts.tsx";
 import { flowHref, flowsHref, openAskAi } from "./flow-routes.ts";
 import { usePageFocus } from "./focus.ts";
 import { ops } from "./ops-data.ts";
-import type { AnalysisView, FlowRow, MachineCheck, ServicePage, TodoView } from "./ops-page-types.ts";
+import type { AnalysisView, FlowRow, MachineCheck, ServicePage, TodoView } from "../server/services/ops-types.ts";
 import { actionLabel, changeRow, clock, TRIGGER_TEXT } from "./ops-view.ts";
 import { shortTime } from "./FlowParts.tsx";
 
@@ -239,6 +239,7 @@ function ApplyDialog({ t, cluster, onClose, onCreated }: { t: TodoView; cluster:
   useEffect(() => { const d = ref.current; if (d && !d.open) d.showModal(); }, []);
   if (t.action?.kind !== "config-change") return null;
   const rows = t.action.changes.map(changeRow);
+  const showNow = rows.some((r) => r.now !== undefined);
   const create = async () => {
     setBusy(true);
     try { await ops.draftTodo(t.id); onCreated(); } catch (e) { setError((e as Error).message); setBusy(false); }
@@ -248,8 +249,8 @@ function ApplyDialog({ t, cluster, onClose, onCreated }: { t: TodoView; cluster:
       <div className="body">
         <h2>Change drafted by the AI</h2>
         <table>
-          <thead><tr><th>Setting</th><th>Change to</th></tr></thead>
-          <tbody>{rows.map((r, i) => <tr key={i}><td>{r.setting}{r.file && <small>{r.file}{cluster ? " · all nodes" : ""}</small>}</td><td style={{ fontWeight: 700 }}>{r.to}</td></tr>)}</tbody>
+          <thead><tr><th>Setting</th>{showNow && <th>Now</th>}<th>Change to</th></tr></thead>
+          <tbody>{rows.map((r, i) => <tr key={i}><td>{r.setting}{r.file && <small>{r.file}{cluster ? " · all nodes" : ""}</small>}</td>{showNow && <td>{r.now ?? "-"}</td>}<td style={{ fontWeight: 700 }}>{r.to}</td></tr>)}</tbody>
         </table>
         {t.action.note && <p style={{ margin: 0, fontSize: 14, color: "#3C3C39", lineHeight: 1.6 }}>{t.action.note}</p>}
         <div className="next">

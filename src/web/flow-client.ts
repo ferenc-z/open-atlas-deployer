@@ -1,7 +1,7 @@
 // The flow pages' three calls (pages-rethink §10.2.2 items 6, 7, 8) over a `call(method, path, body)` function, so a test
 // can see which route each action takes. api.ts binds it to fetch; flows-data.ts chooses between it and the sample data.
 
-import type { FlowAction, FlowCard, FlowDetail, FlowsReview, TodoView } from "./flow-types.ts";
+import type { FlowAction, FlowCard, FlowDetail, FlowsReview, TodoView } from "../server/services/ops-types.ts";
 
 export type Call = <T>(method: string, path: string, body?: unknown) => Promise<T>;
 

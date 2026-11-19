@@ -3,7 +3,7 @@
 // No React and no elkjs import here, so the conversion is unit-testable; flowlayout.ts runs ELK.
 
 import type { ElkExtendedEdge, ElkNode } from "elkjs/lib/elk-api.js";
-import type { FlowGraph, Light } from "./flow-types.ts";
+import type { FlowGraph, Light } from "../server/services/ops-types.ts";
 
 export type EdgeKind = FlowGraph["edges"][number]["kind"];
 
@@ -29,12 +29,12 @@ export function textWidth(text: string, size = 14): number {
   return w;
 }
 
-/** A node's label: the first line is the name (bold), the rest a short description. */
-export const labelLines = (label: string) => label.split("\n");
+/** A node's text lines: the label (bold) and, when the graph gives one, the second line `detail` (§10.3). */
+export const nodeLines = (label: string, detail?: string) => (detail ? [label, detail] : [label]);
 
 /** Box size from the text, so the box holds it without the SVG measuring anything. */
-export function nodeSize(kind: "group" | "external", label: string, hasLightLine: boolean): { width: number; height: number } {
-  const lines = labelLines(label);
+export function nodeSize(kind: "group" | "external", label: string, detail: string | undefined, hasLightLine: boolean): { width: number; height: number } {
+  const lines = nodeLines(label, detail);
   const widest = Math.max(...lines.map((l) => textWidth(l)));
   const width = Math.round(Math.min(Math.max(widest + 32, kind === "group" ? 180 : 140), 300));
   const inner = width - 32;
@@ -64,7 +64,7 @@ const SERVICE_PADDING = "[top=30,left=16,bottom=16,right=16]";
 export function toElk(graph: FlowGraph): ElkNode {
   const known = new Set(graph.services.map((s) => s.id));
   const nodeIds = new Set(graph.nodes.map((n) => n.id));
-  const toNode = (n: FlowGraph["nodes"][number]): ElkNode => ({ id: NODE_ID(n.id), ...nodeSize(n.kind, n.label, n.kind === "group" && n.light !== undefined) });
+  const toNode = (n: FlowGraph["nodes"][number]): ElkNode => ({ id: NODE_ID(n.id), ...nodeSize(n.kind, n.label, n.detail, n.kind === "group" && n.light !== undefined) });
   const children: ElkNode[] = graph.services.map((s) => ({
     id: SERVICE_ID(s.id),
     labels: [{ text: s.label }],
@@ -81,7 +81,7 @@ export function toElk(graph: FlowGraph): ElkNode {
   return { id: "root", layoutOptions: { ...LAYOUT_OPTIONS }, children, edges };
 }
 
-export interface LaidNode { id: string; kind: "group" | "external"; label: string; light?: Light; x: number; y: number; width: number; height: number; dropTarget: boolean }
+export interface LaidNode { id: string; kind: "group" | "external"; label: string; detail?: string; light?: Light; x: number; y: number; width: number; height: number; dropTarget: boolean }
 export interface LaidService { id: string; label: string; x: number; y: number; width: number; height: number }
 export interface LaidEdge { id: string; kind: EdgeKind; from: string; to: string; path: string; label: { text: string; x: number; y: number; width: number; height: number } | null }
 export interface Laid { width: number; height: number; services: LaidService[]; nodes: LaidNode[]; edges: LaidEdge[] }
@@ -102,7 +102,7 @@ export function fromElk(graph: FlowGraph, laid: ElkNode): Laid {
       const s = serviceMeta.get(c.id);
       if (s) services.push({ id: s.id, label: s.label, x, y, width: c.width ?? 0, height: c.height ?? 0 });
       const m = meta.get(c.id);
-      if (m) nodes.push({ id: m.id, kind: m.kind, label: m.label, ...(m.light ? { light: m.light } : {}), x, y, width: c.width ?? 0, height: c.height ?? 0, dropTarget: dropTargets.has(c.id) });
+      if (m) nodes.push({ id: m.id, kind: m.kind, label: m.label, ...(m.detail ? { detail: m.detail } : {}), ...(m.light ? { light: m.light } : {}), x, y, width: c.width ?? 0, height: c.height ?? 0, dropTarget: dropTargets.has(c.id) });
       walk(c, x, y);
     }
   };

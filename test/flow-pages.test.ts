@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { makeFlowClient } from "../src/web/flow-client.ts";
 import { flowHref, flowsHref, parseFlowRoute } from "../src/web/flow-routes.ts";
-import type { FlowAction, FlowGraph } from "../src/web/flow-types.ts";
+import type { FlowAction, FlowGraph } from "../src/server/services/ops-types.ts";
 import { fromElk, nodeSize, toElk } from "../src/web/flowgraph.ts";
 import { layoutFlow } from "../src/web/flowlayout.ts";
 import { mockFlowClient } from "../src/web/flows-mock.ts";
@@ -49,10 +49,10 @@ test("toElk: every node has a size, edges keep their ends, an edge to a missing 
 });
 
 test("nodeSize: a longer label makes a wider box, capped; a group is at least 72 high", () => {
-  const small = nodeSize("group", "A", false), big = nodeSize("group", "Customs_Receipt_Retry\n重试 3 次后送回再重试再重试", false);
+  const small = nodeSize("group", "A", undefined, false), big = nodeSize("group", "Customs_Receipt_Retry", "重试 3 次后送回再重试再重试", false);
   assert.ok(big.width > small.width && big.width <= 300);
   assert.equal(small.height, 72);
-  assert.ok(nodeSize("group", "A", true).height >= small.height);
+  assert.ok(nodeSize("group", "A", undefined, true).height >= small.height);
 });
 
 test("layout: ELK places services around their groups, left to right, and routes every edge", async () => {

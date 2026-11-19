@@ -1,7 +1,7 @@
 // Pieces the two flow pages share: the stuck-times editor, the inline rename field, the light badge and the wording.
 
 import { useId, useState } from "react";
-import type { Anomaly, FlowCard, Light, UnknownReason } from "./flow-types.ts";
+import type { Anomaly, FlowCard, Light, UnknownReason } from "../server/services/ops-types.ts";
 import "./flows.css";
 
 export const LIGHT_LABEL: Record<Light, string> = { failing: "Failing", attention: "Attention", healthy: "Healthy", unknown: "Unknown" };

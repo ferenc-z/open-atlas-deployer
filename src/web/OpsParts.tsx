@@ -1,7 +1,7 @@
 // Pieces the overview and the service page share: the light with its word (a colour is never the only signal), and the
 // card's top bar colour.
 
-import type { Light } from "./ops-page-types.ts";
+import type { Light } from "../server/services/ops-types.ts";
 import { LIGHT_LABEL } from "./FlowParts.tsx";
 import "./ops.css";
 

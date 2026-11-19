@@ -2,7 +2,7 @@
 
 import ELKModule from "elkjs/lib/elk.bundled.js";
 import type { ElkNode } from "elkjs/lib/elk-api.js";
-import type { FlowGraph } from "./flow-types.ts";
+import type { FlowGraph } from "../server/services/ops-types.ts";
 import { fromElk, toElk, type Laid } from "./flowgraph.ts";
 
 // elkjs is CommonJS: depending on the loader the constructor is the module itself or its `default`.

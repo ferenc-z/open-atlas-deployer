@@ -1,7 +1,7 @@
 // Pure helpers of the overview and service page (kept apart from the components so they can be tested).
 
 import { LIGHT_ORDER } from "../server/services/ops-types.ts";
-import type { AnalysisTrigger, Light, ServiceCard, TodoAction } from "./ops-page-types.ts";
+import type { AnalysisTrigger, ConfigChange, Light, ServiceCard, TodoAction } from "../server/services/ops-types.ts";
 
 /** The worse of two lights. */
 export const worstLight = (a: Light, b: Light): Light => (LIGHT_ORDER[a] <= LIGHT_ORDER[b] ? a : b);
@@ -50,12 +50,13 @@ export function actionLabel(a: TodoAction): string {
 }
 
 /** A configuration change as the dialog's row: the setting, where it is, and what it becomes. */
-export function changeRow(change: Record<string, unknown>): { setting: string; file: string; to: string } {
+export function changeRow(change: ConfigChange): { setting: string; file: string; to: string; now?: string } {
   const file = typeof change.file === "string" ? change.file : "";
   const key = typeof change.key === "string" ? change.key : "";
-  if (change.unset === true) return { setting: key || file, file, to: "(removed)" };
-  if (typeof change.value === "string" || typeof change.value === "number" || typeof change.value === "boolean") return { setting: key, file, to: String(change.value) };
-  return { setting: key || file || "File", file, to: "(file edited)" };
+  const now = typeof change.current === "string" && change.current ? { now: change.current } : {};
+  if (change.unset === true) return { setting: key || file, file, to: "(removed)", ...now };
+  if (typeof change.value === "string" || typeof change.value === "number" || typeof change.value === "boolean") return { setting: key, file, to: String(change.value), ...now };
+  return { setting: key || file || "File", file, to: "(file edited)", ...now };
 }
 
 /** "10:14" from an ISO time, in the browser's zone. */

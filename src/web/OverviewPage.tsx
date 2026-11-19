@@ -7,7 +7,7 @@ import { useCallback, useEffect, useState } from "react";
 import { LightBadge } from "./OpsParts.tsx";
 import { ops } from "./ops-data.ts";
 import { businessLabel, cardLight, clock, nextLine, summaryParts, TRIGGER_TEXT } from "./ops-view.ts";
-import type { ServiceCard, ServicesOverview } from "./ops-page-types.ts";
+import type { ServiceCard, ServicesOverview } from "../server/services/ops-types.ts";
 
 export function OverviewPage({ onOpen, onTakeover }: { onOpen: (id: string) => void; onTakeover: () => void }) {
   const [data, setData] = useState<ServicesOverview | undefined>();

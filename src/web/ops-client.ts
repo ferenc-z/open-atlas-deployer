@@ -2,7 +2,7 @@
 // so a test can see which route each action takes. api.ts binds it to fetch; ops-data.ts chooses between it and the sample data.
 
 import type { Call } from "./flow-client.ts";
-import type { AnalysisView, ServicePage, ServicesOverview, TodoView } from "./ops-page-types.ts";
+import type { AnalysisView, ServicePage, ServicesOverview, TodoView } from "../server/services/ops-types.ts";
 
 export interface OpsClient {
   /** 1: every service, worst first. */

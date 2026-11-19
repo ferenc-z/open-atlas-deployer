@@ -5,48 +5,14 @@
 
 import type { ExecutorInfo } from "../handoff.ts";
 import type { Store } from "../store.ts";
-import { ANOMALY_LABEL, anomalyText, businessLight, flowLight, type BusinessLightView } from "./business.ts";
-import { flowCard, type FlowCard, type GraphExtras } from "./flow-views.ts";
-import { LIGHT_ORDER, type AnalysisState, type AnalysisTrigger, type Anomaly, type GateVerdict, type Light, type UnknownReason } from "./ops-types.ts";
+import { ANOMALY_LABEL, anomalyText, businessLight, flowLight } from "./business.ts";
+import { flowCard, type GraphExtras } from "./flow-views.ts";
+import { LIGHT_ORDER, type AnalysisState, type AnalysisTrigger, type AnalysisView, type Anomaly, type BusinessLightView, type FlowCard, type FlowDetail, type FlowProblem, type GateVerdict, type Light, type Lights, type ServiceCard, type ServicePage, type ServicesOverview, type TodoView, type UnknownReason } from "./ops-types.ts";
 import type { BusinessHooks } from "./ops-routes.ts";
-import { machineLight, type MachineLightView } from "./rules.ts";
-import { opsReads, type AnalysisView, type Lights, type TodoView } from "./todos.ts";
+import { machineLight } from "./rules.ts";
+import { opsReads } from "./todos.ts";
 import { CUES, type Cue } from "./trace/model.ts";
 
-export interface ServiceCard {
-  id: string; kind: "standalone" | "cluster"; environment: string;
-  /** §10.3: the whole subtitle ("NiFi 2.5.0 · cluster, 2 nodes"); the name is id. */
-  label: string;
-  machine: { light: Light; sentence: string };
-  business: { light: Light; reason?: UnknownReason; sentence: string; flowCount: number; toConfirm: number; confirmedAt?: string };
-  todoCount: number;
-  nextCheckAt?: string; aiHasPlan?: boolean;
-}
-export interface ServicesOverview {
-  services: ServiceCard[];
-  lastCheckup: { at: string; trigger: AnalysisTrigger; state: AnalysisState } | null;
-  running: boolean;
-}
-export interface ServicePage {
-  service: { id: string; kind: "standalone" | "cluster"; environment: string; label: string; webUrl: string | null };
-  machine: MachineLightView;
-  business: BusinessLightView;
-  analysis: AnalysisView | null;
-  todos: TodoView[];
-  config: { revision: number | null; lastChange: { at: string; by: string; text: string } | null; activeChange: string | null; drift: boolean };
-}
-export interface FlowProblem {
-  anomaly: Anomaly; light: Light; title: string; service: string; group: string; component: string | null;
-  count: number; since: string; latest: string; cause: string | null; advice: string[]; nifiUrl: string | null;
-}
-export interface FlowDetail {
-  flow: FlowCard;
-  light: Light; reason?: UnknownReason; sentence: string;
-  problems: FlowProblem[];
-  last7Days: { day: string; anomaly: Anomaly; light: Light; text: string }[];
-  findBy: { cue: Cue; attribute: string }[];
-  history: { at: string; by: "ai" | "person"; text: string; verdict: GateVerdict | null }[];
-}
 
 /** What step 4 (and 5) give the pages: the to-dos and the AI's analyses. Left out, there are none. */
 export interface PageSources {

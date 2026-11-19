@@ -21,8 +21,8 @@ import type { Thresholds } from "./profiles.ts";
 import { serviceStatus, thresholdsOf, type MemberStatus, type ServiceStatus } from "./status.ts";
 import { bucketOf } from "./logs.ts";
 import { memberDrift } from "./configdrift.ts";
-import { LIGHT_ORDER, type Light, type MachineCheck } from "./ops-types.ts";
-import { businessLight, type BusinessLightView } from "./business.ts";
+import { LIGHT_ORDER, type BusinessLightView, type Light, type MachineCheck, type MachineCheckRow, type MachineLightView } from "./ops-types.ts";
+import { businessLight } from "./business.ts";
 
 /** The six checks and configuration drift (an alert, not a check: P2). */
 export type RuleId = MachineCheck | "config-drift";
@@ -268,12 +268,6 @@ export function evaluate(store: Store, s: ServiceStatus, t: Thresholds, now: Dat
 
 // --- The machine light (§10.2.2 MachineLightView): six rows, each its light and a plain sentence's material.
 
-export interface MachineCheckRow { check: MachineCheck; light: Light; text: string; member: string | null; since: string | null }
-export interface MachineLightView {
-  light: Light; sentence: string; asOf: string;
-  checks: MachineCheckRow[];
-  members: { key: string; label: string; state: string; connection: string | null }[];
-}
 
 /** The light over the six rows: any failing is failing; else collection unknown is unknown; else any attention; else healthy.
  *  Another row that cannot tell (a store unreadable, a member blind) shows unknown on its row only. */
@@ -506,11 +500,10 @@ export const alertView = (a: ServiceAlert) => ({ ...a, label: RULES[a.rule as Ru
 // findings: what is wrong now, since when, the evidence, a template cause and the next actions. Preventive risk is a finding
 // only (no alert, no light: C1, "full in days" is the analysis's). Same function for the page and get_service_health (D10).
 
-/** collection-incomplete: never produced any more (the collection check took it over); kept for the old Status page until 6a removes it. */
-export type TodoRule = RuleId | "preventive-risk" | "collection-incomplete";
+export type TodoRule = RuleId | "preventive-risk";
 export type Severity = "CRIT" | "WARN" | "INFO";
-/** A next step: open-nifi, draft-config, member-control (start/stop), config-diff. Step 3a (§9.2 ⑥): investigate and metrics are gone. */
-export interface TodoAction { kind: "open-nifi" | "draft-config" | "member-control" | "config-diff"; label: string; target?: Record<string, unknown> }
+/** A next step: open-nifi, draft-config, member-control (start/stop). */
+export interface TodoAction { kind: "open-nifi" | "draft-config" | "member-control"; label: string; target?: Record<string, unknown> }
 export interface Todo { id: string; rule: TodoRule; severity: Severity; since: string; member: string; memberLabel: string | null; evidence: string[]; cause: string; actions: TodoAction[] }
 
 const CAUSES: Record<TodoRule, string> = {
@@ -521,18 +514,16 @@ const CAUSES: Record<TodoRule, string> = {
   coordinator: "The cluster has no primary node or no coordinator, or keeps losing ZooKeeper: the election has not finished, or ZooKeeper is down, overloaded or unreachable.",
   collection: "Nothing is being collected of this member: the service executor or the host is down, the network to the Deployer is cut, or NiFi's REST API cannot be read (monitor certificate, address). The machine light is unknown until it is back.",
   "config-drift": "A configuration file on the host differs from what the Deployer keeps: someone or something edited or removed it.",
-  "collection-incomplete": "Replaced by the collection check.",
   "preventive-risk": "A trend, not a fault yet: if it continues, the limit is reached within the time shown.",
 };
 
 const nifiLink = (s: ServiceStatus): TodoAction[] => (s.webUrl ? [{ kind: "open-nifi", label: "Open in NiFi", target: { url: s.webUrl } }] : []);
 const ACTIONS: Partial<Record<TodoRule, (s: ServiceStatus, member: string, c?: Condition) => TodoAction[]>> = {
-  process: (s, m, c) => (m === "*" ? [{ kind: "config-diff", label: "Compare the nodes" }]
+  process: (s, m, c) => (m === "*" ? []
     : c?.detail.why === "process-down" ? [{ kind: "member-control", label: "Start", target: { member: m, action: "start" } }]
     : s.kind === "cluster" ? [{ kind: "member-control", label: "Restart", target: { member: m, action: "restart" } }] : []),
   heap: () => [{ kind: "draft-config", label: "Draft a heap change", target: { file: "bootstrap.conf" } }],
   coordinator: (s) => nifiLink(s),
-  "config-drift": (_s, m) => [{ kind: "config-diff", label: "See the differences", target: { member: m } }],
 };
 
 const ORDER: Record<Severity, number> = { CRIT: 0, WARN: 1, INFO: 2 };

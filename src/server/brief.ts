@@ -9,8 +9,7 @@ import type { DriftItem } from "./drift.ts";
 import type { EnvironmentStatus } from "./observe.ts";
 import { sessionOutcome, type OmaSessions } from "./oma.ts";
 import type { PeerStatus } from "./peer.ts";
-import { LIGHT_ORDER } from "./services/ops-types.ts";
-import type { ServicesOverview } from "./services/page-views.ts";
+import { LIGHT_ORDER, type ServicesOverview } from "./services/ops-types.ts";
 import type { Store } from "./store.ts";
 import type { Versions } from "./versions.ts";
 

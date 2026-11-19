@@ -4,7 +4,7 @@
 
 import { LIGHT_ORDER } from "../server/services/ops-types.ts";
 import type { OpsClient } from "./ops-client.ts";
-import type { FlowRow, Light, MachineLightView, ServiceCard, ServicePage, ServicesOverview, TodoView } from "./ops-page-types.ts";
+import type { FlowRow, Light, MachineLightView, ServiceCard, ServicePage, ServicesOverview, TodoView } from "../server/services/ops-types.ts";
 
 /** Today at hh:mm in the browser's zone, as an ISO string. */
 const today = (hhmm: string, daysAgo = 0): string => {

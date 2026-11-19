@@ -6,6 +6,7 @@ import type { ExecutorInfo } from "../src/server/handoff.ts";
 import { ingest } from "../src/server/services/metrics.ts";
 import { check, checkAll, heldSince, machineLight, MACHINE_CHECKS, overallLight, parseThresholds, type MachineTurn } from "../src/server/services/rules.ts";
 import { NIFI_THRESHOLDS } from "../src/server/services/profiles.ts";
+import { THRESHOLD_KEYS } from "../src/server/services/ops-types.ts";
 import { serviceStatus, thresholdsOf } from "../src/server/services/status.ts";
 import type { ServiceSample } from "../src/server/services/watch.ts";
 import { Store } from "../src/server/store.ts";
@@ -276,6 +277,7 @@ test("thresholds: the C1 defaults, overrides from the column, bounds and order c
   const now = { t: new Date("2026-11-06T12:00:10Z") };
   const store = lab(now);
   assert.deepEqual(NIFI_THRESHOLDS, { collectionMinutes: 5, repoDiskWarnPct: 85, repoDiskCritPct: 95, heapPct: 85, heapMinutes: 10, oomMinutes: 60, zkErrors: 3, zkMinutes: 5, certWarnDays: 30, certCritDays: 7 });
+  assert.deepEqual(Object.keys(NIFI_THRESHOLDS), [...THRESHOLD_KEYS], "the names a set-threshold to-do may use are the thresholds");
   assert.deepEqual(thresholdsOf(store, "c250", "nifi-2.x"), { defaults: NIFI_THRESHOLDS, overrides: {}, effective: NIFI_THRESHOLDS });
   assert.deepEqual(parseThresholds({ thresholds: { certWarnDays: 400, heapPct: 85, collectionMinutes: null } }, NIFI_THRESHOLDS), { overrides: { certWarnDays: 400 } }, "a default or null is no override");
   const bad = parseThresholds({ thresholds: { certWarnDays: 5, nope: 1, heapPct: 101, backpressureMinutes: 3 } }, NIFI_THRESHOLDS);

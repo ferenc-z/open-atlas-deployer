@@ -2,38 +2,14 @@
 // flow graph (FlowGraph, B5) made from the model: services as areas, groups as boxes, the world outside NiFi as
 // external nodes, S2S / failure / retry / drop edges (§10.3: a drop goes to an external node, edge kind drop; a node's
 // second line is `detail`). Step 3 adds the lights and the drops (FlowDetail #8) through GraphExtras.
-// The HTTP types live here until the merge puts them in ops-types.ts with the enums (§10.3).
 
 import type { FlowRecord, Store } from "../store.ts";
 import { DEFAULT_STUCK } from "./flowmodel.ts";
-import type { FlowStatus, Light } from "./ops-types.ts";
+import type { Endpoint2, FlowCard, FlowGraph, FlowsReview, FlowStatus, Light, StuckTimes } from "./ops-types.ts";
 import { skeletonOf, type Skeleton } from "./skeleton.ts";
 import { links } from "./trace/channels.ts";
 import { toTraceModel, WHOLE, type Endpoint, type ModelV2, type Segment } from "./trace/model.ts";
 
-export interface Endpoint2 { service: string; component: string; name: string; type: string; relationship?: string; text: string }
-export interface StuckTimes { attentionMinutes: number; failingMinutes: number; by: "ai" | "person"; basis: string }
-export interface FlowGraph {
-  services: { id: string; label: string }[];
-  nodes: { id: string; kind: "group" | "external"; service: string | null; label: string; detail?: string; light?: Light }[];
-  edges: { from: string; to: string; kind: "data" | "s2s" | "failure" | "retry" | "drop"; label?: string }[];
-}
-export interface FlowCard {
-  id: string; name: string; nameBy: "ai" | "person"; status: FlowStatus; summary: string;
-  services: string[]; graph: FlowGraph;
-  entries: Endpoint2[]; exits: Endpoint2[];
-  groups: { service: string; id: string; name: string }[];
-  reason: string | null;
-  risks: { text: string; component: string | null }[];
-  stuck: StuckTimes;
-  pending: { kind: "new" | "gone" | "merge" | "split" | "cross-service"; text: string } | null;
-}
-export interface FlowsReview {
-  service: string; intro: string;
-  flows: FlowCard[]; ignored: FlowCard[];
-  shared: { service: string; group: string; name: string }[];
-  allConfirmed: boolean;
-}
 /** What step 3 adds to the graph: node lights, and drops outside an exit (B3 data-dropped). */
 export interface GraphExtras {
   lights?: Map<string, Light>;

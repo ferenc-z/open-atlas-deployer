@@ -1,12 +1,14 @@
-// SAMPLE DATA for the flow pages, until the server routes (§10.2.2 items 6, 7, 8) exist. Taken from the prototype
+// SAMPLE DATA for the flow pages, for unit tests. Taken from the prototype
 // (Flows.dc.html, Business.dc.html); the numbers, file names and group names are made up. It answers like the real
-// client does and keeps the person's actions in memory. flows-data.ts switches between this and the real routes.
+// client does and keeps the person's actions in memory. used by unit tests only (the pages call the real routes).
 
 import type { FlowClient } from "./flow-client.ts";
-import type { FlowAction, FlowCard, FlowDetail, FlowGraph, FlowsReview, StuckTimes } from "./flow-types.ts";
+import type { FlowAction, FlowCard, FlowDetail, FlowGraph, FlowsReview, StuckTimes } from "../server/services/ops-types.ts";
 
-const ext = (id: string, label: string) => ({ id, kind: "external" as const, service: null, label });
-const grp = (id: string, service: string, label: string, light?: FlowGraph["nodes"][number]["light"]) => ({ id, kind: "group" as const, service, label, ...(light ? { light } : {}) });
+// A "name\ndescription" text becomes label + detail (the graph's second line).
+const lines = (text: string) => { const [label = "", ...rest] = text.split("\n"); return rest.length ? { label, detail: rest.join(" ") } : { label }; };
+const ext = (id: string, text: string) => ({ id, kind: "external" as const, service: null, ...lines(text) });
+const grp = (id: string, service: string, text: string, light?: FlowGraph["nodes"][number]["light"]) => ({ id, kind: "group" as const, service, ...lines(text), ...(light ? { light } : {}) });
 const ai = (basis: string, a: number, f: number): StuckTimes => ({ attentionMinutes: a, failingMinutes: f, by: "ai", basis });
 
 const crm: FlowCard = {
@@ -109,14 +111,14 @@ function detail(flow: string): FlowDetail {
     flow: card, light: "failing",
     sentence: "今天 08:10 起，有 7 个发票文件在 n112 的 ConvertRecord 转换失败后被丢掉了，找不回来。c250 那一段没有异常。",
     problems: [{
-      anomaly: "data-dropped", light: "failing", service: "n112-edge", group: "Invoice_Receive", component: "c8", count: 7, since: "2026-11-19T08:10:00", latest: "2026-11-19T10:02:00",
+      anomaly: "data-dropped", light: "failing", title: "7 个发票文件被丢掉了", service: "n112-edge", group: "Invoice_Receive", component: "c8", count: 7, since: "2026-11-19T08:10:00", latest: "2026-11-19T10:02:00",
       cause: "这 7 个文件用了新的税号格式（18 位，带字母），转换规则只认 15 位数字，所以转换失败；而 ConvertRecord 的 failure 设成了自动终止，失败的文件直接被丢弃，没有进错误处理。",
       advice: ["在 NiFi 里把 ConvertRecord 的 failure 连到 Common_Errors，以后转换失败的不会再丢。", "把转换规则改成也认新税号格式。", "请发件方重发这 7 个文件（文件名问 AI）。"],
       nifiUrl: "https://n112.example/nifi/",
     }],
     last7Days: [
-      { day: "2026-11-19", anomaly: "data-dropped", text: "7 个文件被丢掉，见上面。" },
-      { day: "2026-11-17", anomaly: "stuck", text: "c250 写发票库超时，140 个文件最久等了 38 分钟，之后数据库恢复，自己处理完了。" },
+      { day: "2026-11-19", anomaly: "data-dropped", light: "failing", text: "7 个文件被丢掉，见上面。" },
+      { day: "2026-11-17", anomaly: "stuck", light: "attention", text: "c250 写发票库超时，140 个文件最久等了 38 分钟，之后数据库恢复，自己处理完了。" },
     ],
     findBy: [{ cue: "fileName", attribute: "filename" }],
     history: [

@@ -3,8 +3,8 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { FlowGraphView } from "./FlowGraphView.tsx";
-import { ANOMALY_LABEL, anomalyLight, groupsText, LightPill, RenameField, shortDay, shortTime, StuckEditor, UNKNOWN_REASON } from "./FlowParts.tsx";
-import type { FlowDetail, Light } from "./flow-types.ts";
+import { ANOMALY_LABEL, groupsText, LightPill, RenameField, shortDay, shortTime, StuckEditor, UNKNOWN_REASON } from "./FlowParts.tsx";
+import type { FlowDetail, Light } from "../server/services/ops-types.ts";
 import { flowHref, openAskAi } from "./flow-routes.ts";
 import { flows } from "./flows-data.ts";
 import { usePageFocus } from "./focus.ts";
@@ -80,8 +80,8 @@ export function FlowDetailPage({ flow, service, isAdmin, onBack, onOpenFlow }: {
             <div key={i} className="fl-problem">
               <div className="fl-row" style={{ gap: 10 }}>
                 <LightPill light={p.light} text={ANOMALY_LABEL[p.anomaly]} />
-                <span style={{ fontSize: 16, fontWeight: 600 }}>{p.count} {p.count === 1 ? "occurrence" : "occurrences"}</span>
-                <span className="fl-muted">{p.service} · {p.group} · since {shortTime(p.since)}, latest {shortTime(p.latest)}</span>
+                <span style={{ fontSize: 16, fontWeight: 600 }}>{p.title}</span>
+                <span className="fl-muted">{p.count} {p.count === 1 ? "occurrence" : "occurrences"} · {p.service} · {p.group} · since {shortTime(p.since)}, latest {shortTime(p.latest)}</span>
               </div>
               {p.cause && <p><b>Cause · </b>{p.cause}</p>}
               {p.advice.length > 0 && (
@@ -104,7 +104,7 @@ export function FlowDetailPage({ flow, service, isAdmin, onBack, onOpenFlow }: {
           {d.last7Days.map((h, i) => (
             <div key={i} className="fl-day">
               <span className="fl-muted" style={{ flex: "0 0 auto" }}>{shortDay(h.day)}</span>
-              <LightPill light={anomalyLight(h.anomaly)} text={ANOMALY_LABEL[h.anomaly]} />
+              <LightPill light={h.light} text={ANOMALY_LABEL[h.anomaly]} />
               <span className="text">{h.text}</span>
             </div>
           ))}

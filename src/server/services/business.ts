@@ -15,7 +15,7 @@
 import type { FlowAnomaly, FlowRecord, ServiceBulletin, Store } from "../store.ts";
 import { DEFAULT_STUCK, dropRelationship, exitOf, gateRejected } from "./flowmodel.ts";
 import type { Topology } from "./flowcounts.ts";
-import { LIGHT_ORDER, type Anomaly, type FlowStatus, type Light, type UnknownReason } from "./ops-types.ts";
+import { LIGHT_ORDER, type Anomaly, type BusinessLightView, type FlowRow, type FlowStatus, type Light, type UnknownReason } from "./ops-types.ts";
 import { lightOfAlert } from "./rules.ts";
 import { WHOLE, type ModelV2, type Segment } from "./trace/model.ts";
 
@@ -376,13 +376,6 @@ export function flowLight(store: Store, f: FlowRecord, ctx: { collection?: (s: s
   return { flow: f, services, light: "healthy", sentence: "No problems found.", anomalies };
 }
 
-export interface FlowRow { id: string; name: string; status: FlowStatus; light: Light; sentence: string; services: string[]; anomalies: Anomaly[] }
-export interface BusinessLightView {
-  light: Light; reason?: UnknownReason; sentence: string;
-  flows: FlowRow[]; toConfirm: number;
-  /** §10.3: when a person last confirmed one of them (the business card's "you confirmed them on …"). */
-  confirmedAt?: string;
-}
 
 const REASON_ORDER: UnknownReason[] = ["collection", "gate-rejected", "no-evidence", "unconfirmed"];
 

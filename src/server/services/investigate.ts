@@ -59,7 +59,7 @@ export interface InvestigateAsk { member?: string | undefined; from?: string | u
 const FOCUS: Record<string, CardKind> = {
   "process-down": "process", "node-disconnected": "process", "no-samples": "process", "executor-lost": "process", "no-coordinator": "process",
   "error-bulletins": "bulletins", "zk-errors": "logs", "heap": "metrics", "repo-disk": "metrics", "backpressure": "metrics",
-  "collection-incomplete": "metrics", "preventive-risk": "metrics", "config-drift": "changes", "version-mismatch": "changes", "cert-expiry": "changes",
+  "preventive-risk": "metrics", "config-drift": "changes", "version-mismatch": "changes", "cert-expiry": "changes",
   // Step 3a (C1): the six checks.
   process: "process", collection: "process", coordinator: "logs", disk: "metrics", certificate: "changes",
 };
