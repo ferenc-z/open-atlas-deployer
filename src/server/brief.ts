@@ -41,7 +41,10 @@ export async function collectFacts(d: { store: Store; deployments: Deployments; 
     try {
       const o = d.ops();
       nifi = {
-        services: o.services.map((s) => ({ id: s.id, verdict: LIGHT_ORDER[s.machine.light] <= LIGHT_ORDER[s.business.light] ? s.machine.light : s.business.light, machine: s.machine.light, business: s.business.light, sentence: `${s.machine.sentence} ${s.business.sentence}` })),
+        services: o.services.map((s) => {
+          const checkup = morningCheckup(d.store, s.id, now);
+          return { id: s.id, verdict: LIGHT_ORDER[s.machine.light] <= LIGHT_ORDER[s.business.light] ? s.machine.light : s.business.light, machine: s.machine.light, business: s.business.light, sentence: `${s.machine.sentence} ${s.business.sentence}`, ...(checkup ? { checkup } : {}) };
+        }),
         todos: [], todoCount: o.services.reduce((n, s) => n + s.todoCount, 0),
       };
     } catch { nifi = undefined; }
@@ -55,6 +58,13 @@ export async function collectFacts(d: { store: Store; deployments: Deployments; 
   };
 }
 
+/** A1: the brief uses the morning check-up — the service's newest scheduled analysis of the last 8 hours. */
+function morningCheckup(store: Store, service: string, now: number): { at: string; machine: string; business: string; summary: string } | null {
+  const a = store.analyses(service, 20).find((x) => x.trigger === "schedule" && x.state === "done" && now - Date.parse(x.startedAt) < 8 * 3_600_000);
+  const b = (a?.body ?? null) as { machine?: unknown; business?: unknown; summary?: unknown } | null;
+  return a && b ? { at: a.startedAt, machine: String(b.machine ?? ""), business: String(b.business ?? ""), summary: String(b.summary ?? "") } : null;
+}
+
 export interface BriefFacts {
   environment: string;
   /** versionsError: the release tags could not be read, so newer is not known (not "none"). */
@@ -66,7 +76,8 @@ export interface BriefFacts {
   waiting: { job: string; app: string; version: string; step: string }[];
   /** The managed NiFi services: a verdict sentence each, and the worst to-dos (todoCount of them in all) of the ops desk. */
   /** Ops step 3b: from the services overview; verdict is the worse of the two lights. todos: step 4's to-dos (none yet). */
-  nifi?: { services: { id: string; verdict: string; machine?: string; business?: string; sentence: string }[]; todos: { service: string; rule: string; severity: string; since: string; member: string | null; cause: string }[]; todoCount: number };
+  /** Ops step 5: checkup is the morning check-up's conclusion (Chinese, the AI's), when there was one. */
+  nifi?: { services: { id: string; verdict: string; machine?: string; business?: string; sentence: string; checkup?: { at: string; machine: string; business: string; summary: string } }[]; todos: { service: string; rule: string; severity: string; since: string; member: string | null; cause: string }[]; todoCount: number };
 }
 
 export interface Brief {
@@ -83,7 +94,7 @@ export interface Brief {
 export function briefPrompt(facts: BriefFacts): string {
   return [
     `Write today's deploy brief for the ${facts.environment.toUpperCase()} environment, for the team to read on the Deployer home page. Use only the facts below and invent nothing; check with the read-only tools if needed.`,
-    "Format: a one-sentence summary, then sections as needed: upgrades available, versions UAT has run that are waiting for PROD, environment drift (someone changed the server by hand), deploys that failed or are waiting for a person, and NiFi services that need attention (the nifi fact: name the service and its worst to-do; say nothing if every service is normal). At most 5 lines per section, naming the app, version and evidence. Leave out empty sections. End with one line: the single thing to do first.",
+    "Format: a one-sentence summary, then sections as needed: upgrades available, versions UAT has run that are waiting for PROD, environment drift (someone changed the server by hand), deploys that failed or are waiting for a person, and NiFi services that need attention (the nifi fact: name the service and its worst to-do; where a service has checkup, that is the morning check-up's conclusion: use it rather than repeating the lights; say nothing if every service is normal). At most 5 lines per section, naming the app, version and evidence. Leave out empty sections. End with one line: the single thing to do first.",
     "```json",
     JSON.stringify(facts, null, 1),
     "```",
@@ -97,13 +108,15 @@ export class Briefs {
   private now: () => number;
   private hour: number;
   private busy = false;
+  private ready: (() => boolean) | undefined;
 
-  constructor(store: Store, gather: () => Promise<BriefFacts>, oma: OmaSessions | undefined, options: { now?: () => number; hour?: number } = {}) {
+  constructor(store: Store, gather: () => Promise<BriefFacts>, oma: OmaSessions | undefined, options: { now?: () => number; hour?: number; ready?: () => boolean } = {}) {
     this.store = store;
     this.gather = gather;
     this.oma = oma;
     this.now = options.now ?? Date.now;
     this.hour = options.hour ?? 8;
+    this.ready = options.ready;
   }
 
   private today(): string {
@@ -131,7 +144,10 @@ export class Briefs {
     this.busy = true;
     try {
       const last = this.latest();
-      if ((!last || last.date !== this.today()) && new Date(this.now()).getHours() >= this.hour) await this.generate("deployer");
+      const at = new Date(this.now());
+      // Ops step 5: wait up to an hour past the hour for the morning check-up (ready), then go without it.
+      const waiting = this.ready && !this.ready() && at.getHours() < this.hour + 1;
+      if ((!last || last.date !== this.today()) && at.getHours() >= this.hour && !waiting) await this.generate("deployer");
       const current = this.latest();
       if (current?.state === "writing" && current.session && this.oma) {
         const outcome = sessionOutcome(await this.oma.events(current.session));

@@ -60,6 +60,8 @@ import { checkNginxUrl } from "./services/graph.ts";
 import { E2E_ID, E2eTraceSource } from "./services/trace/e2e-trace.ts";
 import { e2eImport, mountE2eTrace } from "./services/trace/e2e-routes.ts";
 import { mountFlows } from "./services/flow-routes.ts";
+import { mountAnalyses } from "./services/analysis-routes.ts";
+import type { Analyses } from "./services/analyses.ts";
 import type { ModelDeps } from "./services/flowmodel.ts";
 import { McpClient } from "./mcp-client.ts";
 import { readToken } from "./versions.ts";
@@ -122,6 +124,8 @@ export interface Dependencies {
   businessHooks?: import("./services/ops-routes.ts").BusinessHooks;
   /** Ops step 3b: the to-dos and analyses the overview and the service page show (opsReads(store); none without it). */
   pageSources?: PageSources;
+  /** Ops step 5 (A1): starting the AI's analyses (user-visit, Check now, flows feedback); none: the POSTs answer 503. */
+  analyses?: Analyses;
 }
 
 const reject = (c: Context, status: 400 | 401 | 403 | 404 | 409 | 429 | 503, code: string, message: string, details: string[] = []) =>
@@ -815,7 +819,8 @@ export function createApp({ config, store, sessions, observer, deployments, vers
   };
   const noTakeover = (c: Context) => reject(c, 503, "takeover/off", "Taking over services is not set up in this Deployer.");
   // Ops step 3b (§10.2.2 #1, #2, #8): the services overview, a service's page, a business's detail (before /api/services/:id).
-  mountPages(api, { store, executor: (host) => handoff.executor(host, "service"), authenticate, reject, ...(deps.pageSources ? { sources: deps.pageSources } : {}) });
+  mountPages(api, { store, executor: (host) => handoff.executor(host, "service"), authenticate, reject, ...(deps.pageSources ? { sources: deps.pageSources } : {}),
+    ...(deps.analyses ? { visit: (seen, by) => deps.analyses!.visit(seen, by), view: (a) => deps.analyses!.view(a) } : {}) });
   api.get("/api/services", async (c) => {
     const p = await authenticate(c, "view");
     if (p instanceof Response) return p;
@@ -1315,7 +1320,10 @@ export function createApp({ config, store, sessions, observer, deployments, vers
   // pages-rethink §10.2 step 2: the business model v2 and its gate (run_model / publish_model, registered as MCP verbs
   // in step 4), the flows page and a person's actions on a business. The gate's to-dos wait for step 4's table.
   const flowModelDeps: ModelDeps = { store, e2e: (id) => e2eImport(e2eTrace)(id), todos: todoSink(store) };
-  mountFlows(api, { store, model: flowModelDeps, authenticate, reject, registered: registeredService, actorOf });
+  mountFlows(api, { store, model: flowModelDeps, authenticate, reject, registered: registeredService, actorOf,
+    ...(deps.analyses ? { feedback: (f, services, kind, note, by) => deps.analyses!.feedback(f, services, kind, note, by) } : {}) });
+  // §10.2.2 #3, #4, #5 (step 5): Look again now, Check now, following an analysis.
+  mountAnalyses(api, { store, ...(deps.analyses ? { analyses: deps.analyses } : {}), authenticate, reject, registered: registeredService });
   // §10.2 step 4: the routes behind the MCP verbs (describe, the model, record, look's extra kinds) and the to-do buttons.
   mountOps(api, {
     store, executor: (host) => handoff.executor(host, "service"), model: flowModelDeps, flowSearch: (id, q) => provenance.flowSearch(id, q),

@@ -189,6 +189,15 @@ export function parseRecord(service: string, body: unknown): RecordInput {
   return { service, analysisId, analysis, todos, resolve };
 }
 
+/** A scheduled check-up's services make one round: the newest round when it is a schedule's, under 2 hours old and
+ *  without this service yet; otherwise a new one. */
+export function scheduleRun(store: Store, service: string, now: number): string {
+  const last = store.analysisRun();
+  const first = last.length ? last.reduce((x, y) => (x.startedAt <= y.startedAt ? x : y)) : null;
+  if (first && first.run && first.trigger === "schedule" && now - Date.parse(first.startedAt) < 2 * 3_600_000 && !last.some((a) => a.service === service)) return first.run;
+  return `sch-${new Date(now).toISOString().replace(/[-:.]/g, "")}`;
+}
+
 export interface RecordContext {
   store: Store; actor: Actor;
   /** P5: "todos" for the Deploy Assistant's key (to-dos only, source chat); "full" for the check-up's key and an administrator. */
@@ -219,13 +228,15 @@ export function record(ctx: RecordContext, input: RecordInput): RecordResult {
     let analysis: number | null = null;
     if (input.analysis) {
       const body = redactStrings(input.analysis);
-      const running = target ?? store.analyses(service, 5).find((a) => a.state === "running") ?? null;
+      // Step 5: the scheduled check-up has no ids (OMA opened its session); it never fills another start's running row.
+      const running = target ?? (input.analysis.trigger === "schedule" ? null : store.analyses(service, 5).find((a) => a.state === "running") ?? null);
       if (running) {
         store.setAnalysis({ id: running.id, state: "done", session: running.session, finishedAt: now, body, error: null });
         analysis = running.id;
       } else {
         const l = ctx.lights();
-        analysis = store.addAnalysis({ service, run: null, trigger: input.analysis.trigger, state: "done", session: null, requestedBy: actor.id, startedAt: now, finishedAt: now, machineLight: l.machine, businessLight: l.business, body, error: null });
+        const run = input.analysis.trigger === "schedule" ? scheduleRun(store, service, Date.parse(now)) : null;
+        analysis = store.addAnalysis({ service, run, trigger: input.analysis.trigger, state: "done", session: null, requestedBy: actor.id, startedAt: now, finishedAt: now, machineLight: l.machine, businessLight: l.business, body, error: null });
       }
       // B4: the AI's stuck times, unless a person set them.
       for (const s of input.analysis.stuckSuggestions ?? []) {

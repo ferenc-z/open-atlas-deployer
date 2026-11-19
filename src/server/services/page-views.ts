@@ -61,12 +61,15 @@ export interface PageSources {
   };
 }
 
-/** Step 4's tables as the pages read them. */
-export function opsPageSources(store: Store): PageSources {
+/** Step 4's tables as the pages read them; step 5's next scheduled check-up (checkup-schedule.ts) when given. */
+export function opsPageSources(store: Store, nextCheckAt?: () => string | null): PageSources {
   const reads = opsReads(store);
   return {
     todos: { open: (service) => reads.todos(service) },
-    analyses: { latest: (service, lights) => reads.analysis(service, lights), lastCheckup: () => reads.lastCheckup(), running: () => reads.running() },
+    analyses: {
+      latest: (service, lights) => reads.analysis(service, lights), lastCheckup: () => reads.lastCheckup(), running: () => reads.running(),
+      ...(nextCheckAt ? { nextCheckAt: () => { const n = nextCheckAt(); return n && Date.parse(n) > Date.now() ? n : null; } } : {}),
+    },
   };
 }
 

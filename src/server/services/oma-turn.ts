@@ -42,9 +42,9 @@ export async function openTurn(oma: Pick<OmaSessions, "open">, title: string, ke
   try { return { session: await oma.open(title.slice(0, 200), key, text) }; } catch (error) { return { error: `Could not start the session: ${(error as Error).message}` }; }
 }
 
-/** One look at a running turn: done (with the answer's text), failed, or still running; late after TURN_TIMEOUT_MS. */
-export async function pollTurn(oma: Pick<OmaSessions, "events">, session: string, asked: number, startedAt: string, now = Date.now()): Promise<{ state: "running" } | { state: "done"; text: string } | { state: "failed"; error: string }> {
-  const late = now - Date.parse(startedAt) > TURN_TIMEOUT_MS;
+/** One look at a running turn: done (with the answer's text), failed, or still running; late after timeoutMs. */
+export async function pollTurn(oma: Pick<OmaSessions, "events">, session: string, asked: number, startedAt: string, now = Date.now(), timeoutMs = TURN_TIMEOUT_MS): Promise<{ state: "running" } | { state: "done"; text: string } | { state: "failed"; error: string }> {
+  const late = now - Date.parse(startedAt) > timeoutMs;
   try {
     const o = turnOutcome(await oma.events(session), asked);
     if (o.error) return { state: "failed", error: `OMA session error: ${o.error}` };
@@ -52,5 +52,5 @@ export async function pollTurn(oma: Pick<OmaSessions, "events">, session: string
   } catch (error) {
     if (late) return { state: "failed", error: (error as Error).message };
   }
-  return late ? { state: "failed", error: "No answer after 10 minutes" } : { state: "running" };
+  return late ? { state: "failed", error: `No answer after ${Math.round(timeoutMs / 60_000)} minutes` } : { state: "running" };
 }
