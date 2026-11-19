@@ -51,10 +51,10 @@ test("the ZooKeeper rule counts nifi-app.log's summary as well as the bulletins"
   const zk = (key: string, at: string, count: number, more = {}) => pattern(key, at, { level: "ERROR", logger: "o.a.z.ClientCnxn", template: "Session <hex> for server localhost/<ip>:<n>, Closing socket connection", count, ...more });
   ingest(store, [sample(KEY1, "2026-11-06T12:06:00Z", [zk("bbbbbbbbbbbbbbbb", "2026-11-06T12:05:50Z", 2), pattern("cccccccccccccccc", "2026-11-06T12:05:50Z", { level: "INFO", template: "zookeeper fine", count: 50 })])]);
   check(store, () => online, "c250", now.t);
-  assert.equal(store.serviceAlerts({ service: "c250", state: "open" }).filter((a) => a.rule === "zk-errors").length, 0, "2 of 3; INFO does not count");
+  assert.equal(store.serviceAlerts({ service: "c250", state: "open" }).filter((a) => a.rule === "coordinator").length, 0, "2 of 3; INFO does not count");
   ingest(store, [sample(KEY2, "2026-11-06T12:06:05Z", [zk("dddddddddddddddd", "2026-11-06T12:06:01Z", 1, { logger: "o.a.n.c.l.e.CuratorLeaderElectionManager", template: "Failed to ..." })])]);
   check(store, () => online, "c250", now.t);
-  const open = store.serviceAlerts({ service: "c250", state: "open" }).find((a) => a.rule === "zk-errors");
+  const open = store.serviceAlerts({ service: "c250", state: "open" }).find((a) => a.rule === "coordinator");
   assert.ok(open, "3 ZooKeeper messages in the log open it");
   assert.deepEqual([open.detail.count, open.detail.log, open.detail.bulletins], [3, 3, 0]);
 });
@@ -64,7 +64,7 @@ test("step 14b: what NiFi logs of ZooKeeper while a change runs (forming and the
   const store = lab(now);
   const online: ExecutorInfo = { online: true, host: "local", ageSeconds: 5, heartbeat: { collector: { seconds: 30 } } as never };
   const zk = (key: string, at: string, count: number) => pattern(key, at, { level: "ERROR", logger: "o.a.z.ClientCnxn", template: "Session <hex> for server localhost/<ip>:<n>, Closing socket connection", count });
-  const open = () => store.serviceAlerts({ service: "c250", state: "open" }).find((a) => a.rule === "zk-errors");
+  const open = () => store.serviceAlerts({ service: "c250", state: "open" }).find((a) => a.rule === "coordinator");
   store.createServiceChange({ id: "chg-1", service: "c250", kind: "apply", revision: 1, mode: "full", phase: "gate", plan: {}, options: {}, reason: null, progress: {}, text: "x" }, admin);
   now.t = new Date("2026-11-06T12:04:00Z");
   store.updateServiceChange("chg-1", { state: "succeeded", phase: "done", currentMember: null, message: null, finishedAt: now.t.toISOString(), progress: {} });

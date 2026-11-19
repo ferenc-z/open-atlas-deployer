@@ -60,6 +60,8 @@ const FOCUS: Record<string, CardKind> = {
   "process-down": "process", "node-disconnected": "process", "no-samples": "process", "executor-lost": "process", "no-coordinator": "process",
   "error-bulletins": "bulletins", "zk-errors": "logs", "heap": "metrics", "repo-disk": "metrics", "backpressure": "metrics",
   "collection-incomplete": "metrics", "preventive-risk": "metrics", "config-drift": "changes", "version-mismatch": "changes", "cert-expiry": "changes",
+  // Step 3a (C1): the six checks.
+  process: "process", collection: "process", coordinator: "logs", disk: "metrics", certificate: "changes",
 };
 const WEIGHT: Record<Weight, number> = { high: 0, medium: 1, low: 2, none: 3 };
 const iso = (ms: number) => new Date(ms).toISOString().replace(".000Z", "Z");
@@ -141,7 +143,7 @@ function processCard(c: Ctx): EvidenceCard {
   const known = new Set<string>();
   for (const e of events) {
     const rule = String(e.detail.rule ?? "");
-    const alert = (e.kind === "alert-opened" || e.kind === "alert-resolved") && (rule === "process-down" || rule === "node-disconnected" || rule === "no-samples");
+    const alert = (e.kind === "alert-opened" || e.kind === "alert-resolved") && (rule === "process-down" || rule === "node-disconnected" || rule === "no-samples" || rule === "process" || rule === "collection");
     if (!PROCESS_EVENTS.has(e.kind) && !alert) continue;
     if (e.kind === "process-restarted" && e.member) known.add(`${e.member}\0${String(e.detail.startedAt ?? e.at)}`);
     items.push({ at: e.at, member: e.member, memberLabel: e.member ? c.label(e.member) : null, text: String(e.detail.text ?? e.kind), raw: [JSON.stringify({ kind: e.kind, ...e.detail })], detail: { kind: e.kind } });
