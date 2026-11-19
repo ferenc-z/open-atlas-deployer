@@ -504,18 +504,18 @@ async function tool(t: T, key: string, name: string, args: Record<string, unknow
 const AI = "dps_assistant";
 let requestId = 0;
 const draftTool = (t: T, id: string, changes: unknown[], key = AI, extra: Record<string, unknown> = {}) =>
-  tool(t, key, "draft_service_config", { id, changes, note: "As asked", request_id: `r${++requestId}`, ...extra });
+  tool(t, key, "draft_change", { service: id, changes, note: "As asked", request_id: `r${++requestId}`, ...extra });
 const openDrafts = (t: T, service: string) => t.store.serviceConfigDrafts(service, "open");
 
 for (const name of ["uat", "prod"]) {
-  test(`draft_service_config in ${name.toUpperCase()}: the service key makes a draft, a person saves it`, async () => {
+  test(`draft_change in ${name.toUpperCase()}: the service key makes a draft, a person saves it`, async () => {
     const t = setup(name);
     takenOver(t.store);
     const listed = await (await t.call("POST", "/mcp", { key: AI }, { jsonrpc: "2.0", id: 1, method: "tools/list" })).json() as any;
-    const entry = listed.result.tools.find((x: { name: string }) => x.name === "draft_service_config");
+    const entry = listed.result.tools.find((x: { name: string }) => x.name === "draft_change");
     assert.equal(entry.annotations.readOnlyHint, false);
     assert.equal(entry.annotations.destructiveHint, false);
-    for (const n of ["list_service_changes", "get_service_change", "get_service_drift"]) assert.equal(listed.result.tools.find((x: { name: string }) => x.name === n)?.annotations.readOnlyHint, true, n);
+    for (const n of ["look"]) assert.equal(listed.result.tools.find((x: { name: string }) => x.name === n)?.annotations.readOnlyHint, true, n);
     assert.ok(!listed.result.tools.some((x: { name: string }) => /save|apply|restart/.test(x.name) && /service/.test(x.name)), "no tool saves or applies a service's configuration");
 
     const made = await draftTool(t, "solo", [BANNER]);
@@ -541,8 +541,8 @@ for (const name of ["uat", "prod"]) {
     assert.equal(saved.status, 201, "a person does");
     assert.equal((await saved.json()).revision, 2);
 
-    const again = await tool(t, AI, "draft_service_config", { id: "solo", changes: [BANNER], note: "x", request_id: "same" });
-    const retry = await tool(t, AI, "draft_service_config", { id: "solo", changes: [BANNER], note: "x", request_id: "same" });
+    const again = await tool(t, AI, "draft_change", { service: "solo", changes: [BANNER], note: "x", request_id: "same" });
+    const retry = await tool(t, AI, "draft_change", { service: "solo", changes: [BANNER], note: "x", request_id: "same" });
     assert.equal(retry.value.draft, again.value.draft, "a retry does not make a second draft");
     assert.equal(openDrafts(t, "solo").length, 1);
 
@@ -551,7 +551,7 @@ for (const name of ["uat", "prod"]) {
     else assert.equal(personal.isError, false);
   });
 
-  test(`draft_service_config in ${name.toUpperCase()}: it cannot touch a secret, in any form, and nothing is drafted`, async () => {
+  test(`draft_change in ${name.toUpperCase()}: it cannot touch a secret, in any form, and nothing is drafted`, async () => {
     const t = setup(name);
     takenOver(t.store);
     const P = "nifi.properties", X = "authorizers.xml";
@@ -593,7 +593,7 @@ for (const name of ["uat", "prod"]) {
   });
 }
 
-test("draft_service_config on a cluster: common layer and one node, restart or whole cluster, no revision and no secret labels", async () => {
+test("draft_change on a cluster: common layer and one node, restart or whole cluster, no revision and no secret labels", async () => {
   const t = setup();
   takenOver(t.store);
   // A person made the nodes' sensitive key differ: the page's finding has labels for it, the AI's has none.
@@ -622,38 +622,38 @@ test("draft_service_config on a cluster: common layer and one node, restart or w
   assert.equal(t.store.serviceConfig("flow")!.revision, revision, "drafts make no revision, not even the first split");
 });
 
-test("diff_service_config compares two revisions for the AI: a changed secret by name, a password in a comment hidden; the node comparison stays", async () => {
+test("look kind config-diff compares two revisions for the AI: a changed secret by name, a password in a comment hidden; the node comparison stays", async () => {
   const t = setup();
   takenOver(t.store);
   const made = await (await t.call("POST", "/api/services/solo/config/drafts", { as: "uat" }, { changes: [BANNER, { file: "nifi.properties", key: "nifi.security.keystorePasswd", secret: "new-pass" }, { file: "authorizers.xml", text: `<!-- password=comment-s3cret -->\n${AUTH("(hidden)")}` }] })).json();
   assert.equal((await t.call("POST", `/api/services/solo/config/drafts/${made.id}/save`, { as: "uat" }, {})).status, 201);
 
-  const diff = await tool(t, AI, "diff_service_config", { id: "solo", to: 2 });
+  const diff = await tool(t, AI, "look", { service: "solo", kind: "config-diff", base: 1, revision: 2 });
   assert.equal(diff.isError, false, diff.text);
-  assert.equal(diff.value.from, 1);
-  assert.equal(diff.value.to, 2);
-  const files = diff.value.members[0].files as { name: string; diff: string; secretsChanged: string[] }[];
+  assert.equal(diff.value.data.from, 1);
+  assert.equal(diff.value.data.to, 2);
+  const files = diff.value.data.members[0].files as { name: string; diff: string; secretsChanged: string[] }[];
   assert.deepEqual(files.find((f) => f.name === "nifi.properties")!.secretsChanged, ["nifi.security.keystorePasswd"]);
   assert.match(files.find((f) => f.name === "nifi.properties")!.diff, /banner\.text=hello/);
   assert.match(files.find((f) => f.name === "authorizers.xml")!.diff, /password=\[hidden\]/);
   assert.doesNotMatch(diff.text, LEAK);
   assert.doesNotMatch(diff.text, /[0-9a-f]{64}/, "no hashes");
-  assert.equal((await tool(t, AI, "diff_service_config", { id: "solo", from: 1, to: 2, member: "local:/nope" })).value.finding.code, "config/unknown-member");
-  assert.equal((await tool(t, AI, "diff_service_config", { id: "solo", from: 9 })).value.finding.code, "service-config/none");
-  const nodes = await tool(t, AI, "diff_service_config", { id: "flow" });
-  assert.equal(nodes.value.kind, "cluster");
-  assert.match((await tool(t, AI, "diff_service_config", { id: "solo" })).value.note, /from or to/);
+  assert.equal((await tool(t, AI, "look", { service: "solo", kind: "config-diff", base: 1, revision: 2, member: "local:/nope" })).value.finding.code, "config/unknown-member");
+  assert.equal((await tool(t, AI, "look", { service: "solo", kind: "config-diff", base: 9 })).value.finding.code, "service-config/none");
+  const nodes = await tool(t, AI, "look", { service: "flow", kind: "config-diff" });
+  assert.equal(nodes.value.data.kind, "cluster");
+  assert.match((await tool(t, AI, "look", { service: "solo", kind: "config-diff" })).value.data.note, /base/);
 });
 
 test("the read tools for what comes later: no change made yet, drift not known yet", async () => {
   const t = setup();
   takenOver(t.store);
-  const list = await tool(t, AI, "list_service_changes", { id: "solo" });
-  assert.deepEqual(list.value.changes, []);
-  assert.equal(list.value.active, null);
-  assert.equal((await tool(t, AI, "get_service_change", { id: "solo", change: "x" })).value.finding.code, "service-change/unknown");
-  assert.equal((await tool(t, AI, "get_service_drift", { id: "solo" })).value.known, false, "no samples yet: not known");
-  for (const name of ["list_service_changes", "get_service_drift"]) assert.equal((await tool(t, AI, name, { id: "nope" })).value.finding.code, "service/unknown");
+  const list = await tool(t, AI, "look", { service: "solo", kind: "changes" });
+  assert.deepEqual(list.value.data.changes, []);
+  assert.equal(list.value.data.active, null);
+  assert.equal((await tool(t, AI, "look", { service: "solo", kind: "changes", query: "x" })).value.finding.code, "service-change/unknown");
+  assert.equal((await tool(t, AI, "look", { service: "solo", kind: "drift" })).value.data.known, false, "no samples yet: not known");
+  for (const kind of ["changes", "drift"]) assert.equal((await tool(t, AI, "look", { service: "nope", kind })).value.finding.code, "service/unknown");
   assert.equal((await t.call("GET", "/api/services/solo/drift", {})).status, 401);
 });
 
@@ -918,13 +918,13 @@ test("a changed file: the alert and the timeline name it, the differences hide i
   assert.doesNotMatch(JSON.stringify(left), /s3cret/);
 
   // The AI: the same, without a hash.
-  const ai = await tool(t, AI, "get_service_drift", { id: "solo", member: SOLO });
-  assert.equal(ai.value.drifted, true);
-  assert.deepEqual(ai.value.differences.files[0].secretsChanged.sort(), ["nifi.extra.password", "nifi.security.keystorePasswd"]);
+  const ai = await tool(t, AI, "look", { service: "solo", kind: "drift", member: SOLO });
+  assert.equal(ai.value.data.drifted, true);
+  assert.deepEqual(ai.value.data.differences.files[0].secretsChanged.sort(), ["nifi.extra.password", "nifi.security.keystorePasswd"]);
   assert.doesNotMatch(ai.text, HEX);
   assert.doesNotMatch(ai.text, LEAK);
-  assert.doesNotMatch((await tool(t, AI, "get_service_drift", { id: "solo" })).text, HEX);
-  assert.equal((await tool(t, AI, "get_service_drift", { id: "solo", member: "local:/nope" })).value.finding.code, "config/unknown-member");
+  assert.doesNotMatch((await tool(t, AI, "look", { service: "solo", kind: "drift" })).text, HEX);
+  assert.equal((await tool(t, AI, "look", { service: "solo", kind: "drift", member: "local:/nope" })).value.finding.code, "config/unknown-member");
 });
 
 test("adopting: who may, the same content as was shown, a new revision, nothing written, and the alert closes", async () => {

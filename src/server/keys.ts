@@ -2,14 +2,19 @@
 // their Workbench account, and every call asks Workbench again whether that account is still enabled and in which
 // Groups; it may do what its owner does on the page, minus PROD execution, overriding promotion and revealing
 // secrets, which take a browser session. A service key (dps_) is made by an administrator for the Deploy Assistant
-// in OMA's Vault: read-only, no person behind it. Only the SHA-256 is kept; a key never makes a key.
+// in OMA's Vault: read-only, no person behind it. A check-up key (dpc_, pages-rethink §10.2.3) is made the same way for
+// the scheduled check-up agent (A1, P7): like the service key it has no person behind it, and it may also write
+// analyses back (record) but never draft a change. Only the SHA-256 is kept; a key never makes a key.
 
 import { randomBytes } from "node:crypto";
 import { permissionsFor, sha256, type Principal } from "./auth.ts";
 import type { WorkbenchAdmin } from "./drivers/workbench.ts";
 import type { Store } from "./store.ts";
 
-export type KeyKind = "personal" | "service";
+export type KeyKind = "personal" | "service" | "checkup";
+/** The bearer prefixes the Deployer takes as API keys. */
+export const KEY_PATTERN = /^dp[ksc]_/;
+const PREFIX: Record<KeyKind, string> = { personal: "dpk", service: "dps", checkup: "dpc" };
 
 export interface ApiKey {
   id: string;
@@ -46,12 +51,12 @@ export class Keys {
 
   create(p: Principal, kind: KeyKind, name: string, days: number): { key: string; record: ApiKey } {
     if (p.via !== "workbench") throw new KeyError(403, "key/browser-only", "API keys can only be created on the page while signed in with Workbench, not with another key.");
-    if (kind === "service" && !p.isAdmin) throw new KeyError(403, "key/forbidden", "Only Workbench admins can create service keys.");
+    if (kind !== "personal" && !p.isAdmin) throw new KeyError(403, "key/forbidden", `Only Workbench admins can create ${kind === "checkup" ? "check-up" : "service"} keys.`);
     if (kind === "personal" && !p.permissions.includes("view")) throw new KeyError(403, "key/forbidden", "You are not in any deploy group, so you cannot create a key.");
     const label = name.trim();
     if (!label || label.length > 80) throw new KeyError(400, "key/name", "A key name is 1 to 80 characters.");
     if (!Number.isInteger(days) || days < 1 || days > 365) throw new KeyError(400, "key/expiry", "Expiry is 1 to 365 days.");
-    const key = `${kind === "personal" ? "dpk" : "dps"}_${randomBytes(32).toString("base64url")}`;
+    const key = `${PREFIX[kind]}_${randomBytes(32).toString("base64url")}`;
     const id = `key_${randomBytes(8).toString("hex")}`;
     const record = this.store.addKey({ id, kind, name: label, prefix: key.slice(0, 12), sha256: sha256(key), owner: p.id, expiresAt: new Date(this.now() + days * 86_400_000).toISOString() }, { id: p.id, via: "workbench" });
     return { key, record };
@@ -66,7 +71,7 @@ export class Keys {
     // D38: an administrator's own key may revoke keys too (revoking only takes access away); making one stays on the page.
     if (p.via !== "workbench" && !(p.via === "key" && p.isAdmin)) throw new KeyError(403, "key/browser-only", "Keys are revoked on the page.");
     const k = this.store.listKeys().find((x) => x.id === id);
-    if (!k || (!p.isAdmin && k.owner !== p.id) || (k.kind === "service" && !p.isAdmin)) throw new KeyError(404, "key/unknown", "No such key.");
+    if (!k || (!p.isAdmin && k.owner !== p.id) || (k.kind !== "personal" && !p.isAdmin)) throw new KeyError(404, "key/unknown", "No such key.");
     this.store.revokeKey(id, { id: p.id, via: p.via });
   }
 
@@ -76,14 +81,15 @@ export class Keys {
     if (!k || k.revokedAt) throw new KeyError(401, "key/invalid", "The API key is wrong or revoked.");
     if (Date.parse(k.expiresAt) <= this.now()) throw new KeyError(401, "key/expired", "The API key has expired.");
     this.store.touchKey(k.id);
-    if (k.kind === "service") {
-      return { id: `service:${k.name}`, displayName: `Service key ${k.name}`, via: "service", groups: [], isAdmin: false, permissions: ["view"], csrfToken: "", keyId: k.id };
+    if (k.kind === "service" || k.kind === "checkup") {
+      const checkup = k.kind === "checkup";
+      return { id: `${checkup ? "checkup" : "service"}:${k.name}`, displayName: `${checkup ? "Check-up" : "Service"} key ${k.name}`, via: "service", keyKind: k.kind, groups: [], isAdmin: false, permissions: ["view"], csrfToken: "", keyId: k.id };
     }
     let owner: Awaited<ReturnType<WorkbenchAdmin["person"]>>;
     try { owner = await this.workbench.person(k.owner); } catch (error) { throw new KeyError(503, "key/workbench-unavailable", `Cannot confirm the key's owner with Workbench: ${(error as Error).message}`); }
     if (!owner?.enabled) throw new KeyError(401, "key/owner-disabled", "The key's owner is disabled or missing in Workbench.");
     const permissions = permissionsFor(owner.groups, owner.isAdmin);
     if (!permissions.includes("view")) throw new KeyError(403, "auth/forbidden", "The key's owner is no longer in any deploy group.");
-    return { id: owner.email, displayName: owner.displayName || owner.email, via: "key", groups: owner.groups, isAdmin: owner.isAdmin, permissions, csrfToken: "", keyId: k.id };
+    return { id: owner.email, displayName: owner.displayName || owner.email, via: "key", keyKind: "personal", groups: owner.groups, isAdmin: owner.isAdmin, permissions, csrfToken: "", keyId: k.id };
   }
 }

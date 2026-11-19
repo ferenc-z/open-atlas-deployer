@@ -5,6 +5,29 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
 
 ## Unreleased
 
+- Ops step 4 (pages-rethink §9.1 C3, §10.2.3): the managed-service MCP is seven verbs — `describe` (the machine and
+  business lights, the businesses, open to-dos, the newest AI analysis, the model's gaps, each with the verb that fixes
+  it), `look` (raw data by `kind`: metrics, logs, provenance, lineage, event, bulletins, queues, members, topology,
+  flow-counts, events, evidence, components, config, config-diff, drift, changes, property, model), `trace`,
+  `run_model`, `publish_model`, `record` (the AI's analysis and to-dos, a to-do with at most one suggested action) and
+  `draft_change` (was `draft_service_config`). The 22 old service tools are gone (`list_service_clusters`,
+  `get_cluster_status`, `get_metrics`, `list_alerts`, `list_events`, `get_bulletins`, `search_logs`, `tail_logs`,
+  `search_provenance`, `get_lineage`, `get_provenance_event`, `get_service_config`, `diff_service_config`,
+  `draft_service_config`, `list_service_changes`, `get_service_change`, `get_service_drift`, `lookup_property`,
+  `get_service_health`, `investigate_service`, `list_service_cases`, `trace_business_data`). A new key kind, the
+  check-up's `dpc_` (made by an administrator, `POST /api/keys {kind: "checkup"}`), sees the verbs but not
+  `draft_change`; the Assistant's `dps_` may also `publish_model` and `record` to-dos (only to-dos); for a personal key
+  both are for administrators. New tables `service_todos` and `service_analyses`; the gate's to-dos go to
+  `service_todos`; `POST /api/todos/:todo/state` and `POST /api/todos/:todo/draft` (a to-do's change drafted as the
+  person). `POST trace-business-data` is now `POST /api/services/:id/trace`. The cases are gone (their five routes, the
+  CRIT alerts' own analysis; `service_cases` is kept but no longer used).
+- [ ] OMA: republish the Deploy Assistant (allowed tools: the deploy and assessment tools plus `describe`, `look`,
+  `trace`, `run_model`, `publish_model`, `record`, `draft_change`; prompt without the "Service case" and "Clue from a
+  sentence" sections; Skill `nifi-ops` new version, rewritten for the seven verbs), then point `DEPLOYER_OMA_AGENT` and
+  the Workbench Business Agent "Deploy Assistant" at the new agent.
+- [ ] OMA: create the Service Check-up agent (`bin/publish-assistant.ts … service-checkup`, prompt
+  `agents/service-checkup.md`, template `templates/service-checkup.oma.json`, Skill `nifi-ops`) with a `dpc_` key in its
+  Vault; ops step 5 schedules it.
 - S37 step 9 (Q4, S9): "Let the AI analyse" on the Investigate and Data trace tabs sends the page's result (the
   investigation worked out again compact and redacted; the trace answer trimmed and redacted) to the Deploy Assistant
   in a background OMA session; the answer comes in three parts (likely cause, evidence, next steps) and the person can

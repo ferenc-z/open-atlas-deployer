@@ -1,0 +1,29 @@
+{
+  "name": "deployer-checkup",
+  "display_name": "Service Check-up",
+  "description": "Open Atlas Deployer's scheduled check-up of the managed NiFi services: reads their lights and data through the Deployer's MCP verbs, keeps the business model right through its gate, and writes the analysis and to-dos back.",
+  "agents": [
+    {
+      "key": "checkup",
+      "name": "Service Check-up",
+      "model": "{{model}}",
+      "harness": "default",
+      "system": "{{system}}",
+      "mcp_servers": [
+        {
+          "name": "open-atlas-deployer",
+          "type": "http",
+          "url": "{{mcpUrl}}",
+          "allowed_tools": ["describe", "look", "trace", "run_model", "publish_model", "record"]
+        }
+      ],
+      "tools": [
+        { "type": "agent_toolset_20260401", "default_config": { "enabled": false } },
+        { "type": "mcp_toolset", "mcp_server_name": "open-atlas-deployer", "default_config": { "permission_policy": { "type": "always_allow" } } }
+      ]
+    }
+  ],
+  "credential_requirements": [
+    { "key": "deployer-checkup-key", "description": "The Deployer's check-up key (dpc_), stored for the MCP URL above: reads, publishes the business model through its gate, writes analyses and to-dos; never drafts a change.", "required_scopes": ["read"] }
+  ]
+}

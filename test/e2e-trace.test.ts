@@ -280,7 +280,8 @@ test("e2e_trace routes: an admin sets the Graph and token (sealed), viewers read
   const again = await publishModel(deps, { service: "c250", base: 1, actor: ai, note: "move", model: { ...stored.model, segments: stored.model.segments.map((s) => ({ ...s, steps: [{ id: "x", name: "x", position: { kind: "worker", id: "x" } }], entries: [{ id: "e", step: "x", channel: { type: "external", system: "x" } }] })) } });
   assert.equal(again.verdict, "published");
   assert.deepEqual(store.flowModel("c250")!.model.segments[0]!.steps.map((x) => x.id), WORKERS);
-  const traced = await call("POST", "/api/services/c250/trace-business-data", { fileName: "INV-B-001.pdf", from: ago(86400), to: NOW.toISOString() }, "viewer");
+  assert.equal((await call("POST", "/api/services/c250/trace-business-data", { fileName: "x" }, "viewer")).status, 404, "taken over by POST trace (ops step 4)");
+  const traced = await call("POST", "/api/services/c250/trace", { fileName: "INV-B-001.pdf", from: ago(86400), to: NOW.toISOString() }, "viewer");
   assert.equal(traced.body.traces[0].verdict.kind, "failed");
 
   assert.equal((await call("DELETE", "/api/services/c250/trace-sources/e2e_trace")).body.e2e_trace, null);

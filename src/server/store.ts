@@ -16,10 +16,9 @@ import type { ServiceConfigBody } from "./services/config.ts";
 import type { ConfigFinding } from "./services/configcheck.ts";
 import type { DraftChange } from "./services/configedit.ts";
 import type { ConfigReview } from "./services/configreview.ts";
-import type { ServiceCase } from "./services/cases.ts";
 import { randomBytes } from "node:crypto";
 import { migrateV1, type ModelV2 } from "./services/trace/model.ts";
-import type { FlowStatus, GateVerdict } from "./services/ops-types.ts";
+import type { AnalysisState, AnalysisTrigger, FlowStatus, GateVerdict, Light, TodoAction, TodoSource, TodoState } from "./services/ops-types.ts";
 
 /** A business id (§10.2.4: flw_ + random). */
 export const newFlowId = () => `flw_${randomBytes(6).toString("hex")}`;
@@ -226,6 +225,20 @@ CREATE TABLE IF NOT EXISTS service_cases (
   id INTEGER PRIMARY KEY AUTOINCREMENT, service TEXT NOT NULL, kind TEXT NOT NULL, rule TEXT, alert_id INTEGER UNIQUE, state TEXT NOT NULL,
   requested_at TEXT NOT NULL, body TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS service_cases_service ON service_cases (service, rule, requested_at);
+-- pages-rethink §10.2.4 step 4: the AI's analyses (record) and the to-dos (record, the gate, a person). service_cases is
+-- no longer read or written (kept, not migrated: its rows belong to the removed cases feature).
+CREATE TABLE IF NOT EXISTS service_analyses (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, service TEXT NOT NULL, run TEXT,
+  trigger TEXT NOT NULL, state TEXT NOT NULL, session TEXT, requested_by TEXT NOT NULL,
+  started_at TEXT NOT NULL, finished_at TEXT, machine_light TEXT NOT NULL, business_light TEXT NOT NULL,
+  body TEXT, error TEXT);
+CREATE INDEX IF NOT EXISTS service_analyses_service ON service_analyses (service, started_at);
+CREATE TABLE IF NOT EXISTS service_todos (
+  id TEXT PRIMARY KEY, service TEXT NOT NULL, flow TEXT, source TEXT NOT NULL, key TEXT NOT NULL,
+  severity TEXT NOT NULL, title TEXT NOT NULL, detail TEXT NOT NULL, action TEXT,
+  state TEXT NOT NULL, analysis INTEGER, draft TEXT,
+  created_at TEXT NOT NULL, created_by TEXT NOT NULL, updated_at TEXT NOT NULL, closed_at TEXT, closed_by TEXT);
+CREATE UNIQUE INDEX IF NOT EXISTS service_todos_open ON service_todos (service, key) WHERE state = 'open';
 `;
 
 /** queued: waiting for the host's executor to claim it; the rest are the executor's states. */
@@ -1000,9 +1013,13 @@ export class Store {
   // Service ops §5.2, §6 (S4): takeover drafts, and the standalone instances and clusters they become when confirmed.
   // A draft is edited item by item while open; confirming (step 5) registers its items and closes it.
 
+  private txDepth = 0;
+  /** One transaction; work that opens another inside it joins this one. */
   private inTransaction<T>(work: () => T): T {
+    if (this.txDepth) return work();
     this.db.exec("BEGIN IMMEDIATE");
-    try { const result = work(); this.db.exec("COMMIT"); return result; } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    this.txDepth++;
+    try { const result = work(); this.db.exec("COMMIT"); return result; } catch (error) { this.db.exec("ROLLBACK"); throw error; } finally { this.txDepth--; }
   }
 
   private draftItems(draft: string): DraftItem[] {
@@ -1965,49 +1982,95 @@ export class Store {
     });
   }
 
-  // S37 step 9 (pages-rethink §4.4): cases — an AI analysis with the evidence it was given, the conversation after it and
-  // the outcome a person wrote. One per alert at most (alert_id is unique).
+  // pages-rethink §10.2.4 step 4: the to-dos (one open per service and key: the same key again updates it) and the AI's
+  // analyses. services/todos.ts decides; these only read and write.
 
-  /** A new case; undefined when the alert has one already. */
-  addServiceCase(c: Omit<ServiceCase, "id">): number | undefined {
-    const r = this.db.prepare("INSERT OR IGNORE INTO service_cases (service, kind, rule, alert_id, state, requested_at, body) VALUES (?, ?, ?, ?, ?, ?, ?)")
-      .run(c.service, c.kind, c.rule, c.alertId, c.state, c.requestedAt, JSON.stringify(c));
-    return Number(r.changes) ? Number(r.lastInsertRowid) : undefined;
-  }
-
-  serviceCase(id: number): ServiceCase | null {
-    const r = this.db.prepare("SELECT id, body FROM service_cases WHERE id = ?").get(id) as Row | undefined;
-    return r ? { ...parse(r.body), id: r.id } : null;
-  }
-
-  setServiceCase(c: ServiceCase) {
-    this.db.prepare("UPDATE service_cases SET state = ?, body = ? WHERE id = ?").run(c.state, JSON.stringify(c), c.id);
-  }
-
-  /** Cases newest first: of a service, a rule, a kind, an alert, requested since. */
-  serviceCases(o: { service?: string; rule?: string; kind?: string; alertIds?: number[]; since?: string; limit?: number } = {}): ServiceCase[] {
-    const where = ["1 = 1"], args: (string | number)[] = [];
-    if (o.service) { where.push("service = ?"); args.push(o.service); }
-    if (o.rule) { where.push("rule = ?"); args.push(o.rule); }
-    if (o.kind) { where.push("kind = ?"); args.push(o.kind); }
-    if (o.alertIds) { if (!o.alertIds.length) return []; where.push(`alert_id IN (${o.alertIds.map(() => "?").join(",")})`); args.push(...o.alertIds); }
-    if (o.since) { where.push("requested_at >= ?"); args.push(o.since); }
-    args.push(Math.min(500, Math.max(1, o.limit ?? 50)));
-    return (this.db.prepare(`SELECT id, body FROM service_cases WHERE ${where.join(" AND ")} ORDER BY requested_at DESC, id DESC LIMIT ?`).all(...args) as Row[]).map((r) => ({ ...parse(r.body), id: r.id }));
-  }
-
-  runningServiceCases(): ServiceCase[] {
-    return (this.db.prepare("SELECT id, body FROM service_cases WHERE state = 'running'").all() as Row[]).map((r) => ({ ...parse(r.body), id: r.id }));
-  }
-
-  /** A person's outcome of a case, audited. */
-  setServiceCaseOutcome(c: ServiceCase, actor: Actor) {
-    this.inTransaction(() => {
-      this.setServiceCase(c);
-      this.insertAudit(actor, "service.case-outcome", c.service, { case: c.id });
+  /** Opens a to-do, or updates the open one with the same service and key. */
+  upsertTodo(t: Pick<TodoRecord, "service" | "flow" | "source" | "key" | "severity" | "title" | "detail" | "action" | "analysis">, by: string): { id: string; created: boolean } {
+    return this.inTransaction(() => {
+      const at = this.stamp();
+      const was = this.db.prepare("SELECT id FROM service_todos WHERE service = ? AND key = ? AND state = 'open'").get(t.service, t.key) as Row | undefined;
+      const action = t.action ? JSON.stringify(t.action) : null;
+      if (was) {
+        this.db.prepare("UPDATE service_todos SET flow = ?, source = ?, severity = ?, title = ?, detail = ?, action = ?, analysis = COALESCE(?, analysis), updated_at = ? WHERE id = ?")
+          .run(t.flow, t.source, t.severity, t.title, t.detail, action, t.analysis, at, was.id);
+        return { id: was.id as string, created: false };
+      }
+      const id = `td_${randomBytes(6).toString("hex")}`;
+      this.db.prepare("INSERT INTO service_todos (id, service, flow, source, key, severity, title, detail, action, state, analysis, draft, created_at, created_by, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, NULL, ?, ?, ?)")
+        .run(id, t.service, t.flow, t.source, t.key, t.severity, t.title, t.detail, action, t.analysis, at, by, at);
+      return { id, created: true };
     });
   }
+
+  todo(id: string): TodoRecord | null {
+    const r = this.db.prepare("SELECT * FROM service_todos WHERE id = ?").get(id) as Row | undefined;
+    return r ? toTodo(r) : null;
+  }
+
+  /** A service's to-dos (open by default), oldest first. */
+  todos(service: string, state: TodoState | "all" = "open"): TodoRecord[] {
+    return (state === "all"
+      ? this.db.prepare("SELECT * FROM service_todos WHERE service = ? ORDER BY created_at, id").all(service)
+      : this.db.prepare("SELECT * FROM service_todos WHERE service = ? AND state = ? ORDER BY created_at, id").all(service, state)).map((r) => toTodo(r as Row));
+  }
+
+  /** Closes an open to-do (done or dismissed), audited; false when it is not open. */
+  closeTodo(id: string, state: "done" | "dismissed", actor: Actor): boolean {
+    return this.inTransaction(() => {
+      const at = this.stamp();
+      const r = this.db.prepare("UPDATE service_todos SET state = ?, closed_at = ?, closed_by = ?, updated_at = ? WHERE id = ? AND state = 'open'").run(state, at, actor.id, at, id);
+      if (!Number(r.changes)) return false;
+      this.insertAudit(actor, `service.todo.${state}`, id, {});
+      return true;
+    });
+  }
+
+  setTodoDraft(id: string, draft: string) { this.db.prepare("UPDATE service_todos SET draft = ?, updated_at = ? WHERE id = ?").run(draft, this.stamp(), id); }
+
+  addAnalysis(a: Omit<AnalysisRecord, "id">): number {
+    const r = this.db.prepare("INSERT INTO service_analyses (service, run, trigger, state, session, requested_by, started_at, finished_at, machine_light, business_light, body, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(a.service, a.run, a.trigger, a.state, a.session, a.requestedBy, a.startedAt, a.finishedAt, a.machineLight, a.businessLight, a.body === null || a.body === undefined ? null : JSON.stringify(a.body), a.error);
+    return Number(r.lastInsertRowid);
+  }
+
+  analysis(id: number): AnalysisRecord | null {
+    const r = this.db.prepare("SELECT * FROM service_analyses WHERE id = ?").get(id) as Row | undefined;
+    return r ? toAnalysis(r) : null;
+  }
+
+  /** A service's analyses, newest first (running ones included). */
+  analyses(service: string, limit = 1): AnalysisRecord[] {
+    return (this.db.prepare("SELECT * FROM service_analyses WHERE service = ? ORDER BY started_at DESC, id DESC LIMIT ?").all(service, Math.min(200, Math.max(1, limit))) as Row[]).map(toAnalysis);
+  }
+
+  /** An analysis's outcome (state, session, end, body, error). */
+  setAnalysis(a: Pick<AnalysisRecord, "id" | "state" | "session" | "finishedAt" | "body" | "error">) {
+    this.db.prepare("UPDATE service_analyses SET state = ?, session = ?, finished_at = ?, body = ?, error = ? WHERE id = ?")
+      .run(a.state, a.session, a.finishedAt, a.body === null || a.body === undefined ? null : JSON.stringify(a.body), a.error, a.id);
+  }
 }
+
+/** §10.2.4 step 4: one row of service_todos. */
+export interface TodoRecord {
+  id: string; service: string; flow: string | null; source: TodoSource; key: string; severity: "failing" | "attention";
+  title: string; detail: string; action: TodoAction | null; state: TodoState; analysis: number | null; draft: string | null;
+  createdAt: string; createdBy: string; updatedAt: string; closedAt: string | null; closedBy: string | null;
+}
+const toTodo = (r: Row): TodoRecord => ({
+  id: r.id, service: r.service, flow: r.flow ?? null, source: r.source, key: r.key, severity: r.severity, title: r.title, detail: r.detail,
+  action: parse(r.action ?? null), state: r.state, analysis: r.analysis ?? null, draft: r.draft ?? null,
+  createdAt: r.created_at, createdBy: r.created_by, updatedAt: r.updated_at, closedAt: r.closed_at ?? null, closedBy: r.closed_by ?? null,
+});
+/** §10.2.4 step 4: one row of service_analyses. body: record's analysis as it came (redacted). */
+export interface AnalysisRecord {
+  id: number; service: string; run: string | null; trigger: AnalysisTrigger; state: AnalysisState; session: string | null; requestedBy: string;
+  startedAt: string; finishedAt: string | null; machineLight: Light; businessLight: Light; body: unknown; error: string | null;
+}
+const toAnalysis = (r: Row): AnalysisRecord => ({
+  id: r.id, service: r.service, run: r.run ?? null, trigger: r.trigger, state: r.state, session: r.session ?? null, requestedBy: r.requested_by,
+  startedAt: r.started_at, finishedAt: r.finished_at ?? null, machineLight: r.machine_light, businessLight: r.business_light, body: parse(r.body ?? null), error: r.error ?? null,
+});
 
 /** What a registered standalone instance or cluster carries besides its draft shape. */
 export interface Registered { environment: string; draft: string | null; createdAt: string; createdBy: string; nginxUrl: string | null; nginxCheck: NginxCheck | null }

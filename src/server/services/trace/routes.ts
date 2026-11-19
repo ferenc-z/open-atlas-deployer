@@ -1,7 +1,7 @@
 // S37 step 5: the business data trace's HTTP side. The models are v2 (flow_models, ops step 2), written only through
 // publish_model (services/flowmodel.ts); GET trace-model and the e2e import route went with it (§10.2.5).
-// trace_business_data takes structured conditions and returns the engine's verdicts; evidence source adapters are
-// registered in app.ts.
+// POST /api/services/:id/trace (the MCP verb trace, ops step 4: it took over trace_business_data) takes structured
+// conditions and returns the engine's verdicts; evidence source adapters are registered in app.ts.
 
 import type { Context, Hono } from "hono";
 import type { Permission, Principal } from "../../auth.ts";
@@ -35,9 +35,15 @@ export const stuckSeconds = (store: Store) => (service: string, segment: string)
   return (flow && store.flow(flow)?.stuck?.attentionS) || undefined;
 };
 
-/** trace_business_data's input: {service, business?, fileName?, emailFrom?, emailSubject?, from?, to?}; the range defaults to the last 24 hours. */
-export function parseTraceQuery(service: string, body: unknown, now = new Date()): TraceQuery | { error: string } {
+/** trace's input: {flow? (a business id, flw_…) or business? (a segment id of the service's model), fileName?,
+ *  emailFrom?, emailSubject?, from?, to?}; the range defaults to the last 24 hours. A business starts at its first segment in this service. */
+export function parseTraceQuery(service: string, body: unknown, now = new Date(), segmentsOf: (flow: string) => string[] = () => []): TraceQuery | { error: string } {
   const b = (body && typeof body === "object" ? body : {}) as Record<string, unknown>;
+  if (b.flow !== undefined && b.flow !== null && b.flow !== "") {
+    const first = typeof b.flow === "string" ? segmentsOf(b.flow)[0] : undefined;
+    if (!first) return { error: `flow is a business of ${service} (an id describe gives).` };
+    if (!b.business) b.business = first;
+  }
   const to = b.to ? new Date(String(b.to)) : now;
   const from = b.from ? new Date(String(b.from)) : new Date(to.getTime() - DAY);
   if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime()) || from >= to) return { error: "from and to are ISO times, from before to (default: the last 24 hours)." };
@@ -61,13 +67,14 @@ export function mountTrace(api: Hono, d: TraceDeps) {
   const engine = new TraceEngine({ models: () => allModels(d.store), adapters: d.adapters, stuckContext: stuckContextFrom(d.store), stuckSeconds: stuckSeconds(d.store) });
   const unknown = (c: Context, id: string) => d.reject(c, 404, "service/unknown", `No standalone instance or cluster ${id}.`);
 
-  // trace_business_data (§4.2): the skeleton the page (step 8) and the MCP tool share.
-  api.post("/api/services/:id/trace-business-data", async (c) => {
+  // The MCP verb trace (§10.2.3).
+  api.post("/api/services/:id/trace", async (c) => {
     const p = await d.authenticate(c, "view");
     if (p instanceof Response) return p;
     const id = c.req.param("id");
     if (!d.registered(id)) return unknown(c, id);
-    const q = parseTraceQuery(id, await c.req.json().catch(() => ({})));
+    const segmentsOf = (flow: string) => d.store.flowSegments(flow).filter((s) => s.service === id).map((s) => s.segment);
+    const q = parseTraceQuery(id, await c.req.json().catch(() => ({})), new Date(), segmentsOf);
     if ("error" in q) return d.reject(c, 400, "trace/query", q.error);
     return c.json(await engine.trace(q));
   });

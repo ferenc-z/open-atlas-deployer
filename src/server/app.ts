@@ -18,7 +18,7 @@ import {
 import type { Config } from "./config.ts";
 import { DeployError, deploymentRecord, type Deployments } from "./deploy.ts";
 import type { EnvManager } from "./env.ts";
-import { KeyError, isKey, type Keys } from "./keys.ts";
+import { KEY_PATTERN, KeyError, isKey, type KeyKind, type Keys } from "./keys.ts";
 import { handleMcp } from "./mcp.ts";
 import { OnboardingError, type Onboarding } from "./onboarding.ts";
 import type { Briefs } from "./brief.ts";
@@ -43,7 +43,8 @@ import { installKey, type DraftItem } from "./services/draft.ts";
 import { serviceStatus, thresholdsOf, timeline } from "./services/status.ts";
 import { alertView, check, health, parseThresholds, RULES, THRESHOLDS } from "./services/rules.ts";
 import { opsDesk } from "./services/ops.ts";
-import { mountCases, withAnalysis } from "./services/cases.ts";
+import { mountOps } from "./services/ops-routes.ts";
+import { todoSink } from "./services/todos.ts";
 import { TakeoverError, type Takeover } from "./services/takeover.ts";
 import { investigate, InvestigateError } from "./services/investigate.ts";
 import { acceptSamples, watchList } from "./services/watch.ts";
@@ -116,8 +117,8 @@ export interface Dependencies {
   nginxFetcher?: typeof fetch;
   /** S37 step 7: the e2e_trace evidence source (tests pass one with a fake data plane). */
   e2eTrace?: E2eTraceSource;
-  /** S37 step 9: the AI analysis of the service pages and the cases; without it the pages offer no AI. */
-  analyst?: import("./services/cases.ts").Analyst;
+  /** pages-rethink §10.2 step 4: step 3b's business light and business detail for describe (stand-ins without them). */
+  businessHooks?: import("./services/ops-routes.ts").BusinessHooks;
 }
 
 const reject = (c: Context, status: 400 | 401 | 403 | 404 | 409 | 429 | 503, code: string, message: string, details: string[] = []) =>
@@ -136,6 +137,22 @@ export function createApp({ config, store, sessions, observer, deployments, vers
   // /mcp calls the API in-process as the key's principal: a one-time nonce with this process's secret, never from outside.
   const internalSecret = randomBytes(24).toString("hex");
   const internal = new Map<string, Principal>();
+  /** One request to this API as a principal, in-process (MCP tools; a to-do's Apply making the draft as the person). */
+  async function callAs(principal: Principal, spec: { method: string; path: string; query?: Record<string, unknown>; body?: unknown; headers?: Record<string, string> }, origin = "http://deployer.internal"): Promise<{ status: number; body: any }> {
+    const nonce = randomBytes(12).toString("hex");
+    internal.set(nonce, principal);
+    const query = Object.entries(spec.query ?? {}).filter(([, v]) => v !== undefined && v !== null && v !== "").map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`).join("&");
+    const res = await api.fetch(new Request(`${origin}${spec.path}${query ? `?${query}` : ""}`, {
+      method: spec.method,
+      headers: { ...(spec.headers ?? {}), "x-deployer-internal": `${internalSecret}.${nonce}`, ...(isKey(principal) ? {} : { "x-csrf-token": principal.csrfToken }), ...(spec.body !== undefined ? { "content-type": "application/json" } : {}) },
+      ...(spec.body !== undefined ? { body: JSON.stringify(spec.body) } : {}),
+    }));
+    internal.delete(nonce);
+    const raw = await res.text();
+    let body: unknown = raw;
+    try { body = raw ? JSON.parse(raw) : null; } catch { /* a text answer, e.g. an nginx configuration */ }
+    return { status: res.status, body };
+  }
 
   async function emergency(c: Context): Promise<Principal | undefined> {
     const token = parseCookies(c.req.header("cookie")).get(EMERGENCY_COOKIE);
@@ -159,7 +176,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     }
     // A personal or service API key (§9.4): no cookie, no CSRF token.
     const bearer = /^Bearer (\S+)$/.exec(c.req.header("authorization") ?? "")?.[1];
-    if (!principal && bearer && keys && /^dp[ks]_/.test(bearer)) {
+    if (!principal && bearer && keys && KEY_PATTERN.test(bearer)) {
       try { principal = await keys.resolve(bearer); } catch (error) {
         if (error instanceof KeyError) return reject(c, error.status, error.code, error.message);
         throw error;
@@ -839,6 +856,8 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     const p = await authenticate(c, deployPermission(env), serviceMay);
     if (p instanceof Response) return p;
     if (isProd(env) && isKey(p) && p.via !== "service") return reject(c, 403, "auth/browser-only", "On PROD the configuration is changed only from a browser session, not API keys.");
+    // §10.2.3: the scheduled check-up's key never drafts a change (C3).
+    if (p.keyKind === "checkup") return reject(c, 403, "auth/forbidden", "The check-up's key does not draft configuration changes.");
     return p;
   };
   /** The service, its newest revision and the key its files are sealed with, or the answer why there are none. */
@@ -990,7 +1009,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     return c.json({ ...draftView(d, store.serviceConfig(id)?.revision ?? 0), preview: draftPreview(d, service) });
   });
   // §16.3: the Assistant's service key may create a draft, on PROD too; a person still saves it (every other draft route
-  // keeps it out). What the AI submits (the service key, or ai: true from draft_service_config) touches no secret.
+  // keeps it out). What the AI submits (the service key, or ai: true from draft_change and a to-do's Apply) touches no secret.
   api.post("/api/services/:id/config/drafts", async (c) => {
     const p = await configEditor(c, true);
     if (p instanceof Response) return p;
@@ -1296,8 +1315,13 @@ export function createApp({ config, store, sessions, observer, deployments, vers
   mountTrace(api, { store, provenance, authenticate, reject, registered: registeredService, actorOf, adapters: deps.traceAdapters ?? new Map<string, EvidenceAdapter>([[PROVENANCE_SOURCE, new ProvenanceAdapter(provenance)]]) });
   // pages-rethink §10.2 step 2: the business model v2 and its gate (run_model / publish_model, registered as MCP verbs
   // in step 4), the flows page and a person's actions on a business. The gate's to-dos wait for step 4's table.
-  const flowModelDeps: ModelDeps = { store, e2e: (id) => e2eImport(e2eTrace)(id) };
+  const flowModelDeps: ModelDeps = { store, e2e: (id) => e2eImport(e2eTrace)(id), todos: todoSink(store) };
   mountFlows(api, { store, model: flowModelDeps, authenticate, reject, registered: registeredService, actorOf });
+  // §10.2 step 4: the routes behind the MCP verbs (describe, the model, record, look's extra kinds) and the to-do buttons.
+  mountOps(api, {
+    store, executor: (host) => handoff.executor(host, "service"), model: flowModelDeps, flowSearch: (id, q) => provenance.flowSearch(id, q),
+    authenticate, reject, registered: registeredService, actorOf, call: (p, spec) => callAs(p, spec), ...(deps.businessHooks ? { hooks: deps.businessHooks } : {}),
+  });
   // Phase 2 step 4 (§9.3, §15.3): a service's logs, read through its members' service executors (deploy-viewer, §13): the
   // last lines of a member's file and a search of all (or some) members in parallel, merged by time (both the AI reads
   // through the MCP tools; the page for them was removed, pages-rethink §9.2).
@@ -1327,7 +1351,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     if (state !== undefined && state !== "open" && state !== "resolved") return reject(c, 400, "alerts/state", "state is open or resolved.");
     const limit = c.req.query("limit") ? Number(c.req.query("limit")) : 200;
     return c.json({
-      alerts: withAnalysis(store, store.serviceAlerts({ service: id, ...(state ? { state } : {}), limit }).map(alertView)),
+      alerts: store.serviceAlerts({ service: id, ...(state ? { state } : {}), limit }).map(alertView),
       rules: RULES, thresholds: { ...thresholdsOf(store, id, s.profile), info: THRESHOLDS },
       canEdit: p.permissions.includes("admin") && !isKey(p),
     });
@@ -1353,8 +1377,6 @@ export function createApp({ config, store, sessions, observer, deployments, vers
       throw e;
     }
   });
-  // S37 step 9 (§4.4): cases — "Let the AI analyse", the follow-up questions, the outcome; CRIT alerts' own analysis.
-  mountCases(api, { store, authenticate, reject, registered: registeredService, actorOf, ...(deps.analyst ? { analyst: deps.analyst } : {}) });
   api.get("/api/services/:id/events", async (c) => {
     const p = await authenticate(c, "view");
     if (p instanceof Response) return p;
@@ -1447,8 +1469,8 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     if (!["open", "resolved", "all"].includes(state)) return reject(c, 400, "alerts/state", "state is open, resolved or all.");
     const since = c.req.query("since") ?? new Date(Date.now() - 86_400_000).toISOString();
     const services = new Map([...store.standalones(), ...store.clusters()].map((x) => [x.id, { kind: x.kind, environment: x.environment, profile: x.profile }] as const));
-    const alerts = withAnalysis(store, store.serviceAlerts({ ...(state === "all" ? { since } : { state: state as "open" | "resolved" }), limit: Number(c.req.query("limit") ?? 500) })
-      .filter((a) => services.has(a.service)).map((a) => ({ ...alertView(a), ...services.get(a.service)! })));
+    const alerts = store.serviceAlerts({ ...(state === "all" ? { since } : { state: state as "open" | "resolved" }), limit: Number(c.req.query("limit") ?? 500) })
+      .filter((a) => services.has(a.service)).map((a) => ({ ...alertView(a), ...services.get(a.service)! }));
     return c.json({ alerts, open: alerts.filter((a) => a.state === "open").length, rules: RULES });
   });
   api.post("/api/services/drafts", async (c) => {
@@ -1562,9 +1584,9 @@ export function createApp({ config, store, sessions, observer, deployments, vers
   // MCP (§10.4): every tool is one call to this API as the key's principal.
   api.post("/mcp", async (c) => {
     const bearer = /^Bearer (\S+)$/.exec(c.req.header("authorization") ?? "")?.[1];
-    if (!keys || !bearer || !/^dp[ks]_/.test(bearer)) {
+    if (!keys || !bearer || !KEY_PATTERN.test(bearer)) {
       c.header("www-authenticate", "Bearer");
-      return c.json({ jsonrpc: "2.0", id: null, error: { code: -32001, message: "a Deployer API key (dpk_ or dps_) is required" } }, 401);
+      return c.json({ jsonrpc: "2.0", id: null, error: { code: -32001, message: "a Deployer API key (dpk_, dps_ or dpc_) is required" } }, 401);
     }
     let principal: Principal;
     try { principal = await keys.resolve(bearer); } catch (error) {
@@ -1573,22 +1595,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     }
     let message: unknown;
     try { message = await c.req.json(); } catch { return c.json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } }, 400); }
-    const origin = new URL(c.req.url).origin;
-    const call = async (spec: { method: string; path: string; query?: Record<string, unknown>; body?: unknown; headers?: Record<string, string> }) => {
-      const nonce = randomBytes(12).toString("hex");
-      internal.set(nonce, principal);
-      const query = Object.entries(spec.query ?? {}).filter(([, v]) => v !== undefined && v !== null && v !== "").map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`).join("&");
-      const res = await api.fetch(new Request(`${origin}${spec.path}${query ? `?${query}` : ""}`, {
-        method: spec.method, headers: { ...(spec.headers ?? {}), "x-deployer-internal": `${internalSecret}.${nonce}`, ...(spec.body !== undefined ? { "content-type": "application/json" } : {}) },
-        ...(spec.body !== undefined ? { body: JSON.stringify(spec.body) } : {}),
-      }));
-      internal.delete(nonce);
-      const raw = await res.text();
-      let body: unknown = raw;
-      try { body = raw ? JSON.parse(raw) : null; } catch { /* a text answer, e.g. an nginx configuration */ }
-      return { status: res.status, body };
-    };
-    const reply = await handleMcp(message, { principal, store, call });
+    const reply = await handleMcp(message, { principal, store, call: (spec) => callAs(principal, spec, new URL(c.req.url).origin) });
     return reply ? c.json(reply) : c.body(null, 202);
   });
   api.get("/mcp", (c) => c.json({ jsonrpc: "2.0", id: null, error: { code: -32601, message: "no event stream here; POST JSON-RPC to /mcp" } }, 405));
@@ -1644,7 +1651,8 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     if (!keys) return reject(c, 404, "key/not-configured", "API keys are not enabled.");
     const body = await c.req.json().catch(() => ({})) as { kind?: string; name?: string; days?: number };
     try {
-      const made = keys.create(p, body.kind === "service" ? "service" : "personal", String(body.name ?? ""), Number(body.days ?? 90));
+      const kind: KeyKind = body.kind === "service" || body.kind === "checkup" ? body.kind : "personal";
+      const made = keys.create(p, kind, String(body.name ?? ""), Number(body.days ?? 90));
       c.header("cache-control", "no-store");
       return c.json(made, 201);
     } catch (error) { return keyError(c, error); }

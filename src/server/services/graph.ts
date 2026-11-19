@@ -276,7 +276,7 @@ export function generateGraph(services: GraphService[], opts: { workspace?: stri
       ":graph/id": graphId, ":graph/label": opts.label ?? "NiFi operations", ":graph/exposure": kw("restricted"),
       ":graph/entities": entityIds, ":graph/resolvers": resolverIds, ":graph/operations": [], ":graph/terms": [], ":graph/dependencies": [],
       ":graph/usage-guide": {
-        ":guide/purpose": "Live details of the NiFi instances and clusters the Open Atlas Deployer manages: flow status, nodes, JVMs, process groups, queues, processors, bulletins. Provenance (FlowFile trace) is not here: ask the Deployer's search_provenance and get_lineage tools.",
+        ":guide/purpose": "Live details of the NiFi instances and clusters the Open Atlas Deployer manages: flow status, nodes, JVMs, process groups, queues, processors, bulletins. Provenance (FlowFile trace) is not here: ask the Deployer's look tool (kind provenance, lineage).",
         ":guide/asset-scope": `Services: ${list.map((s) => `${s.id} (${s.kind}, NiFi ${s.version}) as nifi.${slug(s.id)}.*`).join("; ")}.`,
         ":guide/applicability": "Drill down to a component when the Deployer's samples point at one. Process groups are named by an ident join, [{[:nifi.<service>.pg/id \"root\"] [...]}] for the top, and answer one level: their child groups, processors and connections.",
         ":guide/limitations": ["Read only: nothing here starts, stops or changes NiFi", "Each call goes to NiFi through nginx, two at a time per service, 5 seconds each; history and alerts are in the Deployer", "Times are in NiFi's own time zone (controller timezone)", "Fields marked 2.x only are empty on NiFi 1.x"],
