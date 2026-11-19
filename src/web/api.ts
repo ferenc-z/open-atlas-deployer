@@ -8,6 +8,7 @@ import type { Manifest } from "../compose/generate.ts";
 import type { SetupStatus, SetupStep } from "../server/setup.ts";
 import type { AiItem, AiStatus, AiUse } from "../server/setup-ai.ts";
 import type { SettingRow } from "../server/deployer-settings.ts";
+import { makeFlowClient } from "./flow-client.ts";
 
 export type { SettingRow };
 export type { AiItem, AiStatus, AiUse, AuditEntry, EnvironmentStatus, Manifest, Principal, RegisteredApp, SetupStatus, SetupStep };
@@ -351,3 +352,6 @@ export const serviceCases = (id: string, q: { rule?: string; kind?: string; limi
 export const serviceCase = (id: string, kase: number) => call<ServiceCase>("GET", casePath(id, `/${kase}`));
 export const askCase = (id: string, kase: number, text: string) => call<ServiceCase>("POST", casePath(id, `/${kase}/messages`), { text });
 export const caseOutcome = (id: string, kase: number, text: string) => call<ServiceCase>("PUT", casePath(id, `/${kase}/outcome`), { text });
+
+// Step 6b: the flow pages (pages-rethink 10.2.2 items 6, 7, 8). flows-data.ts decides whether the pages use these or the sample data.
+export const flowClient = makeFlowClient(call);

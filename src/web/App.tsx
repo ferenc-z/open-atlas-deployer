@@ -16,8 +16,11 @@ import { Platform } from "./Platform.tsx";
 import { SettingsPage } from "./Settings.tsx";
 import { SetupPage } from "./Setup.tsx";
 import { ask } from "./Confirm.tsx";
+import { FlowsPage } from "./FlowsPage.tsx";
+import { FlowDetailPage } from "./FlowDetailPage.tsx";
+import { flowHref, parseFlowRoute, type FlowRoute } from "./flow-routes.ts";
 
-type Tab = "setup" | "status" | "history" | "hosts" | "settings" | "env" | "registry" | "onboarding" | "ingress" | "keys" | "audit" | "services" | "takeover" | "alerts";
+type Tab = "setup" | "status" | "history" | "hosts" | "settings" | "env" | "registry" | "onboarding" | "ingress" | "keys" | "audit" | "services" | "takeover" | "alerts" | "flows" | "flow";
 type Panel = { kind: "deploy"; app: string; initial?: { version: string; pinFrom?: string } } | { kind: "job"; id: string } | undefined;
 
 const VERDICT: Record<string, { label: string; tone: string }> = {
@@ -69,6 +72,17 @@ export function App() {
     window.addEventListener("oa:open-service-draft", on);
     return () => window.removeEventListener("oa:open-service-draft", on);
   }, [actions]);
+  // Step 6b: the flow pages are hash routes (#/flows/<service>, #/flow/<flow>?service=): the service page links to them, and
+  // they can ask for the Ask AI panel to open (oa:open-assistant).
+  const [flowRoute, setFlowRoute] = useState<FlowRoute | null>(() => parseFlowRoute(location.hash));
+  useEffect(() => {
+    const on = () => { const r = parseFlowRoute(location.hash); setFlowRoute(r); if (r) setTab(r.kind); };
+    const open = () => setAssistant(true);
+    if (parseFlowRoute(location.hash)) on();
+    window.addEventListener("hashchange", on);
+    window.addEventListener("oa:open-assistant", open);
+    return () => { window.removeEventListener("hashchange", on); window.removeEventListener("oa:open-assistant", open); };
+  }, []);
   // §15 (D41): until setup is complete, Setup is the only page.
   const [setup, setSetup] = useState<SetupStatus | undefined>();
   const load = useCallback(() => {
@@ -90,7 +104,7 @@ export function App() {
   if (!setup) return <main className="center"><p className="muted">Checking setup…</p></main>;
   const setupOnly = !setup.complete;
   const shown: Tab = setupOnly ? "setup" : tab;
-  const go = (t: Tab) => { setTab(t); if (t !== "onboarding") setAssessment(undefined); setService(undefined); };
+  const go = (t: Tab) => { setTab(t); if (t !== "onboarding") setAssessment(undefined); setService(undefined); if (parseFlowRoute(location.hash)) history.replaceState(null, "", location.pathname + location.search); };
   const openService = (id: string) => { setTab("services"); setService(id); setServiceDraft(undefined); };
   return (
     <PageFocus.Provider value={setFocus}>
@@ -110,6 +124,8 @@ export function App() {
           {shown === "hosts" && <HostsPage isAdmin={p.permissions.includes("admin")} />}
           {shown === "services" && <ServicesPage key={`${service ?? ""}:${serviceDraft?.at ?? ""}`} onTakeover={() => go("takeover")} isAdmin={p.permissions.includes("admin")} {...(service ? { initialOpen: service } : {})} {...(serviceDraft ? { initialDraft: serviceDraft.draft } : {})} />}
           {shown === "alerts" && <AlertsPage onOpen={openService} />}
+          {shown === "flows" && flowRoute?.kind === "flows" && <FlowsPage service={flowRoute.service} isAdmin={p.permissions.includes("admin")} onBack={() => { go("services"); openService(flowRoute.service); }} />}
+          {shown === "flow" && flowRoute?.kind === "flow" && <FlowDetailPage key={`${flowRoute.flow}:${flowRoute.service ?? ""}`} flow={flowRoute.flow} {...(flowRoute.service ? { service: flowRoute.service } : {})} isAdmin={p.permissions.includes("admin")} onBack={(s) => { go("services"); openService(s); }} onOpenFlow={(f, s) => { location.hash = flowHref(f, s); }} />}
           {shown === "takeover" && <TakeoverPage isAdmin={p.permissions.includes("admin")} onRegistered={() => go("services")} />}
           {shown === "settings" && <SettingsPage />}
           {shown === "env" && <EnvPage />}

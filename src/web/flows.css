@@ -1,0 +1,91 @@
+/* The flow pages (confirm flows, flow detail): the prototype's look (prototype/README.md "页面规范"), scoped under .fl so
+   it does not touch the rest of the console. Colours: red #B3261E / #FDECEA, amber #8A5300 / #FFF1D6, green #1E6B34 / #E6F4EA,
+   grey #4F4F4B / #EEEEEA; cards white with #E3E3DE border, radius 12; buttons 44px high; links #1F4FB8. */
+.fl { max-width: 1040px; margin: 0 auto; padding: 4px 0 64px; display: flex; flex-direction: column; gap: 18px; color: #1B1B1B; font-family: Inter, "Noto Sans SC", system-ui, sans-serif; }
+.fl.wide { max-width: 1120px; }
+.fl h1 { margin: 0; font-size: 26px; }
+.fl h2 { margin: 0; font-size: 20px; }
+.fl h3 { margin: 0; font-size: 18px; }
+.fl a { color: #1F4FB8; text-decoration: none; cursor: pointer; }
+.fl a:hover { color: #163A88; }
+.fl .fl-lead { margin: 0; font-size: 16px; line-height: 1.7; color: #3C3C39; }
+.fl .fl-muted { font-size: 13px; color: #5B5B57; }
+.fl .fl-error { padding: 10px 12px; border-radius: 8px; background: #FDECEA; color: #B3261E; font-size: 14px; }
+.fl .fl-legend { display: flex; flex-wrap: wrap; gap: 16px; font-size: 13px; color: #5B5B57; }
+.fl .fl-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.fl .fl-swatch { width: 18px; height: 12px; border-radius: 3px; display: inline-block; }
+
+.fl .fl-card { background: #fff; border: 1px solid #E3E3DE; border-radius: 12px; padding: 20px 22px; display: flex; flex-direction: column; gap: 14px; }
+.fl .fl-card.confirmed { border-color: #9CCBAA; }
+.fl .fl-card.dashed { border: 1px dashed #C9C9C2; padding: 16px 20px; flex-direction: row; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
+.fl .fl-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; }
+.fl .fl-title { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; }
+.fl .fl-pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; white-space: nowrap; }
+.fl .fl-pill.big { padding: 4px 10px; font-size: 13px; }
+.fl .tone-failing { background: #FDECEA; color: #B3261E; }
+.fl .tone-attention { background: #FFF1D6; color: #8A5300; }
+.fl .tone-healthy { background: #E6F4EA; color: #1E6B34; }
+.fl .tone-unknown { background: #EEEEEA; color: #4F4F4B; }
+
+.fl .fl-btn { height: 44px; padding: 0 16px; border-radius: 8px; border: 1px solid #C9C9C2; background: #fff; color: #1B1B1B; font: inherit; cursor: pointer; display: inline-flex; align-items: center; }
+.fl .fl-btn.primary { padding: 0 22px; border-color: #1B1B1B; background: #1B1B1B; color: #fff; font-weight: 600; }
+.fl .fl-btn.small { height: 40px; padding: 0 14px; }
+.fl .fl-btn:disabled { opacity: .5; cursor: default; }
+.fl a.fl-btn.primary { color: #fff; }
+.fl .fl-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.fl .fl-input { height: 44px; padding: 0 12px; border-radius: 8px; border: 1px solid #C9C9C2; font: inherit; min-width: 0; }
+.fl .fl-input.num { width: 64px; height: 40px; padding: 0 10px; }
+.fl textarea.fl-input { height: auto; padding: 10px 12px; width: 100%; box-sizing: border-box; }
+.fl .fl-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 14px; }
+.fl .fl-rename { display: flex; gap: 8px; flex: 1 1 320px; }
+.fl .fl-rename .fl-input { flex: 1 1 auto; font-size: 16px; border-color: #1F4FB8; }
+
+.fl .fl-scroll { overflow-x: auto; overflow-y: hidden; border: 1px solid #E3E3DE; border-radius: 10px; background: #FCFCFA; }
+.fl .fl-scroll > div { padding: 12px; box-sizing: content-box; }
+.fl .fl-diagram { position: relative; }
+.fl .fl-diagram svg { position: absolute; left: 0; top: 0; overflow: visible; }
+.fl .fl-svcbox { position: absolute; box-sizing: border-box; background: #EEF2F8; border: 1px dashed #C3CCDA; border-radius: 12px; }
+.fl .fl-svclabel { position: absolute; font-size: 12px; line-height: 16px; font-weight: 600; color: #4A5468; }
+.fl .fl-node { position: absolute; box-sizing: border-box; padding: 8px; display: flex; align-items: center; justify-content: center; text-align: center; font-size: 14px; line-height: 20px; border-radius: 10px; background: #fff; border: 1px solid #C9C9C2; overflow: hidden; }
+.fl .fl-node.external { background: #F9F9F7; border: 1px dashed #A3A39C; }
+.fl .fl-node.drop { color: #B3261E; background: #FDECEA; border: 1px solid #E8B4AE; }
+.fl .fl-node.failing { border: 2px solid #B3261E; }
+.fl .fl-node.attention { border: 2px solid #C98A1B; }
+.fl .fl-node.healthy { border: 2px solid #7DBB90; }
+.fl .fl-node b { font-weight: 700; }
+.fl .fl-edgelabel { position: absolute; text-align: center; font-size: 13px; line-height: 16px; background: #FCFCFA; }
+
+.fl .fl-facts { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 280px), 1fr)); gap: 8px 20px; font-size: 14px; line-height: 1.6; }
+.fl .fl-facts > div { display: flex; flex-direction: column; }
+.fl .fl-facts .k { font-size: 13px; color: #5B5B57; }
+.fl .fl-risk { padding: 10px 12px; border-radius: 8px; background: #FFF4DD; font-size: 14px; line-height: 1.6; }
+.fl .fl-note { padding: 10px 12px; border-radius: 8px; background: #F6F6F3; font-size: 14px; color: #3C3C39; line-height: 1.6; }
+.fl .fl-stuck { display: flex; flex-direction: column; gap: 6px; padding-top: 12px; border-top: 1px solid #EFEFEA; }
+.fl .fl-ok { padding: 16px 18px; border-radius: 12px; background: #E6F4EA; color: #1E6B34; font-size: 15px; line-height: 1.6; font-weight: 600; }
+
+.fl .fl-top { background: #fff; border: 1px solid #E3E3DE; border-radius: 12px; padding: 22px 24px; display: flex; flex-wrap: wrap; align-items: flex-start; gap: 20px 28px; }
+.fl .fl-top.failing { border: 2px solid #B3261E; }
+.fl .fl-top.attention { border: 2px solid #C98A1B; }
+.fl .fl-top.healthy { border: 2px solid #7DBB90; }
+.fl .fl-top .left { flex: 1 1 260px; min-width: 0; display: flex; flex-direction: column; gap: 12px; }
+.fl .fl-top .right { flex: 0 1 720px; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+.fl .fl-top h1 { font-size: 28px; }
+.fl .fl-light { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.fl .fl-light .word { font-size: 28px; font-weight: 700; }
+.fl .fl-light .word.failing { color: #B3261E; } .fl .fl-light .word.attention { color: #8A5300; } .fl .fl-light .word.healthy { color: #1E6B34; } .fl .fl-light .word.unknown { color: #4F4F4B; }
+.fl .fl-sentence { margin: 0; font-size: 17px; line-height: 1.6; }
+.fl .fl-cols { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 16px; }
+.fl .fl-cols > .main { flex: 3 1 520px; min-width: 0; display: flex; flex-direction: column; gap: 12px; }
+.fl .fl-cols > .side { flex: 2 1 340px; min-width: 0; margin-top: 38px; }
+.fl .fl-problem { background: #fff; border: 1px solid #E3E3DE; border-radius: 12px; padding: 18px 20px; display: flex; flex-direction: column; gap: 10px; }
+.fl .fl-problem p { margin: 0; font-size: 15px; line-height: 1.7; }
+.fl .fl-advice { display: flex; flex-direction: column; gap: 4px; padding: 12px 14px; background: #F6F6F3; border-radius: 8px; font-size: 14px; line-height: 1.6; }
+.fl .fl-day { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 14px; padding: 8px 0; border-top: 1px solid #EFEFEA; }
+.fl .fl-day .text { flex: 1 1 100%; font-size: 14px; line-height: 1.6; }
+.fl .fl-about > button { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 56px; padding: 0 22px; border: none; background: transparent; font: inherit; text-align: left; cursor: pointer; }
+.fl .fl-about > button .t { font-size: 16px; font-weight: 700; }
+.fl .fl-about > button .s { font-size: 13px; color: #1F4FB8; }
+.fl .fl-about .body { display: flex; flex-direction: column; gap: 18px; padding: 0 22px 22px; }
+.fl .fl-about { padding: 0; gap: 0; }
+.fl .fl-linkbtn { border: none; background: none; padding: 0; font: inherit; color: #1F4FB8; cursor: pointer; text-align: left; }
+.fl .fl-linkbtn:hover { color: #163A88; }
