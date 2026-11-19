@@ -655,7 +655,7 @@ async function sampled(t: T, member: string, running: boolean, hash?: string, mo
   ingest(t.store, [{
     service: "flow", member, at,
     process: running ? { running: true, pid: 1, startedAt: "2026-11-01T00:00:00Z" } : { running: false },
-    nifi: running ? { state: "ok", about: { version: "2.5.0", timezone: "UTC" }, cluster: { nodes: [{ address: "localhost", apiPort: member === A ? 8443 : member === B ? 9443 : 10443, status: "CONNECTED", roles: member === A ? [COORD] : [] }] }, backpressure: { connections: 0, full: 0, maxPercent: 0 } } : { state: "not-running" },
+    nifi: running ? { state: "ok", about: { version: "2.5.0", timezone: "UTC" }, cluster: { nodes: [{ address: "localhost", apiPort: member === A ? 8443 : member === B ? 9443 : 10443, status: "CONNECTED", roles: member === A ? [COORD, PRIMARY] : [] }] }, backpressure: { connections: 0, full: 0, maxPercent: 0 } } : { state: "not-running" },
     files, ...more,
   } as unknown as ServiceSample]);
 }
@@ -676,26 +676,26 @@ test("the rules leave the member at work alone while the change runs, and while 
   t.now.t += 30_000;
   await sampled(t, B, false, "e".repeat(64));
   check(t.store, () => online, "flow", new Date(t.now.t));
-  assert.ok(!rule().some((r) => r === `process-down ${B}`), "no process-down for the node being worked on");
-  assert.ok(!rule().some((r) => r === `node-disconnected ${B}`));
-  assert.ok(!rule().some((r) => r === `no-samples ${B}`));
+  assert.ok(!rule().some((r) => r === `process ${B}`), "no process-down for the node being worked on");
+  assert.ok(!rule().some((r) => r === `process ${B}`));
+  assert.ok(!rule().some((r) => r === `collection ${B}`));
   assert.ok(!rule().some((r) => r === `config-drift ${B}`), "nor drift");
   // Another member is judged as ever.
   await sampled(t, C, false);
   check(t.store, () => online, "flow", new Date(t.now.t));
-  assert.ok(rule().includes(`process-down ${C}`), "the others count");
+  assert.ok(rule().includes(`process ${C}`), "the others count");
 
   const c = await drive(t, "flow", id);
   assert.equal(c.state, "stopped");
   t.now.t += 3000;
   await sampled(t, B, false);
   check(t.store, () => online, "flow", new Date(t.now.t));
-  assert.ok(!rule().includes(`process-down ${B}`), "stopped: still the change's, a person is on it");
+  assert.ok(!rule().includes(`process ${B}`), "stopped: still the change's, a person is on it");
   assert.equal((await act(t, "flow", id, "close")).status, 200);
   t.now.t += 3000;
   await sampled(t, B, false);
   check(t.store, () => online, "flow", new Date(t.now.t));
-  assert.ok(rule().includes(`process-down ${B}`), "closed: judged again");
+  assert.ok(rule().includes(`process ${B}`), "closed: judged again");
   assert.ok(!t.store.serviceEvents("flow", { from: before }).some((e) => e.kind === "process-restarted"), "the timeline has the change's steps");
 });
 
@@ -1732,7 +1732,7 @@ test("full: the rules leave every member and the cluster alone while it runs, an
   for (const m of NODES) await sampled(t, m, false, "e".repeat(64));
   zkMessages(t);
   check(t.store, () => online, "flow", new Date(t.now.t));
-  assert.deepEqual(rule().filter((r) => /process-down|node-disconnected|no-samples|no-coordinator|zk-errors|config-drift/.test(r)), []);
+  assert.deepEqual(rule().filter((r) => /^(process|collection|coordinator|config-drift) /.test(r)), []);
 
   const c = await drive(t, "flow", id);
   assert.equal(c.state, "stopped");
@@ -1740,20 +1740,20 @@ test("full: the rules leave every member and the cluster alone while it runs, an
   for (const m of NODES) await sampled(t, m, false);
   zkMessages(t);
   check(t.store, () => online, "flow", new Date(t.now.t));
-  assert.deepEqual(rule().filter((r) => /process-down|node-disconnected|no-samples|no-coordinator|zk-errors|config-drift/.test(r)), [], "stopped: still the change's (step 14b)");
+  assert.deepEqual(rule().filter((r) => /^(process|collection|coordinator|config-drift) /.test(r)), [], "stopped: still the change's (step 14b)");
   assert.equal((await t.call("POST", `/api/services/flow/changes/${id}/close`, { as: "uat" }, { filesMayBeMixed: true })).status, 200);
   t.now.t += 3000;
   for (const m of NODES) await sampled(t, m, false);
   check(t.store, () => online, "flow", new Date(t.now.t));
-  for (const m of NODES) assert.ok(rule().includes(`process-down ${m}`), `${m} is judged again`);
-  assert.ok(!rule().includes("zk-errors *"), "what NiFi said of ZooKeeper while the change ran does not count afterwards (step 14b)");
+  for (const m of NODES) assert.ok(rule().includes(`process ${m}`), `${m} is judged again`);
+  assert.ok(!rule().includes("coordinator *"), "what NiFi said of ZooKeeper while the change ran does not count afterwards (step 14b)");
   t.now.t += 3000;
   zkMessages(t);
   check(t.store, () => online, "flow", new Date(t.now.t));
-  assert.ok(rule().includes("zk-errors *"), "what it says after the change does");
+  assert.ok(rule().includes("coordinator *"), "what it says after the change does");
   await sampled(t, B, true);
   check(t.store, () => online, "flow", new Date(t.now.t));
-  assert.ok(rule().includes("no-coordinator *"));
+  assert.ok(rule().includes("coordinator *"));
   assert.ok(!t.store.serviceEvents("flow", { from: before }).some((e) => e.kind === "process-restarted" || e.kind === "node-disconnected"), "the timeline has the change's steps");
 });
 

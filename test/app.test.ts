@@ -2495,8 +2495,8 @@ test("§15.2 P5, §15.3: a service executor's heartbeat reply carries its watch 
   t.store.setServiceFact("flow", "app2:/opt/a", "onlineSince", `${DAY}T00:00:00Z`);
   await send(service, [sample("app2:/opt/a", `${DAY}T01:05:00Z`)]);
   const a = await (await t.request("/api/services/flow/alerts", { as: "viewer" })).json();
-  assert.deepEqual([a.canEdit, a.thresholds.effective.certWarnDays, a.thresholds.info.certWarnDays.unit, a.rules["node-disconnected"].levels], [false, 30, "days", ["CRIT"]]);
-  assert.deepEqual(a.alerts.map((x: { rule: string; member: string; state: string; level: string }) => [x.rule, x.member, x.state, x.level]), [["no-samples", "app2:/opt/a", "open", "WARN"]]);
+  assert.deepEqual([a.canEdit, a.thresholds.effective.certWarnDays, a.thresholds.info.certWarnDays.unit, a.rules.process.levels], [false, 30, "days", ["WARN", "CRIT"]]);
+  assert.deepEqual(a.alerts.map((x: { rule: string; member: string; state: string; level: string }) => [x.rule, x.member, x.state, x.level]), [["collection", "app2:/opt/a", "open", "WARN"]]);
   assert.equal((await (await t.request("/api/services", { as: "viewer" })).json()).clusters[0].status.alerts.open, 1, "the card's alert count");
   const ev = await (await t.request("/api/services/flow/events", { as: "viewer" })).json();
   assert.deepEqual(ev.events.map((e: { kind: string }) => e.kind), ["alert-opened", "taken-over"]);
@@ -2507,7 +2507,7 @@ test("§15.2 P5, §15.3: a service executor's heartbeat reply carries its watch 
   assert.deepEqual([okPut.status, (await okPut.json()).thresholds.overrides], [200, { certWarnDays: 400 }]);
   assert.equal((await put(t, "/api/services/none/thresholds", "admin", { thresholds: {} })).status, 404);
   const all = await (await t.request("/api/alerts", { as: "viewer" })).json();
-  assert.deepEqual(all.alerts.map((x: { service: string; environment: string; kind: string; label: string }) => [x.service, x.environment, x.kind, x.label]), [["flow", "uat", "cluster", "No samples"]]);
+  assert.deepEqual(all.alerts.map((x: { service: string; environment: string; kind: string; label: string }) => [x.service, x.environment, x.kind, x.label]), [["flow", "uat", "cluster", "Collection"]]);
   assert.equal(all.open, 1);
   assert.equal((await t.request("/api/alerts?state=nope", { as: "viewer" })).status, 400);
 });
@@ -2607,7 +2607,7 @@ test("phase 2 step 5: the read-only service tools over /mcp: metrics, alerts, ev
   const alerts = (await tool(t, key, "list_alerts", { id: "flow" })).value;
   assert.deepEqual(alerts.alerts.map((a: { rule: string; state: string }) => [a.rule, a.state]), [["node-disconnected", "open"]]);
   assert.ok(JSON.stringify(alerts.alerts).includes("token=[hidden]") && !JSON.stringify(alerts).includes("abc123"));
-  assert.ok(alerts.rules["node-disconnected"] && alerts.thresholds.info, "with the rules and thresholds");
+  assert.ok(alerts.rules.process && alerts.thresholds.info, "with the rules and thresholds");
   const all = (await tool(t, key, "list_alerts", { state: "all" })).value;
   assert.deepEqual([all.open, all.alerts[0].service], [1, "flow"]);
   assert.equal((await tool(t, key, "list_alerts", { state: "nope" })).value.finding.code, "alerts/state");

@@ -26,7 +26,7 @@ import type { DraftCluster, DraftStandalone } from "../src/server/services/draft
 import { Takeover } from "../src/server/services/takeover.ts";
 import { watchList } from "../src/server/services/watch.ts";
 import { ingest } from "../src/server/services/metrics.ts";
-import { check } from "../src/server/services/rules.ts";
+import { check, machineLight } from "../src/server/services/rules.ts";
 import { Store } from "../src/server/store.ts";
 import { Versions } from "../src/server/versions.ts";
 
@@ -893,6 +893,8 @@ test("a changed file: the alert and the timeline name it, the differences hide i
   assert.match(String(alert.detail.text), /nifi\.properties/);
   assert.doesNotMatch(JSON.stringify(alert), HEX);
   assert.ok(eventKinds(t, "solo").includes("drift-detected"));
+  // P2 (pages-rethink 10.3): drift keeps its alert but is no machine check: the light does not move.
+  assert.deepEqual(machineLight(t.store, (h) => t.handoff.executor(h, "service"), "solo")!.checks.filter((r) => r.light === "attention" || r.light === "failing"), []);
   assert.doesNotMatch(JSON.stringify(t.store.serviceEvents("solo", { limit: 100 })), HEX);
   const status = await (await t.call("GET", "/api/services/solo/status", { as: "viewer" })).json() as any;
   assert.deepEqual(status.members[0].configDrift, ["nifi.properties"]);

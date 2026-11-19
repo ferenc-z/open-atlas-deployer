@@ -1,10 +1,10 @@
-// S37 step 2 (pages-rethink §4.1): the to-do list over the rules, the two findings-only rules (collection incomplete,
-// preventive risk) and the health body.
+// S37 step 2 (pages-rethink §4.1), step 3a (C1): the to-do list over the machine checks, the findings-only preventive
+// risk and the health body (with the machine light).
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ExecutorInfo } from "../src/server/handoff.ts";
 import { ingest } from "../src/server/services/metrics.ts";
-import { check, health, preventive } from "../src/server/services/rules.ts";
+import { check, health, machineLight, preventive } from "../src/server/services/rules.ts";
 import { opsDesk } from "../src/server/services/ops.ts";
 import { NIFI_THRESHOLDS } from "../src/server/services/profiles.ts";
 import type { ServiceSample } from "../src/server/services/watch.ts";
@@ -32,7 +32,7 @@ function sample(member: string, at: string, m: More = {}): ServiceSample {
       ...(m.selfNodeId ? { selfNodeId: m.selfNodeId } : {}),
       diagnostics: { nodes: [diag(18445, m.heap ?? 50, m.repo ?? 10), diag(18446, m.heap ?? 50, m.repo ?? 10)] },
       cluster: { nodes: [
-        { address: "localhost", apiPort: 18445, status: "CONNECTED", roles: ["Cluster Coordinator"] },
+        { address: "localhost", apiPort: 18445, status: "CONNECTED", roles: ["Cluster Coordinator", "Primary Node"] },
         { address: "localhost", apiPort: 18446, status: m.status2 ?? "CONNECTED", roles: [] },
       ] },
       backpressure: { connections: 3, full: 0, maxPercent: 10 }, bulletins: [],
@@ -44,19 +44,21 @@ const both = (at: string, m: More = {}, m2: More = m) => [sample(KEY1, at, m), s
 const rules = (h: ReturnType<typeof health>) => h!.todos.map((x) => `${x.severity} ${x.rule} ${x.member === "*" ? "*" : x.member === KEY1 ? "1" : "2"}`).sort();
 const t = NIFI_THRESHOLDS;
 
-test("healthy: nothing to do, verdict ok, one row per node", () => {
+test("healthy: nothing to do, verdict ok, the machine light healthy, one row per node", () => {
   const now = { t: new Date("2026-11-06T12:00:10Z") };
   const store = lab(now);
   ingest(store, both("2026-11-06T12:00:00Z"));
   const h = health(store, () => online, "c250", now.t)!;
   assert.equal(h.verdict, "ok");
   assert.deepEqual(h.todos, []);
+  assert.equal(h.machine.light, "healthy");
+  assert.deepEqual(h.machine, machineLight(store, () => online, "c250", now.t), "the same light as machineLight()");
   assert.deepEqual(h.members.map((m) => [m.label, m.connection, m.heapPct]), [["localhost:18445", "CONNECTED", 50], ["localhost:18446", "CONNECTED", 50]]);
   assert.equal(health(store, () => online, "nope", now.t), undefined);
   store.close();
 });
 
-test("a stopped node: process-down and node-disconnected as CRIT to-dos with cause, evidence and actions; since is the alert's opening", () => {
+test("a stopped node: the process check's CRIT to-do with cause, evidence and Start; since is the alert's opening; investigate and metrics are gone", () => {
   const now = { t: new Date("2026-11-06T12:00:10Z") };
   const store = lab(now);
   ingest(store, both("2026-11-06T12:00:00Z"));
@@ -67,43 +69,22 @@ test("a stopped node: process-down and node-disconnected as CRIT to-dos with cau
   now.t = new Date("2026-11-06T12:01:00Z");
   const h = health(store, () => online, "c250", now.t)!;
   assert.equal(h.verdict, "critical");
-  assert.deepEqual(rules(h), ["CRIT node-disconnected 2", "CRIT process-down 2"]);
-  const down = h.todos.find((x) => x.rule === "process-down")!;
+  assert.equal(h.machine.light, "failing");
+  assert.deepEqual(rules(h), ["CRIT process 2"]);
+  const down = h.todos[0]!;
   assert.equal(down.since, "2026-11-06T12:00:40.000Z", "since: when the alert opened, not now");
   assert.equal(down.memberLabel, "localhost:18446");
-  assert.match(down.cause, /No NiFi process/);
+  assert.match(down.cause, /NiFi is not running/);
   assert.match(down.evidence[0]!, /no NiFi process/);
-  assert.deepEqual(down.actions.map((a) => a.kind), ["investigate", "member-control"]);
-  assert.deepEqual(h.counts, { CRIT: 2, WARN: 0, INFO: 0 });
+  assert.match(down.evidence[1]!, /disconnected in the coordinator's view/);
+  assert.deepEqual(down.actions.map((a) => [a.kind, a.label]), [["member-control", "Start"]]);
+  assert.deepEqual(h.counts, { CRIT: 1, WARN: 0, INFO: 0 });
   store.close();
-});
-
-test("collection incomplete: REST state not ok shows the reading; a node not in the list is named; no-certificate and a stopped process stay with their own rules", () => {
-  const now = { t: new Date("2026-11-06T12:00:10Z") };
-  const store = lab(now);
-  ingest(store, [sample(KEY1, "2026-11-06T12:00:00Z", { nifi: "unreachable" }), sample(KEY2, "2026-11-06T12:00:00Z", { nifi: "no-certificate" })]);
-  let h = health(store, () => online, "c250", now.t)!;
-  const c = h.todos.find((x) => x.rule === "collection-incomplete")!;
-  assert.equal(c.member, KEY1);
-  assert.equal(c.severity, "WARN");
-  assert.match(c.evidence[0]!, /"unreachable"/);
-  assert.equal(h.todos.filter((x) => x.rule === "collection-incomplete").length, 1, "no-certificate is not doubled");
-  store.close();
-
-  // _unmatched: the diagnostics list does not hold this node (ports differ)
-  const store2 = lab(now);
-  const odd = (member: string) => { const s = sample(member, "2026-11-06T12:00:00Z"); (s.nifi as any).diagnostics.nodes = [{ ...diag(19999, 50, 10), address: "elsewhere" }, { ...diag(19998, 50, 10), address: "elsewhere" }]; (s.nifi as any).cluster.nodes = [{ address: "elsewhere", apiPort: 19999, status: "CONNECTED", roles: [] }, { address: "elsewhere", apiPort: 19998, status: "CONNECTED", roles: [] }]; return s; };
-  ingest(store2, [odd(KEY1), sample(KEY2, "2026-11-06T12:00:00Z")]);
-  h = health(store2, () => online, "c250", now.t)!;
-  const u = h.todos.filter((x) => x.rule === "collection-incomplete");
-  assert.deepEqual(u.map((x) => x.member), [KEY1]);
-  assert.match(u[0]!.evidence[0]!, /not found in NiFi's node list/);
-  store2.close();
 });
 
 const rows = (n: number, f: (i: number) => Record<string, number | null>) => Array.from({ length: n }, (_, i) => ({ bucket: new Date(Date.parse("2026-11-05T12:00:00Z") + i * 5 * 60_000).toISOString(), avg: f(i) }));
 
-test("preventive: disk growing fills in days (WARN within 3 days, INFO within 14), flat or already critical stays quiet, too little history stays quiet", () => {
+test("preventive: disk growing fills in days (WARN within 3 days, INFO within 14), flat or already failing stays quiet, too little history stays quiet", () => {
   // 24 h of 5-minute points: 288. 40 -> 52 % in a day = 12 points a day: 48 % left = 4 days
   const grow = (perDay: number, start: number) => rows(288, (i) => ({ repoContentPct: start + (perDay * i) / 288 }));
   let p = preventive(grow(12, 40), t);
@@ -114,7 +95,7 @@ test("preventive: disk growing fills in days (WARN within 3 days, INFO within 14
   assert.equal(p[0]!.severity, "WARN");
   assert.deepEqual(preventive(grow(0, 40), t), []);
   assert.deepEqual(preventive(grow(2, 40), t), [], "more than 14 days away");
-  assert.deepEqual(preventive(grow(12, 85), t), [], "already over the critical threshold: the alert's");
+  assert.deepEqual(preventive(grow(12, 85), t), [], "already over the failing threshold: the check's");
   assert.deepEqual(preventive(grow(12, 40).slice(0, 10), t), [], "under an hour of points");
 });
 
@@ -128,7 +109,7 @@ test("preventive: a heap baseline that keeps rising warns, a sawtooth around a s
   assert.deepEqual(preventive(saw((i) => 30 + (i / 288) * 3), t), [], "a small rise");
 });
 
-test("preventive in the health body: disk rollups of a node, and a certificate beyond the warning days but within 90", () => {
+test("preventive in the health body: disk rollups of a node, and a certificate beyond the attention days but within 90; the machine light does not move (C1)", () => {
   const now = { t: new Date("2026-11-06T12:00:10Z") };
   const store = lab(now);
   ingest(store, both("2026-11-06T12:00:00Z", { certs: "2027-01-20T00:00:00Z" }));
@@ -140,15 +121,16 @@ test("preventive in the health body: disk rollups of a node, and a certificate b
   assert.ok(pre.some((x) => /expires in 74 days/.test(x.evidence[0]!)), JSON.stringify(pre.map((x) => x.evidence)));
   assert.ok(pre.every((x) => x.severity !== "CRIT"));
   assert.equal(h.verdict, "attention");
+  assert.equal(h.machine.light, "healthy", "full in days is the analysis's, not the light's");
   store.close();
 });
 
-test("an expired or close certificate is the cert-expiry rule's CRIT to-do, not doubled by the preventive one", () => {
+test("an expired or close certificate is the certificate check's CRIT to-do, not doubled by the preventive one", () => {
   const now = { t: new Date("2026-11-06T12:00:10Z") };
   const store = lab(now);
   ingest(store, both("2026-11-06T12:00:00Z", { certs: "2026-11-10T00:00:00Z" }));
   const h = health(store, () => online, "c250", now.t)!;
-  assert.deepEqual(rules(h), ["CRIT cert-expiry 1", "CRIT cert-expiry 2"]);
+  assert.deepEqual(rules(h), ["CRIT certificate 1", "CRIT certificate 2"]);
   store.close();
 });
 
