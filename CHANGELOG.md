@@ -9,6 +9,17 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   of the whole assessment, which made OMA fail with a context-too-large harness error. New read-only tool
   `get_draft` (draft, manifest, findings); `draft_env_key` takes `keys` to write several env keys in one call
   (all or none); a version assessment's first message carries the manifest it starts from.
+- Overview redesigned (prototype of 2026-11-19): "Needs you" first (offline executors, upgrades, a newer Deployer,
+  one button each), then the apps, then "Hosts & executors" (each host's deploy and service executor side by side)
+  beside the services and the brief. A host shows only the executors it has: one with only a service executor no
+  longer shows an offline deploy executor (same rule as the Hosts page).
+- The deploy and the service executor have their own shipped versions (`EXECUTOR_VERSIONS` in `handoff.ts`, each
+  executor's `VERSION`); each is offered an upgrade only when its own version moved. A change to `executor_core.py`
+  moves both. Each archive goes to the release `executor-v<its version>`. `/api/platform` adds `shippedVersions`,
+  `hosts` and each row's `shipped`; `/api/hosts` adds `executorVersions`.
+- Slow Overview on servers that cannot reach GitHub (or the UAT Deployer): a failed version list is cached for a
+  minute instead of being fetched (8 s timeout) on every 10-second refresh; an older list is returned at once while
+  a fresh one is fetched; a failed release check and an unreachable UAT are cached the same way.
 
 ### After upgrading
 

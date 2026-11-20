@@ -25,6 +25,7 @@ export class Peer {
   private keyFile: TokenSource;
   private fetcher: typeof fetch;
   private cache = new Map<string, { at: number; value: unknown }>();
+  private unreachable = new Map<string, { at: number; message: string }>();
   private now: () => number;
 
   constructor(url: string | undefined, keyFile: TokenSource, fetcher: typeof fetch = fetch, now: () => number = Date.now) {
@@ -41,13 +42,19 @@ export class Peer {
     if (!this.url) throw new PeerError("No UAT Deployer is configured (DEPLOYER_UAT_URL)");
     const hit = this.cache.get(path);
     if (hit && this.now() - hit.at < 30_000) return hit.value as T;
+    // A UAT that cannot be reached is not asked again for 30 seconds: each page would wait for the timeout otherwise.
+    const failed = this.unreachable.get(path);
+    if (failed && this.now() - failed.at < 30_000) throw new PeerError(failed.message);
     const key = readToken(this.keyFile);
     let response: Response;
     try {
       response = await this.fetcher(`${this.url}/api/peer/${path}`, { headers: { accept: "application/json", ...(key ? { authorization: `Bearer ${key}` } : {}) }, signal: AbortSignal.timeout(5_000) });
     } catch (error) {
-      throw new PeerError(`Cannot reach the UAT Deployer: ${(error as Error).message}`);
+      const message = `Cannot reach the UAT Deployer: ${(error as Error).message}`;
+      this.unreachable.set(path, { at: this.now(), message });
+      throw new PeerError(message);
     }
+    this.unreachable.delete(path);
     const body = await response.json().catch(() => ({})) as { message?: string };
     if (!response.ok) throw new PeerError(`The UAT Deployer returned HTTP ${response.status}${body.message ? `: ${body.message}` : ""}`);
     this.cache.set(path, { at: this.now(), value: body });

@@ -25,7 +25,7 @@ export function readToken(source: TokenSource): string {
 }
 
 export class Versions {
-  private cache = new Map<string, { at: number; versions: string[] }>();
+  private cache = new Map<string, { at: number; versions: string[]; error?: string }>();
   private tokenFile: TokenSource;
   private fetcher: typeof fetch;
   private now: () => number;
@@ -40,16 +40,28 @@ export class Versions {
     this.api = api.replace(/\/+$/, "");
   }
 
+  /** Cached: an answer for 5 minutes, a failure for 1 (a GitHub or SSH the host cannot reach must not hold every page
+   *  for its timeout). Once the cached one is older than that, it is returned at once and a fresh one fetched meanwhile. */
   async list(repo: string, pattern: string): Promise<{ versions: string[]; error?: string }> {
     const key = `${repo} ${pattern}`;
     const hit = this.cache.get(key);
-    if (hit && this.now() - hit.at < 5 * 60_000) return { versions: hit.versions };
+    const answer = (h: { versions: string[]; error?: string }) => ({ versions: h.versions, ...(h.error ? { error: h.error } : {}) });
+    if (hit && this.now() - hit.at < (hit.error ? 60_000 : 5 * 60_000)) return answer(hit);
+    let pending = this.listing.get(key);
+    if (!pending) {
+      pending = this.fetchList(repo, pattern).then((r) => { this.cache.set(key, { at: this.now(), ...r }); return r; }).finally(() => this.listing.delete(key));
+      this.listing.set(key, pending);
+    }
+    return hit ? answer(hit) : pending;
+  }
+
+  private listing = new Map<string, Promise<{ versions: string[]; error?: string }>>();
+
+  private async fetchList(repo: string, pattern: string): Promise<{ versions: string[]; error?: string }> {
     if (this.git?.configured) {
       // D46: over SSH, the same for every host.
       try {
-        const versions = versionsFromTags(await this.git.tags(repo), pattern);
-        this.cache.set(key, { at: this.now(), versions });
-        return { versions };
+        return { versions: versionsFromTags(await this.git.tags(repo), pattern) };
       } catch (error) {
         return { versions: [], error: `Cannot list the tags of ${repo} over SSH: ${(error as Error).message}` };
       }
@@ -70,9 +82,7 @@ export class Versions {
     } catch (error) {
       return { versions: [], error: `Cannot reach GitHub: ${(error as Error).message}` };
     }
-    const versions = versionsFromTags(tags, pattern);
-    this.cache.set(key, { at: this.now(), versions });
-    return { versions };
+    return { versions: versionsFromTags(tags, pattern) };
   }
 
   private releases = new Map<string, { at: number; result: { released: boolean; detail: string; notes?: string; url?: string } }>();
@@ -90,7 +100,7 @@ export class Versions {
         signal: AbortSignal.timeout(8_000),
       });
       if (response.status === 404) result = { released: false, detail: `${repo} has no GitHub Release for ${tag}${token ? "" : " (private repositories need DEPLOYER_GITHUB_TOKEN_FILE)"}` };
-      else if (!response.ok) return { released: false, detail: `GitHub returned HTTP ${response.status} when checking the release of ${tag}` };
+      else if (!response.ok) result = { released: false, detail: `GitHub returned HTTP ${response.status} when checking the release of ${tag}` };
       else {
         const r = (await response.json()) as { draft?: boolean; prerelease?: boolean; html_url?: string; body?: string };
         const more = { ...(r.body ? { notes: r.body.slice(0, 4000) } : {}), ...(r.html_url ? { url: r.html_url } : {}) };
@@ -99,8 +109,9 @@ export class Versions {
           : { released: true, detail: `${tag} of ${repo} is officially released${r.html_url ? ` (${r.html_url})` : ""}`, ...more };
       }
     } catch (error) {
-      return { released: false, detail: `Cannot reach GitHub to check whether ${tag} is released: ${(error as Error).message}` };
+      result = { released: false, detail: `Cannot reach GitHub to check whether ${tag} is released: ${(error as Error).message}` };
     }
+    // Not released (a failure too) is asked again after a minute.
     this.releases.set(key, { at: this.now(), result });
     return result;
   }

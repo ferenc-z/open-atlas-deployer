@@ -51,7 +51,7 @@ export function HostsPage({ isAdmin, compact = false }: { isAdmin: boolean; comp
   const [shipped, setShipped] = useState("");
   const [error, setError] = useState("");
   const [issued, setIssued] = useState<{ host: string; executor: ExecutorKind; token: string } | undefined>();
-  const refresh = useCallback(() => { api.hosts().then((r) => { setList(r.hosts); setShipped(r.executorVersion); }, (e: Error) => setError(e.message)); }, []);
+  const refresh = useCallback(() => { api.hosts().then((r) => { setList(r.hosts); setShipped(r.executorVersions?.service ?? r.executorVersion); }, (e: Error) => setError(e.message)); }, []);
   useEffect(() => { refresh(); const t = setInterval(refresh, 10_000); return () => clearInterval(t); }, [refresh]);
   const issue = async (id: string, kind: ExecutorKind) => {
     if (!(await ask(`Issue a new ${NAME[kind]} token for ${id}? Earlier ${NAME[kind]} tokens of ${id} keep working until revoked.`, { confirm: "Issue token" }))) return;

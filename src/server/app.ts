@@ -24,7 +24,7 @@ import { OnboardingError, type Onboarding } from "./onboarding.ts";
 import type { Briefs } from "./brief.ts";
 import type { Drift } from "./drift.ts";
 import { PeerError, type Peer, type PeerStatus } from "./peer.ts";
-import { EXECUTOR_KINDS, EXECUTOR_VERSION, ExecutorUnsupported, hostIds, hostOf, newJobId, SERVICE_READ_KINDS, tokenSha256, type ExecutorKind, type Heartbeat } from "./handoff.ts";
+import { EXECUTOR_KINDS, EXECUTOR_VERSION, EXECUTOR_VERSIONS, ExecutorUnsupported, hostIds, hostOf, newJobId, SERVICE_READ_KINDS, tokenSha256, type ExecutorKind, type Heartbeat } from "./handoff.ts";
 import { lineDiff } from "./ingress.ts";
 import { environmentStatus, hostStateOf, parseDockerPs, type Observer } from "./observe.ts";
 import { StoreError, type Actor, type ServiceConfigDraft, type Store } from "./store.ts";
@@ -243,7 +243,8 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     const last = store.listJobs({ app: upgradeApp(host, kind), kind: "executor-upgrade", limit: 1 })[0];
     const job = last ? { id: last.id, state: last.state, version: last.version, message: last.message, finishedAt: last.finishedAt } : null;
     const version = info.heartbeat?.version;
-    const available = Boolean(version && /^\d+\.\d+\.\d+(-.+)?$/.test(version) && compareVersions(version, EXECUTOR_VERSION) < 0);
+    const shipped = EXECUTOR_VERSIONS[kind];
+    const available = Boolean(version && /^\d+\.\d+\.\d+(-.+)?$/.test(version) && compareVersions(version, shipped) < 0);
     // A deploy executor waits for the deploys of its host; a service executor takes no deploy jobs, only its own upgrade counts.
     const busy = store.activeJobs().find((j) => (j.kind === "executor-upgrade" ? j.app === upgradeApp(host, kind) : kind === "deploy" && env.apps[j.app] !== undefined && hostOf(env, j.app) === host));
     // §16.3: only the service executor is held by changes (it restarts, and a running change's steps go through it); a
@@ -251,7 +252,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     const holding = kind === "service" ? changes.holding(host) : [];
     const blocked = !available ? undefined
       : !info.online ? info.reason
-      : !info.heartbeat?.kinds?.includes("executor-upgrade") ? `${name} ${version} on ${host} cannot upgrade itself: install ${EXECUTOR_VERSION} there by hand once (install.sh)`
+      : !info.heartbeat?.kinds?.includes("executor-upgrade") ? `${name} ${version} on ${host} cannot upgrade itself: install ${shipped} there by hand once (install.sh)`
       : !info.heartbeat.upgradeFrom ? `EXECUTOR_UPGRADE_FROM is not set on ${host}: set it in ${kind === "service" ? "service-executor.env" : "executor.env"} and restart the ${kind === "service" ? "service " : ""}executor`
       : busy ? `${host} is running ${busy.id}; upgrade when it ends`
       : holding.length ? `${host} is in the middle of change ${holding[0]!.id}${holding[0]!.state === "stopped" ? " (stopped)" : ""}; upgrade when it ends`
@@ -570,7 +571,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     const tokens = store.executorTokens();
     const reports = handoff.reports();
     return c.json({
-      executorVersion: EXECUTOR_VERSION,
+      executorVersion: EXECUTOR_VERSION, executorVersions: EXECUTOR_VERSIONS,
       hosts: hostIds(env).map((id) => ({
         id, address: env.hosts?.[id]?.address ?? null, executor: handoff.executor(id),
         apps: Object.keys(env.apps).filter((a) => hostOf(env, a) === id),
@@ -585,21 +586,28 @@ export function createApp({ config, store, sessions, observer, deployments, vers
   });
   // S18: a host has a service executor once it has a token or has called in.
   const hasServiceExecutor = (host: string) => store.executorTokens().some((t) => t.host === host && t.executor === "service") || Boolean(store.executorBeat(host, "service"));
+  // A host has a deploy executor when apps are placed on it, it has a deploy token or has called in, or it has no
+  // service executor either (a new host: the deploy executor is what it gets first). The same rule as the Hosts page.
+  const hasDeployExecutor = (env: Environment, host: string) => !hasServiceExecutor(host)
+    || Object.keys(env.apps).some((a) => hostOf(env, a) === host)
+    || store.executorTokens().some((t) => t.host === host && (t.executor ?? "deploy") === "deploy")
+    || Boolean(store.executorHosts().find((h) => h.host === host)?.heartbeat);
   const executorRow = (env: Environment, host: string, kind: ExecutorKind) => {
     const e = handoff.executor(host, kind);
-    return { host, online: e.online, ...(e.reason ? { reason: e.reason } : {}), version: e.heartbeat?.version ?? null, upgrade: upgradeOf(env, host, kind) };
+    return { host, online: e.online, ...(e.reason ? { reason: e.reason } : {}), version: e.heartbeat?.version ?? null, shipped: EXECUTOR_VERSIONS[kind], ...(e.ageSeconds !== undefined ? { ageSeconds: e.ageSeconds } : {}), upgrade: upgradeOf(env, host, kind) };
   };
   const startExecutorUpgrade = (actor: Actor, host: string, kind: ExecutorKind = "deploy") => {
     const { env } = deployments.environment();
     if (!hostIds(env).includes(host)) throw new DeployError(404, "host/unknown", `${host} is not a host of this environment (environment settings hosts).`);
     const upgrade = upgradeOf(env, host, kind);
     const name = kind === "service" ? "service executor" : "executor";
-    if (!upgrade.available) throw new DeployError(409, "executor/up-to-date", `The ${name} on ${host} is not older than ${EXECUTOR_VERSION}.`);
+    const shipped = EXECUTOR_VERSIONS[kind];
+    if (!upgrade.available) throw new DeployError(409, "executor/up-to-date", `The ${name} on ${host} is not older than ${shipped}.`);
     if (upgrade.blocked) throw new DeployError(409, "executor/upgrade-blocked", upgrade.blocked);
     if (upgrade.killModeUnsafe) throw new DeployError(409, "upgrade/killmode-unsafe", `The service executor's unit on ${host} has KillMode=${upgrade.killModeUnsafe}: restarting it would stop the NiFi it started. Add KillMode=process to the unit, run systemctl daemon-reload, then upgrade.`);
     const id = newJobId("executor-upgrade");
-    const request = { kind: "executor-upgrade", version: EXECUTOR_VERSION };
-    store.addJob({ id, kind: "executor-upgrade", app: upgradeApp(host, kind), version: EXECUTOR_VERSION, environment: env.name, fromVersion: handoff.executor(host, kind).heartbeat?.version ?? null, manifest: null, pinFrom: null, request }, actor);
+    const request = { kind: "executor-upgrade", version: shipped };
+    store.addJob({ id, kind: "executor-upgrade", app: upgradeApp(host, kind), version: shipped, environment: env.name, fromVersion: handoff.executor(host, kind).heartbeat?.version ?? null, manifest: null, pinFrom: null, request }, actor);
     handoff.submit(id, { ...request, requestedBy: actor.id }, host, kind);
     return store.job(id)!;
   };
@@ -641,7 +649,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     if (running?.current) return reject(c, 409, "executor/batch-running", `An upgrade of the executors is running (${running.current.host}).`);
     const { env } = deployments.environment();
     const hosts = hostIds(env).flatMap((h) => [
-      ...(() => { const u = upgradeOf(env, h); return u.available && !u.blocked ? [h] : []; })(),
+      ...(hasDeployExecutor(env, h) ? (() => { const u = upgradeOf(env, h); return u.available && !u.blocked ? [h] : []; })() : []),
       ...(hasServiceExecutor(h) ? (() => { const u = upgradeOf(env, h, "service"); return u.available && !u.blocked && !u.killModeUnsafe ? [`${h}/service`] : []; })() : []),
     ]);
     if (!hosts.length) return reject(c, 409, "executor/none-outdated", "No executor can be upgraded now.");
@@ -671,11 +679,13 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     const { env } = deployments.environment();
     return c.json({
       deployer: { ...selfOf(env), ...(await deployerVersions()), repo: config.deployerRelease && "repo" in config.deployerRelease ? config.deployerRelease.repo : null },
+      // Only the executors a host has: a host with just a service executor shows no deploy executor (and the reverse).
       executors: hostIds(env).flatMap((id) => [
-        { executor: "deploy" as ExecutorKind, ...executorRow(env, id, "deploy") },
+        ...(hasDeployExecutor(env, id) ? [{ executor: "deploy" as ExecutorKind, ...executorRow(env, id, "deploy") }] : []),
         ...(hasServiceExecutor(id) ? [{ executor: "service" as ExecutorKind, ...executorRow(env, id, "service") }] : []),
       ]),
-      shipped: EXECUTOR_VERSION, batch: batchOf(), canUpgrade: p.permissions.includes("admin") && !isKey(p),
+      hosts: hostIds(env).map((id) => ({ host: id, address: env.hosts?.[id]?.address ?? null, apps: Object.keys(env.apps).filter((a) => hostOf(env, a) === id) })),
+      shipped: EXECUTOR_VERSION, shippedVersions: EXECUTOR_VERSIONS, batch: batchOf(), canUpgrade: p.permissions.includes("admin") && !isKey(p),
     });
   });
   api.get("/api/deployer/plan", async (c) => {

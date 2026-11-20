@@ -15,8 +15,11 @@ import type { ExecutorKind, ExecutorStatus, Store } from "./store.ts";
 export { EXECUTOR_KINDS, type ExecutorKind } from "./store.ts";
 
 export const PROTOCOL = 2;
-/** §8.6: the executor release this Deployer ships with (executor/deployer_executor.py VERSION); hosts on an older one are offered the upgrade. */
-export const EXECUTOR_VERSION = "0.9.3";
+/** §8.6: the executor releases this Deployer ships with, one per kind (deployer_executor.py and service_executor.py
+ *  VERSION): each kind is offered an upgrade only when its own version moved. A change to executor_core.py moves both. */
+export const EXECUTOR_VERSIONS: Record<ExecutorKind, string> = { deploy: "0.9.3", service: "0.9.3" };
+/** The deploy executor's release (EXECUTOR_VERSIONS.deploy). */
+export const EXECUTOR_VERSION = EXECUTOR_VERSIONS.deploy;
 
 /** §16.3: the service executor's read channel (service_executor.py READ_JOBS): what it may be handed while a change runs there. */
 export const SERVICE_READ_KINDS = ["svc-discover", "svc-read", "svc-state", "log-read", "log-tail", "nifi-provenance"];

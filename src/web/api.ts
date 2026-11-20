@@ -115,16 +115,18 @@ export type ExecutorKind = "deploy" | "service";
 export type HostView = { id: string; address: string | null; executor: ExecutorInfo; apps: string[]; report: { at: string; stale: boolean; containers: number } | null; tokens: { executor: ExecutorKind; prefix: string; createdAt: string; createdBy: string; revokedAt: string | null }[]; upgrade: ExecutorUpgrade; serviceUpgrade: ExecutorUpgrade | null; service: ExecutorInfo | null };
 /** The service executor's unit has a KillMode other than process: an upgrade restart would stop its NiFi too. */
 export const killModeNote = (host: string, mode: string) => `The service executor's unit on ${host} has KillMode=${mode}: restarting it for the upgrade would stop the NiFi it started. Add KillMode=process to the unit, run systemctl daemon-reload, then upgrade.`;
-export const hosts = () => call<{ executorVersion: string; hosts: HostView[] }>("GET", "hosts");
+export const hosts = () => call<{ executorVersion: string; executorVersions: Record<ExecutorKind, string>; hosts: HostView[] }>("GET", "hosts");
 export const upgradeExecutor = (id: string, executor: ExecutorKind = "deploy") => call<{ job: Job }>("POST", `hosts/${encodeURIComponent(id)}/upgrade-executor`, { executor });
 /** D39: the Overview's Platform area. */
 export type UpgradeJob = { id: string; state: Job["state"]; version: string; fromVersion?: string | null; message: string | null; finishedAt: string | null };
 export type PlatformView = {
   deployer: { version: string; host: string | null; image: string | null; blocked?: string; job: UpgradeJob | null; repo: string | null; latest?: string | null; error?: string;
     versions: { version: string; prerelease: boolean; relation: "newer" | "older" | "running" | "unknown" }[] };
-  /** One row per executor: a host's deploy executor, and its service executor when it has one. */
-  executors: { executor: ExecutorKind; host: string; online: boolean; reason?: string; version: string | null; upgrade: ExecutorUpgrade }[];
-  shipped: string; canUpgrade: boolean;
+  /** One row per executor a host has: its deploy executor, its service executor, or both; each against its own release. */
+  executors: { executor: ExecutorKind; host: string; online: boolean; reason?: string; version: string | null; shipped: string; ageSeconds?: number; upgrade: ExecutorUpgrade }[];
+  hosts?: { host: string; address: string | null; apps: string[] }[];
+  /** The deploy executor's release (shippedVersions.deploy). */
+  shipped: string; shippedVersions: Record<ExecutorKind, string>; canUpgrade: boolean;
   batch: { startedAt: string; current: { host: string; job: string } | null; remaining: string[]; done: string[]; stopped?: string; finishedAt?: string } | null;
 };
 export type DeployerPlan = { from: string; to: string; host: string | null; image: string | null; older: boolean; same: boolean; blocked?: string; steps: string[]; warnings: string[];

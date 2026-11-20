@@ -15,7 +15,7 @@ import type { Config } from "../src/server/config.ts";
 import type { Environment } from "../src/compose/generate.ts";
 import { Deployments } from "../src/server/deploy.ts";
 import { EnvManager, Schemas } from "../src/server/env.ts";
-import { EXECUTOR_VERSION, ExecutorUnsupported, Handoff, hostIds, kindsNeeded, PROTOCOL } from "../src/server/handoff.ts";
+import { EXECUTOR_VERSION, EXECUTOR_VERSIONS, ExecutorUnsupported, Handoff, hostIds, kindsNeeded, PROTOCOL } from "../src/server/handoff.ts";
 import { Takeover } from "../src/server/services/takeover.ts";
 import { DEPLOYER_VERSION } from "../src/server/version.ts";
 import { Observer } from "../src/server/observe.ts";
@@ -1016,7 +1016,7 @@ test("§8.6: an administrator upgrades a host's executor to the version the Depl
 });
 
 test("§16.4 step 16: a host's service executor upgrades itself through its own queue, apart from the deploy executor's", async () => {
-  assert.equal(readFileSync(join(import.meta.dirname, "../executor/service_executor.py"), "utf8").match(/^VERSION = "(.+)"$/m)?.[1], EXECUTOR_VERSION, "both executors ship in one version");
+  assert.equal(readFileSync(join(import.meta.dirname, "../executor/service_executor.py"), "utf8").match(/^VERSION = "(.+)"$/m)?.[1], EXECUTOR_VERSIONS.service, "the service executor ships its own version");
   const t = withBuiltApp();
   setEnvironment(t, ({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", hosts, registries: { ghcr: "ghcr.io/acme" }, apps: { shop: { version: "1.2.0", host: "app2" } } }));
   const service = (await (await post(t, "/api/hosts/app1/token", "admin", { executor: "service" })).json()).token as string;
@@ -1060,19 +1060,19 @@ test("§16.4 step 16: a host's service executor upgrades itself through its own 
   const started = await post(t, "/api/hosts/app1/upgrade-executor", "admin", { executor: "service" });
   assert.equal(started.status, 201);
   const { job } = await started.json();
-  assert.deepEqual([job.kind, job.app, job.fromVersion, job.version], ["executor-upgrade", "service-executor@app1", "0.8.0", EXECUTOR_VERSION]);
+  assert.deepEqual([job.kind, job.app, job.fromVersion, job.version], ["executor-upgrade", "service-executor@app1", "0.8.0", EXECUTOR_VERSIONS.service]);
   assert.match((await host()).serviceUpgrade.blocked, /app1 is running executor-upgrade-/, "one at a time");
   assert.equal((await host()).upgrade.job, null, "the deploy executor's last upgrade is not this one");
 
   assert.equal((await call("/executor/v1/jobs/next", deploy)).status, 204, "it is not for the deploy executor");
   const got = await (await call("/executor/v1/jobs/next", service)).json();
-  assert.deepEqual([got.job.id, got.job.kind, got.job.version], [job.id, "executor-upgrade", EXECUTOR_VERSION]);
-  await call(`/executor/v1/jobs/${job.id}/status`, service, { method: "PUT", body: JSON.stringify({ state: "succeeded", steps: [], result: { from: "0.8.0", to: EXECUTOR_VERSION }, message: "done", finishedAt: "2026-11-01T10:00:00Z" }) });
+  assert.deepEqual([got.job.id, got.job.kind, got.job.version], [job.id, "executor-upgrade", EXECUTOR_VERSIONS.service]);
+  await call(`/executor/v1/jobs/${job.id}/status`, service, { method: "PUT", body: JSON.stringify({ state: "succeeded", steps: [], result: { from: "0.8.0", to: EXECUTOR_VERSIONS.service }, message: "done", finishedAt: "2026-11-01T10:00:00Z" }) });
   assert.equal((await (await t.request(`/api/jobs/${job.id}`, { as: "viewer" })).json()).job.state, "succeeded");
-  await beatS({ version: EXECUTOR_VERSION });
+  await beatS({ version: EXECUTOR_VERSIONS.service });
   const after = (await host()).serviceUpgrade;
   assert.deepEqual([after.available, after.job.state], [false, "succeeded"]);
-  assert.ok(t.store.listAudit().some((e) => e.action === "executor-upgrade.request" && e.target === `service-executor@app1@${EXECUTOR_VERSION}`));
+  assert.ok(t.store.listAudit().some((e) => e.action === "executor-upgrade.request" && e.target === `service-executor@app1@${EXECUTOR_VERSIONS.service}`));
 
   // The Overview lists a row for each executor, and "upgrade outdated" takes the service executors in too.
   const row = async () => (await (await t.request("/api/platform", { as: "viewer" })).json()).executors.filter((e: { host: string }) => e.host === "app1");
@@ -1081,6 +1081,24 @@ test("§16.4 step 16: a host's service executor upgrades itself through its own 
   await beatD({ version: "0.8.0" });
   const batch = await (await post(t, "/api/hosts/upgrade-outdated", "admin", {})).json();
   assert.deepEqual([batch.batch.current.host, batch.batch.remaining], ["app1", ["app1/service"]]);
+});
+
+test("Overview: a host shows only the executors it has, each against its own release", async () => {
+  const t = withBuiltApp();
+  setEnvironment(t, ({ name: "uat", project: "open-atlas", bindIp: "127.0.0.1", hosts, registries: { ghcr: "ghcr.io/acme" }, apps: { shop: { version: "1.2.0", host: "app2" } } }));
+  const service = (await (await post(t, "/api/hosts/app1/token", "admin", { executor: "service" })).json()).token as string;
+  const beat = (version: string) => t.app.request("/deploy/executor/v1/heartbeat", { method: "POST", headers: { authorization: `Bearer ${service}`, "content-type": "application/json" }, body: JSON.stringify({ executor: "service", version, protocols: [2], kinds: ["executor-upgrade"], busy: null, upgradeFrom: "directory" }) });
+  await beat(EXECUTOR_VERSIONS.service);
+  const view = async () => (await t.request("/api/platform", { as: "viewer" })).json();
+  const v = await view();
+  // app1 has only a service executor: no deploy executor row; app2 has an app, so its deploy executor is listed (offline).
+  assert.deepEqual(v.executors.map((e: { host: string; executor: string }) => `${e.host}/${e.executor}`), ["app1/service", "app2/deploy"]);
+  assert.deepEqual(v.shippedVersions, EXECUTOR_VERSIONS);
+  assert.deepEqual(v.hosts.map((h: { host: string; apps: string[] }) => [h.host, h.apps]), [["app1", []], ["app2", ["shop"]]]);
+  assert.equal(v.executors[0].upgrade.available, false, "the service executor is at its own release");
+  assert.equal(v.executors[0].shipped, EXECUTOR_VERSIONS.service);
+  await beat("0.0.1");
+  assert.equal((await view()).executors[0].upgrade.available, true);
 });
 
 test("D16: an administrator upgrades the Deployer through the executor of the host that runs it", async () => {

@@ -12,7 +12,7 @@ import { HostsPage } from "./Hosts.tsx";
 import { ServicesPage, TakeoverPage } from "./Services.tsx";
 import { AlertsPage, ServiceHealthCard } from "./Alerts.tsx";
 import { IngressPage } from "./Ingress.tsx";
-import { Platform } from "./Platform.tsx";
+import { NeedsYou, Platform, usePlatform } from "./Platform.tsx";
 import { SettingsPage } from "./Settings.tsx";
 import { SetupPage } from "./Setup.tsx";
 import { ask } from "./Confirm.tsx";
@@ -99,7 +99,7 @@ export function App() {
         {p.actAs && <div className="banner info">{p.actAs.administrator} is using Workbench as {p.displayName}, so permissions here are also those of {p.displayName}.</div>}
         <main>
           {shown === "setup" && <SetupPage workbenchUrl={me.workbenchUrl} onChanged={setupChanged} onGo={go} />}
-          {shown === "status" && <><SetupLine status={setup} onOpen={() => go("setup")} /><DriftBanner /><Status services={<ServiceHealthCard onServices={() => go("services")} onAlerts={() => go("alerts")} />} panel={panel} setPanel={setPanel} isAdmin={p.permissions.includes("admin")} canRegenerate={p.permissions.includes("deploy-uat") || p.permissions.includes("deploy-prod")} onAssessment={(id) => { setPanel(undefined); setAssessment(id); setTab("onboarding"); }} /></>}
+          {shown === "status" && <><SetupLine status={setup} onOpen={() => go("setup")} /><DriftBanner /><Status services={<ServiceHealthCard onServices={() => go("services")} onAlerts={() => go("alerts")} />} onHosts={() => go("hosts")} panel={panel} setPanel={setPanel} isAdmin={p.permissions.includes("admin")} canRegenerate={p.permissions.includes("deploy-uat") || p.permissions.includes("deploy-prod")} onAssessment={(id) => { setPanel(undefined); setAssessment(id); setTab("onboarding"); }} /></>}
           {shown === "history" && <HistoryPage onBack={(j) => { setPanel({ kind: "deploy", app: j.app, initial: { version: j.version, pinFrom: j.id } }); setTab("status"); }} />}
           {shown === "hosts" && <HostsPage isAdmin={p.permissions.includes("admin")} />}
           {shown === "services" && <ServicesPage key={`${service ?? ""}:${serviceDraft?.at ?? ""}`} onTakeover={() => go("takeover")} isAdmin={p.permissions.includes("admin")} {...(service ? { initialOpen: service } : {})} {...(serviceDraft ? { initialDraft: serviceDraft.draft } : {})} />}
@@ -238,10 +238,11 @@ function Forbidden({ message }: { message: string }) {
   );
 }
 
-function Status({ panel, setPanel, isAdmin, canRegenerate, onAssessment, services }: { services?: React.ReactNode; panel: Panel; setPanel: (p: Panel) => void; isAdmin: boolean; canRegenerate: boolean; onAssessment: (id: string) => void }) {
+function Status({ panel, setPanel, isAdmin, canRegenerate, onAssessment, services, onHosts }: { services?: React.ReactNode; onHosts?: () => void; panel: Panel; setPanel: (p: Panel) => void; isAdmin: boolean; canRegenerate: boolean; onAssessment: (id: string) => void }) {
   const [data, setData] = useState<StatusView | undefined>();
   const [error, setError] = useState("");
   const [open, setOpen] = useState<Record<string, boolean>>({});
+  const platform = usePlatform();
   const refresh = useCallback(() => { api.statusView().then((d) => { setData(d); setError(""); }, (e: Error) => setError(e.message)); }, []);
   useEffect(() => { refresh(); const t = setInterval(refresh, panel ? 5_000 : 30_000); return () => clearInterval(t); }, [refresh, panel]);
 
@@ -258,12 +259,13 @@ function Status({ panel, setPanel, isAdmin, canRegenerate, onAssessment, service
         </span>
         <button onClick={refresh}>Refresh</button>
       </div>
-      <Platform />
-      {services}
-      <BriefCard canRegenerate={canRegenerate} />
+      {platform.data && <NeedsYou data={platform.data} onChanged={platform.refresh} {...(onHosts ? { onHosts } : {})} />}
       {data.peer && "error" in data.peer && <p className="banner warn">Cannot check the UAT records: {data.peer.error}. Only officially released versions can be deployed, or an admin can skip the promotion rule.</p>}
       {panel?.kind === "deploy" && <DeployPanel key={`${panel.app}-${panel.initial?.version ?? ""}-${panel.initial?.pinFrom ?? ""}`} app={panel.app} isAdmin={isAdmin} {...(panel.initial ? { initial: panel.initial } : {})} onClose={() => setPanel(undefined)} onJob={(id) => setPanel({ kind: "job", id })} onAssessment={onAssessment} />}
       {panel?.kind === "job" && <JobPanel id={panel.id} onClose={() => { setPanel(undefined); refresh(); }} />}
+      <section className="card apps">
+      <div className="toolbar"><h2>Apps</h2><span className="muted">{data.apps.length} app{data.apps.length === 1 ? "" : "s"}{data.executors.length > 1 ? ` on ${new Set(Object.values(data.hostOf)).size} host${new Set(Object.values(data.hostOf)).size === 1 ? "" : "s"}` : ""}</span></div>
+      <div className="scroll-x">
       <table className="status">
         <thead><tr><th>App</th>{data.executors.length > 1 && <th>Host</th>}<th>Desired version</th>{peerApps && <th>{peerName} now</th>}<th>Manifest</th><th>Status</th><th></th></tr></thead>
         <tbody>
@@ -278,6 +280,8 @@ function Status({ panel, setPanel, isAdmin, canRegenerate, onAssessment, service
           })}
         </tbody>
       </table>
+      </div>
+      </section>
       {data.unmanaged.length > 0 && (
         <section>
           <h2>Containers not in any manifest</h2>
@@ -286,6 +290,13 @@ function Status({ panel, setPanel, isAdmin, canRegenerate, onAssessment, service
           </table>
         </section>
       )}
+      <div className="overview-grid">
+        <Platform data={platform.data} error={platform.error} onChanged={platform.refresh} />
+        <div className="overview-side">
+          {services}
+          <BriefCard canRegenerate={canRegenerate} />
+        </div>
+      </div>
     </>
   );
 }
