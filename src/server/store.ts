@@ -2086,6 +2086,11 @@ export class Store {
     return (this.db.prepare("SELECT * FROM service_analyses WHERE service = ? ORDER BY started_at DESC, id DESC LIMIT ?").all(service, Math.min(200, Math.max(1, limit))) as Row[]).map(toAnalysis);
   }
 
+  /** Every running analysis (step 5 follows their sessions). */
+  runningAnalyses(): AnalysisRecord[] {
+    return (this.db.prepare("SELECT * FROM service_analyses WHERE state = 'running' ORDER BY id").all() as Row[]).map(toAnalysis);
+  }
+
   /** The newest analyses of one check-up round (run), or of the newest round when none is given. */
   analysisRun(run?: string): AnalysisRecord[] {
     const id = run ?? (this.db.prepare("SELECT run FROM service_analyses WHERE run IS NOT NULL ORDER BY started_at DESC, id DESC LIMIT 1").get() as Row | undefined)?.run;

@@ -58,6 +58,8 @@ Node 22.18 起直接运行 `.ts`（类型剥离），服务端不需要构建；
 | `DEPLOYER_OMA_URL` / `DEPLOYER_OMA_API_KEY_FILE` | 无 | 可选：OMA 的 API 和 key，发布后归档更早的同名 agent；不设就不归档 |
 | `DEPLOYER_OMA_APPLICATION_ID` / `DEPLOYER_OMA_AGENT` / `DEPLOYER_OMA_ENVIRONMENT` / `DEPLOYER_OMA_VAULTS` | 无 | 接法 B：Deployer 自己开 OMA Session（失败诊断）用的 Application、Agent（Deploy Assistant 的 agent id）、Environment、Vault（放只读服务 key）。配了 `DEPLOYER_OMA_URL`、`DEPLOYER_OMA_API_KEY_FILE`、`DEPLOYER_OMA_AGENT` 才诊断 |
 | `DEPLOYER_OMA_ASSESSOR_AGENT` / `DEPLOYER_OMA_ASSESSOR_ENVIRONMENT` / `DEPLOYER_OMA_ASSESSOR_VAULTS` | 无 | 接入评估：Onboarding Assessor 的 agent id、**隔离的** Environment（只放行 git 站点和 Deployer MCP）、Vault（服务 key、私有仓库只读令牌）。不配就不能评估 |
+| `DEPLOYER_OMA_CHECKUP_AGENT` / `DEPLOYER_OMA_CHECKUP_ENVIRONMENT` / `DEPLOYER_OMA_CHECKUP_VAULTS` | 无 | 受管服务的 AI 分析：Service Check-up 的 agent id、Environment、Vault（放体检 key `dpc_`，对应 Deployer 的 MCP 地址）。不配就没有 AI 分析，灯照常亮 |
+| `DEPLOYER_CHECKUP_CRON` / `DEPLOYER_CHECKUP_TIMEZONE` | `0 */4 * * *` / `Asia/Shanghai` | 定时体检：Deployer 启动时和每 15 分钟确保 OMA 里有一条 `deployer-checkup-<环境>` 的 agent schedule 与此一致 |
 | `DEPLOYER_ISSUE_REPO` / `DEPLOYER_ISSUE_TOKEN_FILE` | 无 | 开 Issue 的 Deployer 仓库（owner/name）和 fine-grained token（只有 Issues: write） |
 | `DEPLOYER_BRIEF_HOUR` | `8` | 每日简报在这个钟点之后生成（服务器时间） |
 | `DEPLOYER_RELEASE_REPO` / `DEPLOYER_RELEASE_TAG` | 无 / `v{version}` | D39：Overview 上 Deployer 版本下拉框的来源，写成 `github:owner/name`（以后加 `bitbucket:`）；不设就手填版本 |

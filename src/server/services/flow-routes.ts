@@ -17,6 +17,8 @@ export interface FlowRouteDeps {
   reject: Reject;
   registered: (id: string) => unknown;
   actorOf: (p: Principal) => Actor;
+  /** Step 5: split and not-right start a flows-feedback analysis of the services the business runs in. */
+  feedback?: (flow: FlowRecord, services: string[], kind: "split" | "not-right", note: string | null, by: string) => unknown;
 }
 
 export type FlowAction =
@@ -89,6 +91,11 @@ export function mountFlows(api: Hono, d: FlowRouteDeps) {
       }
       return c.json({ flow: flowCard(d.store, d.store.flow(f.id)!) });
     }
-    return c.json({ flow: flowCard(d.store, applyFlowAction(d.store, f, a, actor)) });
+    const next = applyFlowAction(d.store, f, a, actor);
+    if (d.feedback && (a.kind === "split" || a.kind === "not-right")) {
+      const services = [...new Set(d.store.flowSegments(f.id).map((s) => s.service))].filter((s) => d.registered(s));
+      if (services.length) d.feedback(next, services, a.kind, a.note ?? null, actor.id);
+    }
+    return c.json({ flow: flowCard(d.store, next) });
   });
 }

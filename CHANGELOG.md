@@ -5,6 +5,19 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
 
 ## Unreleased
 
+- Ops step 5 (pages-rethink A1): the AI's analyses of the managed services, by the Service Check-up agent
+  (`DEPLOYER_OMA_CHECKUP_AGENT`, `_ENVIRONMENT`, `_VAULTS` with its `dpc_` key). Each is a running row in
+  `service_analyses` first, then an OMA session whose first message names the analysis ids; the agent writes back with
+  `record`; a turn that ends without a record, an error or no answer in time (10 minutes, more for several services)
+  fails it. Started by: the scheduled check-up (an OMA agent schedule `deployer-checkup-<environment>` the Deployer
+  creates or puts back at start and every 15 minutes, `DEPLOYER_CHECKUP_CRON` default `0 */4 * * *`,
+  `DEPLOYER_CHECKUP_TIMEZONE` default `Asia/Shanghai`; its records make one round), a machine light turning red, a
+  person opening the overview or a service page while a service is not green and its analysis is out of date (at most
+  once a service an hour), `POST /api/services/:id/analyses` (Look again now), `POST /api/analyses` (Check now, one
+  round), `GET /api/analyses/:analysis`, and "These are two flows" / "Not right" on the flows page (flows-feedback). The
+  daily brief waits up to an hour for the morning check-up and carries its conclusions. The overview's `nextCheckAt` is
+  the schedule's next run.
+
 - Ops step 4 (pages-rethink §9.1 C3, §10.2.3): the managed-service MCP is seven verbs — `describe` (the machine and
   business lights, the businesses, open to-dos, the newest AI analysis, the model's gaps, each with the verb that fixes
   it), `look` (raw data by `kind`: metrics, logs, provenance, lineage, event, bulletins, queues, members, topology,
@@ -27,7 +40,8 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   the Workbench Business Agent "Deploy Assistant" at the new agent.
 - [ ] OMA: create the Service Check-up agent (`bin/publish-assistant.ts … service-checkup`, prompt
   `agents/service-checkup.md`, template `templates/service-checkup.oma.json`, Skill `nifi-ops`) with a `dpc_` key in its
-  Vault; ops step 5 schedules it.
+  Vault; then set `DEPLOYER_OMA_CHECKUP_AGENT`, `DEPLOYER_OMA_CHECKUP_ENVIRONMENT` and `DEPLOYER_OMA_CHECKUP_VAULTS`
+  (ops step 5: the Deployer then keeps its OMA schedule).
 - S37 step 9 (Q4, S9): "Let the AI analyse" on the Investigate and Data trace tabs sends the page's result (the
   investigation worked out again compact and redacted; the trace answer trimmed and redacted) to the Deploy Assistant
   in a background OMA session; the answer comes in three parts (likely cause, evidence, next steps) and the person can
