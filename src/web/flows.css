@@ -26,6 +26,8 @@
 .fl .tone-attention { background: #FFF1D6; color: #8A5300; }
 .fl .tone-healthy { background: #E6F4EA; color: #1E6B34; }
 .fl .tone-unknown { background: #EEEEEA; color: #4F4F4B; }
+/* Owner 2026-11-20: a record that lights nothing (Other drops). */
+.fl .tone-neutral { background: #F1F3F5; color: #3C4043; }
 
 .fl .fl-btn { height: 44px; padding: 0 16px; border-radius: 8px; border: 1px solid #C9C9C2; background: #fff; color: #1B1B1B; font: inherit; cursor: pointer; display: inline-flex; align-items: center; }
 .fl .fl-btn.primary { padding: 0 22px; border-color: #1B1B1B; background: #1B1B1B; color: #fff; font-weight: 600; }

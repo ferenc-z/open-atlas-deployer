@@ -15,7 +15,7 @@
 import type { FlowAnomaly, FlowRecord, ServiceBulletin, Store } from "../store.ts";
 import { DEFAULT_STUCK, dropRelationship, exitOf, gateRejected } from "./flowmodel.ts";
 import type { Topology } from "./flowcounts.ts";
-import { LIGHT_ORDER, type Anomaly, type BusinessLightView, type FlowRow, type FlowStatus, type Light, type UnknownReason } from "./ops-types.ts";
+import { LIGHT_ORDER, type Anomaly, type FlowNote, type BusinessLightView, type FlowRow, type FlowStatus, type Light, type UnknownReason } from "./ops-types.ts";
 import { lightOfAlert } from "./rules.ts";
 import { WHOLE, type ModelV2, type Segment } from "./trace/model.ts";
 
@@ -27,15 +27,17 @@ export const SCAN_MINUTES = 5;
 export const SCAN_BACK_MINUTES = 60;
 /** handover-lost: the window compared (newest bucket left out: the receiver counts it a little later). */
 export const HANDOVER_HOURS = 2;
-const EVENT_KINDS: readonly Anomaly[] = ["processing-failed", "invalid-data", "processor-error", "data-dropped", "e2e-failed"];
+const EVENT_KINDS: readonly (Anomaly | FlowNote)[] = ["processing-failed", "invalid-data", "processor-error", "data-dropped", "e2e-failed", "other-drop"];
 export const ANOMALY_LIGHT: Record<Exclude<Anomaly, "stuck">, Exclude<Light, "healthy" | "unknown">> = {
   "processing-failed": "attention", "invalid-data": "attention", "processor-error": "attention", "e2e-failed": "attention",
   "handover-lost": "failing", "data-dropped": "failing",
 };
-export const ANOMALY_LABEL: Record<Anomaly, string> = {
+export const ANOMALY_LABEL: Record<Anomaly | FlowNote, string> = {
   "processing-failed": "Processing failed", "invalid-data": "Invalid data", stuck: "Stuck", "handover-lost": "Hand-over lost",
-  "processor-error": "Processor error", "data-dropped": "Data dropped", "e2e-failed": "e2e_trace failure",
+  "processor-error": "Processor error", "data-dropped": "Data dropped", "e2e-failed": "e2e_trace failure", "other-drop": "Other drops",
 };
+/** Owner 2026-11-20: what is kept in flow_anomalies but lights nothing (only the flow detail's last 7 days list it). */
+export const isAnomaly = <T extends { anomaly: Anomaly | FlowNote }>(a: T): a is T & { anomaly: Anomaly } => a.anomaly !== "other-drop";
 const FAILURE_GROUP = /error|fail|exception|错误|异常|失败/i;
 const worse = (a: Light, b: Light): Light => (LIGHT_ORDER[a] <= LIGHT_ORDER[b] ? a : b);
 type Any = Record<string, any>;
@@ -76,35 +78,36 @@ export function locator(store: Store, service: string): (o: { component?: string
 
 // ---- observations -----------------------------------------------------------------------------------------------
 
-export interface Observation { place: Place; ref: string; anomaly: Anomaly; light: Light; at: string; count: number; detail: Record<string, unknown> }
+export interface Observation { place: Place; ref: string; anomaly: Anomaly | FlowNote; light: Light; at: string; count: number; detail: Record<string, unknown> }
 
 /** Provenance events (the scan's DROP, EXPIRE and relationship failure / invalid searches) as observations, one per
  *  (business segment, component, anomaly). A DROP at a marked exit is a normal end; a DROP not auto-terminated (a queue
- *  emptied by a person) is "other" and lights nothing. */
+ *  emptied by a person) is "other": kept as other-drop with NiFi's details when it can be placed, lighting nothing
+ *  (owner 2026-11-20: the flow detail's last 7 days list it). */
 export function classifyEvents(model: ModelV2 | null, locate: ReturnType<typeof locator>, events: Any[], atLeast = false): { observations: Observation[]; other: number; exits: number; unplaced: number } {
   const out = new Map<string, Observation>();
   let other = 0, exits = 0, unplaced = 0;
   for (const e of events) {
     const type = String(e.eventType ?? "");
     const component = typeof e.componentId === "string" ? e.componentId : null;
-    let anomaly: Anomaly | null = null, relationship: string | null = null;
+    let anomaly: Anomaly | FlowNote | null = null, relationship: string | null = null;
     if (type === "DROP") {
       relationship = dropRelationship(e.details);
-      if (relationship === null) { other++; continue; }
-      if (component && exitOf(model, component, relationship)) { exits++; continue; }
-      anomaly = "data-dropped";
+      if (relationship === null) { other++; anomaly = "other-drop"; }
+      else if (component && exitOf(model, component, relationship)) { exits++; continue; }
+      else anomaly = "data-dropped";
     } else if (type === "EXPIRE") anomaly = "data-dropped";
     else if (e.relationship === "failure") { anomaly = "processing-failed"; relationship = "failure"; }
     else if (e.relationship === "invalid") { anomaly = "invalid-data"; relationship = "invalid"; }
     if (!anomaly || !component) continue;
     const place = locate({ component, group: typeof e.groupId === "string" ? e.groupId : null });
-    if (!place) { unplaced++; continue; }
+    if (!place) { if (anomaly !== "other-drop") unplaced++; continue; }
     const at = typeof e.at === "string" ? e.at : typeof e.eventTime === "string" ? e.eventTime : new Date().toISOString();
     const key = `${place.flow}\0${component}\0${anomaly}`;
     const was = out.get(key);
     if (was) { was.count++; if (at > was.at) was.at = at; continue; }
     out.set(key, {
-      place, ref: component, anomaly, light: ANOMALY_LIGHT[anomaly as Exclude<Anomaly, "stuck">], at, count: 1,
+      place, ref: component, anomaly, light: anomaly === "other-drop" ? "healthy" : ANOMALY_LIGHT[anomaly as Exclude<Anomaly, "stuck">], at, count: 1,
       detail: { segment: place.segment, component, componentName: e.componentName ?? null, componentType: e.componentType ?? null, relationship, expired: type === "EXPIRE", details: typeof e.details === "string" ? e.details.slice(0, 300) : null, ...(atLeast ? { atLeast: true } : {}) },
     });
   }
@@ -226,7 +229,7 @@ export function record(store: Store, service: string, observations: Observation[
     for (const o of conditions.seen) store.noteFlowAnomaly({ flow: o.place.flow, service, ref: o.ref, anomaly: o.anomaly, light: o.light, at: o.at, count: o.count, detail: o.detail, replace: true });
     const seen = new Set(conditions.seen.map((o) => `${o.place.flow}\0${o.ref}\0${o.anomaly}`));
     for (const a of store.flowAnomalies({ service, state: "open" })) {
-      if (conditions.kinds.includes(a.anomaly) && !EVENT_KINDS.includes(a.anomaly) && !seen.has(`${a.flow}\0${a.ref}\0${a.anomaly}`)) store.closeFlowAnomaly(a.id, at);
+      if ((conditions.kinds as readonly string[]).includes(a.anomaly) && !EVENT_KINDS.includes(a.anomaly) && !seen.has(`${a.flow}\0${a.ref}\0${a.anomaly}`)) store.closeFlowAnomaly(a.id, at);
     }
   }
   const quiet = new Date(now.getTime() - QUIET_MINUTES * MIN).toISOString();
@@ -329,7 +332,7 @@ export class BusinessScanner {
 
 // ---- the lights -------------------------------------------------------------------------------------------------
 
-export interface FlowLight { flow: FlowRecord; services: string[]; light: Light; reason?: UnknownReason; sentence: string; anomalies: FlowAnomaly[] }
+export interface FlowLight { flow: FlowRecord; services: string[]; light: Light; reason?: UnknownReason; sentence: string; anomalies: (FlowAnomaly & { anomaly: Anomaly })[] }
 
 const where = (a: FlowAnomaly) => String(a.detail.componentName ?? a.detail.destination ?? a.detail.errorGroup ?? a.detail.port ?? a.ref);
 /** One anomaly in a sentence (fixed text is English, C2). */
@@ -343,6 +346,7 @@ export function anomalyText(a: FlowAnomaly): string {
     case "handover-lost": return `S2S to ${d.target} port ${d.port}: ${d.sent} sent, ${d.received} received`;
     case "processor-error": return `Error bulletins from ${where(a)} (${a.count})`;
     case "e2e-failed": return `e2e_trace failure at ${String(d.worker ?? where(a))} (${a.count})`;
+    case "other-drop": return `${where(a)}: ${String(d.details ?? "dropped")} × ${a.count}${d.atLeast ? "+" : ""}`;
   }
 }
 
@@ -353,14 +357,15 @@ const REASON_TEXT: Record<UnknownReason, string> = {
   collection: "Not known: collection from the service has stopped.",
 };
 
-/** Whether a service's collection is down (the machine's collection check open as unknown). */
-export const collectionDown = (store: Store, service: string) => store.serviceAlerts({ service, state: "open", limit: 50 }).some((a) => a.rule === "collection" && lightOfAlert(a) === "unknown");
+/** Whether a service's collection is down (the machine's collection check open: unknown, nothing collected; or attention,
+ *  NiFi's REST API not readable, so provenance and queues are not either). */
+export const collectionDown = (store: Store, service: string) => store.serviceAlerts({ service, state: "open", limit: 50 }).some((a) => a.rule === "collection");
 
 /** A business's light: gate rejected → unknown; else the worst open anomaly; else unknown when collection is down, no
  *  flow data exists or nobody confirmed it; else healthy. */
 export function flowLight(store: Store, f: FlowRecord, ctx: { collection?: (s: string) => boolean; open?: FlowAnomaly[] } = {}): FlowLight {
   const services = [...new Set(store.flowSegments(f.id).map((s) => s.service))];
-  const anomalies = ctx.open?.filter((a) => a.flow === f.id) ?? store.flowAnomalies({ flow: f.id, state: "open" });
+  const anomalies = (ctx.open?.filter((a) => a.flow === f.id) ?? store.flowAnomalies({ flow: f.id, state: "open" })).filter(isAnomaly);
   anomalies.sort((a, b) => LIGHT_ORDER[a.light] - LIGHT_ORDER[b.light] || (a.firstAt < b.firstAt ? -1 : 1));
   const unknown = (reason: UnknownReason): FlowLight => ({ flow: f, services, light: "unknown", reason, sentence: REASON_TEXT[reason], anomalies });
   if (gateRejected(store, f.id)) return unknown("gate-rejected");

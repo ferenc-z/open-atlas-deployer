@@ -104,7 +104,7 @@ export function FlowDetailPage({ flow, service, isAdmin, onBack, onOpenFlow }: {
           {d.last7Days.map((h, i) => (
             <div key={i} className="fl-day">
               <span className="fl-muted" style={{ flex: "0 0 auto" }}>{shortDay(h.day)}</span>
-              <LightPill light={h.light} text={ANOMALY_LABEL[h.anomaly]} />
+              {h.anomaly === "other-drop" ? <span className="fl-pill tone-neutral">{ANOMALY_LABEL[h.anomaly]}</span> : <LightPill light={h.light} text={ANOMALY_LABEL[h.anomaly]} />}
               <span className="text">{h.text}</span>
             </div>
           ))}

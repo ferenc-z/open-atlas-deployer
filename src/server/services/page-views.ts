@@ -7,7 +7,7 @@ import type { ExecutorInfo } from "../handoff.ts";
 import type { Store } from "../store.ts";
 import { ANOMALY_LABEL, anomalyText, businessLight, flowLight } from "./business.ts";
 import { flowCard, type GraphExtras } from "./flow-views.ts";
-import { LIGHT_ORDER, type AnalysisState, type AnalysisTrigger, type AnalysisView, type Anomaly, type BusinessLightView, type FlowCard, type FlowDetail, type FlowProblem, type GateVerdict, type Light, type Lights, type ServiceCard, type ServicePage, type ServicesOverview, type TodoView, type UnknownReason } from "./ops-types.ts";
+import { LIGHT_ORDER, type AnalysisState, type AnalysisTrigger, type AnalysisView, type Anomaly, type FlowNote, type BusinessLightView, type FlowCard, type FlowDetail, type FlowProblem, type GateVerdict, type Light, type Lights, type ServiceCard, type ServicePage, type ServicesOverview, type TodoView, type UnknownReason } from "./ops-types.ts";
 import type { BusinessHooks } from "./ops-routes.ts";
 import { machineLight } from "./rules.ts";
 import { opsReads } from "./todos.ts";
@@ -143,14 +143,15 @@ export function flowDetail(store: Store, flow: string, now: Date = new Date()): 
   });
   // Last 7 days: each day an anomaly was open, the worst light and its sentences that day.
   const since = new Date(now.getTime() - 7 * DAY);
-  const days = new Map<string, { day: string; anomaly: Anomaly; light: Light; texts: Set<string> }>();
+  // Other drops (owner 2026-11-20) are listed too, light healthy: they light nothing. Their text keeps NiFi's details and the count.
+  const days = new Map<string, { day: string; anomaly: Anomaly | FlowNote; light: Light; texts: Set<string> }>();
   for (const a of store.flowAnomalies({ flow, since: since.toISOString() })) {
     const start = Math.max(Date.parse(a.firstAt), since.getTime()), end = a.closedAt ? Date.parse(a.closedAt) : now.getTime();
     for (let t = Date.UTC(new Date(start).getUTCFullYear(), new Date(start).getUTCMonth(), new Date(start).getUTCDate()); t <= end; t += DAY) {
       const day = new Date(t).toISOString().slice(0, 10), key = `${day}\0${a.anomaly}`;
       const d = days.get(key) ?? { day, anomaly: a.anomaly, light: a.light, texts: new Set<string>() };
       if (LIGHT_ORDER[a.light] < LIGHT_ORDER[d.light]) d.light = a.light;
-      d.texts.add(anomalyText(a).replace(/ \(\d+\+?\)$/, ""));
+      d.texts.add(a.anomaly === "other-drop" ? anomalyText(a) : anomalyText(a).replace(/ \(\d+\+?\)$/, ""));
       days.set(key, d);
     }
   }

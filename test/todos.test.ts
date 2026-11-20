@@ -9,6 +9,7 @@ import { servicePage, servicesOverview } from "../src/server/services/page-views
 import { NIFI_THRESHOLDS } from "../src/server/services/profiles.ts";
 import type { ServiceSample } from "../src/server/services/watch.ts";
 import { Store } from "../src/server/store.ts";
+import { withCurrent } from "../src/server/services/todos.ts";
 
 const admin = { id: "admin", via: "cli" } as const;
 const node = (installDir: string, https: number) => ({ host: "local", installDir, serviceUser: "ferenc", startEnvironment: null, ports: { https }, nodeAddress: "localhost", discovery: null });
@@ -158,4 +159,23 @@ test("services overview and service page (step 3b): both lights per card, the pa
   assert.deepEqual(page.config, { revision: null, lastChange: null, activeChange: null, drift: false });
   assert.equal(servicePage(store, () => online, "nope", {}, now.t), undefined);
   store.close();
+});
+
+test("a config-change to-do's Now column is read from the current revision at file, key and member (owner 2026-11-20); the AI's is not kept", () => {
+  const f = (name: string, redacted: string, format: "properties" | "xml" = "properties") => ({ name, path: `/x/${name}`, sha256: "", size: 0, modifiedAt: "", format, sealed: "", redacted, secrets: [] });
+  const m = (dir: string, heap: string) => ({ host: "local", installDir: dir, files: [f("nifi.properties", `a=1\nnifi.queue.swap.threshold=${heap}\n`), f("logback.xml", "<x/>", "xml")], missing: [] });
+  const body = { members: [m("/lab/c250-1", "20000"), m("/lab/c250-2", "20000")] };
+  const action = { kind: "config-change" as const, label: "Raise", note: "why", changes: [
+    { file: "nifi.properties", key: "nifi.queue.swap.threshold", value: "40000", current: "AI guess" },
+    { file: "nifi.properties", key: "a", member: KEY1, value: "2" },
+    { file: "nifi.properties", key: "not.there", value: "x", current: "AI guess" },
+    { file: "logback.xml", xml: "<y/>" },
+  ] };
+  const out = withCurrent(action, body);
+  assert.ok(out.kind === "config-change");
+  assert.deepEqual(out.changes.map((c) => c.current), ["20000", "1", undefined, undefined]);
+  assert.ok(!("current" in out.changes[2]!), "not readable: left out, not the AI's");
+  const differ = { members: [m("/lab/c250-1", "20000"), m("/lab/c250-2", "30000")] };
+  assert.equal(withCurrent(action, differ).kind === "config-change" && (withCurrent(action, differ) as typeof out).changes[0]!.current, undefined, "the nodes differ: no one value");
+  assert.equal((withCurrent(action, undefined) as typeof out).changes[0]!.current, undefined, "no revision yet");
 });

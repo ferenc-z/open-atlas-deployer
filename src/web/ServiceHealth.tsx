@@ -225,7 +225,7 @@ function TodoCard(p: TodoProps & { t: TodoView; n: number; onApply: () => void }
           <button type="button" className="fl-linkbtn" disabled={busy} onClick={() => void guard(() => ops.todoState(t.id, "done"))}>Mark done</button>
           <button type="button" className="fl-linkbtn" disabled={busy} onClick={() => void guard(() => ops.todoState(t.id, "dismissed"))}>Not needed</button>
         </>}
-        <span className="fl-muted" style={{ fontSize: 12 }}>{t.source === "chat" ? `From your chat with the AI · ${t.createdBy}` : t.source === "flows" ? "From the flows" : t.source === "gate" ? "From a rejected model" : `AI · ${shortTime(t.createdAt)}`}</span>
+        <span className="fl-muted" style={{ fontSize: 12 }}>{t.source === "chat" ? `From your chat with the AI · ${t.createdBy}` : t.source === "flows" ? "From the flows" : t.source === "gate" ? "From a rejected model" : t.source === "machine" ? "From the machine checks" : `AI · ${shortTime(t.createdAt)}`}</span>
       </div>
     </div>
   );

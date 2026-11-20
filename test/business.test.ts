@@ -80,9 +80,11 @@ test("the provenance scan: a DROP outside the exits and an EXPIRE are data dropp
   await scanner.scan("n1", clock.t);
   assert.equal(asked.length, 4);
   assert.match(asked[0]!, /2026-11-19T11:55:00.000Z$/, "the first scan reads the last 5 minutes");
-  assert.deepEqual(open(store), ["n1 data-dropped failing p-route 2", "n1 data-dropped failing p-slow 1", "n1 invalid-data attention p-validate 1", "n1 processing-failed attention p-parse 1"]);
+  assert.deepEqual(open(store), ["n1 data-dropped failing p-route 2", "n1 data-dropped failing p-slow 1", "n1 invalid-data attention p-validate 1", "n1 other-drop healthy p-put 1", "n1 processing-failed attention p-parse 1"], "the queue emptied by hand is kept as other-drop (owner 2026-11-20)");
+  assert.equal(store.flowAnomalies({ flow: FLOW }).find((a) => a.anomaly === "other-drop")!.detail.details, "FlowFile Queue emptied by admin");
   const l = flowLight(store, store.flow(FLOW)!);
   assert.equal(l.light, "failing");
+  assert.ok(!l.anomalies.some((a) => (a.anomaly as string) === "other-drop"), "it lights nothing");
   assert.equal(l.sentence, "Data expired in the queue before p-slow (1) (+3 more)", "the worst first, then the oldest");
   // The next scan starts where this one ended; nothing new for an hour closes the events.
   clock.t = new Date("2026-11-19T12:05:00Z");
@@ -184,6 +186,7 @@ test("#8 the business detail: light and problems with titles, the graph's lights
   store.noteFlowAnomaly({ flow: FLOW, service: "c2", ref: "p-db", anomaly: "processor-error", light: "attention", at: "2026-11-18T08:00:00Z", count: 2, detail: { segment: "R", component: "p-db", componentName: "PutDB" } });
   store.closeFlowAnomaly(store.flowAnomalies({ flow: FLOW }).find((a) => a.anomaly === "processor-error")!.id, "2026-11-18T09:00:00Z");
   store.addFlowChange({ flow: FLOW, service: "n1", by: "ai", kind: "found", text: "AI 找到这条业务", revision: 1, verdict: "published" });
+  store.noteFlowAnomaly({ flow: FLOW, service: "n1", ref: "c-q", anomaly: "other-drop", light: "healthy", at: "2026-11-19T11:30:00Z", count: 12, detail: { segment: "A", component: "c-q", componentName: "success", details: "FlowFile Queue emptied by admin" } });
   const d = flowDetail(store, FLOW, clock.t)!;
   assert.deepEqual([d.light, d.reason, d.flow.id, d.flow.services], ["failing", undefined, FLOW, ["n1", "c2"]]);
   assert.deepEqual(d.problems.map((p) => [p.anomaly, p.light, p.title, p.service, p.group, p.component, p.count, p.nifiUrl]),
@@ -191,8 +194,9 @@ test("#8 the business detail: light and problems with titles, the graph's lights
   assert.deepEqual(d.flow.graph.nodes.find((n) => n.id === "n1/A")!.light, "failing");
   assert.deepEqual(d.flow.graph.nodes.find((n) => n.id === "drop:n1/A"), { id: "drop:n1/A", kind: "external", service: null, label: "Dropped", detail: "Dropped · 7 个" });
   assert.ok(d.flow.graph.edges.some((e) => e.kind === "drop" && e.label === "unmatched"));
-  assert.deepEqual(d.last7Days.map((x) => [x.day, x.anomaly, x.light]), [["2026-11-19", "data-dropped", "failing"], ["2026-11-18", "processor-error", "attention"]]);
-  assert.match(d.last7Days[1]!.text, /^Error bulletins from PutDB$/);
+  assert.deepEqual(d.last7Days.map((x) => [x.day, x.anomaly, x.light]), [["2026-11-19", "data-dropped", "failing"], ["2026-11-19", "other-drop", "healthy"], ["2026-11-18", "processor-error", "attention"]]);
+  assert.equal(d.last7Days[1]!.text, "success: FlowFile Queue emptied by admin × 12", "NiFi's details and the count");
+  assert.match(d.last7Days[2]!.text, /^Error bulletins from PutDB$/);
   assert.deepEqual(d.findBy, [{ cue: "fileName", attribute: "filename" }]);
   assert.deepEqual(d.history.map((h) => [h.by, h.text, h.verdict]), [["ai", "AI 找到这条业务", "published"]]);
   assert.equal(flowDetail(store, "flw_none", clock.t), undefined);

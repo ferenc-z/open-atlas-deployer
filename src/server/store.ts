@@ -18,7 +18,7 @@ import type { DraftChange } from "./services/configedit.ts";
 import type { ConfigReview } from "./services/configreview.ts";
 import { randomBytes } from "node:crypto";
 import { migrateV1, type ModelV2 } from "./services/trace/model.ts";
-import type { AnalysisState, AnalysisTrigger, Anomaly, FlowStatus, GateVerdict, Light, TodoAction, TodoSource, TodoState } from "./services/ops-types.ts";
+import type { AnalysisState, AnalysisTrigger, Anomaly, FlowNote, FlowStatus, GateVerdict, Light, TodoAction, TodoSource, TodoState } from "./services/ops-types.ts";
 
 /** A business id (§10.2.4: flw_ + random). */
 export const newFlowId = () => `flw_${randomBytes(6).toString("hex")}`;
@@ -1973,7 +1973,7 @@ export class Store {
   }
 
   /** Step 3b: an anomaly seen (again). Opens one, or adds `count` to the open one and moves its last time, light and detail. */
-  noteFlowAnomaly(a: { flow: string; service: string; ref: string; anomaly: Anomaly; light: Light; at: string; count: number; detail: Record<string, unknown>; replace?: boolean }) {
+  noteFlowAnomaly(a: { flow: string; service: string; ref: string; anomaly: Anomaly | FlowNote; light: Light; at: string; count: number; detail: Record<string, unknown>; replace?: boolean }) {
     const open = this.db.prepare("SELECT id, count, last_at FROM flow_anomalies WHERE flow = ? AND service = ? AND ref = ? AND anomaly = ? AND state = 'open'").get(a.flow, a.service, a.ref, a.anomaly) as Row | undefined;
     if (open) {
       this.db.prepare("UPDATE flow_anomalies SET light = ?, last_at = ?, count = ?, detail = ? WHERE id = ?")
@@ -2172,7 +2172,7 @@ const toFlow = (r: Row): FlowRecord => ({
 });
 /** §10.2.4 step 3: one row of flow_anomalies. */
 export interface FlowAnomaly {
-  id: number; flow: string; service: string; ref: string; anomaly: Anomaly; light: Light; state: "open" | "closed";
+  id: number; flow: string; service: string; ref: string; anomaly: Anomaly | FlowNote; light: Light; state: "open" | "closed";
   firstAt: string; lastAt: string; count: number; detail: Record<string, unknown>; closedAt: string | null;
 }
 export type FlowChangeKind ="found" | "updated" | "confirmed" | "renamed" | "stuck" | "split-asked" | "not-right" | "ignored" | "watched" | "rejected";

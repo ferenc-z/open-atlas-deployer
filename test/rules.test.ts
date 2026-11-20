@@ -131,21 +131,41 @@ test("collection: the executor offline is unknown only after 5 minutes (other ro
   store.close();
 });
 
-test("collection: NiFi's REST API blind (no monitor certificate) for 5 minutes is unknown; readable again resolves it", () => {
+test("collection: NiFi's REST API blind (no monitor certificate) for 5 minutes is attention with a monitor-cert to-do; readable again resolves both", () => {
   const now = { t: new Date("2026-11-06T12:00:10Z") };
   const store = lab(now);
+  const todos = () => store.todos("c250").map((t) => [t.key, t.source, t.severity, t.title]);
   ingest(store, both("2026-11-06T12:00:00Z", {}, { nifi: "no-certificate" }));
   check(store, () => online, "c250", now.t);
   assert.deepEqual(openRules(store), []);
+  assert.deepEqual(todos(), [], "not 5 minutes yet");
   now.t = new Date("2026-11-06T12:05:20Z");
   ingest(store, both("2026-11-06T12:05:00Z", {}, { nifi: "no-certificate" }));
   check(store, () => online, "c250", now.t);
+  check(store, () => online, "c250", now.t);
   assert.deepEqual(openRules(store), ["WARN collection 2"]);
-  assert.match(row(store, now.t, "collection").text, /no monitor certificate/);
+  const r = row(store, now.t, "collection");
+  assert.deepEqual([r.light, light(store, now.t).light], ["attention", "attention"], "not unknown: the executor itself is fine");
+  assert.match(r.text, /no monitor certificate/);
+  assert.deepEqual(todos(), [["monitor-cert:c250", "machine", "attention", "Add a monitoring certificate so Deployer can read NiFi"]], "one to-do, not one per check");
+  // The executor offline meanwhile: cannot tell, the to-do stays.
+  check(store, () => offline(30), "c250", now.t);
+  assert.equal(todos().length, 1);
   now.t = new Date("2026-11-06T12:06:10Z");
   ingest(store, both("2026-11-06T12:06:00Z"));
   check(store, () => online, "c250", now.t);
   assert.deepEqual(openRules(store), []);
+  assert.deepEqual(todos(), [], "closed once NiFi can be read");
+  assert.equal(store.todos("c250", "done").length, 1);
+  // Unreachable is the other to-do.
+  ingest(store, both("2026-11-06T12:06:30Z", {}, { nifi: "unreachable" }));
+  now.t = new Date("2026-11-06T12:06:40Z");
+  check(store, () => online, "c250", now.t);
+  now.t = new Date("2026-11-06T12:12:00Z");
+  ingest(store, both("2026-11-06T12:11:50Z", {}, { nifi: "unreachable" }));
+  check(store, () => online, "c250", now.t);
+  check(store, () => online, "c250", now.t);
+  assert.deepEqual(todos().map((t) => t[0]), ["nifi-rest:c250"]);
   store.close();
 });
 

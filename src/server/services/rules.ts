@@ -16,7 +16,7 @@
 // summary read it) but is no check and does not light. Queues are the business light's (stuck), not the machine's.
 
 import type { ExecutorInfo } from "../handoff.ts";
-import type { AlertLevel, ServiceAlert, Store } from "../store.ts";
+import type { Actor, AlertLevel, ServiceAlert, Store } from "../store.ts";
 import type { Thresholds } from "./profiles.ts";
 import { serviceStatus, thresholdsOf, type MemberStatus, type ServiceStatus } from "./status.ts";
 import { bucketOf } from "./logs.ts";
@@ -36,7 +36,7 @@ export const RULES: Record<RuleId, { label: string; scope: "member" | "service";
   heap: { label: "Heap", scope: "member", levels: ["WARN", "CRIT"], description: "Attention: the JVM heap has stayed above the threshold for the threshold minutes. Failing: nifi-app.log has an OutOfMemoryError within the window and the process has not started again since." },
   certificate: { label: "Certificate", scope: "member", levels: ["WARN", "CRIT"], description: "The soonest-expiring certificate of the keystore, the truststore or the monitor certificate: attention within the warning days, failing within the critical days or expired. A store that cannot be read is unknown." },
   coordinator: { label: "Coordinator", scope: "service", levels: ["WARN", "CRIT"], description: "Failing: no node of the cluster is the primary node or the cluster coordinator in the newest view. Attention: messages about the ZooKeeper connection keep coming (bulletins and nifi-app.log's WARN/ERROR summary, at least the threshold within the window). A standalone is always healthy." },
-  collection: { label: "Collection", scope: "member", levels: ["WARN"], description: "Unknown: nothing has been collected of the member for the threshold minutes (the service executor offline, no sample, or NiFi's REST API not readable: no monitor certificate, unreachable, the node not in NiFi's list). The machine light is unknown then, unless a check is failing." },
+  collection: { label: "Collection", scope: "member", levels: ["WARN"], description: "Unknown: nothing has been collected of the member for the threshold minutes (the service executor offline, or no sample); the machine light is unknown then, unless a check is failing. Attention, with a to-do: NiFi's REST API not readable for the threshold minutes (no monitor certificate, unreachable, not on HTTPS, the node not in NiFi's list)." },
   "config-drift": { label: "Configuration drift", scope: "member", levels: ["WARN"], description: "A configuration file on the host is not what the Deployer says it should be: someone or NiFi changed or removed it. Not part of the machine light (P2): the configuration summary shows it." },
 };
 
@@ -167,7 +167,8 @@ export function evaluate(store: Store, s: ServiceStatus, t: Thresholds, now: Dat
     } else {
       const why = restBlind(m);
       const from = since.restBlind.get(k);
-      if (why && from && nowMs - Date.parse(from) >= gap) add("collection", k, "unknown", `${name}: ${why}`, { ...base, why: "rest", nifi: m.live?.nifi ?? null });
+      // Owner 2026-11-20: NiFi's REST API not readable (the executor itself is fine) is attention, with a to-do (check()).
+      if (why && from && nowMs - Date.parse(from) >= gap) add("collection", k, "attention", `${name}: ${why}`, { ...base, why: "rest", nifi: m.live?.nifi ?? (m.live?.point?._unmatched ? "unmatched" : null) });
       else if (why) hold("collection", k, "blind");
     }
     // What the samples say, only from a fresh one with NiFi's side readable.
@@ -401,6 +402,7 @@ export function check(store: Store, executor: (host: string) => ExecutorInfo, id
     store.resolveServiceAlert(a.id, at, { text: `Resolved: ${RULES[a.rule as RuleId]?.label ?? a.rule}${a.member === "*" ? "" : ` (${String(a.detail.label ?? a.member)})`}` }, a.rule === "config-drift" ? "drift-resolved" : undefined);
     out.resolved++;
   }
+  restTodos(store, s, result);
   out.events += changes(store, s);
   // The machine light's turn (C1, A1 "red: analyse at once"). The first look only records it (no turn from nothing).
   const view = machineView(s, result, store.serviceAlerts({ service: id, state: "open", limit: 1000 }), now);
@@ -417,6 +419,32 @@ export function check(store: Store, executor: (host: string) => ExecutorInfo, id
     }
   }
   return out;
+}
+
+const DEPLOYER: Actor = { id: "deployer", via: "cli" };
+/** Owner 2026-11-20: NiFi's REST API not readable (collection attention) is a to-do: monitor-cert:<service> when the
+ *  executor has no monitor certificate, nifi-rest:<service> otherwise. Closed once it is gone; kept while collection
+ *  cannot tell (the executor offline, a change working). */
+function restTodos(store: Store, s: ServiceStatus, result: ReturnType<typeof evaluate>) {
+  const want = new Map<string, string[]>();
+  for (const c of result.active) {
+    if (c.rule !== "collection" || c.detail.why !== "rest") continue;
+    const key = `${c.detail.nifi === "no-certificate" ? "monitor-cert" : "nifi-rest"}:${s.id}`;
+    want.set(key, [...(want.get(key) ?? []), c.text]);
+  }
+  const open = new Map(store.todos(s.id).filter((t) => t.key === `monitor-cert:${s.id}` || t.key === `nifi-rest:${s.id}`).map((t) => [t.key, t] as const));
+  for (const [key, texts] of want) {
+    const cert = key.startsWith("monitor-cert:");
+    const title = cert ? "Add a monitoring certificate so Deployer can read NiFi" : "Let Deployer read NiFi's REST API";
+    const detail = cert
+      ? `${texts.join("; ")}. Without it the Deployer cannot read NiFi's nodes, queues, bulletins or provenance. Give the service executor a client certificate NiFi trusts (monitor role).`
+      : `${texts.join("; ")}. Until NiFi's REST API can be read, the nodes, queues, bulletins and provenance are not watched.`;
+    const was = open.get(key);
+    if (was && was.title === title && was.detail === detail) continue;
+    store.upsertTodo({ service: s.id, flow: null, source: "machine", key, severity: "attention", title, detail, action: null, analysis: null }, DEPLOYER.id);
+  }
+  const unsure = [...result.held.keys()].some((k) => k.startsWith("collection\0"));
+  for (const [key, t] of open) if (!want.has(key) && !unsure) store.closeTodo(t.id, "done", DEPLOYER);
 }
 
 /** The timeline's own entries from the newest samples: restarts (start time), versions, a node's connection. */
@@ -512,7 +540,7 @@ const CAUSES: Record<TodoRule, string> = {
   heap: "The JVM heap stays high or ran out: a flow holds many FlowFiles or attributes in memory, or the heap is too small for the load; a leak shows as a baseline that keeps rising.",
   certificate: "A certificate used by NiFi is expired or about to be, or its store cannot be read: connections that rely on it will fail once it is.",
   coordinator: "The cluster has no primary node or no coordinator, or keeps losing ZooKeeper: the election has not finished, or ZooKeeper is down, overloaded or unreachable.",
-  collection: "Nothing is being collected of this member: the service executor or the host is down, the network to the Deployer is cut, or NiFi's REST API cannot be read (monitor certificate, address). The machine light is unknown until it is back.",
+  collection: "Nothing is being collected of this member: the service executor or the host is down, the network to the Deployer is cut, or NiFi's REST API cannot be read (monitor certificate, address). The machine light is unknown while nothing is collected, and needs attention while only NiFi's REST API cannot be read.",
   "config-drift": "A configuration file on the host differs from what the Deployer keeps: someone or something edited or removed it.",
   "preventive-risk": "A trend, not a fault yet: if it continues, the limit is reached within the time shown.",
 };

@@ -1,14 +1,14 @@
 // Pieces the two flow pages share: the stuck-times editor, the inline rename field, the light badge and the wording.
 
 import { useId, useState } from "react";
-import type { Anomaly, FlowCard, Light, UnknownReason } from "../server/services/ops-types.ts";
+import type { Anomaly, FlowCard, FlowNote, Light, UnknownReason } from "../server/services/ops-types.ts";
 import "./flows.css";
 
 export const LIGHT_LABEL: Record<Light, string> = { failing: "Failing", attention: "Attention", healthy: "Healthy", unknown: "Unknown" };
 export const UNKNOWN_REASON: Record<UnknownReason, string> = { unconfirmed: "Not confirmed yet", "gate-rejected": "Model rejected", "no-evidence": "No data yet", collection: "Collection gap" };
-export const ANOMALY_LABEL: Record<Anomaly, string> = {
+export const ANOMALY_LABEL: Record<Anomaly | FlowNote, string> = {
   "processing-failed": "Processing failed", "invalid-data": "Invalid data", stuck: "Stuck", "handover-lost": "Handover lost",
-  "processor-error": "Processor error", "data-dropped": "Data dropped", "e2e-failed": "End-to-end check failed",
+  "processor-error": "Processor error", "data-dropped": "Data dropped", "e2e-failed": "End-to-end check failed", "other-drop": "Other drops",
 };
 
 /** A past anomaly's colour (ops-types.ts Anomaly: handover-lost and data-dropped are failing, the rest attention; a stuck one may have been either, the history does not say). */

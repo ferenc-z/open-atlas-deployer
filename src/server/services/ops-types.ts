@@ -20,6 +20,9 @@ export type MachineCheck = "process" | "disk" | "heap" | "certificate" | "coordi
 /** 业务异常（B3）。灯：handover-lost、data-dropped → failing；processing-failed、invalid-data、processor-error → attention；
  *  stuck 按该业务的两个卡住时间；e2e-failed 见待定 P3。 */
 export type Anomaly = "processing-failed" | "invalid-data" | "stuck" | "handover-lost" | "processor-error" | "data-dropped" | "e2e-failed";
+/** 不亮灯的记录（owner 2026-11-20）：other-drop = 非自动终止的 DROP（人清空队列等）。存在 flow_anomalies 里（light healthy），
+ *  不进业务灯、problems 和 FlowRow.anomalies，只在业务详情 last7Days 列一行（带 NiFi details 原文和次数）。 */
+export type FlowNote = "other-drop";
 
 /** 业务灯不是 healthy/failing/attention 时说明为什么（只在 unknown 时有值）。 */
 export type UnknownReason = "unconfirmed" | "gate-rejected" | "no-evidence" | "collection";
@@ -41,7 +44,8 @@ export type AnalysisState = "running" | "done" | "failed";
 export const THRESHOLD_KEYS = ["collectionMinutes", "repoDiskWarnPct", "repoDiskCritPct", "heapPct", "heapMinutes", "oomMinutes", "zkErrors", "zkMinutes", "certWarnDays", "certCritDays"] as const;
 
 /** 待办来源、状态、建议动作。 */
-export type TodoSource = "analysis" | "chat" | "gate" | "flows";
+/** machine：机器检查自己开的（如 monitor-cert:<服务>：读不到 NiFi REST），条件消失时 Deployer 关掉。 */
+export type TodoSource = "analysis" | "chat" | "gate" | "flows" | "machine";
 export type TodoState = "open" | "done" | "dismissed";
 export type TodoAction =
   | { kind: "config-change"; label: string; changes: ConfigChange[]; note: string }        // 人点了才由 Deployer 以本人身份建草稿（见 10.2.2 第 9 条）
@@ -50,7 +54,7 @@ export type TodoAction =
   | { kind: "confirm-flows"; label: string }                                                 // 跳流程确认页
   | { kind: "open-nifi"; label: string; url: string; component?: string };                   // 改画布的事只给链接
 /** 与 draft_service_config 的 changes 同形：{file,key,value} | {file,key,unset:true} | {file,xml…}（照 mcp.ts 现有 schema）；
- *  current：现值（AI 写进去的，弹窗 "Now" 列，没有就不显示）。 */
+ *  current：现值（弹窗 "Now" 列，没有就不显示）：Deployer 生成 TodoView 时按 {file,key,member?} 从当前修订读（owner 2026-11-20），AI 带的不用。 */
 export type ConfigChange = Record<string, unknown> & { current?: string };
 
 // ---- HTTP views (§10.2.2) ----
@@ -151,7 +155,8 @@ export interface FlowDetail {
   flow: FlowCard;
   light: Light; reason?: UnknownReason; sentence: string;
   problems: FlowProblem[];
-  last7Days: { day: string; anomaly: Anomaly; light: Light; text: string }[];
+  /** anomaly other-drop: light healthy (does not light), text the NiFi details and the count. */
+  last7Days: { day: string; anomaly: Anomaly | FlowNote; light: Light; text: string }[];
   findBy: { cue: Cue; attribute: string }[];
   history: { at: string; by: "ai" | "person"; text: string; verdict: GateVerdict | null }[];
 }

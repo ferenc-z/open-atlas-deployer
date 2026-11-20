@@ -8,6 +8,9 @@ import type { Actor, AnalysisRecord, Store, TodoRecord } from "../store.ts";
 import type { TodoSink } from "./flowmodel.ts";
 import { THRESHOLD_KEYS, type Anomaly, type AnalysisState, type AnalysisTrigger, type AnalysisView, type Lights, type TodoAction, type TodoSource, type TodoView } from "./ops-types.ts";
 import { redactStrings } from "./redact.ts";
+import type { ConfigFileRecord, ConfigMember, ServiceConfigBody } from "./config.ts";
+import { parseProperties } from "./configview.ts";
+import { installKey } from "./draft.ts";
 
 export const ANALYSIS_TRIGGERS: readonly AnalysisTrigger[] = ["schedule", "machine-red", "user-visit", "check-now", "flows-feedback"];
 export const ANOMALIES: readonly Anomaly[] = ["processing-failed", "invalid-data", "stuck", "handover-lost", "processor-error", "data-dropped", "e2e-failed"];
@@ -21,9 +24,41 @@ export const todoView = (t: TodoRecord): TodoView => ({
   action: t.action, createdAt: t.createdAt, createdBy: t.createdBy, draft: t.draft,
 });
 
-/** A service's open to-dos: failing first, then oldest first. */
+/** A service's open to-dos: failing first, then oldest first. A config-change's Now column is read from the current revision. */
 export function openTodos(store: Store, service: string): TodoView[] {
-  return store.todos(service).sort((a, b) => (a.severity === b.severity ? (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0) : a.severity === "failing" ? -1 : 1)).map(todoView);
+  let body: ServiceConfigBody | undefined | null = null;
+  const current = () => (body === null ? (body = store.serviceConfig(service)?.body) : body);
+  return store.todos(service).sort((a, b) => (a.severity === b.severity ? (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0) : a.severity === "failing" ? -1 : 1))
+    .map((t) => { const v = todoView(t); return v.action?.kind === "config-change" ? { ...v, action: withCurrent(v.action, current()) } : v; });
+}
+
+/** Owner 2026-11-20: a config-change's `current` (the dialog's Now column) is what the Deployer reads at {file, key} (and
+ *  member) in the service's current revision; the AI's own is not kept. Not readable (no revision, not a properties file,
+ *  the key not in it, a cluster's nodes differing): left out. */
+export function withCurrent(action: TodoAction, body: ServiceConfigBody | undefined): TodoAction {
+  if (action.kind !== "config-change") return action;
+  return {
+    ...action,
+    changes: action.changes.map((c) => {
+      const { current: _ai, ...rest } = c;
+      if (!body || typeof c.file !== "string" || typeof c.key !== "string") return rest;
+      const v = valueAt(body, c.file, c.key, typeof c.member === "string" && c.member ? c.member : null);
+      return v === null ? rest : { ...rest, current: v };
+    }),
+  };
+}
+function valueAt(body: ServiceConfigBody, file: string, key: string, member: string | null): string | null {
+  const read = (f: Pick<ConfigFileRecord, "format" | "redacted"> | undefined): string | null => {
+    if (!f || f.format !== "properties") return null;
+    const lines = parseProperties(f.redacted).filter((l) => l.key === key);
+    return lines.length ? lines[lines.length - 1]!.value : null;
+  };
+  const fileOf = (m: ConfigMember) => m.files.find((f) => f.name === file);
+  if (member) { const m = body.members.find((x) => installKey(x) === member); return m ? read(fileOf(m)) : null; }
+  const common = body.layers?.common[file];
+  if (common) return read(common);
+  const values = body.members.map((m) => read(fileOf(m)));
+  return values.length && values.every((v) => v !== null && v === values[0]) ? values[0]! : null;
 }
 
 export function analysisView(a: AnalysisRecord, now: Date, lights?: Lights): AnalysisView {
