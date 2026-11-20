@@ -85,4 +85,6 @@ writeFileSync(stateFile, JSON.stringify(state, null, 2) + "\n");
 console.log(`package ${state.packageId} revision ${published.revision ?? "?"} agent ${agent}`);
 console.log(agentName === "deploy-assistant"
   ? "Next: point the Business Agent \"Deploy Assistant\" at this agent (Workbench update_business_agent), and set DEPLOYER_OMA_AGENT to it."
-  : "Next: set DEPLOYER_OMA_ASSESSOR_AGENT to this agent; its sessions run in DEPLOYER_OMA_ASSESSOR_ENVIRONMENT (isolated).");
+  : agentName === "service-checkup"
+    ? "Next: set DEPLOYER_OMA_CHECKUP_AGENT to this agent, and DEPLOYER_OMA_CHECKUP_VAULTS to a Vault holding the Deployer's check-up key (dpc_) for the MCP URL above."
+    : "Next: set DEPLOYER_OMA_ASSESSOR_AGENT to this agent; its sessions run in DEPLOYER_OMA_ASSESSOR_ENVIRONMENT (isolated).");
