@@ -25,13 +25,14 @@ unzip_to() { # zip dest-parent
 # ---------- extract ----------
 mkdir -p "$LAB/dist" "$LAB/jdk" "$LAB/instances" "$LAB/secrets"
 chmod 700 "$LAB/secrets"
-for v in 11 21; do
+# JDK 8 (S37 step 6: NiFi 1.9.2 runs on Java 8 only) unpacks as jdk8u<update>-b<build>, the others as jdk-<v>...
+for v in 8 11 21; do
   if [ ! -e "$LAB/jdk/$v" ]; then
     log "extract JDK $v"
     d="$(mktemp -d "$LAB/jdk/x.XXXX")"
     tar -xzf "$DL/jdk$v.tar.gz" -C "$d"
     mv "$d"/* "$LAB/jdk/" && rmdir "$d"
-    ln -s "$(ls -d "$LAB"/jdk/jdk-"$v"* | head -1)" "$LAB/jdk/$v"
+    ln -s "$(ls -d "$LAB"/jdk/jdk-"$v"* "$LAB"/jdk/jdk"$v"u* 2>/dev/null | head -1)" "$LAB/jdk/$v"
   fi
 done
 if [ ! -d "$LAB/dist/zookeeper-$ZK_VERSION" ]; then
@@ -235,5 +236,5 @@ for n in $ONLY; do
 done
 
 # lab.sh needs these next to it.
-if [ "$HERE" != "$LAB" ]; then cp "$HERE"/{lab.conf,lab.sh,setup.sh,grant.py,props.py,nginx.conf} "$LAB/"; chmod +x "$LAB"/*.sh; fi
+if [ "$HERE" != "$LAB" ]; then cp "$HERE"/{lab.conf,lab.sh,setup.sh,grant.py,props.py,nginx.conf,s2s.py} "$LAB/"; chmod +x "$LAB"/*.sh; fi
 log "done. Next: $LAB/lab.sh start && $LAB/lab.sh grant && $LAB/lab.sh status (and $LAB/lab.sh nginx start for Studio, P8)"

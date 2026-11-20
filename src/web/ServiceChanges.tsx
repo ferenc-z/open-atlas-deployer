@@ -1,4 +1,4 @@
-// A service's Changes tab (§12.2, §16.3): what is being done to it and what was (a plan to look at, the change holding the
+// A service's Changes section (§12.2, §16.3): what is being done to it and what was (a plan to look at, the change holding the
 // service with its buttons, the ones that ended), whether the hosts still have what is kept, the open configuration drafts,
 // and the saved revisions compared two at a time. A draft is a list of changes on a revision (made on the Configuration
 // tab); saving one makes the next revision and changes nothing on the hosts; only a confirmed plan touches a host.
@@ -11,7 +11,7 @@ import { ask } from "./Confirm.tsx";
 import { Markdown } from "./Markdown.tsx";
 import { SEVERITY, SOURCE, webPort, when } from "./svc.tsx";
 
-/** The open drafts of a service, and the one edits on the Configuration tab go into. */
+/** The open drafts of a service, and the one edits on the Configuration section go into. */
 export type Drafts = {
   list: ConfigDraft[];
   /** undefined: edits start a new draft. */
@@ -41,7 +41,7 @@ export const memberName = (s: ServiceStatus, key: string | null) => {
   const m = s.members.find((x) => x.key === key);
   if (!m) return key;
   if (s.kind !== "cluster") return m.host;
-  // As on the Configuration tab: by address, or by host and port when the addresses do not tell the nodes apart.
+  // As on the Configuration section: by address, or by host and port when the addresses do not tell the nodes apart.
   const addresses = s.members.map((x) => x.nodeAddress ?? x.host);
   return m.nodeAddress && new Set(addresses).size === addresses.length ? m.nodeAddress : `${m.host}:${webPort(m.ports) ?? "?"}`;
 };
@@ -177,7 +177,7 @@ function DraftDetail({ draft, s, cfg, drafts, onSaved, onEdit }: { draft: Config
         <span className="muted small">by {draft.createdBy}{draft.via === "service" ? " (AI)" : ""} · {when(draft.updatedAt)}</span>
       </div>
       {draft.stale && <div className="banner warn inline">Someone saved a revision after this draft was made. Move it to r{cfg.revision} to save it: its changes are made again on that revision. {cfg.canDraft && <button onClick={move} disabled={busy}>Move to r{cfg.revision}</button>}</div>}
-      {draft.changes.length === 0 ? <p className="muted">No changes yet. {cfg.canDraft && <button className="link" onClick={onEdit}>Edit on the Configuration tab</button>}</p> : <table className="props">
+      {draft.changes.length === 0 ? <p className="muted">No changes yet. {cfg.canDraft && <button className="link" onClick={onEdit}>Edit on the Configuration section</button>}</p> : <table className="props">
         <thead><tr><th>File</th>{s.kind === "cluster" && <th>Applies to</th>}<th>Key</th><th>New value</th>{cfg.canDraft && <th></th>}</tr></thead>
         <tbody>{draft.changes.map((c, i) => (
           <tr key={i}>
@@ -199,7 +199,7 @@ function DraftDetail({ draft, s, cfg, drafts, onSaved, onEdit }: { draft: Config
           <span className="muted small">Kept with the revision and shown on the timeline. Anything that looks like a password is masked.</span></label>
         <div className="row">
           <button className="primary" onClick={save} disabled={busy || draft.stale || !draft.changes.length || Boolean(problem)} title={draft.stale ? "Move it to the newest revision first" : undefined}>Save as revision {next}</button>
-          <button onClick={onEdit}>Edit on the Configuration tab</button>
+          <button onClick={onEdit}>Edit on the Configuration section</button>
           <button onClick={discard} disabled={busy}>Discard</button>
         </div>
         <p className="muted small">Saving keeps a new revision here. The hosts keep their files until the revision is applied.</p>
@@ -683,7 +683,7 @@ function ChangeActions({ c, s, desk, onBusy }: { c: ServiceChangeView; s: Servic
 }
 
 /** One change: how far it got, what stopped it, and for the one holding the service, the buttons. */
-function ChangeRun({ c, s, desk, canSteer, onLogs }: { c: ServiceChangeView; s: ServiceStatus; desk: ChangeDesk; canSteer: boolean; onLogs: () => void }) {
+function ChangeRun({ c, s, desk, canSteer }: { c: ServiceChangeView; s: ServiceStatus; desk: ChangeDesk; canSteer: boolean }) {
   const [error, setError] = useState("");
   const st = CHANGE_STATE[c.state] ?? { label: c.state, tone: "muted" };
   const steps: Steps = c.steps ?? [];
@@ -722,13 +722,12 @@ function ChangeRun({ c, s, desk, canSteer, onLogs }: { c: ServiceChangeView; s: 
             </tr>
           ))}</tbody>
         </table>
-        <p className="muted small">What NiFi itself said is on the <button className="link" onClick={onLogs}>Logs tab</button>.</p>
       </details>}
     </section>
   );
 }
 
-function ChangeHistory({ s, desk, canSteer, onLogs }: { s: ServiceStatus; desk: ChangeDesk; canSteer: boolean; onLogs: () => void }) {
+function ChangeHistory({ s, desk, canSteer }: { s: ServiceStatus; desk: ChangeDesk; canSteer: boolean }) {
   const [shown, setShown] = useState<string | null>(null);
   const [detail, setDetail] = useState<ServiceChangeView | undefined>();
   useEffect(() => {
@@ -757,12 +756,12 @@ function ChangeHistory({ s, desk, canSteer, onLogs }: { s: ServiceStatus; desk: 
           );
         })}</tbody>
       </table>}
-      {detail && <ChangeRun c={detail} s={s} desk={desk} canSteer={canSteer} onLogs={onLogs} />}
+      {detail && <ChangeRun c={detail} s={s} desk={desk} canSteer={canSteer} />}
     </section>
   );
 }
 
-export function ServiceChanges({ s, cfg, drafts, desk, onSaved, onEdit, onLogs }: { s: ServiceStatus; cfg: ServiceConfigView; drafts: Drafts; desk: ChangeDesk; onSaved: () => void; onEdit: () => void; onLogs: () => void }) {
+export function ServiceChanges({ s, cfg, drafts, desk, onSaved, onEdit }: { s: ServiceStatus; cfg: ServiceConfigView; drafts: Drafts; desk: ChangeDesk; onSaved: () => void; onEdit: () => void }) {
   const { refresh } = drafts;
   useEffect(refresh, [refresh]);
   const current = drafts.active;
@@ -771,16 +770,16 @@ export function ServiceChanges({ s, cfg, drafts, desk, onSaved, onEdit, onLogs }
     <>
       <p className="muted small page-note">Drafts become revisions here, and a revision is kept until it is applied. Only a plan you confirm changes a host.</p>
       {desk.asked && <PlanPanel key={JSON.stringify(desk.asked)} s={s} desk={desk} request={desk.asked} canSteer={cfg.canDraft} />}
-      {desk.active && <ChangeRun c={desk.active} s={s} desk={desk} canSteer={cfg.canDraft} onLogs={onLogs} />}
+      {desk.active && <ChangeRun c={desk.active} s={s} desk={desk} canSteer={cfg.canDraft} />}
       {!desk.active && !desk.asked && cfg.canDraft && notApplied.length > 0 && <div className="banner info inline pending-bar">
         <span>r{cfg.revision} is saved but not on the hosts yet: {notApplied.length} file{notApplied.length > 1 ? "s" : ""}{s.kind === "cluster" ? ` on ${new Set(notApplied.map((x) => x.member)).size} node${new Set(notApplied.map((x) => x.member)).size > 1 ? "s" : ""}` : ""}.</span>
         <button className="primary" onClick={() => desk.plan({ kind: "apply", revision: cfg.revision })}>Plan applying r{cfg.revision}</button>
       </div>}
-      <ChangeHistory s={s} desk={desk} canSteer={cfg.canDraft} onLogs={onLogs} />
+      <ChangeHistory s={s} desk={desk} canSteer={cfg.canDraft} />
       <Drift s={s} cfg={cfg} desk={desk} onSaved={onSaved} />
       <section className="panel">
         <h3>Drafts</h3>
-        {!drafts.list.length ? <p className="muted">No open drafts. {cfg.canDraft ? <>Edit a key on the <button className="link" onClick={onEdit}>Configuration tab</button> to start one.</> : "You can see drafts here, but not make them."}</p> : <>
+        {!drafts.list.length ? <p className="muted">No open drafts. {cfg.canDraft ? <>Edit a key on the <button className="link" onClick={onEdit}>Configuration section</button> to start one.</> : "You can see drafts here, but not make them."}</p> : <>
           <table className="props revisions">
             <thead><tr><th>Draft</th><th>On</th><th>Changes</th><th>Checks</th><th>By</th><th>Updated</th></tr></thead>
             <tbody>{drafts.list.map((d) => (

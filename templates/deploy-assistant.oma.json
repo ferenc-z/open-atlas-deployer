@@ -14,7 +14,7 @@
           "name": "open-atlas-deployer",
           "type": "http",
           "url": "{{mcpUrl}}",
-          "allowed_tools": ["get_status", "list_apps", "get_app", "list_versions", "plan_deploy", "list_jobs", "get_job", "list_artifacts", "get_env", "plan_env", "get_env_fingerprint", "compare_env_with_uat", "list_assessments", "onboarding_draft", "list_service_clusters", "get_cluster_status", "get_metrics", "list_alerts", "list_events", "get_bulletins", "search_logs", "tail_logs", "search_provenance", "get_lineage", "get_provenance_event", "get_service_config", "diff_service_config", "lookup_property", "list_service_changes", "get_service_change", "get_service_drift", "draft_service_config"]
+          "allowed_tools": ["get_status", "list_apps", "get_app", "list_versions", "plan_deploy", "list_jobs", "get_job", "list_artifacts", "get_env", "plan_env", "get_env_fingerprint", "compare_env_with_uat", "list_assessments", "onboarding_draft", "describe", "look", "trace", "run_model", "publish_model", "record", "draft_change"]
         }
       ],
       "tools": [
@@ -25,6 +25,6 @@
     }
   ],
   "credential_requirements": [
-    { "key": "deployer-service-key", "description": "The Deployer's read-only service key (dps_), stored for the MCP URL above.", "required_scopes": ["read"] }
+    { "key": "deployer-service-key", "description": "The Deployer's service key (dps_), stored for the MCP URL above: reads, drafts configuration changes, publishes the business model through its gate, saves to-dos.", "required_scopes": ["read"] }
   ]
 }

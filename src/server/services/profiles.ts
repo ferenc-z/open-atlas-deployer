@@ -68,24 +68,23 @@ export interface ServiceProfile {
 
 /** The thresholds of the health rules (services/rules.ts THRESHOLDS says what each is). */
 export interface Thresholds {
-  executorLostMinutes: number;
-  backpressureMinutes: number;
+  collectionMinutes: number;
   repoDiskWarnPct: number;
   repoDiskCritPct: number;
   heapPct: number;
   heapMinutes: number;
-  errorBulletins: number;
-  errorBulletinMinutes: number;
+  oomMinutes: number;
   zkErrors: number;
   zkMinutes: number;
   certWarnDays: number;
   certCritDays: number;
 }
 
-/** Both NiFi lines start from the same thresholds (§9.2, §15.3). */
+/** Both NiFi lines start from the same thresholds (pages-rethink C1: one default for all, a service may override). WarnPct /
+ *  WarnDays are the attention bounds, CritPct / CritDays the failing ones. Overrides of thresholds from before C1 are ignored. */
 export const NIFI_THRESHOLDS: Thresholds = {
-  executorLostMinutes: 2, backpressureMinutes: 10, repoDiskWarnPct: 80, repoDiskCritPct: 90, heapPct: 85, heapMinutes: 5,
-  errorBulletins: 10, errorBulletinMinutes: 5, zkErrors: 3, zkMinutes: 5, certWarnDays: 30, certCritDays: 7,
+  collectionMinutes: 5, repoDiskWarnPct: 85, repoDiskCritPct: 95, heapPct: 85, heapMinutes: 10, oomMinutes: 60,
+  zkErrors: 3, zkMinutes: 5, certWarnDays: 30, certCritDays: 7,
 };
 
 /** What each catalog key does, in a line (the pages show it on hover). */

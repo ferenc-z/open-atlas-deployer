@@ -51,10 +51,10 @@ test("the ZooKeeper rule counts nifi-app.log's summary as well as the bulletins"
   const zk = (key: string, at: string, count: number, more = {}) => pattern(key, at, { level: "ERROR", logger: "o.a.z.ClientCnxn", template: "Session <hex> for server localhost/<ip>:<n>, Closing socket connection", count, ...more });
   ingest(store, [sample(KEY1, "2026-11-06T12:06:00Z", [zk("bbbbbbbbbbbbbbbb", "2026-11-06T12:05:50Z", 2), pattern("cccccccccccccccc", "2026-11-06T12:05:50Z", { level: "INFO", template: "zookeeper fine", count: 50 })])]);
   check(store, () => online, "c250", now.t);
-  assert.equal(store.serviceAlerts({ service: "c250", state: "open" }).filter((a) => a.rule === "zk-errors").length, 0, "2 of 3; INFO does not count");
+  assert.equal(store.serviceAlerts({ service: "c250", state: "open" }).filter((a) => a.rule === "coordinator").length, 0, "2 of 3; INFO does not count");
   ingest(store, [sample(KEY2, "2026-11-06T12:06:05Z", [zk("dddddddddddddddd", "2026-11-06T12:06:01Z", 1, { logger: "o.a.n.c.l.e.CuratorLeaderElectionManager", template: "Failed to ..." })])]);
   check(store, () => online, "c250", now.t);
-  const open = store.serviceAlerts({ service: "c250", state: "open" }).find((a) => a.rule === "zk-errors");
+  const open = store.serviceAlerts({ service: "c250", state: "open" }).find((a) => a.rule === "coordinator");
   assert.ok(open, "3 ZooKeeper messages in the log open it");
   assert.deepEqual([open.detail.count, open.detail.log, open.detail.bulletins], [3, 3, 0]);
 });
@@ -64,7 +64,7 @@ test("step 14b: what NiFi logs of ZooKeeper while a change runs (forming and the
   const store = lab(now);
   const online: ExecutorInfo = { online: true, host: "local", ageSeconds: 5, heartbeat: { collector: { seconds: 30 } } as never };
   const zk = (key: string, at: string, count: number) => pattern(key, at, { level: "ERROR", logger: "o.a.z.ClientCnxn", template: "Session <hex> for server localhost/<ip>:<n>, Closing socket connection", count });
-  const open = () => store.serviceAlerts({ service: "c250", state: "open" }).find((a) => a.rule === "zk-errors");
+  const open = () => store.serviceAlerts({ service: "c250", state: "open" }).find((a) => a.rule === "coordinator");
   store.createServiceChange({ id: "chg-1", service: "c250", kind: "apply", revision: 1, mode: "full", phase: "gate", plan: {}, options: {}, reason: null, progress: {}, text: "x" }, admin);
   now.t = new Date("2026-11-06T12:04:00Z");
   store.updateServiceChange("chg-1", { state: "succeeded", phase: "done", currentMember: null, message: null, finishedAt: now.t.toISOString(), progress: {} });
@@ -94,7 +94,7 @@ function withExecutor(kinds = KINDS) {
   const handoff = new Handoff(store);
   const beat = (k = kinds) => handoff.heartbeat("local", { executor: "service", version: "0.8.0", protocols: [2], kinds: k, at: "", project: "", registries: [], databaseBackup: {}, busy: null }, "service");
   beat();
-  const logs = new ServiceLogs(store, handoff, { pollMs: 5, waitMs: 3000, tailSeconds: 1, retryMs: 20 });
+  const logs = new ServiceLogs(store, handoff, { pollMs: 5, waitMs: 3000 });
   const jobs: Record<string, unknown>[] = [];
   const claim = async () => { for (let i = 0; i < 400; i++) { const j = await handoff.next("local", 0, undefined, "service"); if (j) { jobs.push(j); return j; } await new Promise((r) => setTimeout(r, 5)); } throw new Error("no job"); };
   const done = (id: string, result: Record<string, unknown>, state: "succeeded" | "failed" = "succeeded", message?: string) => handoff.putStatus(id, { state, steps: [], result: result as never, ...(message ? { message } : {}) });
@@ -127,72 +127,17 @@ test("a search runs on both nodes in parallel and the matches are merged by time
 
 test("log jobs go only to an executor that names them, and only while it is online", async () => {
   const x = withExecutor(["svc-discover", "svc-read", "executor-upgrade"]);
-  await assert.rejects(x.logs.files("c250", KEY1), /cannot read logs/);
-  assert.throws(() => x.logs.tail("c250", KEY1, "nifi-app.log", () => {}), /cannot follow logs/);
   const r = await x.logs.search("c250", { from: "2026-11-06T10:00:00.000Z", to: "2026-11-06T11:00:00.000Z", limit: 10 });
   assert.deepEqual(r.members.map((m) => m.state), ["failed", "failed"]);
   assert.equal(x.store.executorJobs("local").length, 0, "nothing queued");
-  await assert.rejects(x.logs.files("c250", "local:/elsewhere"), /not a member/);
-  await assert.rejects(x.logs.files("nope", KEY1), /No standalone instance or cluster/);
-  assert.throws(() => x.logs.tail("c250", KEY1, "../x", () => {}), /file is the name/);
   assert.deepEqual(x.logs.members("c250")!.map((m) => [m.label, m.logDir, m.canRead]), [["localhost:18445", "/lab/c250-1/logs", false], ["localhost:18446", "/lab/c250-2/logs", false]]);
 });
 
-test("a download comes back over the content channel, cut at its limit", async () => {
+test("the content channel cuts at the request's maxBytes", () => {
   const x = withExecutor();
-  const running = x.logs.download("c250", KEY1, ["nifi-app.log", "nifi-bootstrap.log"]);
-  const j = await x.claim();
-  assert.deepEqual([j.mode, j.files, j.maxBytes], ["download", ["nifi-app.log", "nifi-bootstrap.log"], 50 << 20]);
-  x.handoff.putContent(String(j.id), Buffer.from("tar.gz bytes"));
-  x.done(String(j.id), { mode: "download", files: ["nifi-app.log", "nifi-bootstrap.log"] });
-  const got = await running;
-  assert.equal(got.data.toString(), "tar.gz bytes");
-  assert.match(got.name, /^c250-localhost_18445-logs-\d{8}T\d{6}\.tar\.gz$/);
-  // The content channel cuts at the request's maxBytes.
   x.handoff.submit("log-read-cut-1", { kind: "log-read", member: KEY1, mode: "lines", maxBytes: 4 }, "local", "service");
   assert.deepEqual(x.handoff.putContent("log-read-cut-1", Buffer.from("123456")), { bytes: 4, truncated: true });
   assert.equal(x.handoff.takeContent("log-read-cut-1")!.data.toString(), "1234");
   assert.equal(x.handoff.takeContent("log-read-cut-1"), undefined, "handed over once");
 });
 
-test("a tail is shared by its followers, renewed from its cursor while someone follows, and told to stop when nobody does", async () => {
-  const x = withExecutor();
-  const seen1: Record<string, unknown>[] = [], seen2: Record<string, unknown>[] = [];
-  const stop1 = x.logs.tail("c250", KEY1, "nifi-app.log", (e) => seen1.push(e));
-  const first = await x.claim();
-  assert.deepEqual([first.kind, first.member, first.file, first.seconds, first.lines, first.cursor], ["log-tail", KEY1, "nifi-app.log", 1, 100, undefined]);
-  assert.deepEqual(x.handoff.putChunk(String(first.id), { seq: 1, inode: 7, offset: 10, text: "line 1\n", first: true }), { stop: false });
-  const stop2 = x.logs.tail("c250", KEY1, "nifi-app.log", (e) => seen2.push(e));
-  assert.deepEqual(x.logs.tailing().map((t) => [t.followers, t.job]), [[2, first.id]], "one tail for both");
-  assert.deepEqual(seen2.filter((e) => e.type === "lines").map((e) => [e.text, e.backlog]), [["line 1\n", true]], "a newcomer gets the recent lines");
-  x.handoff.putChunk(String(first.id), { seq: 2, inode: 7, offset: 17, text: "line 2\n" });
-  // The tail ends (its 120 seconds): the next one carries on from where it stood, a rollover included.
-  x.done(String(first.id), { file: "nifi-app.log", inode: 8, offset: 3 });
-  const second = await x.claim();
-  assert.deepEqual([second.kind, second.cursor, second.lines], ["log-tail", { inode: 8, offset: 3 }, undefined]);
-  assert.ok(seen1.some((e) => e.type === "state" && e.state === "renewed"));
-  x.handoff.putChunk(String(second.id), { seq: 1, inode: 8, offset: 20, text: "after the restart\n" });
-  assert.deepEqual(seen1.filter((e) => e.type === "lines").map((e) => e.text), ["line 1\n", "line 2\n", "after the restart\n"]);
-  assert.deepEqual(seen2.filter((e) => e.type === "lines").map((e) => e.text), ["line 1\n", "line 2\n", "after the restart\n"]);
-  stop1();
-  assert.deepEqual(x.handoff.putChunk(String(second.id), { seq: 2, inode: 8, offset: 20, text: "" }), { stop: false }, "one still follows");
-  stop2();
-  assert.deepEqual(x.handoff.putChunk(String(second.id), { seq: 3, inode: 8, offset: 20, text: "" }), { stop: true }, "nobody follows: the executor ends it");
-  x.done(String(second.id), { inode: 8, offset: 20, stopped: true });
-  await new Promise((r) => setTimeout(r, 50));
-  assert.deepEqual(x.logs.tailing(), [], "not renewed");
-  assert.equal(x.jobs.length, 2);
-});
-
-test("a tail whose executor fails says so and tries again while someone follows", async () => {
-  const x = withExecutor();
-  const seen: Record<string, unknown>[] = [];
-  const stop = x.logs.tail("c250", KEY2, "nifi-app.log", (e) => seen.push(e));
-  const j = await x.claim();
-  x.done(String(j.id), {}, "failed", "timed out after 120 seconds");
-  const again = await x.claim();
-  assert.equal(again.kind, "log-tail");
-  assert.ok(seen.some((e) => e.type === "state" && e.state === "error" && String(e.message).includes("timed out")));
-  stop();
-  x.done(String(again.id), {});
-});

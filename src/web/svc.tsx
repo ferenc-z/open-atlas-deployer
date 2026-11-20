@@ -82,7 +82,7 @@ export const daysText = (days: number) => (days < 0 ? `expired ${-days}d ago` : 
 export function CertBadge({ s, only30 = false }: { s: ServiceSummary | null; only30?: boolean }) {
   if (!s) return null;
   const c = s.cert;
-  const unread = s.certErrors > 0 && <span className="badge warn" title="A keystore or truststore could not be read (see the certificates on Overview)">cert unreadable</span>;
+  const unread = s.certErrors > 0 && <span className="badge warn" title="A keystore or truststore could not be read (see the certificates on Status)">cert unreadable</span>;
   if (!c) return unread || null;
   if (only30 && c.days > (s.certDays?.warn ?? 30)) return unread || null;
   return <>

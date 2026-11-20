@@ -10,7 +10,7 @@ import type { SecretBox } from "./secretbox.ts";
 import type { Actor, Store } from "./store.ts";
 import { readToken } from "./versions.ts";
 
-export type SettingKind = "url" | "url-or-path" | "text" | "tag" | "ids" | "hour" | "release" | "repo" | "secret" | "fixed";
+export type SettingKind = "url" | "url-or-path" | "text" | "cron" | "tag" | "ids" | "hour" | "release" | "repo" | "secret" | "fixed";
 
 export interface SettingDef {
   key: string;
@@ -42,10 +42,16 @@ export const SETTINGS: SettingDef[] = [
   { key: "DEPLOYER_OMA_ASSESSOR_AGENT", kind: "text", group: "OMA", help: "The Onboarding Assessor agent." },
   { key: "DEPLOYER_OMA_ASSESSOR_ENVIRONMENT", kind: "text", group: "OMA", help: "The Assessor's isolated Environment." },
   { key: "DEPLOYER_OMA_ASSESSOR_VAULTS", kind: "ids", group: "OMA", help: "Vaults the Assessor's sessions use, separated by commas." },
+  { key: "DEPLOYER_OMA_CHECKUP_AGENT", kind: "text", group: "OMA", help: "The Service Check-up agent (AI analyses of the managed services, the scheduled check-up)." },
+  { key: "DEPLOYER_OMA_CHECKUP_ENVIRONMENT", kind: "text", group: "OMA", help: "The Environment the check-up's sessions run in." },
+  { key: "DEPLOYER_OMA_CHECKUP_VAULTS", kind: "ids", group: "OMA", help: "Vaults the check-up's sessions use (the one with its dpc_ key for the Deployer's MCP), separated by commas." },
+  { key: "DEPLOYER_CHECKUP_CRON", kind: "cron", group: "OMA", help: "When OMA runs the scheduled check-up (cron, in the time zone below).", default: "0 */4 * * *" },
+  { key: "DEPLOYER_CHECKUP_TIMEZONE", kind: "text", group: "OMA", help: "The scheduled check-up's time zone (IANA name).", default: "Asia/Shanghai" },
   { key: "DEPLOYER_OMA_BUILDER_URL", kind: "url", group: "OMA", help: "OMA's Builder MCP, for deploying OMA agents." },
   { key: "DEPLOYER_OMA_BUILDER_KEY_FILE", kind: "secret", group: "OMA", help: "The key for OMA's Builder MCP." },
   { key: "DEPLOYER_STUDIO_BUILDER_URL", kind: "url", group: "Studio", help: "Studio's Builder MCP, for deploying Studio graphs." },
   { key: "DEPLOYER_STUDIO_TOKEN_FILE", kind: "secret", group: "Studio", help: "Studio workspace token (oaw_v1., read and write)." },
+  { key: "DEPLOYER_STUDIO_DATA_URL", kind: "url", group: "Studio", help: "Studio's data plane MCP (…:9632/mcp), read with each service's graph token for the e2e_trace run records." },
   { key: "DEPLOYER_NIFI_OPS_GRAPH", kind: "text", group: "Studio", help: "The Studio graph the Deployer publishes its NiFi services to (name, or workspace/name).", default: "nifi-ops" },
   { key: "DEPLOYER_UAT_URL", kind: "url", group: "Promotion", help: "PROD only: UAT's Deployer as this one reaches it." },
   { key: "DEPLOYER_UAT_KEY_FILE", kind: "secret", group: "Promotion", help: "PROD only: the read-only key UAT's Deployer gave this one." },
@@ -201,6 +207,7 @@ function check(d: SettingDef, v: string): string | undefined {
     case "url": return url(v) ? undefined : "an http or https address";
     case "url-or-path": return url(v) || /^\/\S*$/.test(v) ? undefined : "an http or https address, or a path starting with /";
     case "text": return /^\S+$/.test(v) ? undefined : "one word, no spaces";
+    case "cron": return /^\S+( \S+){4}$/.test(v) ? undefined : "five cron fields, e.g. 0 */4 * * *";
     case "tag": return /^\S*\{version\}\S*$/.test(v) ? undefined : "a tag with {version} in it, e.g. v{version}";
     case "ids": return v.split(/[\s,]+/).filter(Boolean).every((s) => /^\S+$/.test(s)) ? undefined : "ids separated by commas";
     case "hour": return /^\d{1,2}$/.test(v) && Number(v) <= 23 ? undefined : "a whole hour from 0 to 23";

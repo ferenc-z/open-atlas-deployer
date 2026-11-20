@@ -76,6 +76,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import urllib.parse
 import zlib
 
 # >>> executor_core
@@ -85,7 +86,7 @@ from executor_core import (  # noqa: F401
     FINAL, ID_RE, PROTOCOLS, Failed, ProtocolExecutor, Refused, Restarting, load_env_file, now_iso, write_json)
 # <<< executor_core
 
-VERSION = "0.9.3"
+VERSION = "0.9.4"
 # The executor's release (§8.6): one directory in the archive, holding only these files.
 PACKAGE = "open-atlas-service-executor"
 PACKAGE_FILES = ("service_executor.py", "launch.sh", "switch", "install.sh", "open-atlas-service-executor.service", "service-executor.env.example")
@@ -127,6 +128,8 @@ def config(env_file=None, environ=None):
         # (EXECUTOR_BACKPRESSURE_TOP, default 5, 1 to 50); the samples between carry none.
         "backpressure_seconds": min(BACKPRESSURE_MAX, max(COLLECT_MIN, int(e.get("EXECUTOR_BACKPRESSURE_SECONDS", str(BACKPRESSURE_DEFAULT))))),
         "backpressure_top": min(BACKPRESSURE_TOP_MAX, max(1, int(e.get("EXECUTOR_BACKPRESSURE_TOP", str(BACKPRESSURE_TOP))))),
+        # Flow counts and topology (pages-rethink A9): every this many seconds (default 300, 30 to 3600; 0 turns them off).
+        "flow_seconds": (lambda v: 0 if v <= 0 else min(FLOW_MAX, max(COLLECT_MIN, v)))(int(e.get("EXECUTOR_FLOW_SECONDS", str(FLOW_DEFAULT)))),
         # §8.6: where the installed releases are, and the only place a newer one may come from.
         "base": pathlib.Path(e.get("EXECUTOR_BASE", "/opt/open-atlas-deployer/service-executor")),
         "upgrade_from": e.get("EXECUTOR_UPGRADE_FROM", "").strip(),
@@ -687,6 +690,17 @@ COLLECT_DEFAULT, COLLECT_MIN, COLLECT_MAX = 60, 30, 300
 # Back pressure (owner 2026-11-07): read less often than the rest and sent only as a summary.
 BACKPRESSURE_DEFAULT, BACKPRESSURE_MAX = 300, 3600
 BACKPRESSURE_TOP, BACKPRESSURE_TOP_MAX = 5, 50
+BACKPRESSURE_STOPPED_MAX = 50
+# Flow counts (pages-rethink A9, §10.2 step 1): every FLOW_DEFAULT seconds the in/out counts of each group under root
+# and of the S2S ports (NiFi's own 5-minute window), with the topology the skeleton is found from. The topology is
+# walked group by group (flow/process-groups/<id>) only when the status shows other components or once an hour.
+FLOW_DEFAULT, FLOW_MAX = 300, 3600
+FLOW_BUDGET = 20.0
+TOPOLOGY_SECONDS = 3600
+TOPOLOGY_GROUPS_MAX = 500
+HISTORY_CALLS_MAX = 200
+FLOW_NAMES_MAX = 5
+FIVE_MINUTES_MS = 300_000
 # Per NiFi and round, and per REST request: a NiFi that hangs costs its own sample at most this, never the others'.
 NIFI_BUDGET = 10.0
 REQUEST_TIMEOUT = 5.0
@@ -728,6 +742,8 @@ def watch_entries(value):
             "nodeAddress": w["nodeAddress"] if isinstance(w.get("nodeAddress"), str) else None,
             "logDir": os.path.normpath(logs) if ok_path(logs) else None,
             "files": watch_files(w.get("files")),
+            # The Deployer has no flow counts of this service yet: read NiFi's own status history (about 24 hours) once.
+            "flowHistory": w.get("flowHistory") is True,
         })
     return out
 
@@ -829,6 +845,65 @@ def endpoint(https_host, node_address=None):
     return host, host
 
 
+LOCAL_TTL = 300
+_local_cache = {}
+
+
+def host_name(name):
+    """A host name as compared: lower case, without the trailing dot."""
+    return str(name or "").strip().lower().rstrip(".")
+
+
+def is_local_address(address):
+    """Whether an address (name or IP) resolves to an IP of this machine: one it can bind. Remembered LOCAL_TTL seconds,
+    so a slow resolver is asked once in a while, not every round."""
+    key = host_name(address)
+    if not key:
+        return False
+    hit = _local_cache.get(key)
+    if hit and hit[1] > time.monotonic():
+        return hit[0]
+    local = False
+    try:
+        infos = socket.getaddrinfo(key, None, 0, socket.SOCK_STREAM)
+    except (OSError, UnicodeError):
+        infos = []
+    for family, _, _, _, sockaddr in infos:
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as s:
+                s.bind((sockaddr[0], 0) if family == socket.AF_INET else (sockaddr[0], 0, 0, sockaddr[3] if len(sockaddr) > 3 else 0))
+            local = True
+            break
+        except OSError:
+            continue
+    _local_cache[key] = (local, time.monotonic() + LOCAL_TTL)
+    return local
+
+
+def own_names(w, props):
+    """What this NiFi may call itself in its cluster's node list (S34): its API host, its cluster node address, the
+    machine's names."""
+    names = {host_name((w.get("https") or {}).get("host")), host_name(props.get("nifi.web.https.host")),
+             host_name(w.get("nodeAddress")), host_name(props.get("nifi.cluster.node.address"))}
+    with contextlib.suppress(OSError):
+        names.add(host_name(socket.gethostname()))
+    with contextlib.suppress(OSError):
+        names.add(host_name(socket.getfqdn()))
+    return {n for n in names if n and n not in WILDCARD_HOSTS}
+
+
+def self_node(nodes, port, names, local=is_local_address):
+    """nodeId of this machine's NiFi among a cluster's nodes (S34): the API port is its HTTPS port, and the address is
+    one of its names or resolves to this machine. The only node on that port when none says so (NiFis of one machine
+    differ by port). None when it cannot tell."""
+    # By node id: the same node may come from both the nodewise diagnostics and the cluster view.
+    on_port = {n["nodeId"]: n.get("address") for n in nodes or [] if isinstance(n, dict) and n.get("apiPort") == port and n.get("nodeId")}
+    mine = [i for i, a in on_port.items() if host_name(a) in names] or [i for i, a in on_port.items() if local(a)]
+    if len(mine) == 1:
+        return mine[0]
+    return next(iter(on_port)) if len(on_port) == 1 else None
+
+
 def _num(d, *keys):
     return {k: d[k] for k in keys if isinstance(d.get(k), (int, float)) and not isinstance(d.get(k), bool)}
 
@@ -899,8 +974,10 @@ def trim_bulletins(d):
 def trim_backpressure(d, top=BACKPRESSURE_TOP):
     """Back pressure from the root process group's recursive status (§15.4 step 2), only as a summary (owner
     2026-11-07): how many connections there are, how many are at their threshold (object count or size at 100 %), the
-    fullest percentage and the fullest `top` queues that hold anything; never the whole list."""
-    conns = []
+    fullest percentage and the fullest `top` queues that hold anything; never the whole list. S37 step 6 (T11): the
+    queues name their source and destination ids, and the processors that are not running (at most
+    BACKPRESSURE_STOPPED_MAX) are listed, so a stuck trace can say whether its component runs."""
+    conns, stopped = [], []
 
     def walk(snap, group):
         if not isinstance(snap, dict):
@@ -908,7 +985,12 @@ def trim_backpressure(d, top=BACKPRESSURE_TOP):
         for c in snap.get("connectionStatusSnapshots") or []:
             c = (c or {}).get("connectionStatusSnapshot") or {}
             conns.append({"id": c.get("id"), "name": c.get("name"), "group": group, "sourceName": c.get("sourceName"), "destinationName": c.get("destinationName"),
+                          **{k: c[k] for k in ("sourceId", "destinationId", "groupId") if isinstance(c.get(k), str)},
                           **_num(c, "percentUseCount", "percentUseBytes", "flowFilesQueued", "bytesQueued")})
+        for p in snap.get("processorStatusSnapshots") or []:
+            p = (p or {}).get("processorStatusSnapshot") or {}
+            if p.get("runStatus") not in (None, "Running") and len(stopped) < BACKPRESSURE_STOPPED_MAX:
+                stopped.append({"id": p.get("id"), "name": p.get("name"), "runStatus": p.get("runStatus")})
         for g in snap.get("processGroupStatusSnapshots") or []:
             g = (g or {}).get("processGroupStatusSnapshot") or {}
             walk(g, g.get("name"))
@@ -918,10 +1000,219 @@ def trim_backpressure(d, top=BACKPRESSURE_TOP):
     fill = lambda c: max(c.get("percentUseCount") or 0, c.get("percentUseBytes") or 0)
     conns.sort(key=fill, reverse=True)
     return {"connections": len(conns), "full": sum(1 for c in conns if fill(c) >= 100), "maxPercent": fill(conns[0]) if conns else 0,
-            "top": [c for c in conns[:top] if fill(c) > 0]}
+            "top": [c for c in conns[:top] if fill(c) > 0], "notRunning": stopped}
 
 
 TRIM = {"about": trim_about, "diagnostics": trim_diagnostics, "status": trim_status, "cluster": trim_cluster, "bulletins": trim_bulletins}
+
+
+# --- flow counts and topology (pages-rethink A7, A9; §10.2 step 1) ---------------------------------------------------
+
+STATUS_KINDS = (("processorStatusSnapshots", "processorStatusSnapshot", "processor"), ("inputPortStatusSnapshots", "portStatusSnapshot", "input-port"),
+                ("outputPortStatusSnapshots", "portStatusSnapshot", "output-port"), ("connectionStatusSnapshots", "connectionStatusSnapshot", "connection"),
+                ("remoteProcessGroupStatusSnapshots", "remoteProcessGroupStatusSnapshot", "rpg"))
+
+
+def status_index(d):
+    """The root group's recursive status: the root snapshot, every component's snapshot by id, and a signature of the
+    ids (other components: the topology is walked again)."""
+    root = ((d or {}).get("processGroupStatus") or {}).get("aggregateSnapshot") or {}
+    comps = {}
+
+    def walk(g):
+        for key, inner, kind in STATUS_KINDS:
+            for x in g.get(key) or []:
+                s = (x or {}).get(inner) or {}
+                if isinstance(s.get("id"), str):
+                    comps[s["id"]] = (kind, s)
+        for x in g.get("processGroupStatusSnapshots") or []:
+            s = (x or {}).get("processGroupStatusSnapshot") or {}
+            if isinstance(s.get("id"), str):
+                comps[s["id"]] = ("group", s)
+                walk(s)
+
+    walk(root)
+    signature = hashlib.sha256("\n".join(sorted(f"{k[0]}:{i}" for i, k in comps.items())).encode()).hexdigest()
+    return {"root": root, "comps": comps, "signature": signature}
+
+
+def target_uris(rpg):
+    c = (rpg or {}).get("component") or {}
+    raw = c.get("targetUris") or c.get("targetUri") or ""
+    return [u.strip().rstrip("/").lower() for u in str(raw).split(",") if u.strip()]
+
+
+def build_topology(root_id, root_name, groups):
+    """The skeleton's raw material from the walked groups [{id, name, parent, flow}] (flow: processGroupFlow.flow):
+    each group directly under root is a unit, and so are the components on the root canvas itself (unit = root id,
+    root: true). Inside a unit, the connected pieces are its fragments (A7 ②); root-level connections between units are
+    links (A7 ①, ③); S2S: the remote input ports (s2sIn) and the RPG ports connections go to (s2sOut, ref
+    '<target uri>#<port name>'). Returns (body, helper): the body is what the Deployer stores, the helper what the
+    counts need (connection ids by S2S ref, root sources)."""
+    parent = {g["id"]: g.get("parent") for g in groups}
+
+    def unit_of(gid):
+        if gid == root_id:
+            return root_id
+        u, seen = gid, set()
+        while parent.get(u) not in (None, root_id) and u not in seen:
+            seen.add(u)
+            u = parent[u]
+        return u
+
+    names = {g["id"]: g.get("name") or g["id"] for g in groups}
+    nodes = {}  # id -> {unit, group, kind, name, remote?, rpg?, targets?}
+    conns = []
+    for g in groups:
+        gid, f = g["id"], g.get("flow") or {}
+        u = unit_of(gid)
+        name_of = lambda e: ((e.get("component") or {}).get("name")) or e.get("id")
+        for e in f.get("processors") or []:
+            nodes[e["id"]] = {"unit": u, "group": gid, "kind": "processor", "name": name_of(e)}
+        for e in f.get("inputPorts") or []:
+            remote = (e.get("component") or {}).get("allowRemoteAccess", e.get("allowRemoteAccess"))
+            # NiFi 1.x has no allowRemoteAccess: its root-level input ports are the remote ones.
+            nodes[e["id"]] = {"unit": u, "group": gid, "kind": "input-port", "name": name_of(e), "remote": bool(remote) if remote is not None else gid == root_id}
+        for e in f.get("outputPorts") or []:
+            nodes[e["id"]] = {"unit": u, "group": gid, "kind": "output-port", "name": name_of(e)}
+        for e in f.get("funnels") or []:
+            nodes[e["id"]] = {"unit": u, "group": gid, "kind": "funnel", "name": "funnel"}
+        for e in f.get("remoteProcessGroups") or []:
+            uris = target_uris(e)
+            for p in (((e.get("component") or {}).get("contents") or {}).get("inputPorts") or []):
+                if isinstance(p, dict) and isinstance(p.get("id"), str):
+                    nodes[p["id"]] = {"unit": u, "group": gid, "kind": "rpg-port", "name": p.get("name") or p["id"], "rpg": e.get("id"), "targets": uris}
+        for e in f.get("connections") or []:
+            s, d = e.get("sourceId") or ((e.get("component") or {}).get("source") or {}).get("id"), e.get("destinationId") or ((e.get("component") or {}).get("destination") or {}).get("id")
+            if isinstance(s, str) and isinstance(d, str):
+                conns.append((e.get("id"), s, d))
+    up = {}
+
+    def find(x):
+        while up.get(x, x) != x:
+            up[x] = up.get(up[x], up[x])
+            x = up[x]
+        return x
+
+    incoming, linked, links = {}, set(), []
+    for cid, s, d in conns:
+        if s not in nodes or d not in nodes:
+            continue
+        incoming.setdefault(d, []).append(cid)
+        if nodes[s]["unit"] == nodes[d]["unit"]:
+            up[find(s)] = find(d)
+            linked.update((s, d))
+        else:
+            links.append((cid, s, d))
+    classes = {}
+    for i, n in nodes.items():
+        if n["kind"] == "processor" or i in linked:
+            classes.setdefault(find(i), []).append(i)
+    frag_of, units = {}, {}
+    for members in classes.values():
+        key = min(members)
+        u = nodes[members[0]]["unit"]
+        procs = sorted(nodes[i]["name"] for i in members if nodes[i]["kind"] == "processor")
+        remote_in = sorted(({"id": i, "name": nodes[i]["name"]} for i in members if nodes[i]["kind"] == "input-port" and nodes[i]["remote"]), key=lambda p: p["id"])
+        s2s_out = sorted({f"{(nodes[i]['targets'] or [''])[0]}#{nodes[i]['name']}" for i in members if nodes[i]["kind"] == "rpg-port" and i in incoming})
+        frag = {"key": key, "processors": len(procs), "names": procs[:FLOW_NAMES_MAX],
+                "inputs": sorted(nodes[i]["name"] for i in members if nodes[i]["kind"] == "input-port" and nodes[i]["group"] == u and u != root_id),
+                "outputs": sorted(nodes[i]["name"] for i in members if nodes[i]["kind"] == "output-port" and nodes[i]["group"] == u and u != root_id),
+                "remoteIn": [p["name"] for p in remote_in], "s2sOut": s2s_out,
+                "starts": sum(1 for i in members if nodes[i]["kind"] == "processor" and i not in incoming) + len(remote_in)}
+        for i in members:
+            frag_of[i] = key
+        units.setdefault(u, []).append(frag)
+    body_groups = []
+    for g in groups:
+        if parent.get(g["id"]) == root_id:
+            body_groups.append({"id": g["id"], "name": names[g["id"]], "root": False, "fragments": sorted(units.get(g["id"], []), key=lambda f: f["key"])})
+    body_groups.sort(key=lambda g: (g["name"], g["id"]))
+    if units.get(root_id):
+        body_groups.insert(0, {"id": root_id, "name": root_name or root_id, "root": True, "fragments": sorted(units[root_id], key=lambda f: f["key"])})
+    port_name = lambda i: nodes[i]["name"] if nodes[i]["kind"] in ("input-port", "output-port") else None
+    body_links = sorted(({"connection": cid, "from": {"group": nodes[s]["unit"], "fragment": frag_of.get(s), "port": port_name(s)},
+                         "to": {"group": nodes[d]["unit"], "fragment": frag_of.get(d), "port": port_name(d)}} for cid, s, d in links), key=lambda l: l["connection"] or "")
+    s2s_in, s2s_out, helper = [], {}, {"s2sOut": {}, "s2sIn": {}, "rootSources": [], "rootOutConns": []}
+    for i, n in sorted(nodes.items()):
+        if n["kind"] == "input-port" and n["remote"]:
+            s2s_in.append({"id": i, "name": n["name"], "group": n["unit"], "fragment": frag_of.get(i)})
+            helper["s2sIn"][i] = [cid for cid, s, _ in conns if s == i]
+        elif n["kind"] == "rpg-port" and i in incoming:
+            ref = f"{(n['targets'] or [''])[0]}#{n['name']}"
+            o = s2s_out.setdefault((ref, n["unit"], frag_of.get(i)), {"ref": ref, "name": n["name"], "targets": n["targets"], "group": n["unit"], "fragment": frag_of.get(i)})
+            helper["s2sOut"].setdefault(ref, {"name": n["name"], "connections": []})["connections"].extend(incoming[i])
+            if n["unit"] == root_id:
+                helper["rootOutConns"].extend(incoming[i])
+        elif n["kind"] == "processor" and n["unit"] == root_id and i not in incoming:
+            helper["rootSources"].append(i)
+    body = {"root": {"id": root_id, "name": root_name or root_id}, "groups": body_groups, "links": body_links,
+            "s2sIn": s2s_in, "s2sOut": sorted(s2s_out.values(), key=lambda o: (o["ref"], o["group"], o["fragment"] or ""))}
+    # Ops step 3b (B3): where a bulletin's, a provenance event's or a queue's component is. nested: a group deeper than
+    # root's children -> its unit; split: in a unit of several fragments, each processor -> its fragment.
+    body["nested"] = {gid: unit_of(gid) for gid in sorted(parent) if gid != root_id and parent.get(gid) not in (None, root_id)}
+    multi = {u for u, fs in units.items() if len(fs) > 1}
+    body["split"] = {i: frag_of[i] for i in sorted(frag_of) if nodes[i]["unit"] in multi and nodes[i]["kind"] == "processor"}
+    return body, helper
+
+
+def _n(s, *keys):
+    return sum(v for v in (s.get(k) for k in keys) if isinstance(v, (int, float)) and not isinstance(v, bool))
+
+
+def flow_counts(index, topology, helper):
+    """The counts of one round (NiFi's 5-minute window ending now): each group under root (in = through its input ports
+    and received, out = through its output ports and sent), the root canvas' own components when they do something
+    (in = what its remote input ports passed on and its source processors made, out = what went to RPG ports), each S2S
+    ref's connections into the RPG ports and each remote input port. transferred (§10.3): the FlowFiles moved inside the
+    unit (a group's flowFilesTransferred; the root canvas' processors' out), so a group that makes and ends its own data
+    is not taken for one without traffic."""
+    root, comps = index["root"], index["comps"]
+    out = []
+    for x in root.get("processGroupStatusSnapshots") or []:
+        g = (x or {}).get("processGroupStatusSnapshot") or {}
+        if isinstance(g.get("id"), str):
+            out.append({"kind": "group", "ref": g["id"], "name": g.get("name") or g["id"],
+                        "flowFilesIn": _n(g, "flowFilesIn", "flowFilesReceived"), "flowFilesOut": _n(g, "flowFilesOut", "flowFilesSent"),
+                        "bytesIn": _n(g, "bytesIn", "bytesReceived"), "bytesOut": _n(g, "bytesOut", "bytesSent"),
+                        "transferred": _n(g, "flowFilesTransferred")})
+    if topology is None:
+        return out
+    snap = lambda i: comps.get(i, (None, {}))[1]
+    if any(g.get("root") for g in topology["groups"]):
+        ins = [snap(p["id"]) for p in topology["s2sIn"] if p["group"] == topology["root"]["id"]] + [snap(i) for i in helper["rootSources"]]
+        outs = [snap(c) for c in helper["rootOutConns"]]
+        out.append({"kind": "group", "ref": topology["root"]["id"], "name": topology["root"]["name"],
+                    "flowFilesIn": sum(_n(s, "flowFilesOut") for s in ins), "flowFilesOut": sum(_n(s, "flowFilesOut") for s in outs),
+                    "bytesIn": sum(_n(s, "bytesOut") for s in ins), "bytesOut": sum(_n(s, "bytesOut") for s in outs),
+                    "transferred": sum(_n((x or {}).get("processorStatusSnapshot") or {}, "flowFilesOut") for x in root.get("processorStatusSnapshots") or [])})
+    for ref, o in sorted(helper["s2sOut"].items()):
+        ss = [snap(c) for c in o["connections"]]
+        out.append({"kind": "s2s-out", "ref": ref, "name": o["name"], "flowFilesIn": sum(_n(s, "flowFilesIn") for s in ss), "flowFilesOut": sum(_n(s, "flowFilesOut") for s in ss),
+                    "bytesIn": sum(_n(s, "bytesIn") for s in ss), "bytesOut": sum(_n(s, "bytesOut") for s in ss)})
+    for p in topology["s2sIn"]:
+        s = snap(p["id"])
+        out.append({"kind": "s2s-in", "ref": p["id"], "name": p["name"], "flowFilesIn": _n(s, "flowFilesIn"), "flowFilesOut": _n(s, "flowFilesOut"),
+                    "bytesIn": _n(s, "bytesIn"), "bytesOut": _n(s, "bytesOut")})
+    return out
+
+
+def history_points(histories):
+    """NiFi's status history (a snapshot a minute, each NiFi's rolling 5-minute window) as one point per 5 minutes:
+    [timestamp ms, flowfiles in, flowfiles out, bytes in, bytes out, transferred], the first snapshot of each 5-minute
+    slot, summed over the histories given (an S2S ref's several connections; transferred only a group's history has)."""
+    slots = {}
+    for h in histories:
+        firsts = {}
+        for s in (h or {}).get("aggregateSnapshots") or []:
+            t, m = s.get("timestamp"), s.get("statusMetrics") or {}
+            if isinstance(t, (int, float)) and int(t) // FIVE_MINUTES_MS not in firsts:
+                firsts[int(t) // FIVE_MINUTES_MS] = (int(t), m)
+        for slot, (t, m) in firsts.items():
+            p = slots.setdefault(slot, [t, 0, 0, 0, 0, 0])
+            for k, key in enumerate(("inputCount", "outputCount", "inputBytes", "outputBytes", "flowFilesTransferred"), 1):
+                p[k] += _n(m, key)
+    return [slots[k] for k in sorted(slots)]
 
 
 # What svc-state says of the start environment (S10, as filterStartEnvironment in the Deployer's draft.ts): only what
@@ -991,6 +1282,9 @@ class Collector:
         self.keytools = {}   # member -> the keytool last found for it (a stopped NiFi has no JAVA_HOME to look at)
         self.bulletins = {}  # member -> the bulletin keys of its last sample: only new ones are sent
         self.backpressure_next = {}  # member -> monotonic time its back pressure is read next
+        self.flow_next = {}  # member -> monotonic time its flow counts are read next
+        self.topologies = {}  # member -> {"at": monotonic, "signature", "body", "helper"}
+        self.history_done = set()  # members whose NiFi status history was read (once per run, when the Deployer asks)
 
     # --- host and processes ---
 
@@ -1103,8 +1397,87 @@ class Collector:
                 out[name] = TRIM[name](json.loads(body))
             except (ValueError, AttributeError, TypeError) as e:
                 errors[name] = f"unexpected answer: {e}"[:300]
+        if node:
+            # Which node entry is this NiFi (S34): the Deployer reads its own numbers by this id.
+            listed = ((out.get("cluster") or {}).get("nodes") or []) + ((out.get("diagnostics") or {}).get("nodes") or [])
+            out["selfNodeId"] = self_node(listed, port, own_names(w, props)) if listed else None
         if errors:
             out.update(state="partial", errors=errors)
+        return out
+
+    def flow(self, w, props, ctx):
+        """Flow counts every flow_seconds (None between): the counts of the round, the topology when it was walked (other
+        components in the status, or an hour since), NiFi's status history once when the Deployer asks (flowHistory).
+        Within FLOW_BUDGET; what did not fit is said in errors."""
+        every = int(self.cfg.get("flow_seconds", FLOW_DEFAULT) or 0)
+        member = w["member"]
+        if every <= 0 or ctx is None or time.monotonic() < self.flow_next.get(member, 0):
+            return None
+        target = nifi_target(w, props)
+        if not target:
+            return None
+        self.flow_next[member] = time.monotonic() + every - min(every, int(self.cfg.get("collect_seconds", COLLECT_DEFAULT))) / 2
+        connect, sni, port = target
+        deadline = time.monotonic() + FLOW_BUDGET
+        out, errors = {"at": now_iso(), "everySeconds": every}, {}
+
+        def get(path):
+            left = deadline - time.monotonic()
+            if left < 0.5:
+                raise TimeoutError(f"{FLOW_BUDGET:g} seconds were used up")
+            status, body = self.fetch(ctx, connect, port, sni, path, min(REQUEST_TIMEOUT, left))
+            if status != 200:
+                raise NifiAnswer(status, body[:200].decode("utf-8", "replace").strip())
+            return json.loads(body)
+
+        try:
+            index = status_index(get("flow/process-groups/root/status?recursive=true"))
+        except (OSError, ssl.SSLError, http.client.HTTPException, NifiAnswer, ValueError) as e:
+            out["errors"] = {"status": (str(e) or type(e).__name__)[:300]}
+            return out
+        cached = self.topologies.get(member)
+        if cached is None or cached["signature"] != index["signature"] or time.monotonic() - cached["at"] >= TOPOLOGY_SECONDS:
+            try:
+                root_id, root_name = index["root"].get("id"), index["root"].get("name")
+                groups, todo = [], [(root_id, None)]
+                while todo:
+                    if len(groups) >= TOPOLOGY_GROUPS_MAX:
+                        raise ValueError(f"more than {TOPOLOGY_GROUPS_MAX} process groups: the topology is not walked")
+                    gid, parent = todo.pop(0)
+                    f = (get(f"flow/process-groups/{urllib.parse.quote(gid)}") or {}).get("processGroupFlow") or {}
+                    flow = f.get("flow") or {}
+                    name = ((f.get("breadcrumb") or {}).get("breadcrumb") or {}).get("name")
+                    groups.append({"id": gid, "name": name, "parent": parent, "flow": flow})
+                    todo.extend((g["id"], gid) for g in flow.get("processGroups") or [] if isinstance(g, dict) and isinstance(g.get("id"), str))
+                body, helper = build_topology(root_id, root_name, groups)
+                cached = {"at": time.monotonic(), "signature": index["signature"], "body": body, "helper": helper}
+                self.topologies[member] = cached
+                out["topology"] = body
+            except (OSError, ssl.SSLError, http.client.HTTPException, NifiAnswer, ValueError, TimeoutError) as e:
+                errors["topology"] = (str(e) or type(e).__name__)[:300]
+                # The counts keep the topology last walked (its S2S refs may be a little behind).
+        out["counts"] = flow_counts(index, cached and cached["body"], cached and cached["helper"])
+        if w.get("flowHistory") and member not in self.history_done and cached is not None:
+            self.history_done.add(member)
+            history, calls = [], 0
+            wanted = [("group", g["id"], g["name"], [f"flow/process-groups/{g['id']}/status/history"]) for g in cached["body"]["groups"] if not g["root"]]
+            wanted += [("s2s-out", ref, o["name"], [f"flow/connections/{c}/status/history" for c in o["connections"]]) for ref, o in sorted(cached["helper"]["s2sOut"].items())]
+            wanted += [("s2s-in", p["id"], p["name"], [f"flow/connections/{c}/status/history" for c in cached["helper"]["s2sIn"].get(p["id"], [])]) for p in cached["body"]["s2sIn"]]
+            try:
+                for kind, ref, name, paths in wanted:
+                    if not paths:
+                        continue
+                    calls += len(paths)
+                    if calls > HISTORY_CALLS_MAX:
+                        raise ValueError(f"more than {HISTORY_CALLS_MAX} history calls: the rest is left out")
+                    points = history_points([(get(urllib.parse.quote(p, safe="/")) or {}).get("statusHistory") for p in paths])
+                    if points:
+                        history.append({"kind": kind, "ref": ref, "name": name, "points": points})
+            except (OSError, ssl.SSLError, http.client.HTTPException, NifiAnswer, ValueError, TimeoutError) as e:
+                errors["history"] = (str(e) or type(e).__name__)[:300]
+            out["history"] = history
+        if errors:
+            out["errors"] = errors
         return out
 
     # --- certificates (S27) ---
@@ -1228,6 +1601,13 @@ class Collector:
             places["logs"] = w["logDir"]
         out["disks"] = self.disks(places)
         out["nifi"] = self.rest(w, props, ctx, why_not) if running else {"state": "not-running"}
+        if out["nifi"].get("state") in ("ok", "partial"):
+            try:
+                flow = self.flow(w, props, ctx)
+            except Exception as e:  # never the sample's end
+                flow = {"at": now_iso(), "errors": {"flow": f"the flow counts failed: {e}"[:300]}}
+            if flow is not None:
+                out["nifi"]["flowCounts"] = flow
         if "bulletins" in out["nifi"]:
             keys = {(b.get("id"), b.get("timestamp"), b.get("nodeAddress")) for b in out["nifi"]["bulletins"]}
             seen = self.bulletins.get(w["member"], set())
@@ -1297,11 +1677,10 @@ class Collector:
             out["error"] = (e.strerror or str(e))[:200]
         return out
 
-    def cluster_table(self, nodes, address, port):
-        """The nodes as svc-state says them, and which is this member (by nifi.cluster.node.address and HTTPS port)."""
+    def cluster_table(self, nodes, port, names):
+        """The nodes as svc-state says them, and which is this member (self_node: HTTPS port, and its names or address)."""
         table = [{"nodeId": n.get("nodeId"), "address": n.get("address"), "apiPort": n.get("apiPort"), "status": n.get("status"), "roles": n.get("roles") or []} for n in nodes]
-        me = next((n["nodeId"] for n in table if n["address"] == address and n["apiPort"] == port), None) if address else None
-        return {"nodes": table, "self": me}
+        return {"nodes": table, "self": self_node(table, port, names)}
 
     def state_rest(self, w, props):
         """svc-state's REST part, with the monitor certificate, within NIFI_BUDGET. state: ok, partial (it answered, but
@@ -1334,7 +1713,7 @@ class Collector:
                 if name == "status":
                     out["invalidCount"] = trim_status(d).get("invalidCount")
                 else:
-                    out["cluster"] = self.cluster_table(trim_cluster(d)["nodes"], w.get("nodeAddress") or props.get("nifi.cluster.node.address", "").strip(), port)
+                    out["cluster"] = self.cluster_table(trim_cluster(d)["nodes"], port, own_names(w, props))
             except (ValueError, AttributeError, TypeError) as e:
                 errors[name] = f"unexpected answer: {e}"[:300]
         if errors:
@@ -1657,7 +2036,11 @@ PROV_POLL = 0.25
 PROV_CLEANUP_TIMEOUT = 2.0
 PROV_ENRICH_MAX = 100          # lineage: the event nodes given their component, at most
 PROV_ATTRS_MAX, PROV_VALUE_MAX = 500, 4096
-PROV_OPS = ("provenance", "lineage", "event", "search-options")
+PROV_OPS = ("provenance", "lineage", "event", "search-options", "flow-search", "oldest")
+# S37 step 5: NiFi's component search (GET flow/search-results), for a trace model's step positions; at most this many.
+FLOW_SEARCH_MAX = 50
+FLOW_SEARCH_KINDS = (("processGroupResults", "process-group"), ("inputPortResults", "input-port"),
+                     ("outputPortResults", "output-port"), ("processorResults", "processor"))
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 NIFI_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 # What of an event leaves the host: never content claims (no content is read) or replay details.
@@ -1719,6 +2102,14 @@ def trim_event(e, offset_ms):
         out["details"] = out["details"][:PROV_VALUE_MAX]
     out["at"] = iso_ms(nifi_time_ms(e.get("eventTime"), offset_ms))
     return out
+
+
+def event_attributes(e):
+    """S37 step 6: an event's FlowFile attributes as {name: value} (bounded), or None when NiFi hides them."""
+    attrs = e.get("attributes") if isinstance(e, dict) else None
+    if not isinstance(attrs, list):
+        return None
+    return {str(a.get("name"))[:256]: str(a["value"])[:PROV_VALUE_MAX] for a in attrs[:PROV_ATTRS_MAX] if isinstance(a, dict) and a.get("value") is not None}
 
 
 def old_terms(version):
@@ -1802,6 +2193,22 @@ class ProvenanceQuery:
         fields = (self.call("GET", "provenance/search-options").get("provenanceOptions") or {}).get("searchableFields") or []
         return {"op": "search-options", "fields": [{k: f.get(k) for k in ("id", "field", "label", "type")} for f in fields if isinstance(f, dict)]}
 
+    def flow_search(self, request):
+        """Components whose name or id matches q (NiFi's own search): process groups, ports and processors, with
+        the group they are in. A read of the flow only."""
+        q = request.get("q")
+        if not isinstance(q, str) or not q.strip() or len(q) > 100:
+            raise Refused("q is 1 to 100 characters")
+        found = self.call("GET", "flow/search-results?q=" + urllib.parse.quote(q.strip())).get("searchResultsDTO") or {}
+        out = []
+        for key, kind in FLOW_SEARCH_KINDS:
+            for r in found.get(key) or []:
+                if not isinstance(r, dict) or not isinstance(r.get("id"), str):
+                    continue
+                parent = r.get("parentGroup") if isinstance(r.get("parentGroup"), dict) else {}
+                out.append({"kind": kind, "id": r["id"], "name": r.get("name"), "groupId": r.get("groupId"), "groupName": parent.get("name")})
+        return {"op": "flow-search", "q": q.strip(), "results": out[:FLOW_SEARCH_MAX], "truncated": len(out) > FLOW_SEARCH_MAX}
+
     def job(self, path, key, body, node):
         """Submit, poll until finished, delete (always). Returns (the finished job, its id)."""
         submitted = self.call("POST", path, body).get(key) or {}
@@ -1839,6 +2246,8 @@ class ProvenanceQuery:
         elif not isinstance(field, str) or not isinstance(value, str) or not 1 <= len(value) <= 256:
             raise Refused("give uuid, or field (a searchable field's id, see search-options) and value (1 to 256 characters)")
         node = self.node_of(r, False)
+        # S37 step 6: the trace needs the attributes (business match rules, the file name); NiFi gives them only unsummarized.
+        full = r.get("attributes") is True
         allowed = {f["id"] for f in self.search_options(r)["fields"]}
         if field not in allowed:
             raise Refused(f"{field} is not searchable on this NiFi (it can search {', '.join(sorted(allowed)) or 'nothing'}; nifi.provenance.repository.indexed.fields)")
@@ -1847,7 +2256,7 @@ class ProvenanceQuery:
         shift = 0.0
 
         def body(old_form):
-            req = {"maxResults": maximum, "summarize": True, "incrementalResults": False,
+            req = {"maxResults": maximum, "summarize": not full, "incrementalResults": False,
                    "startDate": nifi_date(s0 - shift), "endDate": nifi_date(e0 - shift),
                    "searchTerms": {field: value if old_form else {"value": value, "inverse": False}}}
             if node:
@@ -1881,12 +2290,42 @@ class ProvenanceQuery:
             if off is not None and abs(off) >= 60_000:
                 self.notes.append(f"NiFi still reads the dates {round(off / 3600_000, 2):g} h off: the events may not cover the time range asked")
             break
-        events = [trim_event(e, self.offset_ms) for e in (results.get("provenanceEvents") or [])[:maximum]]
+        events = []
+        for e in (results.get("provenanceEvents") or [])[:maximum]:
+            out = trim_event(e, self.offset_ms)
+            if full:
+                attrs = event_attributes(e)
+                out.update({"attributes": attrs} if attrs is not None else {"attributesHidden": True})
+            events.append(out)
         events.sort(key=lambda e: (e.get("at") or "", e.get("eventId") or 0))
         return {"op": "provenance", "query": qid, "nifiVersion": version, "events": events, "total": results.get("totalCount", len(events)),
                 "totalText": results.get("total"), "limit": maximum, "limitReached": len(events) >= maximum, "timeOffset": self.offset_ms,
                 "shiftedHours": round(shift / 3600, 2) if shift else 0, "errors": [str(x)[:300] for x in results.get("errors") or []][:20],
-                "scope": f"node {node}" if node else ("cluster" if self.cluster else "standalone")}
+                "scope": f"node {node}" if node else ("cluster" if self.cluster else "standalone"),
+                "oldest": iso_ms(nifi_time_ms(results.get("oldestEvent"), self.offset_ms)) if isinstance(results.get("oldestEvent"), str) else None}
+
+    def oldest(self, request):
+        """S37 step 6 (T4): the oldest event each node still holds (max.storage.size can age events out before the
+        configured time), from a one-event query per node; a cluster's connected nodes from controller/cluster."""
+        nodes = [None]
+        if self.cluster:
+            listed = (self.call("GET", "controller/cluster").get("cluster") or {}).get("nodes") or []
+            nodes = [n for n in listed if isinstance(n, dict) and n.get("status") == "CONNECTED" and NIFI_ID_RE.match(str(n.get("nodeId") or ""))]
+        now = time.time()
+        out = []
+        for n in nodes:
+            node = n["nodeId"] if n else None
+            req = {"maxResults": 1, "summarize": True, "incrementalResults": False, "startDate": nifi_date(now - 60), "endDate": nifi_date(now + 60)}
+            if node:
+                req["clusterNodeId"] = node
+            job, qid = self.job("provenance", "provenance", {"provenance": {"request": req}}, node)
+            results = job.get("results") or {}
+            if isinstance(results.get("timeOffset"), (int, float)) and not isinstance(results.get("timeOffset"), bool):
+                self.offset_ms = results["timeOffset"]
+            text = results.get("oldestEvent")
+            out.append({"node": node, **({"address": f"{n.get('address')}:{n.get('apiPort')}"} if n else {}),
+                        "oldest": iso_ms(nifi_time_ms(text, self.offset_ms)) if isinstance(text, str) else None})
+        return {"op": "oldest", "nodes": out, "timeOffset": self.offset_ms}
 
     def lineage(self, request):
         r = request

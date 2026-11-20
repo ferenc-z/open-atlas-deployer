@@ -10,7 +10,10 @@
 // the same pair as DEPLOYER_OMA_URL / DEPLOYER_OMA_API_KEY_FILE): OMA's Builder MCP can create a Skill but not add a
 // version to one.
 //
-// Usage: OMA_URL=<OMA API> OMA_API_KEY_FILE=<key file> [NIFI_OPS_MCP_URL=<Studio data plane MCP of the nifi-ops graph>] node bin/publish-assistant.ts <builder MCP url> <builder key file> <model> <Deployer MCP url> <state file> [deploy-assistant | onboarding-assessor]
+// The Service Check-up (pages-rethink A1, P7: service-checkup) is published the same way, with the same Skills, and its
+// Vault holds the Deployer's check-up key (dpc_) instead of the service key.
+//
+// Usage: OMA_URL=<OMA API> OMA_API_KEY_FILE=<key file> [NIFI_OPS_MCP_URL=<Studio data plane MCP of the nifi-ops graph>] node bin/publish-assistant.ts <builder MCP url> <builder key file> <model> <Deployer MCP url> <state file> [deploy-assistant | onboarding-assessor | service-checkup]
 //   e.g. OMA_URL=https://oma:3000 OMA_API_KEY_FILE=/etc/oa/oma-api.key node bin/publish-assistant.ts https://oma:3008/mcp /etc/oa/oma-builder.key claude-x https://wb.example/deploy/mcp ./assistant-uat.json
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -21,13 +24,13 @@ import { attachSkills, OmaSkills, readSkillSources, skillReferences, type Publis
 import { readToken } from "../src/server/versions.ts";
 
 const [builderUrl, keyFile, model, mcpUrl, stateFile, agentName = "deploy-assistant"] = process.argv.slice(2);
-if (!["deploy-assistant", "onboarding-assessor"].includes(agentName)) { console.error(`unknown agent ${agentName}`); process.exit(2); }
+if (!["deploy-assistant", "onboarding-assessor", "service-checkup"].includes(agentName)) { console.error(`unknown agent ${agentName}`); process.exit(2); }
 if (!builderUrl || !keyFile || !model || !mcpUrl || !stateFile) {
   console.error("usage: OMA_URL=<OMA API> OMA_API_KEY_FILE=<key file> node bin/publish-assistant.ts <builder MCP url> <builder key file> <model> <Deployer MCP url> <state file>");
   process.exit(2);
 }
 const root = join(import.meta.dirname, "..");
-const sources = agentName === "deploy-assistant" ? readSkillSources(join(root, "agents", "skills")) : [];
+const sources = agentName !== "onboarding-assessor" ? readSkillSources(join(root, "agents", "skills")) : [];
 const omaUrl = process.env.OMA_URL;
 const omaKeyFile = process.env.OMA_API_KEY_FILE;
 if (sources.length && (!omaUrl || !omaKeyFile)) {
@@ -48,7 +51,7 @@ if (missing.size) { console.error(`the package names ${[...missing].join(", ")} 
 // queue, processor or process group; its graph token (oat_v1.) is a second credential, kept in OMA's Vault.
 const NIFI_OPS_TOOLS = ["list_entities", "list_attributes", "search_attributes", "execute_eql", "list_saved_queries", "run_saved_query"];
 const nifiOps = process.env.NIFI_OPS_MCP_URL;
-if (nifiOps && agentName === "deploy-assistant") {
+if (nifiOps && agentName !== "onboarding-assessor") {
   const agent = filled.agents[0];
   agent.mcp_servers.push({ name: "open-atlas-nifi-ops", type: "http", url: nifiOps, allowed_tools: NIFI_OPS_TOOLS });
   agent.tools.push({ type: "mcp_toolset", mcp_server_name: "open-atlas-nifi-ops", default_config: { permission_policy: { type: "always_allow" } } });
@@ -82,4 +85,6 @@ writeFileSync(stateFile, JSON.stringify(state, null, 2) + "\n");
 console.log(`package ${state.packageId} revision ${published.revision ?? "?"} agent ${agent}`);
 console.log(agentName === "deploy-assistant"
   ? "Next: point the Business Agent \"Deploy Assistant\" at this agent (Workbench update_business_agent), and set DEPLOYER_OMA_AGENT to it."
-  : "Next: set DEPLOYER_OMA_ASSESSOR_AGENT to this agent; its sessions run in DEPLOYER_OMA_ASSESSOR_ENVIRONMENT (isolated).");
+  : agentName === "service-checkup"
+    ? "Next: set DEPLOYER_OMA_CHECKUP_AGENT to this agent, and DEPLOYER_OMA_CHECKUP_VAULTS to a Vault holding the Deployer's check-up key (dpc_) for the MCP URL above."
+    : "Next: set DEPLOYER_OMA_ASSESSOR_AGENT to this agent; its sessions run in DEPLOYER_OMA_ASSESSOR_ENVIRONMENT (isolated).");

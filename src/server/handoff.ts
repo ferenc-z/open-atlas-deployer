@@ -17,7 +17,7 @@ export { EXECUTOR_KINDS, type ExecutorKind } from "./store.ts";
 export const PROTOCOL = 2;
 /** §8.6: the executor releases this Deployer ships with, one per kind (deployer_executor.py and service_executor.py
  *  VERSION): each kind is offered an upgrade only when its own version moved. A change to executor_core.py moves both. */
-export const EXECUTOR_VERSIONS: Record<ExecutorKind, string> = { deploy: "0.9.3", service: "0.9.3" };
+export const EXECUTOR_VERSIONS: Record<ExecutorKind, string> = { deploy: "0.9.3", service: "0.9.4" };
 /** The deploy executor's release (EXECUTOR_VERSIONS.deploy). */
 export const EXECUTOR_VERSION = EXECUTOR_VERSIONS.deploy;
 

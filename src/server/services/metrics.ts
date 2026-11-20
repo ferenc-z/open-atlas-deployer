@@ -8,6 +8,7 @@ import type { Point, ServiceBulletin, ServiceCert, Store } from "../store.ts";
 import type { ServiceSample } from "./watch.ts";
 import { installKey, type ServiceMember } from "./draft.ts";
 import { ingestLogs } from "./logs.ts";
+import { ingestFlow } from "./flowcounts.ts";
 
 export const RAW_DAYS = 2;
 export const ROLLUP_DAYS = 30;
@@ -44,12 +45,21 @@ const num = (v: unknown): number | null => (typeof v === "number" && Number.isFi
 const pct = (used: unknown, total: unknown) => { const u = num(used), t = num(total); return u !== null && t ? Math.round((u / t) * 1000) / 10 : null; };
 const round = (v: number | null, digits = 1) => (v === null ? null : Math.round(v * 10 ** digits) / 10 ** digits);
 
-/** Which of a cluster's node entries (nodewise snapshot, /controller/cluster) is this member: by API port, and address when known. */
-export function ownNode<T extends { address?: unknown; apiPort?: unknown }>(nodes: T[] | undefined, m: Pick<ServiceMember, "ports" | "nodeAddress">): T | undefined {
+const hostName = (v: unknown) => (typeof v === "string" ? v.trim().toLowerCase().replace(/\.$/, "") : "");
+
+/** Which of a cluster's node entries (nodewise snapshot, /controller/cluster) is this member. S34: by the node id the
+ *  member's executor recognised as itself (0.9.4 on); without one (an older executor), by API port, and address when
+ *  known (case and a trailing dot aside). */
+export function ownNode<T extends { nodeId?: unknown; address?: unknown; apiPort?: unknown }>(nodes: T[] | undefined, m: Pick<ServiceMember, "ports" | "nodeAddress">, selfNodeId?: unknown): T | undefined {
   if (!Array.isArray(nodes)) return undefined;
+  if (typeof selfNodeId === "string" && selfNodeId) {
+    const byId = nodes.find((n) => n.nodeId === selfNodeId);
+    if (byId) return byId;
+  }
   const port = m.ports?.https ?? m.ports?.http ?? null;
   const byPort = nodes.filter((n) => n.apiPort === port);
-  return byPort.find((n) => m.nodeAddress && n.address === m.nodeAddress) ?? (byPort.length === 1 ? byPort[0] : undefined);
+  const address = hostName(m.nodeAddress);
+  return byPort.find((n) => address && hostName(n.address) === address) ?? (byPort.length === 1 ? byPort[0] : undefined);
 }
 
 /** A sample's flat numbers; the previous sample of the same member gives the rates (none across a restart). */
@@ -57,8 +67,10 @@ export function pointOf(sample: Any, m: Pick<ServiceMember, "ports" | "nodeAddre
   const proc = sample.process ?? {};
   const nifi = sample.nifi ?? {};
   const diag = nifi.diagnostics ?? {};
-  const snap: Any | undefined = Array.isArray(diag.nodes) ? ownNode(diag.nodes, m) : diag.aggregate;
-  const clusterSelf: Any | undefined = ownNode(nifi.cluster?.nodes, m);
+  const snap: Any | undefined = Array.isArray(diag.nodes) ? ownNode(diag.nodes, m, nifi.selfNodeId) : diag.aggregate;
+  const clusterSelf: Any | undefined = ownNode(nifi.cluster?.nodes, m, nifi.selfNodeId);
+  // A cluster member not found in its NiFi's node list: its JVM, flow and repository numbers stay empty, and says so (S34).
+  const unmatched = (Array.isArray(diag.nodes) && diag.nodes.length > 0 && !snap) || (Array.isArray(nifi.cluster?.nodes) && nifi.cluster.nodes.length > 0 && !clusterSelf);
   const repo = (kind: string) => {
     const list = (snap?.repositories?.[kind] ?? []) as Any[];
     const all = list.map((u) => pct(u.usedSpaceBytes, u.totalSpaceBytes)).filter((v): v is number => v !== null);
@@ -89,6 +101,7 @@ export function pointOf(sample: Any, m: Pick<ServiceMember, "ports" | "nodeAddre
     diskPct: disks.length ? Math.max(...disks) : null,
     _cpuSeconds: num(proc.cpuSeconds), _gcMillis: gcMillis, _gcCount: gcCount, _startedAt: Number.isNaN(startedAt) ? null : startedAt,
     ...(nifi.backpressure ? { _bpEvery: num(nifi.backpressure.everySeconds) } : {}),
+    ...(unmatched ? { _unmatched: 1 } : {}),
   };
   if (previous && previousAt) {
     const minutes = (Date.parse(sample.at) - Date.parse(previousAt)) / 60_000;
@@ -160,7 +173,8 @@ export function bulletinsOf(sample: Any, service: string, member: string): Servi
   return list.flatMap((b): ServiceBulletin[] => {
     const at = bulletinTime(b.timestamp, sample.at, offset);
     if (at === null || typeof b.id !== "number") return [];
-    return [{ service, member, node: String(b.nodeAddress ?? member), id: b.id, at, level: b.level ?? null, category: b.category ?? null, source: b.sourceName ?? null, sourceType: b.sourceType ?? null, message: b.message ?? null }];
+    return [{ service, member, node: String(b.nodeAddress ?? member), id: b.id, at, level: b.level ?? null, category: b.category ?? null, source: b.sourceName ?? null, sourceType: b.sourceType ?? null, message: b.message ?? null,
+      ...(typeof b.sourceId === "string" ? { sourceId: b.sourceId } : {}), ...(typeof b.groupId === "string" ? { groupId: b.groupId } : {}) }];
   });
 }
 
@@ -204,11 +218,13 @@ export function ingest(store: Store, samples: ServiceSample[]): { bulletins: num
     if (c && typeof c.readAt === "string" && store.putServiceCerts(s.service, s.member, c.readAt, certRows(c))) certs++;
     // Step 4: the log summary's patterns to service_log_patterns.
     const logs = ingestLogs(store, s);
+    // pages-rethink step 1: the flow counts and topology to service_flow_counts and service_topology.
+    ingestFlow(store, s);
     // The raw body without what went to its own tables.
     store.setServiceMemberActuals(s.service, s.member, fingerprintsOf(s), s.at);
     const { certs: _c, files: _f, ...rest } = s;
     const nifi = rest.nifi as Any | undefined;
-    kept.push({ ...rest, ...(nifi ? { nifi: { ...nifi, bulletins: undefined } } : {}), ...(logs ? { logs } : {}), point } as ServiceSample & { point: Point });
+    kept.push({ ...rest, ...(nifi ? { nifi: { ...nifi, bulletins: undefined, flowCounts: undefined } } : {}), ...(logs ? { logs } : {}), point } as ServiceSample & { point: Point });
   }
   store.addServiceSamples(kept);
   return { bulletins, certs };

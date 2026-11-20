@@ -24,15 +24,19 @@ export const PROVENANCE_KIND = "nifi-provenance@1";
 const UUID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 const NODE = /^[A-Za-z0-9_-]{1,128}$/;
 
-/** Which NiFi versions the trace was tried on (§15.5): 1.12.1, 2.0.0 and a 2.5.0 cluster; 1.12 and later of 1.x, and 2.x. */
+/** Which NiFi versions the trace was tried on (§15.5): 1.12.1, 2.0.0 and a 2.5.0 cluster; S37 step 6 (S33) opened 1.9
+ *  (1.x environments are traced by provenance alone): 1.9 and later of 1.x, and 2.x. */
+export const PROVENANCE_TRIED = "1.9.2, 1.12.1, 2.0.0 and a 2.5.0 cluster";
 export function provenanceSupport(version: string): { supported: boolean; note: string } {
   const m = /^(\d+)\.(\d+)/.exec(version ?? "");
   const [major, minor] = m ? [Number(m[1]), Number(m[2])] : [0, 0];
-  if ((major === 1 && minor >= 12) || major === 2) return { supported: true, note: `NiFi ${version}: tried on 1.12.1, 2.0.0 and a 2.5.0 cluster.` };
-  return { supported: false, note: `This version is not supported: the FlowFile trace was tried on NiFi 1.12.1, 2.0.0 and 2.5.0 only (NiFi ${version || "of unknown version"}).` };
+  if ((major === 1 && minor >= 9) || major === 2)
+    return { supported: true, note: `NiFi ${version}: tried on ${PROVENANCE_TRIED}${major === 1 && minor < 12 ? "; 1.9 and later are allowed for tracing 1.x environments (S33)" : ""}.` };
+  return { supported: false, note: `This version is not supported: the FlowFile trace was tried on NiFi ${PROVENANCE_TRIED} only (NiFi ${version || "of unknown version"}).` };
 }
 
-export interface ProvenanceSearch { uuid?: string; field?: string; value?: string; from: string; to: string; maxResults: number; node?: string }
+/** attributes (S37 step 6): unsummarized events with their FlowFile attributes, for the trace (executor 0.9.4 on). */
+export interface ProvenanceSearch { uuid?: string; field?: string; value?: string; from: string; to: string; maxResults: number; node?: string; attributes?: boolean }
 export interface LineageAsk { uuid?: string; eventId?: number; direction: "FLOWFILE" | "PARENTS" | "CHILDREN"; node?: string }
 
 /** A search from the page or an API key: a FlowFile UUID or a field and value, and a time range (both ends required). */
@@ -117,10 +121,11 @@ export class ServiceProvenance {
   }
 
   /** One nifi-provenance job, on the first usable member that answers (the next one when a member fails). */
-  private async ask(id: string, request: Record<string, unknown>): Promise<{ body: Any; member: LogMember }> {
+  private async ask(id: string, request: Record<string, unknown>, anyVersion = false): Promise<{ body: Any; member: LogMember }> {
     const s = this.service(id);
     const support = provenanceSupport(s.version);
-    if (!support.supported) throw new LogsError(409, "provenance/unsupported", support.note);
+    // T14: the component search reads only the flow's structure (flow/search-results, there on every version).
+    if (!support.supported && !anyVersion) throw new LogsError(409, "provenance/unsupported", support.note);
     const usable = s.members.filter((m) => m.executor.online && m.canProvenance);
     if (!usable.length) {
       const m = s.members[0];
@@ -175,7 +180,7 @@ export class ServiceProvenance {
   async search(id: string, q: ProvenanceSearch): Promise<Any> {
     const s = this.service(id);
     if (q.node && s.kind !== "cluster") throw new LogsError(400, "provenance/node", "node is only for a cluster.");
-    const { body, member } = await this.ask(id, { op: "provenance", from: q.from, to: q.to, maxResults: q.maxResults, ...(q.uuid ? { uuid: q.uuid } : { field: q.field, value: q.value }), ...(q.node ? { node: q.node } : {}) });
+    const { body, member } = await this.ask(id, { op: "provenance", from: q.from, to: q.to, maxResults: q.maxResults, ...(q.uuid ? { uuid: q.uuid } : { field: q.field, value: q.value }), ...(q.node ? { node: q.node } : {}), ...(q.attributes ? { attributes: true } : {}) });
     if (typeof body.timeOffset === "number") this.offsets.set(id, body.timeOffset);
     const events = (body.events ?? []) as Any[];
     return {
@@ -202,8 +207,16 @@ export class ServiceProvenance {
     return { ...body, via: { member: member.key, label: member.label }, member: this.memberOf(s.members, body.event?.clusterNodeAddress) };
   }
 
-  async options(id: string): Promise<Any> {
-    const { body } = await this.ask(id, { op: "search-options" });
-    return body;
+  /** S37 step 5: components found by name or id (NiFi's flow search), for a trace model step's position; not held to
+   *  provenanceSupport() (T14: it reads the flow's structure only). */
+  async flowSearch(id: string, q: string): Promise<Any> {
+    const { body, member } = await this.ask(id, { op: "flow-search", q }, true);
+    return { ...body, via: { member: member.key, label: member.label } };
+  }
+
+  /** S37 step 6 (T4): the oldest event each node still holds, [{node, address?, oldest}] (executor 0.9.4 on). */
+  async oldest(id: string): Promise<{ node: string | null; address?: string; oldest: string | null }[]> {
+    const { body } = await this.ask(id, { op: "oldest" });
+    return Array.isArray(body.nodes) ? body.nodes : [];
   }
 }

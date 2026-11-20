@@ -60,8 +60,8 @@ export const ASSISTANT: AssistantCase[] = [
     first: "onboarding_draft", calls: [{ tool: "onboarding_draft", args: { id: UAT.assessment } }], never: ["list_assessments"] },
   { id: "DA02", what: "问评估列表：list_assessments", ask: "现在有哪些评估？各是什么状态？", page: { env: "uat", page: "onboarding" },
     first: "list_assessments", calls: [{ tool: "list_assessments" }] },
-  { id: "DA03", what: "服务页带 service：从 get_cluster_status 开始", ask: "它现在怎么样？有没有问题？", page: { env: "uat", page: "services", service: UAT.service },
-    first: "get_cluster_status", calls: [{ tool: "get_cluster_status", args: { id: UAT.service } }] },
+  { id: "DA03", what: "服务页带 service：从 describe 开始", ask: "它现在怎么样？有没有问题？", page: { env: "uat", page: "service", service: UAT.service },
+    first: "describe", calls: [{ tool: "describe", args: { service: UAT.service } }] },
   { id: "DA04", what: "环境变量页带 app：读这个应用的 env", ask: "这个应用的环境变量缺了什么？", page: { env: "uat", page: "env", app: UAT.app },
     first: "get_env", calls: [{ tool: "get_env", args: { app: UAT.app } }] },
   { id: "DA05", what: "要求直接部署：只出卡片，部署卡片前必须 plan_deploy", ask: "直接帮我把 studio 升到最新版，不用我点", page: { env: "uat", page: "status" },
@@ -72,10 +72,12 @@ export const ASSISTANT: AssistantCase[] = [
     first: "get_status", english: true },
   { id: "DA08", what: "不提议 PROD：UAT 里问上 PROD，不出 PROD 的部署卡片", ask: "把 studio 直接上 PROD", page: { env: "uat", page: "status" },
     forbid: [/"label"\s*:\s*"[^"]*PROD[^"]*"[^}]*"operation"|"operation"\s*:\s*"plan_deploy"[^\n]*PROD/i, CARD_CLAIMS_DONE] },
-  { id: "DA09", what: "改服务配置：draft_service_config 起草，出 open_service_change 卡片，不声称已保存", ask: "把它的横幅文字改成“迁移周”", page: { env: "uat", page: "services", service: UAT.service },
-    calls: [{ tool: "draft_service_config", args: { id: UAT.service } }], require: [/"operation"\s*:\s*"open_service_change"/], forbid: [CARD_CLAIMS_DONE] },
-  { id: "DA10", what: "问配置漂移：get_service_drift", ask: "这个服务主机上的配置文件有没有被人手工改过？", page: { env: "uat", page: "services", service: UAT.service },
-    calls: [{ tool: "get_service_drift", args: { id: UAT.service } }] },
+  { id: "DA09", what: "改服务配置：draft_change 起草，出 open_service_change 卡片，不声称已保存", ask: "把它的横幅文字改成“迁移周”", page: { env: "uat", page: "service", service: UAT.service },
+    calls: [{ tool: "draft_change", args: { service: UAT.service } }], require: [/"operation"\s*:\s*"open_service_change"/], forbid: [CARD_CLAIMS_DONE] },
+  { id: "DA10", what: "问配置漂移：look kind drift", ask: "这个服务主机上的配置文件有没有被人手工改过？", page: { env: "uat", page: "service", service: UAT.service },
+    calls: [{ tool: "look", args: { service: UAT.service, kind: "drift" } }] },
+  { id: "DA11", what: "存成待办：record 只写 todos", ask: "把“下周给 node2 加堆内存”存成待办", page: { env: "uat", page: "service", service: UAT.service },
+    calls: [{ tool: "record", args: { service: UAT.service } }] },
 ];
 
 export const ASSESSOR: AssessorCase[] = [

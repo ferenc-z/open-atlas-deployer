@@ -1,19 +1,17 @@
-// Service ops pages (phase 1, §11): the managed services (NiFi) of this environment, and taking them over.
-// Services (S23): grouped by environment, a card per cluster or standalone instance (or a table, where a cluster opens
-// into its node rows); a card opens the service's detail page (ServiceDetail.tsx). Whether a member runs is as of its
-// host's newest discovery (phase 1 has no live probes). Takeover: discover on each host's service executor, make a
-// draft from the newest discoveries (grouped and assessed by rules, P1), edit it, confirm it (which imports each
-// installation's configuration files as revision 1). Nothing here changes anything on the hosts.
+// Service ops pages: the managed services (NiFi) of this environment, and taking them over.
+// Services: the overview (OverviewPage.tsx, prototype screen 1) and, opened from a card, the service's page (ServiceDetail.tsx).
+// Takeover: discover on each host's service executor, make a draft from the newest discoveries (grouped and assessed by
+// rules, P1), edit it, confirm it (which imports each installation's configuration files as revision 1). Nothing here
+// changes anything on the hosts.
 
-import { Fragment, useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import * as api from "./api.ts";
-import type { DiscoveryView, DraftItem, DraftSummary, Finding, HostView, RegisteredService, ServiceDraft, Skipped } from "./api.ts";
+import type { DiscoveryView, DraftItem, DraftSummary, Finding, HostView, ServiceDraft, Skipped } from "./api.ts";
 import { ask } from "./Confirm.tsx";
 import { Markdown } from "./Markdown.tsx";
+import { OverviewPage } from "./OverviewPage.tsx";
 import { ServiceDetail } from "./ServiceDetail.tsx";
-import { CertBadge, ConfCell, confElsewhere, DifferenceBadge, memberKey, membersOf, serviceName, SEVERITY, STATE, StatusNotes, UpBadge, webPort, when } from "./svc.tsx";
-import { Sparkline } from "./Charts.tsx";
-import { AlertBadge } from "./Alerts.tsx";
+import { ConfCell, confElsewhere, memberKey, SEVERITY, when } from "./svc.tsx";
 import { usePageFocus } from "./focus.ts";
 
 type Problem = { message: string; details: string[] };
@@ -24,126 +22,18 @@ function ProblemLine({ problem }: { problem: Problem | undefined }) {
   return <div className="error">{problem.message}{problem.details.length > 0 && <ul>{problem.details.map((d) => <li key={d}>{d}</li>)}</ul>}</div>;
 }
 
-// The environments a service can be in (S14: each environment's Deployer has its own); others found are added after.
-const ENVIRONMENTS = ["UAT", "PROD"];
-type Layout = "cards" | "table";
-const LAYOUT_KEY = "oa.services.layout";
-const savedLayout = (): Layout => { try { return localStorage.getItem(LAYOUT_KEY) === "table" ? "table" : "cards"; } catch { return "cards"; } };
-
-const kindLabel = (s: RegisteredService) => (s.kind === "cluster" ? `Cluster · ${s.nodes.length} nodes` : "Standalone");
-const where = (m: { host: string; ports: { https?: number | null; http?: number | null } }) => `${m.host}${webPort(m.ports) ? `:${webPort(m.ports)}` : ""}`;
-
 export function ServicesPage({ onTakeover, isAdmin, initialOpen, initialDraft }: { onTakeover: () => void; isAdmin: boolean; initialOpen?: string; initialDraft?: string }) {
-  const [list, setList] = useState<{ standalones: RegisteredService[]; clusters: RegisteredService[] } | undefined>();
   const [open, setOpen] = useState<string | undefined>(initialOpen);
+  const [openTab, setOpenTab] = useState<string | undefined>();
   usePageFocus("service", open);
-  const [layout, setLayoutState] = useState<Layout>(savedLayout);
-  const [error, setError] = useState("");
-  const refresh = useCallback(() => { api.services().then(setList, (e: Error) => setError(e.message)); }, []);
-  useEffect(() => { refresh(); const t = setInterval(refresh, 15_000); return () => clearInterval(t); }, [refresh]);
-  const setLayout = (l: Layout) => { setLayoutState(l); try { localStorage.setItem(LAYOUT_KEY, l); } catch { /* per-viewer convenience only */ } };
-  if (open) return <ServiceDetail key={open} id={open} isAdmin={isAdmin} {...(initialDraft && open === initialOpen ? { initialDraft } : {})} onBack={() => { setOpen(undefined); refresh(); }} />;
-  if (!list) return error ? <p className="error">{error}</p> : <p className="muted">Loading…</p>;
-  const all = [...list.clusters, ...list.standalones];
-  const envs = [...ENVIRONMENTS, ...new Set(all.map((s) => s.environment.toUpperCase()).filter((e) => !ENVIRONMENTS.includes(e)))];
-  return (
-    <>
-      <div className="toolbar">
-        <h1>Services</h1>
-        <span className="spacer" />
-        <div className="subtabs inline" role="tablist" aria-label="Layout">
-          <button className={layout === "cards" ? "active" : ""} onClick={() => setLayout("cards")} aria-selected={layout === "cards"}>Cards</button>
-          <button className={layout === "table" ? "active" : ""} onClick={() => setLayout("table")} aria-selected={layout === "table"}>Table</button>
-        </div>
-        <button className="link" onClick={onTakeover}>Take over more…</button>
-      </div>
-      <p className="muted page-note">NiFi taken over by the Deployer, by environment. Whether a member runs is live, from its host's service executor's samples (unknown after 3 sampling periods without one, lost when the executor is offline). The trends are the last hour.</p>
-      {error && <p className="error">{error}</p>}
-      {!all.length && <section className="card"><p className="muted">Nothing is registered yet. Discover on the hosts and confirm a takeover draft first.</p><button className="primary" onClick={onTakeover}>Open Takeover</button></section>}
-      {all.length > 0 && envs.map((env) => {
-        const here = all.filter((s) => s.environment.toUpperCase() === env);
-        const installs = here.reduce((n, s) => n + membersOf(s).length, 0);
-        if (!here.length) return (
-          <details key={env} className="env-group empty">
-            <summary><span className={`env ${env === "PROD" ? "prod" : ""}`}>{env}</span> <span className="muted">No services</span></summary>
-            <p className="muted small">Each environment's Deployer registers its own services (S14); {env}'s are on its Deployer.</p>
-          </details>
-        );
-        return (
-          <section key={env} className="env-group">
-            <div className="env-head"><span className={`env ${env === "PROD" ? "prod" : ""}`}>{env}</span> <span className="muted">{here.length} service{here.length > 1 ? "s" : ""} · {installs} installation{installs > 1 ? "s" : ""}</span></div>
-            {layout === "cards"
-              ? <div className="svc-cards">{here.map((s) => <ServiceCard key={s.id} s={s} onOpen={() => setOpen(s.id)} />)}</div>
-              : <ServiceTable services={here} onOpen={setOpen} />}
-          </section>
-        );
-      })}
-    </>
-  );
-}
-
-function ServiceCard({ s, onOpen }: { s: RegisteredService; onOpen: () => void }) {
-  const members = membersOf(s);
-  return (
-    <button className="svc-card" onClick={onOpen} title={`Open ${s.id}`}>
-      <div className="svc-card-head"><strong className="mono">{s.id}</strong><span><AlertBadge s={s.status} /> <UpBadge s={s.status} /></span></div>
-      <div className="muted small">{kindLabel(s)} · {serviceName(s.service)} <span className="mono">{s.version}</span> <span className="muted">({s.profile})</span></div>
-      <ul className="svc-members mono small">{members.map((m, i) => (
-        <li key={memberKey(m)}><span className={`dot ${STATE[s.states[i] ?? "unknown"].tone}`} title={STATE[s.states[i] ?? "unknown"].label} />{where(m)}{s.kind === "cluster" && m.nodeAddress ? <span className="muted"> · {m.nodeAddress}</span> : null}</li>
-      ))}</ul>
-      {s.trend && (s.trend.heapPct.some((v) => v !== null) || s.trend.queuedCount.some((v) => v !== null)) && <div className="svc-card-trend">
-        <Sparkline label="Heap" values={s.trend.heapPct} unit="%" />
-        <Sparkline label="Queued" values={s.trend.queuedCount} unit="count" />
-      </div>}
-      <div className="svc-card-foot">
-        <span className="small">{s.configRevision ? <>Config <span className="mono">r{s.configRevision}</span></> : <span className="muted">No configuration</span>}</span>
-        <CertBadge s={s.status} only30 />
-        <DifferenceBadge s={s.status} cluster={s.kind === "cluster"} />
-        <StatusNotes s={s.status} />
-      </div>
-    </button>
-  );
-}
-
-function ServiceTable({ services, onOpen }: { services: RegisteredService[]; onOpen: (id: string) => void }) {
-  // Clusters open into their node rows in place; folded ones are remembered while the page is open.
-  const [folded, setFolded] = useState<Set<string>>(new Set());
-  const toggle = (id: string) => setFolded((was) => { const next = new Set(was); if (next.has(id)) next.delete(id); else next.add(id); return next; });
-  return (
-    <table className="svc-table">
-      <thead><tr><th>Name</th><th>Kind</th><th>Version</th><th>Host and port</th><th>Up</th><th>Configuration</th><th>Differences</th></tr></thead>
-      <tbody>{services.map((s) => {
-        const cluster = s.kind === "cluster";
-        const shut = folded.has(s.id);
-        const members = membersOf(s);
-        return (
-          <Fragment key={s.id}>
-            <tr className="app" onClick={() => onOpen(s.id)}>
-              <td>{cluster
-                ? <button className="link caret" onClick={(e) => { e.stopPropagation(); toggle(s.id); }} aria-expanded={!shut} title={shut ? "Show the nodes" : "Hide the nodes"}>{shut ? "▸" : "▾"}</button>
-                : <span className="caret" />}<span className="mono">{s.id}</span></td>
-              <td>{kindLabel(s)}</td>
-              <td>{serviceName(s.service)} <span className="mono">{s.version}</span></td>
-              <td className="mono small">{cluster ? <span className="muted">{members.length} nodes</span> : where(members[0]!)}</td>
-              <td><UpBadge s={s.status} /> <AlertBadge s={s.status} /> <CertBadge s={s.status} only30 /> <StatusNotes s={s.status} /></td>
-              <td>{s.configRevision ? <span className="mono">r{s.configRevision}</span> : <span className="muted">None</span>}</td>
-              <td>{cluster ? <DifferenceBadge s={s.status} cluster /> : <span className="muted">—</span>}</td>
-            </tr>
-            {cluster && !shut && members.map((m, i) => (
-              <tr key={memberKey(m)} className="node-row app" onClick={() => onOpen(s.id)}>
-                <td className="mono small"><span className="caret" /><span className="muted">└</span> Node {i + 1}{m.nodeAddress ? <span className="muted"> · {m.nodeAddress}</span> : null}</td>
-                <td className="muted small">Node</td>
-                <td></td>
-                <td className="mono small">{where(m)}</td>
-                <td><span className={`badge ${STATE[s.states[i] ?? "unknown"].tone}`} title={STATE[s.states[i] ?? "unknown"].title}>{STATE[s.states[i] ?? "unknown"].label}</span></td>
-                <td className="mono small muted" colSpan={2}>{m.installDir}{confElsewhere(m) && <> · conf {confElsewhere(m)}</>}</td>
-              </tr>
-            ))}
-          </Fragment>
-        );
-      })}</tbody>
-    </table>
-  );
+  // Another page can send the person to a service's tab (oa:open-service).
+  useEffect(() => {
+    const on = (e: Event) => { const d = (e as CustomEvent<{ id: string; tab: string }>).detail; if (d.id !== open) { setOpenTab(d.tab); setOpen(d.id); } };
+    window.addEventListener("oa:open-service", on);
+    return () => window.removeEventListener("oa:open-service", on);
+  }, [open]);
+  if (open) return <ServiceDetail key={open} id={open} isAdmin={isAdmin} {...(initialDraft && open === initialOpen ? { initialDraft } : {})} {...(openTab ? { initialTab: openTab } : {})} onBack={() => setOpen(undefined)} />;
+  return <OverviewPage onOpen={(id) => { setOpenTab(undefined); setOpen(id); }} onTakeover={onTakeover} />;
 }
 
 // Takeover.
@@ -168,7 +58,7 @@ function MonitorPolicies() {
         <tbody>{MONITOR_POLICIES.map(([resource, policy, why]) => <tr key={resource}><td className="mono small">{resource}</td><td>{policy}</td><td className="muted small">{why}</td></tr>)}</tbody>
       </table>
       <p className="muted small">On a cluster, also give every node's own identity (its certificate's, e.g. CN=node1, OU=NIFI) <strong>view the data</strong> on the root group: a node passes the request on to the node that holds the event as a proxy, and NiFi checks that policy for every identity on the way; without it the attributes stay hidden.</p>
-      <p className="muted small">Changes that restart a cluster (Changes tab) also use an <strong>operator</strong> identity: the certificate in EXECUTOR_NIFI_OPERATOR_CERT on each host. In NiFi give it, besides the policies above, <strong>modify the controller</strong> (<span className="mono">/controller</span>, write): it is the only thing that disconnects, offloads and reconnects a node. A standalone instance does not need it. The monitor certificate never writes.</p>
+      <p className="muted small">Changes that restart a cluster (Changes section) also use an <strong>operator</strong> identity: the certificate in EXECUTOR_NIFI_OPERATOR_CERT on each host. In NiFi give it, besides the policies above, <strong>modify the controller</strong> (<span className="mono">/controller</span>, write): it is the only thing that disconnects, offloads and reconnects a node. A standalone instance does not need it. The monitor certificate never writes.</p>
     </details>
   );
 }

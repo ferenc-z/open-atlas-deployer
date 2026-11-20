@@ -176,7 +176,6 @@ pre.json { background: var(--surface); border: 1px solid var(--border); border-r
 
 /* phase 2 */
 .executor { margin: -4px 0 12px; display: flex; flex-wrap: wrap; gap: 6px 18px; }
-.executor-host { display: inline-flex; align-items: center; gap: 6px; }
 .panel { margin-bottom: 16px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }
 .panel h2, .panel h3 { margin: 0; }
 .plan { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
@@ -330,42 +329,10 @@ table.deployer-settings td.actions { display: table-cell; }
 table.deployer-settings td.actions button.link { display: block; margin-bottom: 4px; white-space: nowrap; overflow-wrap: normal; }
 
 /* S23: Services by environment, as cards or a table; a service's page with its summary line and tabs. */
-.subtabs.inline { margin-bottom: 0; }
-.env-group { margin: 0 0 22px; }
-.env-head { display: flex; align-items: center; gap: 8px; margin: 0 0 10px; }
-.env-head .env, .env-group summary .env { font-size: 12px; }
-details.env-group.empty { padding: 8px 12px; border: 1px dashed var(--border); border-radius: 10px; }
-details.env-group.empty p { margin: 6px 0 0; }
-.svc-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(280px, 100%), 1fr)); gap: 12px; }
-.svc-card { display: flex; flex-direction: column; gap: 8px; align-items: stretch; text-align: left; padding: 14px 16px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface); }
-.svc-card:hover { border-color: var(--info); box-shadow: 0 0 0 2px var(--info-bg); }
-.svc-card .badge { margin-left: 0; }
-.svc-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.svc-card-head strong { font-size: 15px; }
-.svc-members { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
-.svc-members li { display: flex; align-items: center; gap: 6px; overflow-wrap: anywhere; }
-.svc-card-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; border-top: 1px solid var(--border); padding-top: 8px; }
-.svc-card-foot > :first-child { margin-right: auto; }
 .dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
 .dot.ok { background: var(--ok); }
 .dot.bad { background: var(--bad); }
 .dot.warn { background: var(--warn); }
-.svc-table button.caret { color: var(--muted); }
-.svc-table tr.node-row td { background: var(--bg); padding-top: 5px; padding-bottom: 5px; }
-.svc-summary { display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: center; margin: 10px 0 14px; padding: 14px 18px; }
-.svc-summary-main { flex: 1; min-width: 0; display: grid; gap: 6px; }
-.svc-summary-line { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
-.svc-summary-line h1 { margin-right: 6px; overflow-wrap: anywhere; }
-.svc-summary-line .badge { margin-left: 0; }
-.svc-summary-facts { display: flex; flex-wrap: wrap; gap: 4px 18px; }
-.svc-summary-facts strong { color: var(--text); font-weight: 600; }
-.svc-summary-actions { display: flex; gap: 8px; }
-.metrics { display: flex; flex-wrap: wrap; gap: 12px; }
-.metric { display: grid; gap: 2px; min-width: 160px; padding: 10px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
-.metric strong { font-size: 22px; line-height: 1.2; }
-.timeline { list-style: none; margin: 0; padding: 0 0 0 14px; border-left: 2px solid var(--border); display: grid; gap: 8px; }
-.timeline li { position: relative; }
-.timeline li::before { content: ""; position: absolute; left: -20px; top: 7px; width: 8px; height: 8px; border-radius: 50%; background: var(--info); }
 ul.findings.card { padding: 12px 14px; }
 
 /* S24: the Configuration tab. */
@@ -403,34 +370,9 @@ table.props tr.sev-info td { background: var(--info-bg); }
 .raw .attr { color: var(--warn); }
 .toolbar .spacer { flex: 1; }
 p.page-note { margin: -4px 0 14px; }
-.svc-summary-line h1.mono { font-size: 18px; }
 .row.config-filter input[type="checkbox"] { flex: none; min-width: 0; }
 
-/* Phase 2 step 2: the Metrics tab's charts (Charts.tsx), the cards' sparklines, certificates. */
-.range-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-.charts { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 420px), 1fr)); gap: 12px; }
-.chart { margin: 0; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); min-width: 0; }
-.chart figcaption { margin-bottom: 4px; }
-.chart-plot { position: relative; }
-.chart-plot svg { display: block; overflow: visible; }
-.chart-grid { stroke: var(--border); stroke-width: 1; }
-.chart-cross { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 3 3; }
-.chart-axis { fill: var(--muted); font-size: 11px; }
-.chart-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; list-style: none; margin: 0 0 4px; padding: 0; }
-.swatch { display: inline-block; width: 10px; height: 3px; border-radius: 2px; margin-right: 6px; vertical-align: middle; }
-.chart-tip { position: absolute; top: 4px; pointer-events: none; min-width: 150px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12); }
-.spark { display: inline-flex; align-items: center; gap: 6px; }
-.svc-card-trend { display: flex; flex-wrap: wrap; gap: 4px 14px; }
-.chart-section { display: grid; gap: 8px; }
 /* Phase 2 step 3: alerts and the timeline. */
-.nav-count { margin-left: 6px; padding: 0 6px; font-size: 11px; }
-.timeline li.tl-bad::before { background: var(--bad); }
-.timeline li.tl-warn::before { background: var(--warn); }
-.timeline li.tl-ok::before { background: var(--ok); }
-.timeline li.tl-muted::before { background: var(--border); }
-.service-health { margin-bottom: 16px; padding: 14px 20px; }
-.service-health .toolbar { margin-bottom: 0; }
-.service-health .findings { margin-top: 8px; }
 .thresholds td { vertical-align: top; }
 .nowrap { white-space: nowrap; }
 /* Phase 2 step 4: the Logs tab. */
@@ -442,14 +384,8 @@ p.page-note { margin: -4px 0 14px; }
 .check { display: inline-flex; align-items: center; gap: 4px; }
 .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; align-items: start; margin-top: 8px; }
 .form-grid > .row { grid-column: 1 / -1; }
-.file-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 4px 12px; margin: 8px 0; }
 a.button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
 pre.log.tail { max-height: 560px; min-height: 120px; white-space: pre-wrap; }
-.log-results td { vertical-align: top; }
-.log-results pre.log { max-height: 320px; }
-/* FlowFile trace (phase 2 step 7): a lineage as a list of events in time order. */
-ol.lineage { margin: 0.5rem 0 0; padding-left: 1.5rem; }
-ol.lineage li { padding: 0.25rem 0; border-bottom: 1px solid var(--border, rgba(127,127,127,0.2)); line-height: 1.6; }
 /* Phase 3 step 5: editing a configuration, the Changes tab. */
 .draft-bar { display: grid; gap: 4px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
 .draft-bar p { margin: 0; }
@@ -528,7 +464,8 @@ button.change-now.state-paused { color: var(--warn); border-color: var(--warn); 
   .change-actions > div { grid-template-columns: minmax(0, 1fr); gap: 4px; }
   .plan-close { margin-left: 0; }
   .node-control-buttons { margin-left: 0; }
-  .svc-summary { flex-wrap: wrap; }
-  .svc-summary-main { flex: 1 1 100%; }
-  .svc-summary-actions { flex-wrap: wrap; }
 }
+
+
+pre.raw { white-space: pre-wrap; word-break: break-word; max-height: 24rem; overflow: auto; padding: 0.5rem; background: var(--code-bg, rgba(127,127,127,0.08)); }
+

@@ -17,6 +17,11 @@ import type { ConfigFinding } from "./services/configcheck.ts";
 import type { DraftChange } from "./services/configedit.ts";
 import type { ConfigReview } from "./services/configreview.ts";
 import { randomBytes } from "node:crypto";
+import { migrateV1, type ModelV2 } from "./services/trace/model.ts";
+import type { AnalysisState, AnalysisTrigger, Anomaly, FlowNote, FlowStatus, GateVerdict, Light, TodoAction, TodoSource, TodoState } from "./services/ops-types.ts";
+
+/** A business id (§10.2.4: flw_ + random). */
+export const newFlowId = () => `flw_${randomBytes(6).toString("hex")}`;
 
 export interface Actor { id: string; via: "workbench" | "emergency" | "cli" | "key" | "service" }
 
@@ -150,6 +155,19 @@ CREATE TABLE IF NOT EXISTS service_samples (
 CREATE INDEX IF NOT EXISTS service_samples_at ON service_samples (service, member, at);
 CREATE TABLE IF NOT EXISTS service_rollups (
   service TEXT NOT NULL, member TEXT NOT NULL, bucket TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY (service, member, bucket));
+-- pages-rethink §10.2.4 step 1: flow counts, a row per 5-minute bucket, group or S2S port (30 days); source nifi-history:
+-- filled in from NiFi's own status history when the service was taken over.
+CREATE TABLE IF NOT EXISTS service_flow_counts (
+  service TEXT NOT NULL, bucket TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  ref TEXT NOT NULL,
+  name TEXT NOT NULL, flowfiles_in INTEGER NOT NULL, flowfiles_out INTEGER NOT NULL,
+  bytes_in INTEGER NOT NULL, bytes_out INTEGER NOT NULL, source TEXT NOT NULL, transferred INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (service, kind, ref, bucket));
+CREATE INDEX IF NOT EXISTS service_flow_counts_at ON service_flow_counts (service, bucket);
+-- Step 1: the topology under root (groups, ports, links between groups, RPGs), a row only when its hash changed (30 days).
+CREATE TABLE IF NOT EXISTS service_topology (
+  service TEXT NOT NULL, taken_at TEXT NOT NULL, hash TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY (service, taken_at));
 CREATE TABLE IF NOT EXISTS service_bulletins (
   service TEXT NOT NULL, member TEXT NOT NULL, node TEXT NOT NULL, bulletin_id INTEGER NOT NULL, at TEXT NOT NULL, level TEXT,
   category TEXT, source TEXT, source_type TEXT, message TEXT, received_at TEXT NOT NULL);
@@ -181,6 +199,53 @@ CREATE INDEX IF NOT EXISTS service_log_counts_at ON service_log_counts (service,
 CREATE TABLE IF NOT EXISTS service_graph_runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, by TEXT NOT NULL, reason TEXT NOT NULL, graph TEXT, services TEXT NOT NULL,
   state TEXT NOT NULL, message TEXT NOT NULL, detail TEXT);
+-- pages-rethink §10.2.4 step 2: the business model v2, a full body per service and revision (older ones kept as history);
+-- service_trace_models (v1) is migrated into it as revision 1 and dropped.
+CREATE TABLE IF NOT EXISTS flow_models (
+  service TEXT NOT NULL, revision INTEGER NOT NULL, body TEXT NOT NULL, source TEXT NOT NULL,
+  published_at TEXT NOT NULL, published_by TEXT NOT NULL, gate TEXT NOT NULL,
+  PRIMARY KEY (service, revision));
+-- A business (it may span services): what a person owns is here, the AI's model never overwrites it.
+CREATE TABLE IF NOT EXISTS flows (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, name_by TEXT NOT NULL, status TEXT NOT NULL,
+  summary TEXT NOT NULL, reason TEXT, risks TEXT NOT NULL DEFAULT '[]', pending TEXT,
+  stuck_attention_s INTEGER, stuck_failing_s INTEGER, stuck_by TEXT, stuck_basis TEXT,
+  created_at TEXT NOT NULL, confirmed_at TEXT, confirmed_by TEXT, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS flow_segments (
+  flow TEXT NOT NULL REFERENCES flows(id) ON DELETE CASCADE, seq INTEGER NOT NULL, service TEXT NOT NULL, segment TEXT NOT NULL,
+  PRIMARY KEY (flow, seq));
+CREATE INDEX IF NOT EXISTS flow_segments_service ON flow_segments (service);
+CREATE TABLE IF NOT EXISTS flow_changes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, flow TEXT, service TEXT NOT NULL, at TEXT NOT NULL, by TEXT NOT NULL,
+  kind TEXT NOT NULL, text TEXT NOT NULL, revision INTEGER, verdict TEXT);
+CREATE INDEX IF NOT EXISTS flow_changes_flow ON flow_changes (flow, at);
+-- §10.2.4 step 3: a business's anomalies (B3), opened and closed like service_alerts; ref: the component or group id.
+CREATE TABLE IF NOT EXISTS flow_anomalies (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, flow TEXT NOT NULL, service TEXT NOT NULL, ref TEXT NOT NULL,
+  anomaly TEXT NOT NULL, light TEXT NOT NULL, state TEXT NOT NULL,
+  first_at TEXT NOT NULL, last_at TEXT NOT NULL, count INTEGER NOT NULL, detail TEXT NOT NULL, closed_at TEXT);
+CREATE UNIQUE INDEX IF NOT EXISTS flow_anomalies_open ON flow_anomalies (flow, service, ref, anomaly) WHERE state = 'open';
+CREATE INDEX IF NOT EXISTS flow_anomalies_at ON flow_anomalies (flow, first_at);
+CREATE TABLE IF NOT EXISTS service_trace_sources (
+  service TEXT NOT NULL, source TEXT NOT NULL, body TEXT NOT NULL, saved_at TEXT NOT NULL, saved_by TEXT NOT NULL, PRIMARY KEY (service, source));
+CREATE TABLE IF NOT EXISTS service_cases (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, service TEXT NOT NULL, kind TEXT NOT NULL, rule TEXT, alert_id INTEGER UNIQUE, state TEXT NOT NULL,
+  requested_at TEXT NOT NULL, body TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS service_cases_service ON service_cases (service, rule, requested_at);
+-- pages-rethink §10.2.4 step 4: the AI's analyses (record) and the to-dos (record, the gate, a person). service_cases is
+-- no longer read or written (kept, not migrated: its rows belong to the removed cases feature).
+CREATE TABLE IF NOT EXISTS service_analyses (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, service TEXT NOT NULL, run TEXT,
+  trigger TEXT NOT NULL, state TEXT NOT NULL, session TEXT, requested_by TEXT NOT NULL,
+  started_at TEXT NOT NULL, finished_at TEXT, machine_light TEXT NOT NULL, business_light TEXT NOT NULL,
+  body TEXT, error TEXT);
+CREATE INDEX IF NOT EXISTS service_analyses_service ON service_analyses (service, started_at);
+CREATE TABLE IF NOT EXISTS service_todos (
+  id TEXT PRIMARY KEY, service TEXT NOT NULL, flow TEXT, source TEXT NOT NULL, key TEXT NOT NULL,
+  severity TEXT NOT NULL, title TEXT NOT NULL, detail TEXT NOT NULL, action TEXT,
+  state TEXT NOT NULL, analysis INTEGER, draft TEXT,
+  created_at TEXT NOT NULL, created_by TEXT NOT NULL, updated_at TEXT NOT NULL, closed_at TEXT, closed_by TEXT);
+CREATE UNIQUE INDEX IF NOT EXISTS service_todos_open ON service_todos (service, key) WHERE state = 'open';
 `;
 
 /** queued: waiting for the host's executor to claim it; the rest are the executor's states. */
@@ -333,6 +398,11 @@ export class Store {
     }
     // Phase 2 step 2: each sample's flat numbers (the Metrics tab, the rollups), next to step 1's raw body.
     if (!(this.db.prepare("PRAGMA table_info(service_samples)").all() as Row[]).some((c) => c.name === "point")) this.db.exec("ALTER TABLE service_samples ADD COLUMN point TEXT");
+    // S37 step 4: a bulletin's component and process group (the investigation page's links into NiFi).
+    {
+      const have = (this.db.prepare("PRAGMA table_info(service_bulletins)").all() as Row[]).map((c) => c.name);
+      for (const column of ["source_id", "group_id"]) if (!have.includes(column)) this.db.exec(`ALTER TABLE service_bulletins ADD COLUMN ${column} TEXT`);
+    }
     // Phase 2 step 6: the nginx address operations put a service behind (Studio's nifi-ops graph) and its last check.
     for (const table of ["service_standalones", "service_clusters"]) {
       const have = (this.db.prepare(`PRAGMA table_info(${table})`).all() as Row[]).map((c) => c.name);
@@ -356,6 +426,30 @@ export class Store {
       SELECT service, NULL, saved_at, 'config-imported', json_object('text', 'Configuration revision ' || revision || ' imported from the hosts', 'by', saved_by, 'revision', revision)
       FROM service_configs c WHERE source = 'import'
       AND NOT EXISTS (SELECT 1 FROM service_events e WHERE e.service = c.service AND e.kind = 'config-imported' AND json_extract(e.detail, '$.revision') = c.revision)`);
+    // §10.2.4 step 1 added the counts; §10.3: the FlowFiles moved inside a group.
+    if (!(this.db.prepare("PRAGMA table_info(service_flow_counts)").all() as Row[]).some((c) => c.name === "transferred")) this.db.exec("ALTER TABLE service_flow_counts ADD COLUMN transferred INTEGER NOT NULL DEFAULT 0");
+    this.migrateTraceModels();
+  }
+
+  /** §10.2.4 step 2: each v1 model (service_trace_models) becomes flow_models revision 1 (source migrated), every
+   *  business a proposed business of its own; then the v1 table goes. */
+  private migrateTraceModels() {
+    if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'service_trace_models'").get()) return;
+    this.inTransaction(() => {
+      for (const r of this.db.prepare("SELECT * FROM service_trace_models ORDER BY service").all() as Row[]) {
+        if (this.db.prepare("SELECT 1 FROM flow_models WHERE service = ?").get(r.service)) continue;
+        const { model, flows } = migrateV1(r.service, parse(r.body), () => newFlowId());
+        this.db.prepare("INSERT INTO flow_models (service, revision, body, source, published_at, published_by, gate) VALUES (?, 1, ?, 'migrated', ?, ?, '[]')")
+          .run(r.service, JSON.stringify(model), r.saved_at, r.saved_by);
+        for (const f of flows) {
+          this.db.prepare("INSERT INTO flows (id, name, name_by, status, summary, created_at, updated_at) VALUES (?, ?, 'ai', 'proposed', '', ?, ?)").run(f.id, f.name, r.saved_at, r.saved_at);
+          this.db.prepare("INSERT INTO flow_segments (flow, seq, service, segment) VALUES (?, 0, ?, ?)").run(f.id, r.service, f.segment);
+          this.db.prepare("INSERT INTO flow_changes (flow, service, at, by, kind, text, revision, verdict) VALUES (?, ?, ?, 'ai', 'found', ?, 1, NULL)")
+            .run(f.id, r.service, this.stamp(), `从旧的业务模型迁移（业务 ${f.segment}），等 AI 补上所在的流程组、人确认。`);
+        }
+      }
+      this.db.exec("DROP TABLE service_trace_models");
+    });
   }
 
   close() { this.db.close(); }
@@ -926,9 +1020,13 @@ export class Store {
   // Service ops §5.2, §6 (S4): takeover drafts, and the standalone instances and clusters they become when confirmed.
   // A draft is edited item by item while open; confirming (step 5) registers its items and closes it.
 
+  private txDepth = 0;
+  /** One transaction; work that opens another inside it joins this one. */
   private inTransaction<T>(work: () => T): T {
+    if (this.txDepth) return work();
     this.db.exec("BEGIN IMMEDIATE");
-    try { const result = work(); this.db.exec("COMMIT"); return result; } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    this.txDepth++;
+    try { const result = work(); this.db.exec("COMMIT"); return result; } catch (error) { this.db.exec("ROLLBACK"); throw error; } finally { this.txDepth--; }
   }
 
   private draftItems(draft: string): DraftItem[] {
@@ -1480,6 +1578,13 @@ export class Store {
     return r ? { member: r.member, at: r.at, backpressure: JSON.parse(r.bp) } : undefined;
   }
 
+  /** Ops step 3b (B3 stuck): every back pressure reading of a service at or after a time, oldest first. */
+  serviceBackpressures(service: string, since: string): { member: string; at: string; backpressure: Record<string, unknown> }[] {
+    return (this.db.prepare(`SELECT member, at, json_extract(body, '$.nifi.backpressure') AS bp FROM service_samples
+      WHERE service = ? AND at >= ? AND json_extract(body, '$.nifi.backpressure') IS NOT NULL ORDER BY at, rowid`).all(service, since) as Row[])
+      .map((r) => ({ member: r.member, at: r.at, backpressure: JSON.parse(r.bp) }));
+  }
+
   /** The members with samples at or after a time, with their oldest such sample. */
   sampledMembers(since: string): { service: string; member: string; first: string }[] {
     return (this.db.prepare("SELECT service, member, MIN(at) AS first FROM service_samples WHERE at >= ? AND point IS NOT NULL GROUP BY service, member").all(since) as Row[])
@@ -1511,10 +1616,10 @@ export class Store {
   addServiceBulletins(rows: ServiceBulletin[]): number {
     if (!rows.length) return 0;
     const received = this.stamp();
-    const insert = this.db.prepare(`INSERT OR IGNORE INTO service_bulletins (service, member, node, bulletin_id, at, level, category, source, source_type, message, received_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    const insert = this.db.prepare(`INSERT OR IGNORE INTO service_bulletins (service, member, node, bulletin_id, at, level, category, source, source_type, message, received_at, source_id, group_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     let added = 0;
-    this.inTransaction(() => { for (const b of rows) added += Number(insert.run(b.service, b.member, b.node, b.id, b.at, b.level, b.category, b.source, b.sourceType, b.message, received).changes); });
+    this.inTransaction(() => { for (const b of rows) added += Number(insert.run(b.service, b.member, b.node, b.id, b.at, b.level, b.category, b.source, b.sourceType, b.message, received, b.sourceId ?? null, b.groupId ?? null).changes); });
     return added;
   }
 
@@ -1525,7 +1630,15 @@ export class Store {
     if (options.level) { where.push("level = ?"); args.push(options.level); }
     args.push(Math.min(1000, Math.max(1, options.limit ?? 200)));
     return (this.db.prepare(`SELECT * FROM service_bulletins WHERE ${where.join(" AND ")} ORDER BY at DESC, bulletin_id DESC LIMIT ?`).all(...args) as Row[])
-      .map((r) => ({ service: r.service, member: r.member, node: r.node, id: r.bulletin_id, at: r.at, level: r.level ?? null, category: r.category ?? null, source: r.source ?? null, sourceType: r.source_type ?? null, message: r.message ?? null }));
+      .map((r) => ({ service: r.service, member: r.member, node: r.node, id: r.bulletin_id, at: r.at, level: r.level ?? null, category: r.category ?? null, source: r.source ?? null, sourceType: r.source_type ?? null, message: r.message ?? null,
+        ...(r.source_id ? { sourceId: r.source_id } : {}), ...(r.group_id ? { groupId: r.group_id } : {}) }));
+  }
+
+  /** S37 step 4: each member's NiFi process start times seen in samples of [from, to), with the first sample that showed each. */
+  serviceProcessStarts(service: string, from: string, to: string): { member: string; startedAt: string; pid: number | null; firstSeen: string }[] {
+    return (this.db.prepare(`SELECT member, json_extract(body, '$.process.startedAt') AS started, json_extract(body, '$.process.pid') AS pid, MIN(at) AS first_seen FROM service_samples
+      WHERE service = ? AND at >= ? AND at < ? AND json_extract(body, '$.process.startedAt') IS NOT NULL GROUP BY member, started ORDER BY first_seen`).all(service, from, to) as Row[])
+      .map((r) => ({ member: r.member, startedAt: String(r.started), pid: typeof r.pid === "number" ? r.pid : null, firstSeen: r.first_seen }));
   }
 
   /** S27: a member's certificates as of one reading, kept only when newer (by readAt) than what is there; only the newest reading stays. */
@@ -1557,6 +1670,70 @@ export class Store {
       // Phase 2 step 4: the log summary's 5-minute counts as long as the raw samples, its patterns as long as the rollups.
       out.logCounts = Number(this.db.prepare("DELETE FROM service_log_counts WHERE bucket < ?").run(samplesBefore).changes);
       out.logPatterns = Number(this.db.prepare("DELETE FROM service_log_patterns WHERE last_at < ?").run(rollupsBefore).changes);
+    });
+    return out;
+  }
+
+  // pages-rethink §10.2 step 1: flow counts and topology snapshots.
+
+  /** Adds flow counts; a sample's row replaces what the bucket had, NiFi's history only fills buckets that have none. */
+  putFlowCounts(rows: FlowCountRow[]) {
+    if (!rows.length) return;
+    const replace = this.db.prepare(`INSERT INTO service_flow_counts (service, bucket, kind, ref, name, flowfiles_in, flowfiles_out, bytes_in, bytes_out, transferred, source)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (service, kind, ref, bucket) DO UPDATE SET name = excluded.name, flowfiles_in = excluded.flowfiles_in,
+        flowfiles_out = excluded.flowfiles_out, bytes_in = excluded.bytes_in, bytes_out = excluded.bytes_out, transferred = excluded.transferred, source = excluded.source`);
+    const fill = this.db.prepare(`INSERT OR IGNORE INTO service_flow_counts (service, bucket, kind, ref, name, flowfiles_in, flowfiles_out, bytes_in, bytes_out, transferred, source)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    this.inTransaction(() => {
+      for (const r of rows) (r.source === "sample" ? replace : fill).run(r.service, r.bucket, r.kind, r.ref, r.name, r.flowfilesIn, r.flowfilesOut, r.bytesIn, r.bytesOut, r.transferred ?? 0, r.source);
+    });
+  }
+
+  flowCounts(service: string, from: string, to: string): FlowCountRow[] {
+    return (this.db.prepare("SELECT * FROM service_flow_counts WHERE service = ? AND bucket >= ? AND bucket < ? ORDER BY bucket, kind, ref").all(service, from, to) as Row[]).map((r) => ({
+      service: r.service, bucket: r.bucket, kind: r.kind, ref: r.ref, name: r.name, flowfilesIn: r.flowfiles_in, flowfilesOut: r.flowfiles_out,
+      bytesIn: r.bytes_in, bytesOut: r.bytes_out, transferred: r.transferred ?? 0, source: r.source,
+    }));
+  }
+
+  /** Per kind and ref since a time: the sums, how many buckets, the first and the last bucket. */
+  flowCountTotals(service: string, since: string): { kind: string; ref: string; name: string; flowfilesIn: number; flowfilesOut: number; transferred: number; buckets: number; first: string; last: string }[] {
+    return (this.db.prepare(`SELECT kind, ref, MAX(name) AS name, SUM(flowfiles_in) AS fin, SUM(flowfiles_out) AS fout, SUM(transferred) AS moved, COUNT(*) AS n, MIN(bucket) AS first, MAX(bucket) AS last
+      FROM service_flow_counts WHERE service = ? AND bucket >= ? GROUP BY kind, ref ORDER BY kind, ref`).all(service, since) as Row[])
+      .map((r) => ({ kind: r.kind, ref: r.ref, name: r.name, flowfilesIn: r.fin, flowfilesOut: r.fout, transferred: r.moved ?? 0, buckets: r.n, first: r.first, last: r.last }));
+  }
+
+  hasFlowCounts(service: string): boolean {
+    return Boolean(this.db.prepare("SELECT 1 FROM service_flow_counts WHERE service = ? LIMIT 1").get(service));
+  }
+
+  /** Keeps a topology snapshot when its hash differs from the newest one; true when it was added. */
+  putTopology(service: string, takenAt: string, hash: string, body: unknown): boolean {
+    const last = this.latestTopology(service);
+    if (last && (last.hash === hash || last.takenAt >= takenAt)) return false;
+    this.db.prepare("INSERT OR IGNORE INTO service_topology (service, taken_at, hash, body) VALUES (?, ?, ?, ?)").run(service, takenAt, hash, JSON.stringify(body));
+    return true;
+  }
+
+  latestTopology(service: string, at?: string): { takenAt: string; hash: string; body: unknown } | undefined {
+    const r = (at
+      ? this.db.prepare("SELECT * FROM service_topology WHERE service = ? AND taken_at <= ? ORDER BY taken_at DESC LIMIT 1").get(service, at)
+      : this.db.prepare("SELECT * FROM service_topology WHERE service = ? ORDER BY taken_at DESC LIMIT 1").get(service)) as Row | undefined;
+    return r ? { takenAt: r.taken_at, hash: r.hash, body: JSON.parse(r.body) } : undefined;
+  }
+
+  topologies(service: string, since: string): { takenAt: string; hash: string }[] {
+    return (this.db.prepare("SELECT taken_at, hash FROM service_topology WHERE service = ? AND taken_at >= ? ORDER BY taken_at").all(service, since) as Row[])
+      .map((r) => ({ takenAt: r.taken_at, hash: r.hash }));
+  }
+
+  /** Step 1 retention (30 days): counts before a time; topology snapshots before it except each service's newest. */
+  pruneFlowData(before: string): { counts: number; topologies: number } {
+    const out = { counts: 0, topologies: 0 };
+    this.inTransaction(() => {
+      out.counts = Number(this.db.prepare("DELETE FROM service_flow_counts WHERE bucket < ?").run(before).changes);
+      out.topologies = Number(this.db.prepare(`DELETE FROM service_topology WHERE taken_at < ?
+        AND taken_at < (SELECT MAX(taken_at) FROM service_topology t WHERE t.service = service_topology.service)`).run(before).changes);
     });
     return out;
   }
@@ -1717,7 +1894,236 @@ export class Store {
       this.insertServiceEvent({ service, member: null, at: this.stamp(), kind: "thresholds", detail: { text, by: actor.id } });
     });
   }
+
+  // pages-rethink §10.2.4 step 2: the business model v2 (flow_models), the businesses (flows, flow_segments) and their
+  // history (flow_changes). services/flowmodel.ts decides; these only read and write.
+
+  /** A service's newest model (or a given revision). */
+  flowModel(service: string, revision?: number): StoredFlowModel | null {
+    const r = (revision === undefined
+      ? this.db.prepare("SELECT * FROM flow_models WHERE service = ? ORDER BY revision DESC LIMIT 1").get(service)
+      : this.db.prepare("SELECT * FROM flow_models WHERE service = ? AND revision = ?").get(service, revision)) as Row | undefined;
+    return r ? toFlowModel(r) : null;
+  }
+
+  /** Every service's newest model. */
+  flowModels(): StoredFlowModel[] {
+    return (this.db.prepare("SELECT m.* FROM flow_models m WHERE revision = (SELECT MAX(revision) FROM flow_models x WHERE x.service = m.service) ORDER BY service").all() as Row[]).map(toFlowModel);
+  }
+
+  /** Adds the next revision over `base` (0: none yet); another publish in between is refused. Call inside flowTransaction. */
+  insertFlowModel(service: string, base: number, model: ModelV2, source: "ai" | "e2e_trace" | "migrated", actor: Actor, gate: unknown): number {
+    const was = (this.db.prepare("SELECT MAX(revision) AS r FROM flow_models WHERE service = ?").get(service) as Row | undefined)?.r ?? 0;
+    if (was !== base) throw new StoreError("flow-model/stale", `${service}'s model is at revision ${was}, not ${base}: read it again (describe) and redo the draft on it.`);
+    const revision = base + 1;
+    this.db.prepare("INSERT INTO flow_models (service, revision, body, source, published_at, published_by, gate) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .run(service, revision, JSON.stringify(model), source, this.stamp(), actor.id, JSON.stringify(gate));
+    this.insertAudit(actor, "service.flow-model", service, { revision, source });
+    return revision;
+  }
+
+  flowTransaction<T>(work: () => T): T { return this.inTransaction(work); }
+
+  flow(id: string): FlowRecord | null {
+    const r = this.db.prepare("SELECT * FROM flows WHERE id = ?").get(id) as Row | undefined;
+    return r ? toFlow(r) : null;
+  }
+
+  /** The businesses with a segment in a service (or all of them). */
+  flows(service?: string): FlowRecord[] {
+    return (service
+      ? this.db.prepare("SELECT * FROM flows WHERE id IN (SELECT flow FROM flow_segments WHERE service = ?) ORDER BY created_at, rowid").all(service)
+      : this.db.prepare("SELECT * FROM flows ORDER BY created_at, rowid").all()).map((r) => toFlow(r as Row));
+  }
+
+  /** Inserts or replaces a business row. */
+  putFlow(f: FlowRecord) {
+    this.db.prepare(`INSERT INTO flows (id, name, name_by, status, summary, reason, risks, pending, stuck_attention_s, stuck_failing_s, stuck_by, stuck_basis, created_at, confirmed_at, confirmed_by, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET name = excluded.name, name_by = excluded.name_by, status = excluded.status,
+        summary = excluded.summary, reason = excluded.reason, risks = excluded.risks, pending = excluded.pending, stuck_attention_s = excluded.stuck_attention_s,
+        stuck_failing_s = excluded.stuck_failing_s, stuck_by = excluded.stuck_by, stuck_basis = excluded.stuck_basis, confirmed_at = excluded.confirmed_at,
+        confirmed_by = excluded.confirmed_by, updated_at = excluded.updated_at`)
+      .run(f.id, f.name, f.nameBy, f.status, f.summary, f.reason, JSON.stringify(f.risks), f.pending ? JSON.stringify(f.pending) : null,
+        f.stuck?.attentionS ?? null, f.stuck?.failingS ?? null, f.stuck?.by ?? null, f.stuck?.basis ?? null, f.createdAt, f.confirmedAt, f.confirmedBy, this.stamp());
+  }
+
+  deleteFlow(id: string) { this.db.prepare("DELETE FROM flows WHERE id = ?").run(id); }
+
+  /** A business's segments in order (upstream first). */
+  flowSegments(flow: string): { seq: number; service: string; segment: string }[] {
+    return (this.db.prepare("SELECT seq, service, segment FROM flow_segments WHERE flow = ? ORDER BY seq").all(flow) as Row[]).map((r) => ({ seq: r.seq, service: r.service, segment: r.segment }));
+  }
+
+  /** Replaces a business's segments in one service, keeping the other services' (renumbered in the order given). */
+  setFlowSegments(flow: string, ordered: { service: string; segment: string }[]) {
+    this.db.prepare("DELETE FROM flow_segments WHERE flow = ?").run(flow);
+    ordered.forEach((s, seq) => this.db.prepare("INSERT INTO flow_segments (flow, seq, service, segment) VALUES (?, ?, ?, ?)").run(flow, seq, s.service, s.segment));
+  }
+
+  addFlowChange(c: Omit<FlowChange, "id" | "at">) {
+    this.db.prepare("INSERT INTO flow_changes (flow, service, at, by, kind, text, revision, verdict) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(c.flow, c.service, this.stamp(), c.by, c.kind, c.text, c.revision, c.verdict);
+  }
+
+  /** Newest first: a business's history, or a service's. */
+  flowChanges(o: { flow?: string; service?: string; limit?: number }): FlowChange[] {
+    const where = o.flow ? "flow = ?" : "service = ?";
+    return (this.db.prepare(`SELECT * FROM flow_changes WHERE ${where} ORDER BY id DESC LIMIT ?`).all(o.flow ?? o.service ?? "", Math.min(500, o.limit ?? 50)) as Row[])
+      .map((r) => ({ id: r.id, flow: r.flow ?? null, service: r.service, at: r.at, by: r.by, kind: r.kind, text: r.text, revision: r.revision ?? null, verdict: r.verdict ?? null }));
+  }
+
+  /** Step 3b: an anomaly seen (again). Opens one, or adds `count` to the open one and moves its last time, light and detail. */
+  noteFlowAnomaly(a: { flow: string; service: string; ref: string; anomaly: Anomaly | FlowNote; light: Light; at: string; count: number; detail: Record<string, unknown>; replace?: boolean }) {
+    const open = this.db.prepare("SELECT id, count, last_at FROM flow_anomalies WHERE flow = ? AND service = ? AND ref = ? AND anomaly = ? AND state = 'open'").get(a.flow, a.service, a.ref, a.anomaly) as Row | undefined;
+    if (open) {
+      this.db.prepare("UPDATE flow_anomalies SET light = ?, last_at = ?, count = ?, detail = ? WHERE id = ?")
+        .run(a.light, a.at > open.last_at ? a.at : open.last_at, a.replace ? a.count : open.count + a.count, JSON.stringify(a.detail), open.id);
+    } else {
+      this.db.prepare("INSERT INTO flow_anomalies (flow, service, ref, anomaly, light, state, first_at, last_at, count, detail) VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)")
+        .run(a.flow, a.service, a.ref, a.anomaly, a.light, a.at, a.at, a.count, JSON.stringify(a.detail));
+    }
+  }
+
+  closeFlowAnomaly(id: number, at: string) { this.db.prepare("UPDATE flow_anomalies SET state = 'closed', closed_at = ? WHERE id = ? AND state = 'open'").run(at, id); }
+
+  /** Open anomalies of a service (or of every service), or a business's anomalies since a time (open and closed, newest first). */
+  flowAnomalies(o: { service?: string; flow?: string; state?: "open"; since?: string; limit?: number }): FlowAnomaly[] {
+    const where: string[] = [], args: string[] = [];
+    if (o.service) { where.push("service = ?"); args.push(o.service); }
+    if (o.flow) { where.push("flow = ?"); args.push(o.flow); }
+    if (o.state) { where.push("state = ?"); args.push(o.state); }
+    if (o.since) { where.push("(last_at >= ? OR state = 'open')"); args.push(o.since); }
+    return (this.db.prepare(`SELECT * FROM flow_anomalies ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY id DESC LIMIT ?`).all(...args, Math.min(5000, o.limit ?? 1000)) as Row[])
+      .map((r) => ({ id: r.id, flow: r.flow, service: r.service, ref: r.ref, anomaly: r.anomaly, light: r.light, state: r.state, firstAt: r.first_at, lastAt: r.last_at, count: r.count, detail: parse(r.detail) ?? {}, closedAt: r.closed_at ?? null }));
+  }
+
+  /** Closed anomalies older than a time go (30 days, with the other flow data). */
+  pruneFlowAnomalies(before: string): number { return Number(this.db.prepare("DELETE FROM flow_anomalies WHERE state = 'closed' AND closed_at < ?").run(before).changes); }
+
+  /** A person's change to a business, audited (FlowAction, §10.2.2 #7). */
+  auditFlow(actor: Actor, flow: string, action: string) { this.insertAudit(actor, `service.flow.${action}`, flow, {}); }
+
+  /** S37 step 7 (T8, T9): how a service reaches an evidence source (e2e_trace: the Graph and its sealed graph token). */
+  traceSource(service: string, source: string): { body: unknown; savedAt: string; savedBy: string } | null {
+    const r = this.db.prepare("SELECT * FROM service_trace_sources WHERE service = ? AND source = ?").get(service, source) as Row | undefined;
+    return r ? { body: parse(r.body), savedAt: r.saved_at, savedBy: r.saved_by } : null;
+  }
+
+  setTraceSource(service: string, source: string, body: unknown, actor: Actor) {
+    this.inTransaction(() => {
+      this.db.prepare("INSERT INTO service_trace_sources (service, source, body, saved_at, saved_by) VALUES (?, ?, ?, ?, ?) ON CONFLICT(service, source) DO UPDATE SET body = excluded.body, saved_at = excluded.saved_at, saved_by = excluded.saved_by")
+        .run(service, source, JSON.stringify(body), this.stamp(), actor.id);
+      this.insertAudit(actor, "service.trace-source", service, { source });
+    });
+  }
+
+  removeTraceSource(service: string, source: string, actor: Actor) {
+    this.inTransaction(() => {
+      this.db.prepare("DELETE FROM service_trace_sources WHERE service = ? AND source = ?").run(service, source);
+      this.insertAudit(actor, "service.trace-source.remove", service, { source });
+    });
+  }
+
+  // pages-rethink §10.2.4 step 4: the to-dos (one open per service and key: the same key again updates it) and the AI's
+  // analyses. services/todos.ts decides; these only read and write.
+
+  /** Opens a to-do, or updates the open one with the same service and key. */
+  upsertTodo(t: Pick<TodoRecord, "service" | "flow" | "source" | "key" | "severity" | "title" | "detail" | "action" | "analysis">, by: string): { id: string; created: boolean } {
+    return this.inTransaction(() => {
+      const at = this.stamp();
+      const was = this.db.prepare("SELECT id FROM service_todos WHERE service = ? AND key = ? AND state = 'open'").get(t.service, t.key) as Row | undefined;
+      const action = t.action ? JSON.stringify(t.action) : null;
+      if (was) {
+        this.db.prepare("UPDATE service_todos SET flow = ?, source = ?, severity = ?, title = ?, detail = ?, action = ?, analysis = COALESCE(?, analysis), updated_at = ? WHERE id = ?")
+          .run(t.flow, t.source, t.severity, t.title, t.detail, action, t.analysis, at, was.id);
+        return { id: was.id as string, created: false };
+      }
+      const id = `td_${randomBytes(6).toString("hex")}`;
+      this.db.prepare("INSERT INTO service_todos (id, service, flow, source, key, severity, title, detail, action, state, analysis, draft, created_at, created_by, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, NULL, ?, ?, ?)")
+        .run(id, t.service, t.flow, t.source, t.key, t.severity, t.title, t.detail, action, t.analysis, at, by, at);
+      return { id, created: true };
+    });
+  }
+
+  todo(id: string): TodoRecord | null {
+    const r = this.db.prepare("SELECT * FROM service_todos WHERE id = ?").get(id) as Row | undefined;
+    return r ? toTodo(r) : null;
+  }
+
+  /** A service's to-dos (open by default), oldest first. */
+  todos(service: string, state: TodoState | "all" = "open"): TodoRecord[] {
+    return (state === "all"
+      ? this.db.prepare("SELECT * FROM service_todos WHERE service = ? ORDER BY created_at, id").all(service)
+      : this.db.prepare("SELECT * FROM service_todos WHERE service = ? AND state = ? ORDER BY created_at, id").all(service, state)).map((r) => toTodo(r as Row));
+  }
+
+  /** Closes an open to-do (done or dismissed), audited; false when it is not open. */
+  closeTodo(id: string, state: "done" | "dismissed", actor: Actor): boolean {
+    return this.inTransaction(() => {
+      const at = this.stamp();
+      const r = this.db.prepare("UPDATE service_todos SET state = ?, closed_at = ?, closed_by = ?, updated_at = ? WHERE id = ? AND state = 'open'").run(state, at, actor.id, at, id);
+      if (!Number(r.changes)) return false;
+      this.insertAudit(actor, `service.todo.${state}`, id, {});
+      return true;
+    });
+  }
+
+  setTodoDraft(id: string, draft: string) { this.db.prepare("UPDATE service_todos SET draft = ?, updated_at = ? WHERE id = ?").run(draft, this.stamp(), id); }
+
+  addAnalysis(a: Omit<AnalysisRecord, "id">): number {
+    const r = this.db.prepare("INSERT INTO service_analyses (service, run, trigger, state, session, requested_by, started_at, finished_at, machine_light, business_light, body, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(a.service, a.run, a.trigger, a.state, a.session, a.requestedBy, a.startedAt, a.finishedAt, a.machineLight, a.businessLight, a.body === null || a.body === undefined ? null : JSON.stringify(a.body), a.error);
+    return Number(r.lastInsertRowid);
+  }
+
+  analysis(id: number): AnalysisRecord | null {
+    const r = this.db.prepare("SELECT * FROM service_analyses WHERE id = ?").get(id) as Row | undefined;
+    return r ? toAnalysis(r) : null;
+  }
+
+  /** A service's analyses, newest first (running ones included). */
+  analyses(service: string, limit = 1): AnalysisRecord[] {
+    return (this.db.prepare("SELECT * FROM service_analyses WHERE service = ? ORDER BY started_at DESC, id DESC LIMIT ?").all(service, Math.min(200, Math.max(1, limit))) as Row[]).map(toAnalysis);
+  }
+
+  /** Every running analysis (step 5 follows their sessions). */
+  runningAnalyses(): AnalysisRecord[] {
+    return (this.db.prepare("SELECT * FROM service_analyses WHERE state = 'running' ORDER BY id").all() as Row[]).map(toAnalysis);
+  }
+
+  /** The newest analyses of one check-up round (run), or of the newest round when none is given. */
+  analysisRun(run?: string): AnalysisRecord[] {
+    const id = run ?? (this.db.prepare("SELECT run FROM service_analyses WHERE run IS NOT NULL ORDER BY started_at DESC, id DESC LIMIT 1").get() as Row | undefined)?.run;
+    return id ? (this.db.prepare("SELECT * FROM service_analyses WHERE run = ? ORDER BY service").all(id) as Row[]).map(toAnalysis) : [];
+  }
+
+  /** An analysis's outcome (state, session, end, body, error). */
+  setAnalysis(a: Pick<AnalysisRecord, "id" | "state" | "session" | "finishedAt" | "body" | "error">) {
+    this.db.prepare("UPDATE service_analyses SET state = ?, session = ?, finished_at = ?, body = ?, error = ? WHERE id = ?")
+      .run(a.state, a.session, a.finishedAt, a.body === null || a.body === undefined ? null : JSON.stringify(a.body), a.error, a.id);
+  }
 }
+
+/** §10.2.4 step 4: one row of service_todos. */
+export interface TodoRecord {
+  id: string; service: string; flow: string | null; source: TodoSource; key: string; severity: "failing" | "attention";
+  title: string; detail: string; action: TodoAction | null; state: TodoState; analysis: number | null; draft: string | null;
+  createdAt: string; createdBy: string; updatedAt: string; closedAt: string | null; closedBy: string | null;
+}
+const toTodo = (r: Row): TodoRecord => ({
+  id: r.id, service: r.service, flow: r.flow ?? null, source: r.source, key: r.key, severity: r.severity, title: r.title, detail: r.detail,
+  action: parse(r.action ?? null), state: r.state, analysis: r.analysis ?? null, draft: r.draft ?? null,
+  createdAt: r.created_at, createdBy: r.created_by, updatedAt: r.updated_at, closedAt: r.closed_at ?? null, closedBy: r.closed_by ?? null,
+});
+/** §10.2.4 step 4: one row of service_analyses. body: record's analysis as it came (redacted). */
+export interface AnalysisRecord {
+  id: number; service: string; run: string | null; trigger: AnalysisTrigger; state: AnalysisState; session: string | null; requestedBy: string;
+  startedAt: string; finishedAt: string | null; machineLight: Light; businessLight: Light; body: unknown; error: string | null;
+}
+const toAnalysis = (r: Row): AnalysisRecord => ({
+  id: r.id, service: r.service, run: r.run ?? null, trigger: r.trigger, state: r.state, session: r.session ?? null, requestedBy: r.requested_by,
+  startedAt: r.started_at, finishedAt: r.finished_at ?? null, machineLight: r.machine_light, businessLight: r.business_light, body: parse(r.body ?? null), error: r.error ?? null,
+});
 
 /** What a registered standalone instance or cluster carries besides its draft shape. */
 export interface Registered { environment: string; draft: string | null; createdAt: string; createdBy: string; nginxUrl: string | null; nginxCheck: NginxCheck | null }
@@ -1736,5 +2142,39 @@ export interface LogPattern { member: string; pattern: string; level: string; lo
 
 /** A sample's flat numbers (services/metrics.ts). */
 export type Point = Record<string, number | null>;
-export interface ServiceBulletin { service: string; member: string; node: string; id: number; at: string; level: string | null; category: string | null; source: string | null; sourceType: string | null; message: string | null }
+export interface ServiceBulletin { service: string; member: string; node: string; id: number; at: string; level: string | null; category: string | null; source: string | null; sourceType: string | null; message: string | null; sourceId?: string; groupId?: string }
+/** pages-rethink §10.2.4 step 1: one row of service_flow_counts (ref: group id; s2s-out "<target uri>#<port name>"; s2s-in the input port id). */
+export interface FlowCountRow {
+  service: string; bucket: string; kind: "group" | "s2s-out" | "s2s-in"; ref: string; name: string;
+  flowfilesIn: number; flowfilesOut: number; bytesIn: number; bytesOut: number;
+  /** §10.3: FlowFiles moved inside the group (0 for the S2S rows). */
+  transferred: number;
+  source: "sample" | "nifi-history";
+}
+/** §10.2.4 step 2: a stored v2 model revision. gate: the checks it was published with. */
+export interface StoredFlowModel { service: string; revision: number; model: ModelV2; source: "ai" | "e2e_trace" | "migrated"; publishedAt: string; publishedBy: string; gate: unknown }
+const toFlowModel = (r: Row): StoredFlowModel => ({ service: r.service, revision: r.revision, model: JSON.parse(r.body), source: r.source, publishedAt: r.published_at, publishedBy: r.published_by, gate: parse(r.gate) });
+/** A change the gate held for a person (A8): the draft's segments of this service it would apply, those it removes. */
+export interface FlowPending {
+  id: string; kind: "new" | "gone" | "merge" | "split" | "cross-service"; text: string; service: string; at: string;
+  segments: unknown[]; remove: string[]; notes: unknown[];
+}
+export interface FlowRecord {
+  id: string; name: string; nameBy: "ai" | "person"; status: FlowStatus; summary: string; reason: string | null;
+  risks: { text: string; component?: string }[]; pending: FlowPending | null;
+  stuck: { attentionS: number; failingS: number; by: "ai" | "person"; basis: string } | null;
+  createdAt: string; confirmedAt: string | null; confirmedBy: string | null; updatedAt: string;
+}
+const toFlow = (r: Row): FlowRecord => ({
+  id: r.id, name: r.name, nameBy: r.name_by, status: r.status, summary: r.summary, reason: r.reason ?? null, risks: parse(r.risks) ?? [], pending: parse(r.pending),
+  stuck: r.stuck_attention_s && r.stuck_failing_s ? { attentionS: r.stuck_attention_s, failingS: r.stuck_failing_s, by: r.stuck_by ?? "ai", basis: r.stuck_basis ?? "" } : null,
+  createdAt: r.created_at, confirmedAt: r.confirmed_at ?? null, confirmedBy: r.confirmed_by ?? null, updatedAt: r.updated_at,
+});
+/** §10.2.4 step 3: one row of flow_anomalies. */
+export interface FlowAnomaly {
+  id: number; flow: string; service: string; ref: string; anomaly: Anomaly | FlowNote; light: Light; state: "open" | "closed";
+  firstAt: string; lastAt: string; count: number; detail: Record<string, unknown>; closedAt: string | null;
+}
+export type FlowChangeKind ="found" | "updated" | "confirmed" | "renamed" | "stuck" | "split-asked" | "not-right" | "ignored" | "watched" | "rejected";
+export interface FlowChange { id: number; flow: string | null; service: string; at: string; by: string; kind: FlowChangeKind; text: string; revision: number | null; verdict: GateVerdict | null }
 export interface ServiceCert { member: string; store: string; path: string | null; type: string | null; alias: string | null; chain: number | null; subject: string | null; issuer: string | null; notBefore: string | null; notAfter: string | null; readAt: string; error: string | null }

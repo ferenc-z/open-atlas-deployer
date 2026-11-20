@@ -15,6 +15,9 @@ export interface Principal {
   /** key: a personal API key (its owner as Workbench has them now); service: the Deploy Assistant's read-only key. */
   via: "workbench" | "emergency" | "key" | "service";
   keyId?: string;
+  /** Which key (pages-rethink §10.2.3): with via service, "service" is the Deploy Assistant's (dps_) and "checkup" the
+   *  scheduled check-up's (dpc_), both without a person behind them. */
+  keyKind?: "personal" | "service" | "checkup";
   groups: string[];
   isAdmin: boolean;
   permissions: Permission[];

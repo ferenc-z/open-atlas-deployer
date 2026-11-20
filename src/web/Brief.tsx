@@ -42,6 +42,7 @@ export function BriefCard({ canRegenerate }: { canRegenerate: boolean }) {
   const facts: { key: string; node: ReactNode; muted?: boolean }[] = f ? [
     ...f.failed.map((j) => ({ key: j.job, node: <>Failed · {j.app} {j.version}: {j.diagnosis ?? j.message ?? j.state}</> })),
     ...f.waiting.map((w) => ({ key: `w-${w.job}`, node: <>Waiting for a person · {w.app} {w.version}: {w.step}</> })),
+    ...(f.nifi?.todos ?? []).map((t, i) => ({ key: `n-${i}-${t.service}-${t.rule}`, node: <>NiFi {t.service} · {t.severity === "CRIT" ? "Critical" : t.severity === "WARN" ? "Warning" : "Notice"}{t.member ? ` · ${t.member}` : ""}: {t.cause}</>, ...(t.severity === "INFO" ? { muted: true } : {}) })),
     ...f.drift.map((d) => ({ key: `d-${d.app}-${d.kind}`, node: <>Drift · {d.app}: {d.detail}</> })),
     ...f.promotable.map((p) => ({ key: `p-${p.app}`, node: <>{p.app}: UAT has run {p.uat}, here it is {p.here ?? "—"}</> })),
     ...f.apps.filter((a) => a.newer.length).map((a) => ({ key: a.app, node: <>{a.app}: now {a.desired ?? "—"}, newer versions {a.newer.join(", ")}</> })),

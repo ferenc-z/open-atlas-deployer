@@ -9,7 +9,9 @@ import json
 import os
 import pathlib
 import pwd
+import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -29,6 +31,8 @@ NO_ENV = {"HOME": "/nonexistent"}
 def cfg(root, **over):
     c = sx.config(environ={"EXECUTOR_WORK": str(pathlib.Path(root) / "work"), "EXECUTOR_DEPLOYER_URL": "https://deployer.test",
                            "EXECUTOR_TOKEN_FILE": str(pathlib.Path(root) / "token"), "EXECUTOR_READ_SLOTS": "2"})
+    # The recorded answers have no flow topology: the flow counts are tested on their own (FlowCountsTest).
+    c["flow_seconds"] = 0
     c.update(over)
     return c
 
@@ -802,6 +806,34 @@ class WatchApi(FakeApi):
         self.samples.extend(samples)
 
 
+class SelfNodeTest(unittest.TestCase):
+    """S34: a NiFi per machine, all on 9443, listed by their API address; this machine is nifi01.corp."""
+    NODES = [{"nodeId": "n1", "address": "nifi01.corp", "apiPort": 9443}, {"nodeId": "n2", "address": "nifi02.corp", "apiPort": 9443}]
+
+    def test_same_port_the_address_written_differently(self):
+        not_local = lambda a: False  # noqa: E731
+        # The cluster node address as an IP, a short name, or not set: the API host or the machine's name tells.
+        for names in ({"10.0.0.11", "nifi01.corp"}, {"nifi01", "nifi01.corp"}, {"nifi01.corp"}):
+            self.assertEqual(sx.self_node(self.NODES, 9443, names, not_local), "n1", names)
+        # None of its names: the one whose address resolves to this machine.
+        self.assertEqual(sx.self_node(self.NODES, 9443, {"10.0.0.11"}, lambda a: a == "nifi01.corp"), "n1")
+        self.assertIsNone(sx.self_node(self.NODES, 9443, {"10.0.0.11"}, not_local), "cannot tell: none rather than a guess")
+        # Different ports (the lab: one machine): the port alone.
+        lab = [{"nodeId": "a", "address": "localhost", "apiPort": 18445}, {"nodeId": "b", "address": "localhost", "apiPort": 18446}]
+        self.assertEqual(sx.self_node(lab, 18446, set(), not_local), "b")
+        self.assertIsNone(sx.self_node(lab, 9443, {"localhost"}, not_local))
+
+    def test_names_and_local_addresses(self):
+        self.assertTrue(sx.is_local_address("127.0.0.1"))
+        self.assertTrue(sx.is_local_address(socket.gethostname()))
+        self.assertFalse(sx.is_local_address("192.0.2.1"), "TEST-NET-1 is nobody's")
+        self.assertFalse(sx.is_local_address("no-such-host.invalid"))
+        self.assertEqual(sx.host_name(" NIFI01.Corp. "), "nifi01.corp")
+        names = sx.own_names({"nodeAddress": "10.0.0.11", "https": {"host": "0.0.0.0"}}, {"nifi.web.https.host": "NiFi01.corp", "nifi.cluster.node.address": ""})
+        self.assertTrue({"10.0.0.11", "nifi01.corp", sx.host_name(socket.gethostname())} <= names)
+        self.assertFalse({"", "0.0.0.0"} & names)
+
+
 class RestTrimTest(unittest.TestCase):
     def test_what_each_version_answers_is_cut_to_what_the_deployer_keeps(self):
         for version, want in (("1.12.1", "1.12.1"), ("2.0.0", "2.0.0"), ("2.5.0-cluster", "2.5.0")):
@@ -831,7 +863,7 @@ class RestTrimTest(unittest.TestCase):
         self.assertEqual(sx.trim_bulletins(json.loads(recorded("1.12.1", f"flow/bulletin-board?limit={sx.BULLETINS}")[1])), [])
         for version in ("1.12.1", "2.0.0", "2.5.0-cluster"):
             self.assertEqual(sx.trim_backpressure(json.loads(recorded(version, "flow/process-groups/root/status?recursive=true")[1])),
-                             {"connections": 0, "full": 0, "maxPercent": 0, "top": []}, "the lab's flows are empty")
+                             {"connections": 0, "full": 0, "maxPercent": 0, "top": [], "notRunning": []}, "the lab's flows are empty")
 
     def test_back_pressure_of_nested_groups(self):
         conn = lambda i, count, size: {"connectionStatusSnapshot": {"id": i, "name": f"c{i}", "sourceName": "a", "destinationName": "b", "percentUseCount": count, "percentUseBytes": size, "flowFilesQueued": count * 100, "bytesQueued": 1, "queued": "text"}}
@@ -844,7 +876,18 @@ class RestTrimTest(unittest.TestCase):
         self.assertEqual([c["id"] for c in sx.trim_backpressure(tree, top=2)["top"]], [2, 4], "only the fullest N")
         self.assertEqual(sx.trim_backpressure(tree, top=1)["full"], 2, "the count covers every connection, not only the N")
         self.assertNotIn("queued", bp["top"][0], "only numbers and names")
-        self.assertEqual(sx.trim_backpressure({}), {"connections": 0, "full": 0, "maxPercent": 0, "top": []})
+        self.assertEqual(sx.trim_backpressure({}), {"connections": 0, "full": 0, "maxPercent": 0, "top": [], "notRunning": []})
+
+    def test_back_pressure_names_ids_and_processors_not_running(self):
+        # S37 step 6 (T11): a stuck trace looks its connection up by ids and asks whether the component runs.
+        proc = lambda i, state: {"processorStatusSnapshot": {"id": i, "name": i, "runStatus": state, "flowFilesIn": 3}}
+        tree = {"processGroupStatus": {"aggregateSnapshot": {"name": "root", "connectionStatusSnapshots": [
+            {"connectionStatusSnapshot": {"id": "c1", "sourceId": "p-a", "destinationId": "p-b", "percentUseCount": 40, "flowFilesQueued": 4000}}],
+            "processorStatusSnapshots": [proc("p-a", "Running"), proc("p-b", "Stopped")],
+            "processGroupStatusSnapshots": [{"processGroupStatusSnapshot": {"name": "g", "processorStatusSnapshots": [proc("p-c", "Invalid")]}}]}}}
+        bp = sx.trim_backpressure(tree)
+        self.assertEqual((bp["top"][0]["sourceId"], bp["top"][0]["destinationId"]), ("p-a", "p-b"))
+        self.assertEqual(bp["notRunning"], [{"id": "p-b", "name": "p-b", "runStatus": "Stopped"}, {"id": "p-c", "name": "p-c", "runStatus": "Invalid"}])
 
     def test_keytool_listings_of_both_store_types(self):
         jks = sx.parse_keytool((NIFI_DATA / "1.12.1-keytool-truststore-jks.txt").read_text())
@@ -986,6 +1029,7 @@ class CollectorTest(Base):
         self.assertEqual((n["state"], n["url"], n["about"]["version"]), ("ok", "https://localhost:18445", "2.5.0"))
         self.assertEqual(len(n["diagnostics"]["nodes"]), 2, "a node asks nodewise")
         self.assertEqual(len(n["cluster"]["nodes"]), 2)
+        self.assertEqual(n["selfNodeId"], next(c["nodeId"] for c in n["cluster"]["nodes"] if c["apiPort"] == 18445), "S34: which entry is this node")
         self.assertEqual(len(n["bulletins"]), 3)
         paths = [call[3] for call in c.calls if call[1] == 18445]
         self.assertEqual(paths, ["flow/about", "system-diagnostics?nodewise=true", "flow/status", "controller/cluster", f"flow/bulletin-board?limit={sx.BULLETINS}",
@@ -1061,7 +1105,7 @@ class CollectorTest(Base):
         self.assertEqual([(n["apiPort"], n["address"], n["status"], n["roles"]) for n in rest["cluster"]["nodes"]],
                          [(18445, "localhost", "CONNECTED", ["Primary Node", "Cluster Coordinator"]), (18446, "localhost", "CONNECTED", [])])
         self.assertEqual(sorted(rest["cluster"]["nodes"][0]), ["address", "apiPort", "nodeId", "roles", "status"])
-        self.assertEqual(rest["cluster"]["self"], rest["cluster"]["nodes"][0]["nodeId"], "by address and HTTPS port")
+        self.assertEqual(rest["cluster"]["self"], rest["cluster"]["nodes"][0]["nodeId"], "by HTTPS port and address (self_node)")
         props = next(f for f in out["files"] if f["name"] == "nifi.properties")
         self.assertEqual(props["sha256"], hashlib.sha256((self.c250 / "conf" / "nifi.properties").read_bytes()).hexdigest())
         self.assertEqual((props["owner"], props["mode"]), (sx.user_name(os.geteuid()), "0640"))
@@ -2419,11 +2463,23 @@ class FakeNifi:
             fields = [{"id": i, "field": f, "label": lab, "type": "STRING"} for i, f, lab in (("EventType", "eventType", "Event Type"), ("FlowFileUUID", "uuid", "FlowFile UUID"),
                                                                                          ("Filename", "filename", "Filename"), ("ProcessorID", "processorId", "Component ID"))]
             return 200, json.dumps({"provenanceOptions": {"searchableFields": fields}}).encode()
+        if bare == "controller/cluster":
+            return 200, json.dumps({"cluster": {"nodes": [{"nodeId": "node-1", "address": "localhost", "apiPort": 18445, "status": "CONNECTED"},
+                                                          {"nodeId": "node-2", "address": "localhost", "apiPort": 18446, "status": "CONNECTED"},
+                                                          {"nodeId": "node-3", "address": "localhost", "apiPort": 18447, "status": "DISCONNECTED"}]}}).encode()
         if bare == "flow/about":
             return 200, json.dumps({"about": {"title": "NiFi", "version": self.version, "timezone": "CST"}}).encode()
+        if bare == "flow/search-results":
+            parent = {"id": "pg-root", "name": "NiFi Flow"}
+            return 200, json.dumps({"searchResultsDTO": {
+                "processorResults": [{"id": "p-1", "groupId": "pg-in", "name": "GetFile in", "parentGroup": {"id": "pg-in", "name": "Inbound"}}],
+                "processGroupResults": [{"id": "pg-in", "groupId": "pg-root", "name": "Inbound", "parentGroup": parent}],
+                "inputPortResults": [{"id": "ip-1", "groupId": "pg-root", "name": "in from n112", "parentGroup": parent}, "junk"],
+                "connectionResults": [{"id": "c-1", "name": "ignored"}]}}).encode()
         if method == "POST" and bare == "provenance":
             req = body["provenance"]["request"]
-            term = next(iter(req["searchTerms"].values()))
+            terms = req.get("searchTerms") or {"none": {"value": ""} if not self.old else ""}  # no terms: every event in the range
+            term = next(iter(terms.values()))
             if self.old and isinstance(term, dict):
                 return 400, b"Cannot deserialize instance of `java.lang.String` out of START_OBJECT token"
             if not self.old and not isinstance(term, dict):
@@ -2433,13 +2489,14 @@ class FakeNifi:
             moved = self.shift * 3600_000 if self.cluster else 0
             start, end = self.parse(req["startDate"]) + moved, self.parse(req["endDate"]) + moved
             value = term["value"] if isinstance(term, dict) else term
-            field = next(iter(req["searchTerms"]))
+            field = next(iter(terms))
             hits = [e for e in self.events if start <= e["ms"] <= end and (field != "FlowFileUUID" or e["uuid"] == value) and (field != "EventType" or e["type"] == value)
                     and (not req.get("clusterNodeId") or e.get("node") == req["clusterNodeId"])]
             hits.sort(key=lambda e: -e["ms"])
             echo = {**req, "startDate": self.local(start + moved, millis=False), "endDate": self.local(end + moved, millis=False)}
             self.jobs[qid] = {"id": qid, "finished": False, "percentCompleted": 0, "request": echo,
-                              "results": {"provenanceEvents": [self.event(e) for e in hits[:req["maxResults"]]], "totalCount": len(hits), "total": str(len(hits)), "timeOffset": self.OFFSET}}
+                              "results": {"provenanceEvents": [self.event(e, full=not req["summarize"]) for e in hits[:req["maxResults"]]], "totalCount": len(hits), "total": str(len(hits)), "timeOffset": self.OFFSET,
+                                          **({"oldestEvent": self.local(min(held))} if (held := [e["ms"] for e in self.events if not req.get("clusterNodeId") or e.get("node") == req["clusterNodeId"]]) else {})}}
             return 201, json.dumps({"provenance": {k: v for k, v in self.jobs[qid].items() if k != "results"}}).encode()
         if method == "POST" and bare == "provenance/lineage":
             req = body["lineage"]["request"]
@@ -2527,6 +2584,27 @@ class ProvenanceTest(Base):
         self.assertEqual([e["flowFileUuid"] for e in out["events"]], [UUID_B])
         self.assertEqual([out["scope"], nifi.calls[-1]], ["node node-2", "DELETE provenance/q0001-01a1-1000?clusterNodeId=node-2"])
 
+    def test_attributes_for_the_trace_and_the_oldest_event_each_node_holds(self):
+        # S37 step 6: the trace asks unsummarized (attributes as a map; hidden ones said so) and learns how far back each
+        # node's provenance goes (T4: max.storage.size can age events out before the configured time).
+        events = [{"eventId": 1, "uuid": UUID_A, "type": "RECEIVE", "ms": AT, "node": "node-1", "attributes": [{"name": "filename", "value": "a.csv"}, {"name": "x", "value": None}]},
+                  {"eventId": 2, "uuid": UUID_B, "type": "CREATE", "ms": AT - 3600_000, "node": "node-2"}]
+        nifi = FakeNifi("2.5.0", cluster=True, events=events)
+        out = self.query(nifi, {"op": "provenance", "uuid": UUID_A, "attributes": True, **self.window()}, cluster=True)
+        self.assertFalse(nifi.bodies[0]["provenance"]["request"]["summarize"])
+        self.assertEqual(out["events"][0]["attributes"], {"filename": "a.csv"})
+        self.assertEqual(out["oldest"], sx.iso_ms(AT - 3600_000))
+        nifi = FakeNifi("2.5.0", cluster=True, events=events)
+        out = self.query(nifi, {"op": "provenance", "uuid": UUID_A, **self.window()}, cluster=True)
+        self.assertTrue(nifi.bodies[0]["provenance"]["request"]["summarize"], "the page's search stays summarized")
+        self.assertNotIn("attributes", out["events"][0])
+        nifi = FakeNifi("2.5.0", cluster=True, events=events)
+        out = self.query(nifi, {"op": "oldest"}, cluster=True)
+        self.assertEqual(out["nodes"], [{"node": "node-1", "address": "localhost:18445", "oldest": sx.iso_ms(AT)}, {"node": "node-2", "address": "localhost:18446", "oldest": sx.iso_ms(AT - 3600_000)}])
+        self.assertEqual([c for c in nifi.calls if c.startswith("DELETE")], ["DELETE provenance/q0001-01a1-1000?clusterNodeId=node-1", "DELETE provenance/q0002-01a1-1000?clusterNodeId=node-2"])
+        out = self.query(FakeNifi("1.9.2", events=events[1:]), {"op": "oldest"})
+        self.assertEqual(out["nodes"], [{"node": None, "oldest": sx.iso_ms(AT - 3600_000)}])
+
     def test_a_version_whose_term_form_is_not_known_gets_the_other_one(self):
         nifi = FakeNifi("1.12.1", events=[{"eventId": 0, "uuid": UUID_A, "type": "CREATE", "ms": AT}])
         real = sx.old_terms
@@ -2572,6 +2650,16 @@ class ProvenanceTest(Base):
     def test_refused_certificate_says_which_policies(self):
         with self.assertRaisesRegex(sx.Failed, "query provenance.*view provenance"):
             self.query(FakeNifi(status=403), {"op": "search-options"})
+
+    def test_flow_search_lists_groups_ports_and_processors(self):
+        nifi = FakeNifi()
+        out = self.query(nifi, {"op": "flow-search", "q": " in "})
+        self.assertEqual(nifi.calls, ["GET flow/search-results?q=in"])
+        self.assertEqual([(r["kind"], r["id"], r["groupName"]) for r in out["results"]],
+                         [("process-group", "pg-in", "NiFi Flow"), ("input-port", "ip-1", "NiFi Flow"), ("processor", "p-1", "Inbound")])
+        self.assertFalse(out["truncated"])
+        with self.assertRaises(sx.Refused):
+            self.query(nifi, {"op": "flow-search", "q": ""})
 
     def test_lineage_its_components_and_the_node_on_a_cluster(self):
         events = [{"eventId": 1, "uuid": UUID_A, "type": "CREATE", "ms": AT, "node": "node-1"},
@@ -3303,7 +3391,8 @@ class ReleaseTest(Base):
             shutil.copy2(HERE / f, src / f)
         for name in ("service_executor.py", "deployer_executor.py"):
             code = (src / name).read_text()
-            (src / name).write_text(code.replace(f'VERSION = "{sx.VERSION}"', f'VERSION = "{version}"', 1))
+            # D53: each executor has its own VERSION; set both to the release under test.
+            (src / name).write_text(re.sub(r'(?m)^VERSION = "[^"]+"', f'VERSION = "{version}"', code, count=1))
         env = dict(os.environ, PYTHON=sys.executable)
         subprocess.run(["sh", str(src / "package.sh"), str(out)], check=True, capture_output=True, env=env)
         subprocess.run(["sh", str(src / "service" / "package.sh"), str(out)], check=True, capture_output=True, env=env)
@@ -3358,6 +3447,118 @@ class ReleaseTest(Base):
         self.assertEqual((status["state"], status["message"]), ("succeeded", "Executor upgraded from 0.7.9 to 0.8.0"))
         self.assertEqual((self.api.beats[-1]["executor"], self.api.beats[-1]["version"]), ("service", "0.8.0"))
         self.assertTrue(src.is_dir())
+
+
+def _e(i, name, **kw):
+    return {"id": i, "component": {"name": name, **kw}}
+
+
+def _conn(i, s, d):
+    return {"id": i, "sourceId": s, "destinationId": d}
+
+
+# A flow like the lab's (pages-rethink step 1): on root, a loose piece gen -> rename -> RPG port "orders" (to c250) and a
+# remote input port "in" -> load; group A (two pieces: a -> out port, and a lone x) and group B (in port -> b, inside a
+# child group C) linked at root by A.out -> B.in.
+FLOW_GROUPS = [
+    {"id": "root", "name": "NiFi Flow", "parent": None, "flow": {
+        "processors": [_e("p-gen", "gen"), _e("p-ren", "rename"), _e("p-load", "load")],
+        "inputPorts": [_e("ri", "in")],  # 1.x: no allowRemoteAccess, a root input port is remote
+        "remoteProcessGroups": [{"id": "rpg", "component": {"targetUris": "https://C250:18445/nifi/,https://c250b:18446/nifi",
+                                                            "contents": {"inputPorts": [{"id": "rp", "name": "orders", "connected": True}]}}}],
+        "processGroups": [{"id": "A"}, {"id": "B"}],
+        "connections": [_conn("c1", "p-gen", "p-ren"), _conn("c2", "p-ren", "rp"), _conn("c3", "ri", "p-load"), _conn("c4", "A-out", "B-in")]}},
+    {"id": "A", "name": "Group A", "parent": "root", "flow": {
+        "processors": [_e("a1", "a"), _e("a2", "x")], "outputPorts": [_e("A-out", "out")], "connections": [_conn("ca", "a1", "A-out")]}},
+    {"id": "B", "name": "Group B", "parent": "root", "flow": {
+        "inputPorts": [_e("B-in", "in", allowRemoteAccess=False)], "processGroups": [{"id": "C"}], "connections": [_conn("cb", "B-in", "C-in")]}},
+    {"id": "C", "name": "C", "parent": "B", "flow": {
+        "processors": [_e("b1", "b")], "inputPorts": [_e("C-in", "cin")], "connections": [_conn("cc", "C-in", "b1")]}},
+]
+
+
+class FlowCountsTest(unittest.TestCase):
+    def test_topology_units_fragments_links_and_s2s(self):
+        body, helper = sx.build_topology("root", "NiFi Flow", FLOW_GROUPS)
+        groups = {g["id"]: g for g in body["groups"]}
+        self.assertEqual([g["id"] for g in body["groups"]], ["root", "A", "B"], "the root canvas first, then by name")
+        self.assertEqual([(f["key"], f["names"], f["starts"]) for f in groups["root"]["fragments"]], [("p-gen", ["gen", "rename"], 1), ("p-load", ["load"], 1)])
+        self.assertEqual(groups["root"]["fragments"][0]["s2sOut"], ["https://c250:18445/nifi#orders"])
+        self.assertEqual(groups["root"]["fragments"][1]["remoteIn"], ["in"])
+        self.assertEqual([(f["names"], f["outputs"]) for f in groups["A"]["fragments"]], [(["a"], ["out"]), (["x"], [])], "two pieces (A7 ②)")
+        self.assertEqual([(f["names"], f["inputs"], f["starts"]) for f in groups["B"]["fragments"]], [(["b"], ["in"], 0)], "a child group's components count to B")
+        self.assertEqual(body["links"], [{"connection": "c4", "from": {"group": "A", "fragment": "A-out", "port": "out"}, "to": {"group": "B", "fragment": "B-in", "port": "in"}}])
+        self.assertEqual(body["s2sIn"], [{"id": "ri", "name": "in", "group": "root", "fragment": "p-load"}])
+        self.assertEqual(body["s2sOut"][0]["targets"], ["https://c250:18445/nifi", "https://c250b:18446/nifi"])
+        self.assertEqual((helper["s2sOut"]["https://c250:18445/nifi#orders"]["connections"], helper["s2sIn"]["ri"], helper["rootSources"], helper["rootOutConns"]),
+                         (["c2"], ["c3"], ["p-gen"], ["c2"]))
+        # Ops step 3b: a deeper group's unit, and each processor's piece in a unit of several pieces.
+        self.assertEqual(body["nested"], {"C": "B"})
+        self.assertEqual(body["split"], {"a1": "A-out", "a2": "a2", "p-gen": "p-gen", "p-load": "p-load", "p-ren": "p-gen"})
+
+    def test_counts_from_the_status_and_history_points(self):
+        body, helper = sx.build_topology("root", "NiFi Flow", FLOW_GROUPS)
+        snap = lambda key, inner, **v: {key: [{inner: v}]}
+        status = {"processGroupStatus": {"aggregateSnapshot": {
+            "id": "root", "name": "NiFi Flow",
+            **snap("processorStatusSnapshots", "processorStatusSnapshot", id="p-gen", flowFilesOut=4, bytesOut=40),
+            "inputPortStatusSnapshots": [{"portStatusSnapshot": {"id": "ri", "flowFilesIn": 2, "flowFilesOut": 2, "bytesIn": 20, "bytesOut": 20}}],
+            "connectionStatusSnapshots": [{"connectionStatusSnapshot": {"id": "c2", "flowFilesIn": 4, "flowFilesOut": 3, "bytesIn": 40, "bytesOut": 30}}],
+            "processGroupStatusSnapshots": [{"processGroupStatusSnapshot": {"id": "A", "name": "Group A", "flowFilesIn": 0, "flowFilesReceived": 5, "flowFilesOut": 1, "flowFilesSent": 0, "bytesReceived": 50, "bytesOut": 10, "flowFilesTransferred": 12}},
+                                            {"processGroupStatusSnapshot": {"id": "B", "name": "Group B"}}]}}}
+        index = sx.status_index(status)
+        rows = {(r["kind"], r["ref"]): r for r in sx.flow_counts(index, body, helper)}
+        self.assertEqual((rows[("group", "A")]["flowFilesIn"], rows[("group", "A")]["flowFilesOut"], rows[("group", "A")]["bytesIn"]), (5, 1, 50))
+        self.assertEqual((rows[("group", "root")]["flowFilesIn"], rows[("group", "root")]["flowFilesOut"]), (6, 3), "remote input passed on + source processors; to the RPG port")
+        self.assertEqual((rows[("group", "A")]["transferred"], rows[("group", "B")]["transferred"], rows[("group", "root")]["transferred"]), (12, 0, 4), "§10.3: moved inside the unit")
+        self.assertEqual((rows[("s2s-out", "https://c250:18445/nifi#orders")]["flowFilesOut"], rows[("s2s-in", "ri")]["flowFilesIn"]), (3, 2))
+        self.assertEqual(sorted(rows), sorted([("group", "A"), ("group", "B"), ("group", "root"), ("s2s-out", "https://c250:18445/nifi#orders"), ("s2s-in", "ri")]))
+        self.assertEqual(len(sx.flow_counts(index, None, None)), 2, "without a topology only the groups")
+        other = sx.status_index({"processGroupStatus": {"aggregateSnapshot": {"id": "root", "processorStatusSnapshots": [{"processorStatusSnapshot": {"id": "new"}}]}}})
+        self.assertNotEqual(index["signature"], other["signature"])
+        # A snapshot a minute; the first of each 5-minute slot, summed over the connections.
+        h = lambda *pts: {"aggregateSnapshots": [{"timestamp": t, "statusMetrics": {"inputCount": i, "outputCount": o, "inputBytes": i * 10, "outputBytes": o * 10}} for t, i, o in pts]}
+        self.assertEqual(sx.history_points([h((600_000, 1, 1), (660_000, 9, 9), (900_000, 2, 0)), h((610_000, 3, 3))]),
+                         [[600_000, 4, 4, 40, 40, 0], [900_000, 2, 0, 20, 0, 0]])
+        self.assertEqual(sx.history_points([{"aggregateSnapshots": [{"timestamp": 600_000, "statusMetrics": {"flowFilesTransferred": 7}}]}]), [[600_000, 0, 0, 0, 0, 7]])
+
+    def test_collector_flow_every_interval_topology_on_change_history_once(self):
+        c = sx.Collector({"flow_seconds": 300, "collect_seconds": 60})
+        calls = []
+        status = {"processGroupStatus": {"aggregateSnapshot": {"id": "root", "name": "NiFi Flow", "processGroupStatusSnapshots": [
+            {"processGroupStatusSnapshot": {"id": g["id"], "name": g["name"]}} for g in FLOW_GROUPS[1:3]]}}}
+        flows = {g["id"]: {"processGroupFlow": {"breadcrumb": {"breadcrumb": {"name": g["name"]}}, "flow": g["flow"]}} for g in FLOW_GROUPS}
+        hist = {"statusHistory": {"aggregateSnapshots": [{"timestamp": 600_000, "statusMetrics": {"inputCount": 1, "outputCount": 1}}]}}
+
+        def fetch(ctx, connect, port, sni, path, timeout):
+            calls.append(path)
+            if path == "flow/process-groups/root/status?recursive=true":
+                return 200, json.dumps(status).encode()
+            if path.endswith("/status/history"):
+                return 200, json.dumps(hist).encode()
+            return 200, json.dumps(flows[path.rsplit("/", 1)[1]]).encode()
+
+        c.fetch = fetch
+        clock = [100.0]
+        real = sx.time.monotonic
+        sx.time.monotonic = lambda: clock[0]
+        w = {"member": "m", "https": {"host": "localhost", "port": 18443}, "nodeAddress": None, "flowHistory": True}
+        try:
+            first = c.flow(w, {}, object())
+            clock[0] += 60
+            between = c.flow(w, {}, object())
+            clock[0] += 240
+            second = c.flow(w, {}, object())
+        finally:
+            sx.time.monotonic = real
+        self.assertEqual(sorted(first), ["at", "counts", "everySeconds", "history", "topology"])
+        self.assertEqual([h["kind"] for h in first["history"]], ["group", "group", "s2s-out", "s2s-in"])
+        self.assertIsNone(between, "not again within the interval")
+        self.assertEqual(sorted(second), ["at", "counts", "everySeconds"], "same components: no topology walk, history only once")
+        self.assertEqual(calls.count("flow/process-groups/root/status?recursive=true"), 2)
+        self.assertEqual(sum(1 for p in calls if p.startswith("flow/process-groups/") and "status" not in p), 4, "four groups walked once")
+        self.assertIsNone(sx.Collector({"flow_seconds": 0}).flow(w, {}, object()), "0 turns it off")
+        self.assertEqual(sx.watch_entries([{"service": "s", "member": "m", "installDir": "/opt/nifi", "flowHistory": True}])[0]["flowHistory"], True)
 
 
 if __name__ == "__main__":

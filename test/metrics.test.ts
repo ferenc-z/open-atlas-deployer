@@ -68,6 +68,28 @@ test("a sample's point: the node's own snapshot and queue share, repositories, h
   delete s.nifi.diagnostics.nodes; delete s.nifi.cluster;
   const single = pointOf(s, { ports: { https: 18443 }, nodeAddress: null });
   assert.deepEqual([single.heapUsed, single.queuedCount], [1, 30]);
+  assert.equal(single._unmatched, undefined);
+});
+
+test("S34: one NiFi per machine on the same port: the executor's selfNodeId, else port and address (older executor), else _unmatched", () => {
+  // nifi01.corp is the member; NiFi lists both nodes by their API address, on 9443.
+  const prod = (selfNodeId?: string) => {
+    const s = sample(KEY1, "2026-11-06T12:00:00Z") as Record<string, any>;
+    const names = [["n1", "nifi01.corp"], ["n2", "nifi02.corp"]];
+    s.nifi.diagnostics.nodes = s.nifi.diagnostics.nodes.map((n: object, i: number) => ({ ...n, nodeId: names[i][0], address: names[i][1], apiPort: 9443 }));
+    s.nifi.cluster.nodes = s.nifi.cluster.nodes.map((n: object, i: number) => ({ ...n, nodeId: names[i][0], address: names[i][1], apiPort: 9443 }));
+    if (selfNodeId) s.nifi.selfNodeId = selfNodeId;
+    return s;
+  };
+  const member = (nodeAddress: string | null) => ({ ports: { https: 9443 }, nodeAddress });
+  const numbers = (p: Record<string, number | null>) => [p.heapPct, p.threads, p.repoContentPct, p.queuedCount, p._unmatched ?? null];
+  for (const address of ["10.0.0.11", "nifi01", null]) {
+    assert.deepEqual(numbers(pointOf(prod("n1"), member(address))), [50, 150, 50, 10, null], `${address}: by selfNodeId`);
+    assert.deepEqual(numbers(pointOf(prod(), member(address))), [null, null, null, null, 1], `${address}: an older executor cannot tell, and says so`);
+  }
+  assert.deepEqual(numbers(pointOf(prod(), member("NIFI01.corp."))), [50, 150, 50, 10, null], "older executor: the address, case and trailing dot aside");
+  assert.deepEqual(numbers(pointOf(prod("n9"), member("nifi01.corp"))), [50, 150, 50, 10, null], "a selfNodeId not in the list: the old way");
+  assert.deepEqual(numbers(pointOf(prod("n2"), member("nifi01.corp"))).slice(0, 4), [25, 150, 50, 20], "the executor's word wins");
 });
 
 test("bulletin times: NiFi's time of day dated by the sample, across midnight; the offset from the cluster view or the newest bulletin", () => {

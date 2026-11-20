@@ -5,6 +5,66 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
 
 ## Unreleased
 
+- Ops step 5 (pages-rethink A1): the AI's analyses of the managed services, by the Service Check-up agent
+  (`DEPLOYER_OMA_CHECKUP_AGENT`, `_ENVIRONMENT`, `_VAULTS` with its `dpc_` key). Each is a running row in
+  `service_analyses` first, then an OMA session whose first message names the analysis ids; the agent writes back with
+  `record`; a turn that ends without a record, an error or no answer in time (10 minutes, more for several services)
+  fails it. Started by: the scheduled check-up (an OMA agent schedule `deployer-checkup-<environment>` the Deployer
+  creates or puts back at start and every 15 minutes, `DEPLOYER_CHECKUP_CRON` default `0 */4 * * *`,
+  `DEPLOYER_CHECKUP_TIMEZONE` default `Asia/Shanghai`; its records make one round), a machine light turning red, a
+  person opening the overview or a service page while a service is not green and its analysis is out of date (at most
+  once a service an hour), `POST /api/services/:id/analyses` (Look again now), `POST /api/analyses` (Check now, one
+  round), `GET /api/analyses/:analysis`, and "These are two flows" / "Not right" on the flows page (flows-feedback). The
+  daily brief waits up to an hour for the morning check-up and carries its conclusions. The overview's `nextCheckAt` is
+  the schedule's next run.
+
+- Ops step 4 (pages-rethink §9.1 C3, §10.2.3): the managed-service MCP is seven verbs — `describe` (the machine and
+  business lights, the businesses, open to-dos, the newest AI analysis, the model's gaps, each with the verb that fixes
+  it), `look` (raw data by `kind`: metrics, logs, provenance, lineage, event, bulletins, queues, members, topology,
+  flow-counts, events, evidence, components, config, config-diff, drift, changes, property, model), `trace`,
+  `run_model`, `publish_model`, `record` (the AI's analysis and to-dos, a to-do with at most one suggested action) and
+  `draft_change` (was `draft_service_config`). The 22 old service tools are gone (`list_service_clusters`,
+  `get_cluster_status`, `get_metrics`, `list_alerts`, `list_events`, `get_bulletins`, `search_logs`, `tail_logs`,
+  `search_provenance`, `get_lineage`, `get_provenance_event`, `get_service_config`, `diff_service_config`,
+  `draft_service_config`, `list_service_changes`, `get_service_change`, `get_service_drift`, `lookup_property`,
+  `get_service_health`, `investigate_service`, `list_service_cases`, `trace_business_data`). A new key kind, the
+  check-up's `dpc_` (made by an administrator, `POST /api/keys {kind: "checkup"}`), sees the verbs but not
+  `draft_change`; the Assistant's `dps_` may also `publish_model` and `record` to-dos (only to-dos); for a personal key
+  both are for administrators. New tables `service_todos` and `service_analyses`; the gate's to-dos go to
+  `service_todos`; `POST /api/todos/:todo/state` and `POST /api/todos/:todo/draft` (a to-do's change drafted as the
+  person). `POST trace-business-data` is now `POST /api/services/:id/trace`. The cases are gone (their five routes, the
+  CRIT alerts' own analysis; `service_cases` is kept but no longer used).
+- [ ] OMA: republish the Deploy Assistant (allowed tools: the deploy and assessment tools plus `describe`, `look`,
+  `trace`, `run_model`, `publish_model`, `record`, `draft_change`; prompt without the "Service case" and "Clue from a
+  sentence" sections; Skill `nifi-ops` new version, rewritten for the seven verbs), then point `DEPLOYER_OMA_AGENT` and
+  the Workbench Business Agent "Deploy Assistant" at the new agent.
+- [ ] OMA: create the Service Check-up agent (`bin/publish-assistant.ts … service-checkup`, prompt
+  `agents/service-checkup.md`, template `templates/service-checkup.oma.json`, Skill `nifi-ops`) with a `dpc_` key in its
+  Vault; then set `DEPLOYER_OMA_CHECKUP_AGENT`, `DEPLOYER_OMA_CHECKUP_ENVIRONMENT` and `DEPLOYER_OMA_CHECKUP_VAULTS`
+  (ops step 5: the Deployer then keeps its OMA schedule).
+- S37 step 9 (Q4, S9): "Let the AI analyse" on the Investigate and Data trace tabs sends the page's result (the
+  investigation worked out again compact and redacted; the trace answer trimmed and redacted) to the Deploy Assistant
+  in a background OMA session; the answer comes in three parts (likely cause, evidence, next steps) and the person can
+  ask follow-up questions in the same session. A CRIT alert opened within the hour is analysed once by itself, at most
+  3 a service an hour; the conclusion shows with the alert (`analysis` on alert views). Every analysis is a case (table
+  `service_cases`: evidence, answer, conversation, the outcome a person writes; `/api/services/:id/cases`); the prompt
+  carries the newest cases of the same service and rule, and the new read-only MCP tool `list_service_cases` reads
+  more. What the AI proposes to change is a card: a configuration draft opens on the Changes tab, a start, stop or
+  restart shows its plan there for a person to confirm. The Data trace's "Investigate" button opens the Investigate
+  tab on the node and time where the data stopped. A trace source that cannot be asked a key (provenance and a key its
+  NiFi does not index) is skipped quietly; only when no source could be asked does "insufficient evidence" say so.
+- [ ] OMA: republish the Deploy Assistant (allowed tools `get_service_health`, `investigate_service`,
+  `trace_business_data`, `list_service_cases`; prompt sections "Service case task" and "Clue from a sentence"; Skill
+  `nifi-ops` new version: the new tools, FLOW_CONTROLLER bulletins vs processor errors, the service case, sentence to
+  conditions), then point `DEPLOYER_OMA_AGENT` and the Workbench Business Agent "Deploy Assistant" at the new agent.
+- S37 step 3: a service page opens on a new Status tab: verdict, the to-do list with next-step buttons, the node strip
+  (Start, Restart, Stop with a plan first), preventive risks and the newest changes and restarts, all from
+  `GET /api/services/:id/health`. The Business model tab is read-only for non-admins (`canEdit` in the model response).
+- S37 step 2: `GET /api/services/:id/health` and the MCP tool `get_service_health` give a service's to-do list (rule,
+  severity CRIT/WARN/INFO, since, member, evidence, template cause, actions), a verdict and one row per node. Two new
+  findings-only rules: collection incomplete (REST reading not ok, or a member not found in NiFi's node list) and
+  preventive risk (disk full in days, heap baseline rising, a certificate expiring within 90 days). The tool is not
+  in the Deploy Assistant's whitelist yet (step 9).
 - D52: the Onboarding Assessor's `draft_*` tools answer with a receipt (`{ok, operation, target, changes}`) instead
   of the whole assessment, which made OMA fail with a context-too-large harness error. New read-only tool
   `get_draft` (draft, manifest, findings); `draft_env_key` takes `keys` to write several env keys in one call
@@ -17,14 +77,58 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   executor's `VERSION`); each is offered an upgrade only when its own version moved. A change to `executor_core.py`
   moves both. Each archive goes to the release `executor-v<its version>`. `/api/platform` adds `shippedVersions`,
   `hosts` and each row's `shipped`; `/api/hosts` adds `executorVersions`.
+  This release ships deploy executor 0.9.3 (unchanged) and service executor 0.9.4.
 - Slow Overview on servers that cannot reach GitHub (or the UAT Deployer): a failed version list is cached for a
   minute instead of being fetched (8 s timeout) on every 10-second refresh; an older list is returned at once while
   a fresh one is fetched; a failed release check and an unreachable UAT are cached the same way.
+- S34: a cluster member's JVM, flow and repository numbers no longer stay empty when its NiFis share one port (a NiFi
+  per machine) and the member's recorded node address is written differently from the API address NiFi lists (an IP,
+  a short name, none). Service executor 0.9.4 finds its own node by port and its names or a local address and sends
+  `nifi.selfNodeId`; the Deployer reads the node by that id (the Metrics tab, live states, a rolling restart's
+  "node connected" check). With an older executor it matches port and address as before, now case-insensitively,
+  and a point it cannot match carries `_unmatched`.
+- S37 step 5 (S38): the business data trace's core. A service's page has a "Business model" tab: businesses with
+  match rules, ordered steps bound to a NiFi component (found by name through the service executor; executor 0.9.4
+  adds the read-only `flow-search` op), entry and exit endpoints by channel (S2S, MQ, external) and on entries which
+  field a clue is searched by. Exits join other services' entries with the same channel; unmatched ones show as
+  dangling. `POST /api/services/:id/trace-business-data` runs the trace engine; no evidence source is connected yet.
+- S37 step 6: NiFi provenance is the trace's first evidence source, for every NiFi version: a file found by name at an
+  entry, followed step by step and over S2S (the receiver's RECEIVE names the sender's FlowFile as its source; when it
+  cannot be paired, the same file name within 2 minutes, marked inferred), "expired" judged by each node's oldest
+  event. The provenance search and the trace now accept NiFi 1.9 and later of 1.x (S33); the component search for
+  model positions works on any version. A model may leave its sources out (provenance then, after any source asked by
+  business keys); steps get 600 s by default; a stuck verdict says the queue, back pressure and whether the next
+  processor runs; a dangling exit names the model that lacks the entry; an external exit or entry says where NiFi's
+  part ends. Service executor 0.9.4: provenance with attributes and the `oldest` op, back pressure names queue ends
+  and processors not running.
+- S37 step 7: the e2e_trace evidence source. A service gets it when an admin sets a Studio Graph and a graph token
+  in the Business model tab (pasted, or issued through the Builder MCP; kept sealed); the Deployer reads the run
+  records through Studio's data plane (new setting `DEPLOYER_STUDIO_DATA_URL`) with the graph's saved queries only,
+  always with a time range. MQ hops follow `correlation_id`; a step missing from the run records while a later one
+  is there is reported as incomplete, so the next source is asked. A worker's historical P95 (7 days, 20 runs, at
+  least 60 s) is its allowed time. "Import businesses from e2e_trace" turns schedule_header/schedule_detail into
+  businesses in the editor. The graph's contract and saved queries: `src/server/services/trace/e2e-graph.ts`.
+- S37 step 4: a service page's "Investigate" tab gathers the evidence of a window (at most 24 hours) without AI:
+  process starts, stops, disconnections and out-of-memory signs; bulletins by component with "Open in NiFi" (the
+  component selected); WARN/ERROR log patterns new or surging against the same hours a day before; metrics far from
+  that baseline (with the curve); configuration changes, Deployer changes and drift of the 24 hours before. It starts
+  from a to-do (the Status tab's "Investigate" now opens it), an alert, or a node and a window. Same body from
+  `GET /api/services/:id/investigate` and the MCP tool `investigate_service` (compact, redacted; not in the Deploy
+  Assistant's whitelist yet, step 9). Bulletins now keep their component and process group ids.
+- S37 step 8: a service's Data trace tab for "my data did not arrive". Clues (business, file name, email sender and
+  subject, a time range, the last 24 hours by default) give the end-to-end steps across services, each with state, node,
+  time, evidence source, "inferred" where it is a guess and the allowed time; the step where the data stopped is
+  highlighted, the verdict's message, its queue / back pressure / downstream context and its actions are buttons (edit
+  the other service's model, Open in NiFi), and evidence cards link into NiFi. A sentence in the box on top is read into
+  the conditions by a one-shot Deploy Assistant session (only the sentence, the business names and the time go out; no
+  answer in 5 seconds means the plain form). New read-only MCP tool `trace_business_data` (not on the Assistant's
+  allow-list until step 9).
 
 ### After upgrading
 
 - [ ] OMA: republish the Onboarding Assessor (`get_draft`, `keys` for env keys, shorter reading rules), then set
   `DEPLOYER_OMA_ASSESSOR_AGENT` to the new agent. Not published to PROD automatically (D47).
+- [ ] Upgrade the service executors to 0.9.4 (the Executors page) so clusters on one port get their numbers.
 
 ## 0.3.0-rc.14
 

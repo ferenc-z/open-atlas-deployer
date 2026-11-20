@@ -3,3 +3,8 @@ dist/
 data/
 .check/
 __pycache__/
+
+# e2e (S37 step 10)
+e2e/node_modules
+test-results/
+node_modules

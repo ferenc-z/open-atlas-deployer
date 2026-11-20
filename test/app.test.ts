@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { createApp } from "../src/server/app.ts";
+import { opsBusinessHooks, opsPageSources } from "../src/server/services/page-views.ts";
 import { hashPassword, permissionsFor, verifyPassword, WorkbenchSessions } from "../src/server/auth.ts";
 import type { Config } from "../src/server/config.ts";
 import type { Environment } from "../src/compose/generate.ts";
@@ -166,7 +167,7 @@ function setup(options: SetupOptions = {}) {
   const deployerSettings = new DeployerSettings(store, box, options.deployerEnv ?? {});
   const restarts = { count: 0 };
   const takeover = new Takeover({ store, handoff, box, environment: () => deployments.environment().env.name, hosts: () => hostIds(deployments.environment().env), readTimeoutMs: 5000, pollMs: 5 });
-  const app = createApp({ config, store, takeover, sessions, observer, deployments, versions, env, workbench: workbenchAdmin, workbenchKey, deployerSettings, restart: () => { restarts.count++; }, ...(phase5 ? { omaFetcher: phase5.fetcher } : {}), ...(peer ? { peer } : {}), ...(keys ? { keys } : {}), ...(onboarding ? { onboarding } : {}), ...(options.graph ? { graph: options.graph(store) } : {}), ...(options.nginxFetcher ? { nginxFetcher: options.nginxFetcher } : {}) });
+  const app = createApp({ config, store, pageSources: opsPageSources(store), businessHooks: opsBusinessHooks(store), takeover, sessions, observer, deployments, versions, env, workbench: workbenchAdmin, workbenchKey, deployerSettings, restart: () => { restarts.count++; }, ...(phase5 ? { omaFetcher: phase5.fetcher } : {}), ...(peer ? { peer } : {}), ...(keys ? { keys } : {}), ...(onboarding ? { onboarding } : {}), ...(options.graph ? { graph: options.graph(store) } : {}), ...(options.nginxFetcher ? { nginxFetcher: options.nginxFetcher } : {}) });
   const request = (path: string, init: RequestInit & { as?: string; cookie?: string } = {}) => {
     const headers = new Headers(init.headers);
     const cookies = [init.as ? `${SESSION}=${init.as}` : "", init.cookie ?? ""].filter(Boolean).join("; ");
@@ -1772,7 +1773,7 @@ test("/mcp: tools are the page's calls; a service key sees only the read-only on
   const init = await mcp(t, service, "initialize", { protocolVersion: "2025-03-26" });
   assert.equal(init.body.result.serverInfo.name, "open-atlas-deployer");
   const serviceTools = (await mcp(t, service, "tools/list")).body.result.tools as { name: string; annotations: { readOnlyHint: boolean } }[];
-  assert.ok(serviceTools.every((x) => x.annotations.readOnlyHint || /draft_/.test(x.name)), "read-only tools, and draft tools that need a task token");
+  assert.ok(serviceTools.every((x) => x.annotations.readOnlyHint || /draft_/.test(x.name) || ["publish_model", "record"].includes(x.name)), "read-only tools, draft tools, and the business model and to-dos (P4, P5)");
   assert.ok(serviceTools.some((x) => x.name === "plan_deploy") && !serviceTools.some((x) => x.name === "deploy"));
   const personalTools = (await mcp(t, personal, "tools/list")).body.result.tools as { name: string }[];
   assert.ok(personalTools.some((x) => x.name === "deploy"));
@@ -2419,13 +2420,14 @@ test("service ops step 6: a registered service's status is its members' executor
   // The read-only tools: a service key (the Deploy Assistant's) sees them.
   const key = (await makeKey(t, "admin", { kind: "service", name: "deploy-assistant", days: 30 })).body.key as string;
   const names = ((await mcp(t, key, "tools/list")).body.result.tools as { name: string }[]).map((x) => x.name);
-  assert.ok(names.includes("list_service_clusters") && names.includes("get_cluster_status"));
-  const clusters = await tool(t, key, "list_service_clusters");
-  assert.deepEqual(clusters.value.clusters.map((c: { id: string }) => c.id), ["flow"]);
-  const got = await tool(t, key, "get_cluster_status", { id: "flow" });
-  assert.deepEqual([got.isError, got.value.summary.running, got.value.members[0].seen.pid], [false, 1, 12]);
-  assert.equal((await tool(t, key, "get_cluster_status", { id: "nothing" })).value.finding.code, "service/unknown");
-  assert.equal((await tool(t, key, "get_cluster_status", {})).value.finding.code, "mcp/arguments");
+  assert.ok(names.includes("describe") && names.includes("look") && !names.includes("list_service_clusters") && !names.includes("get_cluster_status"));
+  const all = await tool(t, key, "describe");
+  assert.deepEqual(all.value.services.map((c: { id: string; kind: string }) => [c.id, c.kind]), [["flow", "cluster"], ["n200", "standalone"]]);
+  const got = await tool(t, key, "look", { service: "flow", kind: "members" });
+  assert.deepEqual([got.isError, got.value.kind, got.value.data.summary.running, got.value.data.members[0].seen.pid], [false, "members", 1, 12]);
+  assert.equal((await tool(t, key, "look", { service: "nothing", kind: "members" })).value.finding.code, "service/unknown");
+  assert.equal((await tool(t, key, "look", { kind: "members" })).value.finding.code, "mcp/arguments");
+  assert.equal((await tool(t, key, "look", { service: "flow", kind: "nope" })).value.finding.code, "mcp/arguments");
 });
 
 test("§15.2: a job the executor does not name in its heartbeat is refused when submitted, or at hand-over when queued before", async () => {
@@ -2479,8 +2481,8 @@ test("§15.2 P5, §15.3: a service executor's heartbeat reply carries its watch 
   t.store.addStandalone({ kind: "standalone", id: "n200", service: "nifi", profile: "nifi-2.x", version: "2.0.0", webUrl: null, member: single }, "uat", actor);
   const watch = (await beat()).watch;
   assert.deepEqual(watch, [
-    { service: "flow", kind: "node", member: "app2:/opt/a", profile: "nifi-2.x", installDir: "/opt/a", confDir: "/opt/a/conf", https: { host: "nifi.app2", port: 8443 }, nodeAddress: "node-8443", logDir: "/opt/a/logs", files: [] },
-    { service: "flow", kind: "node", member: "app2:/opt/b (conf /etc/nifi-b)", profile: "nifi-2.x", installDir: "/opt/b", confDir: "/etc/nifi-b", https: { host: "nifi.app2", port: 9443 }, nodeAddress: "node-9443", logDir: "/opt/b/logs", files: [] },
+    { service: "flow", kind: "node", member: "app2:/opt/a", profile: "nifi-2.x", installDir: "/opt/a", confDir: "/opt/a/conf", https: { host: "nifi.app2", port: 8443 }, nodeAddress: "node-8443", logDir: "/opt/a/logs", files: [], flowHistory: true },
+    { service: "flow", kind: "node", member: "app2:/opt/b (conf /etc/nifi-b)", profile: "nifi-2.x", installDir: "/opt/b", confDir: "/etc/nifi-b", https: { host: "nifi.app2", port: 9443 }, nodeAddress: "node-9443", logDir: "/opt/b/logs", files: [], flowHistory: true },
   ], "only this host's, n200 is on app1");
 
   // Samples: only those of what the host watches are kept; at most 20 a request; only from the service executor.
@@ -2512,9 +2514,15 @@ test("§15.2 P5, §15.3: a service executor's heartbeat reply carries its watch 
   // Step 3: the rules run as samples come in. app2:/opt/a's newest sample is old and its executor online for long: no samples.
   t.store.setServiceFact("flow", "app2:/opt/a", "onlineSince", `${DAY}T00:00:00Z`);
   await send(service, [sample("app2:/opt/a", `${DAY}T01:05:00Z`)]);
-  const a = await (await t.request("/api/services/flow/alerts", { as: "viewer" })).json();
-  assert.deepEqual([a.canEdit, a.thresholds.effective.certWarnDays, a.thresholds.info.certWarnDays.unit, a.rules["node-disconnected"].levels], [false, 30, "days", ["CRIT"]]);
-  assert.deepEqual(a.alerts.map((x: { rule: string; member: string; state: string; level: string }) => [x.rule, x.member, x.state, x.level]), [["no-samples", "app2:/opt/a", "open", "WARN"]]);
+  // Ops step 3b: GET alerts is gone; the service page shows the machine light's rows.
+  assert.equal((await t.request("/api/services/flow/alerts", { as: "viewer" })).status, 404);
+  assert.deepEqual(t.store.serviceAlerts({ service: "flow", limit: 10 }).map((x) => [x.rule, x.member, x.state, x.level]), [["collection", "app2:/opt/a", "open", "WARN"]]);
+  const pg = await (await t.request("/api/services/flow/page", { as: "viewer" })).json();
+  assert.deepEqual([pg.service.id, pg.machine.checks.length, pg.business.light, pg.analysis, pg.todos], ["flow", 6, "unknown", null, []]);
+  assert.equal((await t.request("/api/services/none/page", { as: "viewer" })).status, 404);
+  const ov = await (await t.request("/api/services/overview", { as: "viewer" })).json();
+  assert.deepEqual(ov.services.map((x: { id: string }) => x.id).sort(), ["flow", "n200"]);
+  assert.equal((await t.request("/api/flows/flw_none", { as: "viewer" })).status, 404);
   assert.equal((await (await t.request("/api/services", { as: "viewer" })).json()).clusters[0].status.alerts.open, 1, "the card's alert count");
   const ev = await (await t.request("/api/services/flow/events", { as: "viewer" })).json();
   assert.deepEqual(ev.events.map((e: { kind: string }) => e.kind), ["alert-opened", "taken-over"]);
@@ -2524,10 +2532,7 @@ test("§15.2 P5, §15.3: a service executor's heartbeat reply carries its watch 
   const okPut = await put(t, "/api/services/flow/thresholds", "admin", { thresholds: { certWarnDays: 400 } });
   assert.deepEqual([okPut.status, (await okPut.json()).thresholds.overrides], [200, { certWarnDays: 400 }]);
   assert.equal((await put(t, "/api/services/none/thresholds", "admin", { thresholds: {} })).status, 404);
-  const all = await (await t.request("/api/alerts", { as: "viewer" })).json();
-  assert.deepEqual(all.alerts.map((x: { service: string; environment: string; kind: string; label: string }) => [x.service, x.environment, x.kind, x.label]), [["flow", "uat", "cluster", "No samples"]]);
-  assert.equal(all.open, 1);
-  assert.equal((await t.request("/api/alerts?state=nope", { as: "viewer" })).status, 400);
+  assert.equal((await t.request("/api/alerts", { as: "viewer" })).status, 404);
 });
 
 test("phase 2 step 4: a service's logs over the API: members and summary, files, search, download, a tail as SSE, the executor's content and chunks", async () => {
@@ -2557,17 +2562,6 @@ test("phase 2 step 4: a service's logs over the API: members and summary, files,
     throw new Error("no job came");
   };
 
-  const overview = await (await t.request("/api/services/flow/logs", { as: "viewer" })).json();
-  assert.deepEqual(overview.members.map((m: { key: string; label: string; logDir: string; canTail: boolean }) => [m.key, m.label, m.logDir, m.canTail]), [["app2:/opt/a", "node-8443:8443", "/opt/a/logs", true], ["app2:/opt/b", "node-9443:9443", "/opt/b/logs", true]]);
-  assert.deepEqual(overview.patterns, []);
-  assert.equal((await t.request("/api/services/none/logs", { as: "viewer" })).status, 404);
-  assert.equal((await t.request("/api/services/flow/logs", { as: "nobody" })).status, 403);
-
-  const files = t.request("/api/services/flow/logs/files?member=app2:/opt/a", { as: "viewer" });
-  const listJob = await answer(() => ({ content: JSON.stringify({ dir: "/opt/a/logs", files: [{ name: "nifi-app.log", size: 10, modifiedAt: "2026-11-06T01:00:00Z", gz: false }], more: 0 }), result: { mode: "list", files: 1 } }));
-  assert.deepEqual([listJob.kind, listJob.mode, listJob.member], ["log-read", "list", "app2:/opt/a"]);
-  assert.deepEqual((await (await files).json()).files.map((f: { name: string }) => f.name), ["nifi-app.log"]);
-
   assert.equal((await post(t, "/api/services/flow/logs/search", "viewer", { regex: true, query: "(" })).status, 400);
   const search = post(t, "/api/services/flow/logs/search", "viewer", { query: "boom", from: "2026-11-06T00:00:00Z", to: "2026-11-06T02:00:00Z" });
   const entry = (at: string) => ({ file: "nifi-app.log", at, local: at, level: "ERROR", logger: "o.a.n.X", thread: "t", text: `boom ${at}` });
@@ -2576,37 +2570,6 @@ test("phase 2 step 4: a service's logs over the API: members and summary, files,
   await answer((job) => ({ content: JSON.stringify({ entries: [entry(at(job))], truncated: null }), result: { mode: "search", entries: 1 } }));
   const found = await (await search).json();
   assert.deepEqual(found.entries.map((e: { label: string; at: string }) => [e.label, e.at]), [["node-9443:9443", "2026-11-06T01:00:01.000Z"], ["node-8443:8443", "2026-11-06T01:00:02.000Z"]]);
-
-  const download = t.request("/api/services/flow/logs/download?member=app2:/opt/b&files=nifi-app.log,nifi-bootstrap.log", { as: "viewer" });
-  const dl = await answer(() => ({ content: Buffer.from([0x1f, 0x8b, 1, 2, 3]), result: { mode: "download", files: ["nifi-app.log", "nifi-bootstrap.log"], bytes: 5 } }));
-  assert.deepEqual([dl.mode, dl.files, dl.maxBytes], ["download", ["nifi-app.log", "nifi-bootstrap.log"], 50 << 20]);
-  const got = await download;
-  assert.equal(got.headers.get("content-type"), "application/gzip");
-  assert.match(got.headers.get("content-disposition") ?? "", /attachment; filename="flow-node-9443_9443-logs-\d{8}T\d{6}\.tar\.gz"/);
-  assert.deepEqual([...new Uint8Array(await got.arrayBuffer())], [0x1f, 0x8b, 1, 2, 3]);
-  assert.equal(t.store.listAudit(5, { action: "service.logs.download" }).length, 1, "a download is audited");
-  const refused = t.request("/api/services/flow/logs/download?member=app2:/opt/b&files=x.log", { as: "viewer" });
-  await answer(() => ({ state: "refused", message: "x.log is not in the log directory /opt/b/logs" }));
-  const r = await refused;
-  assert.deepEqual([r.status, (await r.json()).message], [400, "node-9443:9443: x.log is not in the log directory /opt/b/logs"]);
-  assert.equal((await t.request("/api/services/flow/logs/download?member=app2:/opt/b&files=../x", { as: "viewer" })).status, 400);
-
-  // A tail as Server-Sent Events: the executor's chunks reach the page; the answer to a chunk says whether anyone follows.
-  const res = await t.request("/api/services/flow/logs/tail?member=app2:/opt/a&file=nifi-app.log", { as: "viewer" });
-  assert.equal(res.headers.get("content-type"), "text/event-stream");
-  const reader = res.body!.getReader();
-  const tail = (await (await call("/executor/v1/jobs/next", service)).json()).job;
-  assert.deepEqual([tail.kind, tail.member, tail.seconds], ["log-tail", "app2:/opt/a", 120]);
-  const chunk = await call(`/executor/v1/jobs/${tail.id}/chunk`, service, { method: "POST", body: JSON.stringify({ seq: 1, inode: 3, offset: 9, text: "hello\n", first: true }) });
-  assert.deepEqual(await chunk.json(), { ok: true, stop: false });
-  let text = "";
-  while (!text.includes("hello")) text += new TextDecoder().decode((await reader.read()).value);
-  assert.match(text, /event: lines\ndata: \{"type":"lines","text":"hello\\n","first":true\}/);
-  await reader.cancel();
-  await new Promise((r) => setTimeout(r, 20));
-  assert.deepEqual(await (await call(`/executor/v1/jobs/${tail.id}/chunk`, service, { method: "POST", body: JSON.stringify({ seq: 2, inode: 3, offset: 9, text: "" }) })).json(), { ok: true, stop: true }, "the page went away");
-  assert.equal((await call(`/executor/v1/jobs/${tail.id}/chunk`, "dpe_nope", { method: "POST", body: "{}" })).status, 401);
-  assert.equal((await t.request("/api/services/flow/logs/tail?member=app2:/opt/a&file=old.log.gz", { as: "viewer" })).status, 400);
 });
 
 test("phase 2 step 5: the read-only service tools over /mcp: metrics, alerts, events, bulletins, logs, configuration, node diff, property catalog; logs and bulletins redacted", async () => {
@@ -2649,36 +2612,30 @@ test("phase 2 step 5: the read-only service tools over /mcp: metrics, alerts, ev
 
   const key = (await makeKey(t, "admin", { kind: "service", name: "deploy-assistant", days: 30 })).body.key as string;
   const names = ((await mcp(t, key, "tools/list")).body.result.tools as { name: string; annotations: { readOnlyHint: boolean } }[]);
-  const NEW = ["get_metrics", "list_alerts", "list_events", "get_bulletins", "search_logs", "tail_logs", "get_service_config", "diff_service_config", "lookup_property"];
-  for (const n of NEW) assert.equal(names.find((x) => x.name === n)?.annotations.readOnlyHint, true, `${n} is a read-only tool the service key sees`);
+  for (const n of ["describe", "look", "trace", "run_model"]) assert.equal(names.find((x) => x.name === n)?.annotations.readOnlyHint, true, `${n} is a read-only verb the service key sees`);
+  const look = (args: Record<string, unknown>) => tool(t, key, "look", args);
+  const data = async (args: Record<string, unknown>) => (await look(args)).value.data;
 
-  // get_metrics: per member and field last / min / max / avg; the points only with series.
-  const m = await tool(t, key, "get_metrics", { id: "flow", fields: ["heapPct", "queuedCount"], step: 60 });
-  assert.equal(m.isError, false);
-  const ma = m.value.members.find((x: { member: string }) => x.member === A);
-  assert.deepEqual([ma.points, ma.summary.heapPct, ma.at], [3, { last: 60, min: 40, max: 60, avg: 50 }, undefined]);
-  assert.deepEqual(m.value.members.find((x: { member: string }) => x.member === B).summary.queuedCount, { last: null, min: null, max: null, avg: null });
-  assert.equal(m.value.units.heapPct, "%");
-  assert.deepEqual((await tool(t, key, "get_metrics", { id: "flow", member: A, fields: ["heapPct"], step: 60, series: true })).value.members[0].values.heapPct, [40, 50, 60]);
-  assert.equal((await tool(t, key, "get_metrics", { id: "flow", fields: ["nope"] })).value.finding.code, "metrics/fields");
-  assert.equal((await tool(t, key, "get_metrics", { id: "nothing" })).value.finding.code, "service/unknown");
+  // look kind metrics: per member and field last / min / max / avg; the points only with series.
+  const m = await look({ service: "flow", kind: "metrics", fields: ["heapPct", "queuedCount"] });
+  assert.deepEqual([m.isError, m.value.kind, m.value.truncated], [false, "metrics", false]);
+  const ma = m.value.data.members.find((x: { member: string }) => x.member === A);
+  assert.deepEqual([ma.summary.heapPct, ma.at], [{ last: 60, min: 40, max: 60, avg: 50 }, undefined]);
+  assert.deepEqual(m.value.data.members.find((x: { member: string }) => x.member === B).summary.queuedCount, { last: null, min: null, max: null, avg: null });
+  assert.equal(m.value.data.units.heapPct, "%");
+  assert.deepEqual((await data({ service: "flow", kind: "metrics", member: A, fields: ["heapPct"], series: true })).members[0].values.heapPct.filter((v: number | null) => v !== null), [40, 50, 60]);
+  assert.equal((await look({ service: "flow", kind: "metrics", fields: ["nope"] })).value.finding.code, "metrics/fields");
+  assert.equal((await look({ service: "nothing", kind: "metrics" })).value.finding.code, "service/unknown");
 
-  // list_alerts (one service, and all) and list_events: the texts redacted.
-  const alerts = (await tool(t, key, "list_alerts", { id: "flow" })).value;
-  assert.deepEqual(alerts.alerts.map((a: { rule: string; state: string }) => [a.rule, a.state]), [["node-disconnected", "open"]]);
-  assert.ok(JSON.stringify(alerts.alerts).includes("token=[hidden]") && !JSON.stringify(alerts).includes("abc123"));
-  assert.ok(alerts.rules["node-disconnected"] && alerts.thresholds.info, "with the rules and thresholds");
-  const all = (await tool(t, key, "list_alerts", { state: "all" })).value;
-  assert.deepEqual([all.open, all.alerts[0].service], [1, "flow"]);
-  assert.equal((await tool(t, key, "list_alerts", { state: "nope" })).value.finding.code, "alerts/state");
-  const events = (await tool(t, key, "list_events", { id: "flow" })).value.events;
+  // look kind events: the timeline (alerts opened and resolved are on it), the texts redacted.
+  const events = (await data({ service: "flow", kind: "events" })).events;
   assert.deepEqual(events.map((e: { kind: string }) => e.kind), ["alert-opened", "process-restarted", "taken-over"]);
-  assert.deepEqual((await tool(t, key, "list_events", { id: "flow", kind: "process-restarted" })).value.events.length, 1);
+  assert.equal((await data({ service: "flow", kind: "events", query: "process-restarted" })).events.length, 1);
 
-  // get_bulletins: redacted for the AI; the page (deploy-viewer) still reads them as NiFi wrote them (§9.3).
-  const bulletins = (await tool(t, key, "get_bulletins", { id: "flow" })).value.bulletins;
+  // look kind bulletins: redacted for the AI; the page (deploy-viewer) still reads them as NiFi wrote them (§9.3).
+  const bulletins = (await data({ service: "flow", kind: "bulletins" })).bulletins;
   assert.deepEqual(bulletins.map((b: { message: string }) => b.message), ["401 for Authorization: Bearer [hidden]", "Cannot connect to jdbc:postgresql://etl:[hidden]@db:5432/x with password=[hidden]"]);
-  assert.equal((await tool(t, key, "get_bulletins", { id: "flow", level: "ERROR" })).value.bulletins.length, 1);
+  assert.equal((await data({ service: "flow", kind: "bulletins", levels: ["ERROR"] })).bulletins.length, 1);
   const page = await (await t.request("/api/services/flow/bulletins", { as: "viewer" })).json();
   assert.ok(page.bulletins.some((b: { message: string }) => b.message.includes("hunter2")), "the page shows the raw text");
 
@@ -2697,61 +2654,51 @@ test("phase 2 step 5: the read-only service tools over /mcp: metrics, alerts, ev
     throw new Error("no job came");
   };
 
-  // search_logs: both nodes, merged by time, the lines redacted.
-  const searching = tool(t, key, "search_logs", { id: "flow", query: "login", levels: ["ERROR"], from: "2026-11-06T00:00:00Z", to: "2026-11-06T02:00:00Z" });
+  // look kind logs: both nodes, merged by time, the lines redacted.
+  const searching = look({ service: "flow", kind: "logs", query: "login", levels: ["ERROR"], from: "2026-11-06T00:00:00Z", to: "2026-11-06T02:00:00Z" });
   const line = (job: Record<string, any>) => ({ file: "nifi-app.log", at: job.member === A ? "2026-11-06T01:00:02.000Z" : "2026-11-06T01:00:01.000Z", local: "x", level: "ERROR", logger: "o.a.n.X", thread: "t", text: `login failed for ${job.member === A ? "password=topsecret" : "https://admin:pw123@ldap"}\n-----BEGIN PRIVATE KEY-----\nMIIabc\n-----END PRIVATE KEY-----` });
   const jobs = [await answer((job) => ({ entries: [line(job)], truncated: null })), await answer((job) => ({ entries: [line(job)], truncated: null }))];
   assert.deepEqual(jobs.map((j) => [j.mode, j.query, j.levels]), [["search", "login", ["ERROR"]], ["search", "login", ["ERROR"]]]);
-  const found = (await searching).value;
+  const found = (await searching).value.data;
   assert.deepEqual(found.entries.map((e: { member: string; text: string }) => [e.member, e.text]), [
     [B, "login failed for https://admin:[hidden]@ldap\n[private key hidden]"],
     [A, "login failed for password=[hidden]\n[private key hidden]"],
   ]);
-  assert.equal((await tool(t, key, "search_logs", { id: "flow", regex: true, query: "(" })).value.finding.code, "logs/search");
+  assert.equal((await look({ service: "flow", kind: "logs", regex: true, query: "(" })).value.finding.code, "logs/search");
 
-  // tail_logs: the last lines; a standalone instance needs no member.
-  const tailing = tool(t, key, "tail_logs", { id: "n1", lines: 2 });
-  const tailJob = await answer(() => ({ file: "nifi-app.log", lines: ["started", "keystorePasswd=changeit used"] }));
-  assert.deepEqual([tailJob.mode, tailJob.member, tailJob.lines, tailJob.file], ["lines", "app2:/opt/n1", 2, "nifi-app.log"]);
-  assert.deepEqual((await tailing).value.lines, ["started", "keystorePasswd=[hidden] used"]);
-  assert.equal((await tool(t, key, "tail_logs", { id: "flow" })).value.finding.code, "logs/member", "a cluster needs a member");
-  assert.equal((await tool(t, key, "tail_logs", { id: "n1", lines: 9999 })).value.finding.code, "logs/lines");
-
-  // get_service_config: the redacted files, narrowed by member and file; other files through the redaction too.
-  const cfg = (await tool(t, key, "get_service_config", { id: "flow" })).value;
+  // look kind config: the redacted files, narrowed by member and file; other files through the redaction too.
+  const cfg = await data({ service: "flow", kind: "config" });
   assert.deepEqual([cfg.revision, cfg.members.map((x: { key: string }) => x.key), cfg.revisions.map((r: { revision: number }) => r.revision)], [1, [A, B], [1]]);
   const [props1, extra] = cfg.members[0].files;
   assert.match(props1.text, /nifi\.sensitive\.props\.key=\(hidden\)/);
   assert.deepEqual(props1.hidden, ["nifi.sensitive.props.key"]);
   assert.equal(extra.text, "{\"password\": [hidden], \"port\": 1}");
   assert.ok(!JSON.stringify(cfg).includes("s3cret") && !JSON.stringify(cfg).includes("sealed"));
-  const one = (await tool(t, key, "get_service_config", { id: "flow", member: B, file: "nifi.properties" })).value;
+  const one = await data({ service: "flow", kind: "config", member: B, file: "nifi.properties" });
   assert.deepEqual(one.members.map((x: { key: string; files: { name: string }[] }) => [x.key, x.files.map((f) => f.name)]), [[B, ["nifi.properties"]]]);
-  assert.equal((await tool(t, key, "get_service_config", { id: "flow", revision: 7 })).value.finding.code, "service-config/none");
+  assert.equal((await look({ service: "flow", kind: "config", revision: 7 })).value.finding.code, "service-config/none");
 
-  // diff_service_config: the nodes compared, only what differs unless all.
-  const diff = (await tool(t, key, "diff_service_config", { id: "flow" })).value;
+  // look kind config-diff: the nodes compared, only what differs.
+  const diff = await data({ service: "flow", kind: "config-diff" });
   assert.deepEqual(diff.nodes, [A, B]);
   const p = diff.files.find((f: { name: string }) => f.name === "nifi.properties");
   assert.deepEqual(p.rows.map((r: { key: string; severity: string; values: { node: string; value: string }[] }) => [r.key, r.severity, r.values.map((v) => `${v.node}=${v.value}`)]), [
     ["nifi.cluster.node.protocol.port", "info", [`${A}=11443`, `${B}=11444`]],
     ["nifi.web.https.port", "info", [`${A}=8443`, `${B}=9443`]],
   ]);
-  assert.ok((await tool(t, key, "diff_service_config", { id: "flow", all: true })).value.files[0].rows.some((r: { key: string; severity: null }) => r.key === "nifi.cluster.is.node" && r.severity === null));
-  const standalone = (await tool(t, key, "diff_service_config", { id: "n1" })).value;
+  const standalone = await data({ service: "n1", kind: "config-diff" });
   assert.deepEqual([standalone.kind, standalone.files, standalone.nodes], ["standalone", [], ["app2:/opt/n1"]]);
 
-  // lookup_property: by service (profile and version), by key or words; a key another version has.
-  const prop = (await tool(t, key, "lookup_property", { service: "flow", key: "nifi.cluster.node.protocol.port" })).value;
+  // look kind property: by the service's profile and version, by key or words; a key another version has.
+  const prop = await data({ service: "flow", kind: "property", query: "nifi.cluster.node.protocol.port" });
   assert.deepEqual([prop.profile, prop.version, prop.entries.map((e: { key: string; scope: string; file: string }) => [e.key, e.scope, e.file])], ["nifi-2.x", "2.5.0", [["nifi.cluster.node.protocol.port", "node", "nifi.properties"]]]);
   assert.ok(prop.entries[0].description.length > 0);
-  const words = (await tool(t, key, "lookup_property", { version: "2.5.0", q: "https port" })).value;
+  const words = await data({ service: "flow", kind: "property", query: "https port" });
   assert.ok(words.entries.some((e: { key: string }) => e.key === "nifi.web.https.port"));
-  const old = (await tool(t, key, "lookup_property", { service: "n1", key: "nifi.flow.configuration.json.file" })).value;
+  const old = await data({ service: "n1", kind: "property", query: "nifi.flow.configuration.json.file" });
   assert.deepEqual([old.profile, old.entries, old.otherVersions.map((e: { since: string }) => e.since)], ["nifi-1.x", [], ["1.16.0"]]);
-  assert.equal((await tool(t, key, "lookup_property", {})).value.finding.code, "properties/profile");
-  assert.equal((await tool(t, key, "lookup_property", { profile: "nifi-2.x", file: "x.conf" })).value.finding.code, "properties/file");
-  assert.equal((await tool(t, key, "lookup_property", { service: "nothing" })).value.finding.code, "service/unknown");
+  assert.equal((await look({ service: "flow", kind: "property", file: "x.conf" })).value.finding.code, "properties/file");
+  assert.equal((await look({ service: "nothing", kind: "property" })).value.finding.code, "service/unknown");
   assert.equal((await t.request("/api/service-properties?profile=nifi-2.x", { as: "nobody" })).status, 403);
 });
 
@@ -2833,22 +2780,26 @@ test("phase 2 step 7: provenance through the service executor (deploy-viewer): t
   const found = await (await searching).json();
   assert.deepEqual([found.events[0].details, found.events[0].member], ["password=hunter2", "app2:/opt/n1"]);
 
-  // The AI: the three tools are read-only and see the service key; attributes and details redacted.
+  // The AI: look kinds provenance, event and lineage (read-only, the service key sees look); attributes and details redacted.
   const key = (await makeKey(t, "admin", { kind: "service", name: "deploy-assistant", days: 30 })).body.key as string;
-  const names = ((await mcp(t, key, "tools/list")).body.result.tools as { name: string; annotations: { readOnlyHint: boolean } }[]);
-  for (const n of ["search_provenance", "get_lineage", "get_provenance_event"]) assert.equal(names.find((x) => x.name === n)?.annotations.readOnlyHint, true, n);
-  const aiSearch = tool(t, key, "search_provenance", { id: "n1", field: "Filename", value: "a.csv", from: "2026-11-06T15:00:00Z", to: "2026-11-06T16:00:00Z" });
-  await answer(() => ({ op: "provenance", events: [{ eventId: 0, details: "password=hunter2" }] }));
-  assert.equal((await aiSearch).value.events[0].details, "password=[hidden]");
-  const aiEvent = tool(t, key, "get_provenance_event", { id: "n1", eventId: 0 });
+  const look = (args: Record<string, unknown>) => tool(t, key, "look", args);
+  const aiSearch = look({ service: "n1", kind: "provenance", query: "Filename=a.csv", from: "2026-11-06T15:00:00Z", to: "2026-11-06T16:00:00Z" });
+  const searchJob = await answer(() => ({ op: "provenance", events: [{ eventId: 0, details: "password=hunter2" }] }));
+  assert.deepEqual([searchJob.field, searchJob.value], ["Filename", "a.csv"]);
+  assert.equal((await aiSearch).value.data.events[0].details, "password=[hidden]");
+  const aiEvent = look({ service: "n1", kind: "event", eventId: 0 });
   const eventJob = await answer(() => ({ op: "event", event: { eventId: 0, attributes: [{ name: "filename", value: "a.csv" }, { name: "db.password", value: "hunter2" }] } }));
   assert.deepEqual([eventJob.op, eventJob.eventId, eventJob.timeOffset], ["event", 0, 28800000]);
-  assert.deepEqual((await aiEvent).value.event.attributes.map((a: { value: string }) => a.value), ["a.csv", "[hidden]"]);
-  assert.equal((await tool(t, key, "search_provenance", { id: "n1", uuid: UUID })).value.finding.code, "mcp/arguments", "a time range is required (from and to are required arguments)");
-  const aiLineage = tool(t, key, "get_lineage", { id: "n1", uuid: UUID });
+  assert.deepEqual((await aiEvent).value.data.event.attributes.map((a: { value: string }) => a.value), ["a.csv", "[hidden]"]);
+  assert.equal((await look({ service: "n1", kind: "event" })).value.finding.code, "mcp/arguments", "kind event needs eventId");
+  const aiUuid = look({ service: "n1", kind: "provenance", uuid: UUID });
+  const uuidJob = await answer(() => ({ op: "provenance", events: [] }));
+  assert.deepEqual([uuidJob.uuid, Date.parse(uuidJob.to) - Date.parse(uuidJob.from)], [UUID, 3_600_000], "the last hour by default");
+  assert.equal((await aiUuid).isError, false);
+  const aiLineage = look({ service: "n1", kind: "lineage", uuid: UUID });
   const lineageJob = await answer(() => ({ op: "lineage", nodes: [{ id: UUID, type: "FLOWFILE" }], links: [] }));
   assert.deepEqual([lineageJob.op, lineageJob.direction, lineageJob.uuid], ["lineage", "FLOWFILE", UUID]);
-  assert.equal((await aiLineage).value.nodes.length, 1);
+  assert.equal((await aiLineage).value.data.nodes.length, 1);
 });
 
 test("phase 3 step 2: no service endpoint or tool answers with a sealed copy or a secret of a layered revision", async () => {
@@ -2878,7 +2829,11 @@ test("phase 3 step 2: no service endpoint or tool answers with a sealed copy or 
   assert.ok(cfg.body.layers.nodes["app2:/opt/a"]["authorizers.xml"].replace.redacted.includes("(hidden)"));
 
   const key = (await makeKey(t, "admin", { kind: "service", name: "deploy-assistant", days: 30 })).body.key as string;
-  for (const name of ["get_service_config", "diff_service_config"]) clean(name, JSON.stringify((await tool(t, key, name, { id: "flow", all: true })).value));
+  for (const kind of ["config", "config-diff"]) {
+    const got = (await tool(t, key, "look", { service: "flow", kind })).value;
+    assert.equal(got.kind, kind);
+    clean(kind, JSON.stringify(got));
+  }
 });
 
 test("D52: draft tools answer with a receipt, get_draft is small, env keys can be written in one call", async () => {

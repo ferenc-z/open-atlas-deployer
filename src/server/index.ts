@@ -13,6 +13,10 @@ import { Diagnoser } from "./diagnose.ts";
 import { Keys } from "./keys.ts";
 import { OmaSessions } from "./oma.ts";
 import { Briefs, collectFacts } from "./brief.ts";
+import { opsBusinessHooks, opsPageSources, servicesOverview } from "./services/page-views.ts";
+import { BusinessScanner, businessCheckAll, SCAN_MINUTES } from "./services/business.ts";
+import { ServiceLogs } from "./services/logs.ts";
+import { ServiceProvenance } from "./services/provenance.ts";
 import { Drift } from "./drift.ts";
 import { environmentStatus, hostStateOf } from "./observe.ts";
 import { Onboarding } from "./onboarding.ts";
@@ -34,7 +38,10 @@ import { Store } from "./store.ts";
 import { WorkbenchKey } from "./workbench-key.ts";
 import { readToken, Versions, type TokenSource } from "./versions.ts";
 import { prune, rollUp } from "./services/metrics.ts";
-import { checkAll } from "./services/rules.ts";
+import { pruneFlow } from "./services/flowcounts.ts";
+import { checkAll, machineLight } from "./services/rules.ts";
+import { Analyses, checkupDone } from "./services/analyses.ts";
+import { CHECKUP_CRON, CHECKUP_TIMEZONE, CheckupSchedule } from "./services/checkup-schedule.ts";
 
 // D45: deployer.env first (the state directory and the credential key come only from there), then what an
 // administrator set on the page for the settings the file leaves unset.
@@ -97,7 +104,26 @@ const drift = new Drift(store, deployments, (host) => deployments.handoff.report
 const briefWriter = config.omaUrl && config.omaApiKeyFile && config.omaAgent
   ? new OmaSessions({ url: config.omaUrl, keyFile: config.omaApiKeyFile, agent: config.omaAgent, ...(config.omaEnvironment ? { environment: config.omaEnvironment } : {}), vaults: config.omaVaults, ...(config.omaApplicationId ? { application: config.omaApplicationId } : {}) })
   : undefined;
-const briefs = new Briefs(store, () => collectFacts({ store, deployments, status: statusOf, versions, ...(peer.configured ? { peer: () => peer.status() } : {}), drift: () => drift.check() }), briefWriter, { hour: config.briefHour });
+// Ops step 5 (A1): the AI's analyses through the Service Check-up agent (its Vault holds the dpc_ key), and its OMA schedule.
+const serviceExecutor = (host: string) => deployments.handoff.executor(host, "service");
+const serviceIds = () => [...store.standalones(), ...store.clusters()].map((s) => s.id).sort();
+const businessHooks = opsBusinessHooks(store);
+const checkupAgent = config.omaUrl && config.omaApiKeyFile && config.omaCheckupAgent
+  ? new OmaSessions({ url: config.omaUrl, keyFile: config.omaApiKeyFile, agent: config.omaCheckupAgent, ...(config.omaCheckupEnvironment ? { environment: config.omaCheckupEnvironment } : {}), vaults: config.omaCheckupVaults ?? [], ...(config.omaApplicationId ? { application: config.omaApplicationId } : {}) })
+  : undefined;
+const analyses = new Analyses({
+  store, ...(checkupAgent ? { oma: checkupAgent } : {}), services: serviceIds,
+  lights: (service, at) => ({ machine: machineLight(store, serviceExecutor, service, at)?.light ?? "unknown", business: businessHooks.business!(service, at).light }),
+});
+const checkupSchedule = config.omaUrl && config.omaApiKeyFile && config.omaCheckupAgent
+  ? new CheckupSchedule({ url: config.omaUrl, keyFile: config.omaApiKeyFile, agent: config.omaCheckupAgent, ...(config.omaCheckupEnvironment ? { environment: config.omaCheckupEnvironment } : {}), vaults: config.omaCheckupVaults ?? [], cron: config.checkupCron ?? CHECKUP_CRON, timezone: config.checkupTimezone ?? CHECKUP_TIMEZONE, name: `deployer-checkup-${(() => { try { return deployments.environment().env.name; } catch { return "default"; } })()}` })
+  : undefined;
+const pageSources = opsPageSources(store, checkupSchedule ? () => checkupSchedule.nextRunAt : undefined);
+const briefs = new Briefs(store, () => collectFacts({ store, deployments, status: statusOf, versions, ...(peer.configured ? { peer: () => peer.status() } : {}), drift: () => drift.check(), ops: () => servicesOverview(store, serviceExecutor, pageSources) }), briefWriter, {
+  hour: config.briefHour,
+  // A1: the brief uses the morning check-up; with a schedule it waits (up to an hour) until every service has one since an hour before.
+  ...(checkupSchedule ? { ready: () => { const d = new Date(); d.setHours(config.briefHour - 1, 0, 0, 0); return checkupDone(store, serviceIds(), d); } } : {}),
+});
 // Service ops §6: taking over discovered NiFi (drafts, confirmation); the AI review uses the Onboarding Assessor.
 const takeover = new Takeover({ store, handoff: deployments.handoff, box, oma: assessor, environment: () => deployments.environment().env.name, hosts: () => hostIds(deployments.environment().env) });
 // Phase 2 step 6: the nifi-ops Studio graph, published through the same Builder MCP as studio-graph.
@@ -109,7 +135,13 @@ const configReview = box && config.omaUrl && config.omaApiKeyFile && config.omaA
 // §16.3: the changes of services, driven from the database: what was running when this process started finishes its member and waits for a person.
 const serviceChanges = new ServiceChanges({ store, handoff: deployments.handoff, box });
 serviceChanges.recover();
-const app = createApp({ config, store, takeover, changes: serviceChanges, ...(configReview ? { configReview } : {}), graph: nifiOpsGraph, sessions: new WorkbenchSessions(config.workbenchUrl), observer, deployments, versions, env, peer, onboarding, drift, briefs, keys, workbench, workbenchKey, deployerSettings,
+// The cases' analysis ("Let the AI analyse", CRIT alerts) went with ops step 4; step 5 starts analyses (oma-turn.ts).
+// Ops step 3b: provenance made here so the business scan (data dropped, failure, invalid) shares it with the pages.
+const serviceLogs = new ServiceLogs(store, deployments.handoff);
+const serviceProvenance = new ServiceProvenance(store, deployments.handoff, serviceLogs);
+const businessScanner = new BusinessScanner(store, serviceProvenance);
+// Steps 3b + 4: the pages read the to-dos and analyses (opsReads); describe reads the real business light.
+const app = createApp({ config, store, takeover, changes: serviceChanges, ...(configReview ? { configReview } : {}), graph: nifiOpsGraph, logs: serviceLogs, provenance: serviceProvenance, pageSources, businessHooks, analyses, sessions: new WorkbenchSessions(config.workbenchUrl), observer, deployments, versions, env, peer, onboarding, drift, briefs, keys, workbench, workbenchKey, deployerSettings,
   // D45: the image sets DEPLOYER_RESTART_BY_EXIT; the container's restart policy starts it again with the new settings.
   ...(process.env.DEPLOYER_RESTART_BY_EXIT === "true" ? { restart: () => setTimeout(() => { store.close(); process.exit(75); }, 300) } : {}) });
 // Job records follow the executor's status files even while nobody has the page open.
@@ -122,20 +154,34 @@ setInterval(() => {
 }, 2_000).unref();
 setInterval(() => { briefs.tick().catch((error) => console.error("brief:", error)); }, 60_000).unref();
 setInterval(() => { drift.check().catch((error) => console.error("drift:", error)); }, 10 * 60_000).unref();
+// Ops step 5: follow the analyses' sessions; keep the check-up's OMA schedule as configured (at start, then every 15 minutes).
+setInterval(() => { analyses.poll().catch((error) => console.error("analyses:", error)); }, 10_000).unref();
+if (checkupSchedule) {
+  const ensure = () => checkupSchedule.ensure()
+    .then((r) => { if (r.action !== "unchanged") console.log(`Check-up schedule ${r.id} ${r.action} (${checkupSchedule.config.cron}, ${checkupSchedule.config.timezone}); next ${r.nextRunAt ?? "?"}`); })
+    .catch((error) => console.error("check-up schedule:", (error as Error).message));
+  setTimeout(ensure, 15_000).unref();
+  setInterval(ensure, 15 * 60_000).unref();
+}
 // §15.3: the services' 5-minute rollups as each bucket ends, and the hourly cleanup (raw 2 days, rollups 30 days).
 const serviceUpkeep = (cleanup: boolean) => {
   try {
     rollUp(store, new Date());
     // §15.3: the rules once a minute too, for what sends nothing (an executor gone, samples overdue).
-    checkAll(store, (h) => deployments.handoff.executor(h, "service"));
+    // Ops step 5 (A1): a machine light turning red is analysed at once.
+    checkAll(store, serviceExecutor, new Date(), (turn) => { analyses.machineTurn(turn); });
+    // Ops step 3b: the business light's bulletins, queues, S2S hand-overs and error groups.
+    businessCheckAll(store);
     store.dropOldExecutorContent();
     deployments.handoff.expireQueued();
-    if (cleanup) prune(store, new Date());
+    if (cleanup) { prune(store, new Date()); pruneFlow(store, new Date()); }
   } catch (error) { console.error("service metrics:", error); }
 };
 setInterval(() => serviceUpkeep(false), 60_000).unref();
 setInterval(() => serviceUpkeep(true), 60 * 60_000).unref();
 setTimeout(() => serviceUpkeep(true), 30_000).unref();
+// Ops step 3b: the provenance scan of every service with businesses (B3 data dropped, processing failed, invalid data).
+setInterval(() => { businessScanner.tick().catch((error) => console.error("business scan:", error)); }, SCAN_MINUTES * 60_000).unref();
 
 serve({ fetch: app.fetch, hostname: config.bind, port: config.port }, (info) => {
   console.log(`Open Atlas Deployer on http://${info.address}:${info.port}${config.basePath}/ (Workbench ${config.workbenchUrl})`);

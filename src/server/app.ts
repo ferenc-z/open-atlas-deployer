@@ -18,7 +18,7 @@ import {
 import type { Config } from "./config.ts";
 import { DeployError, deploymentRecord, type Deployments } from "./deploy.ts";
 import type { EnvManager } from "./env.ts";
-import { KeyError, isKey, type Keys } from "./keys.ts";
+import { KEY_PATTERN, KeyError, isKey, type KeyKind, type Keys } from "./keys.ts";
 import { handleMcp } from "./mcp.ts";
 import { OnboardingError, type Onboarding } from "./onboarding.ts";
 import type { Briefs } from "./brief.ts";
@@ -41,15 +41,30 @@ import { ChangeError, changeView as serviceChangeView, checkContextOf, planView,
 import { adoptedBody, DriftError, hasDrifted, liveDifferences, readLive, serviceDrift, type LiveReadOptions } from "./services/configdrift.ts";
 import { installKey, type DraftItem } from "./services/draft.ts";
 import { serviceStatus, thresholdsOf, timeline } from "./services/status.ts";
-import { alertView, check, parseThresholds, RULES, THRESHOLDS } from "./services/rules.ts";
+import { check, parseThresholds, THRESHOLDS } from "./services/rules.ts";
+import { mountPages } from "./services/page-routes.ts";
+import type { PageSources } from "./services/page-views.ts";
+import { mountOps } from "./services/ops-routes.ts";
+import { todoSink } from "./services/todos.ts";
 import { TakeoverError, type Takeover } from "./services/takeover.ts";
+import { investigate, InvestigateError } from "./services/investigate.ts";
 import { acceptSamples, watchList } from "./services/watch.ts";
 import { FIELDS, ingest, metrics, RANGES, trend, type Field, type Range } from "./services/metrics.ts";
 import { DOWNLOAD_MAX, LogsError, parseSearch, ServiceLogs } from "./services/logs.ts";
 import { parseLineage, parseProvenance, ServiceProvenance } from "./services/provenance.ts";
+import type { EvidenceAdapter } from "./services/trace/events.ts";
+import { mountTrace } from "./services/trace/routes.ts";
+import { PROVENANCE_SOURCE, ProvenanceAdapter } from "./services/trace/provenance-adapter.ts";
 import { checkNginx, graphServices, NifiOpsGraph } from "./services/graph-publish.ts";
 import { checkNginxUrl } from "./services/graph.ts";
-import { streamSSE } from "hono/streaming";
+import { E2E_ID, E2eTraceSource } from "./services/trace/e2e-trace.ts";
+import { e2eImport, mountE2eTrace } from "./services/trace/e2e-routes.ts";
+import { mountFlows } from "./services/flow-routes.ts";
+import { mountAnalyses } from "./services/analysis-routes.ts";
+import type { Analyses } from "./services/analyses.ts";
+import type { ModelDeps } from "./services/flowmodel.ts";
+import { McpClient } from "./mcp-client.ts";
+import { readToken } from "./versions.ts";
 import { DEPLOYER_VERSION } from "./version.ts";
 import { validateEnvironment } from "./environment.ts";
 import { applyPatch, changedPaths, PatchError } from "./jsonpatch.ts";
@@ -97,10 +112,20 @@ export interface Dependencies {
   logs?: ServiceLogs;
   /** Phase 2 step 7 (S28): provenance through the service executors (tests pass their own timings). */
   provenance?: ServiceProvenance;
+  /** S37 step 5: the business data trace's evidence source adapters by id (steps 6 and 7 add provenance and e2e_trace). */
+  traceAdapters?: Map<string, EvidenceAdapter>;
   /** Phase 2 step 6: the nifi-ops Studio graph, published after takeovers and nginx address changes. */
   graph?: NifiOpsGraph;
   /** How the Deployer checks an nginx address (tests pass a fake). */
   nginxFetcher?: typeof fetch;
+  /** S37 step 7: the e2e_trace evidence source (tests pass one with a fake data plane). */
+  e2eTrace?: E2eTraceSource;
+  /** pages-rethink §10.2 step 4: step 3b's business light and business detail for describe (opsHooks(); stand-ins without them). */
+  businessHooks?: import("./services/ops-routes.ts").BusinessHooks;
+  /** Ops step 3b: the to-dos and analyses the overview and the service page show (opsReads(store); none without it). */
+  pageSources?: PageSources;
+  /** Ops step 5 (A1): starting the AI's analyses (user-visit, Check now, flows feedback); none: the POSTs answer 503. */
+  analyses?: Analyses;
 }
 
 const reject = (c: Context, status: 400 | 401 | 403 | 404 | 409 | 429 | 503, code: string, message: string, details: string[] = []) =>
@@ -119,6 +144,22 @@ export function createApp({ config, store, sessions, observer, deployments, vers
   // /mcp calls the API in-process as the key's principal: a one-time nonce with this process's secret, never from outside.
   const internalSecret = randomBytes(24).toString("hex");
   const internal = new Map<string, Principal>();
+  /** One request to this API as a principal, in-process (MCP tools; a to-do's Apply making the draft as the person). */
+  async function callAs(principal: Principal, spec: { method: string; path: string; query?: Record<string, unknown>; body?: unknown; headers?: Record<string, string> }, origin = "http://deployer.internal"): Promise<{ status: number; body: any }> {
+    const nonce = randomBytes(12).toString("hex");
+    internal.set(nonce, principal);
+    const query = Object.entries(spec.query ?? {}).filter(([, v]) => v !== undefined && v !== null && v !== "").map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`).join("&");
+    const res = await api.fetch(new Request(`${origin}${spec.path}${query ? `?${query}` : ""}`, {
+      method: spec.method,
+      headers: { ...(spec.headers ?? {}), "x-deployer-internal": `${internalSecret}.${nonce}`, ...(isKey(principal) ? {} : { "x-csrf-token": principal.csrfToken }), ...(spec.body !== undefined ? { "content-type": "application/json" } : {}) },
+      ...(spec.body !== undefined ? { body: JSON.stringify(spec.body) } : {}),
+    }));
+    internal.delete(nonce);
+    const raw = await res.text();
+    let body: unknown = raw;
+    try { body = raw ? JSON.parse(raw) : null; } catch { /* a text answer, e.g. an nginx configuration */ }
+    return { status: res.status, body };
+  }
 
   async function emergency(c: Context): Promise<Principal | undefined> {
     const token = parseCookies(c.req.header("cookie")).get(EMERGENCY_COOKIE);
@@ -142,7 +183,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     }
     // A personal or service API key (§9.4): no cookie, no CSRF token.
     const bearer = /^Bearer (\S+)$/.exec(c.req.header("authorization") ?? "")?.[1];
-    if (!principal && bearer && keys && /^dp[ks]_/.test(bearer)) {
+    if (!principal && bearer && keys && KEY_PATTERN.test(bearer)) {
       try { principal = await keys.resolve(bearer); } catch (error) {
         if (error instanceof KeyError) return reject(c, error.status, error.code, error.message);
         throw error;
@@ -787,6 +828,9 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     throw error;
   };
   const noTakeover = (c: Context) => reject(c, 503, "takeover/off", "Taking over services is not set up in this Deployer.");
+  // Ops step 3b (§10.2.2 #1, #2, #8): the services overview, a service's page, a business's detail (before /api/services/:id).
+  mountPages(api, { store, executor: (host) => handoff.executor(host, "service"), authenticate, reject, ...(deps.pageSources ? { sources: deps.pageSources } : {}),
+    ...(deps.analyses ? { visit: (seen, by) => deps.analyses!.visit(seen, by), view: (a) => deps.analyses!.view(a) } : {}) });
   api.get("/api/services", async (c) => {
     const p = await authenticate(c, "view");
     if (p instanceof Response) return p;
@@ -826,6 +870,8 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     const p = await authenticate(c, deployPermission(env), serviceMay);
     if (p instanceof Response) return p;
     if (isProd(env) && isKey(p) && p.via !== "service") return reject(c, 403, "auth/browser-only", "On PROD the configuration is changed only from a browser session, not API keys.");
+    // §10.2.3: the scheduled check-up's key never drafts a change (C3).
+    if (p.keyKind === "checkup") return reject(c, 403, "auth/forbidden", "The check-up's key does not draft configuration changes.");
     return p;
   };
   /** The service, its newest revision and the key its files are sealed with, or the answer why there are none. */
@@ -977,7 +1023,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     return c.json({ ...draftView(d, store.serviceConfig(id)?.revision ?? 0), preview: draftPreview(d, service) });
   });
   // §16.3: the Assistant's service key may create a draft, on PROD too; a person still saves it (every other draft route
-  // keeps it out). What the AI submits (the service key, or ai: true from draft_service_config) touches no secret.
+  // keeps it out). What the AI submits (the service key, or ai: true from draft_change and a to-do's Apply) touches no secret.
   api.post("/api/services/:id/config/drafts", async (c) => {
     const p = await configEditor(c, true);
     if (p instanceof Response) return p;
@@ -1248,11 +1294,6 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     if (p instanceof Response) return p;
     return c.json(provenance.info(c.req.param("id")));
   });
-  api.get("/api/services/:id/provenance/options", async (c) => {
-    const p = await authenticate(c, "view");
-    if (p instanceof Response) return p;
-    return c.json(await provenance.options(c.req.param("id")));
-  });
   api.post("/api/services/:id/provenance", async (c) => {
     const p = await authenticate(c, "view");
     if (p instanceof Response) return p;
@@ -1274,24 +1315,33 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     if (!/^\d{1,15}$/.test(c.req.param("eventId"))) return reject(c, 400, "provenance/event", "The event id is a number.");
     return c.json(await provenance.event(c.req.param("id"), eventId, c.req.query("node") || undefined));
   });
-  // Phase 2 step 4 (§9.3, §15.3): a service's logs, read through its members' service executors (deploy-viewer, §13):
-  // the members with their log directories and the WARN/ERROR summary; a member's files; a search of all (or some)
-  // members in parallel, merged by time; a member's files as a tar.gz; following one file (SSE, shared per file).
-  api.get("/api/services/:id/logs", async (c) => {
-    const p = await authenticate(c, "view");
-    if (p instanceof Response) return p;
-    const id = c.req.param("id");
-    const members = serviceLogs.members(id);
-    if (!members) return reject(c, 404, "service/unknown", `No standalone instance or cluster ${id}.`);
-    const hours = Math.min(720, Math.max(1, Number(c.req.query("hours") ?? 24) || 24));
-    const since = new Date(Date.now() - hours * 3600_000).toISOString();
-    return c.json({ members, hours, patterns: store.serviceLogPatterns(id, { since, limit: Number(c.req.query("limit") ?? 100) || 100 }), tails: serviceLogs.tailing().filter((t) => t.service === id) });
+  // S37 step 7 (T8, T9): the e2e_trace evidence source through Studio's data plane, configured per service; registered
+  // with the trace adapters unless the caller brought its own of that id.
+  const e2eTrace = deps.e2eTrace ?? new E2eTraceSource({
+    store, ...(takeover?.box ? { box: takeover.box } : {}), ...(config.studioDataUrl ? { dataUrl: config.studioDataUrl } : {}),
+    ...(config.studioBuilderUrl && config.studioTokenFile ? { builder: new McpClient(config.studioBuilderUrl, () => ({ authorization: `Bearer ${readToken(config.studioTokenFile)}` })) } : {}),
   });
-  api.get("/api/services/:id/logs/files", async (c) => {
-    const p = await authenticate(c, "view");
-    if (p instanceof Response) return p;
-    return c.json(await serviceLogs.files(c.req.param("id"), c.req.query("member") ?? ""));
+  // Without adapters from the caller, both built-in sources (provenance, e2e_trace) are registered.
+  deps.traceAdapters ??= new Map<string, EvidenceAdapter>([[PROVENANCE_SOURCE, new ProvenanceAdapter(provenance)]]);
+  if (!deps.traceAdapters.has(E2E_ID)) deps.traceAdapters.set(E2E_ID, e2eTrace.adapter);
+  mountE2eTrace(api, { store, source: e2eTrace, authenticate, reject, registered: registeredService, actorOf });
+  // S37 step 5 (§4.2.0): the business data trace — a service's model, position search, trace_business_data.
+  mountTrace(api, { store, provenance, authenticate, reject, registered: registeredService, actorOf, adapters: deps.traceAdapters ?? new Map<string, EvidenceAdapter>([[PROVENANCE_SOURCE, new ProvenanceAdapter(provenance)]]) });
+  // pages-rethink §10.2 step 2: the business model v2 and its gate (run_model / publish_model, registered as MCP verbs
+  // in step 4), the flows page and a person's actions on a business. The gate's to-dos wait for step 4's table.
+  const flowModelDeps: ModelDeps = { store, e2e: (id) => e2eImport(e2eTrace)(id), todos: todoSink(store) };
+  mountFlows(api, { store, model: flowModelDeps, authenticate, reject, registered: registeredService, actorOf,
+    ...(deps.analyses ? { feedback: (f, services, kind, note, by) => deps.analyses!.feedback(f, services, kind, note, by) } : {}) });
+  // §10.2.2 #3, #4, #5 (step 5): Look again now, Check now, following an analysis.
+  mountAnalyses(api, { store, ...(deps.analyses ? { analyses: deps.analyses } : {}), authenticate, reject, registered: registeredService });
+  // §10.2 step 4: the routes behind the MCP verbs (describe, the model, record, look's extra kinds) and the to-do buttons.
+  mountOps(api, {
+    store, executor: (host) => handoff.executor(host, "service"), model: flowModelDeps, flowSearch: (id, q) => provenance.flowSearch(id, q),
+    authenticate, reject, registered: registeredService, actorOf, call: (p, spec) => callAs(p, spec), ...(deps.businessHooks ? { hooks: deps.businessHooks } : {}),
   });
+  // Phase 2 step 4 (§9.3, §15.3): a service's logs, read through its members' service executors (deploy-viewer, §13): the
+  // last lines of a member's file and a search of all (or some) members in parallel, merged by time (both the AI reads
+  // through the MCP tools; the page for them was removed, pages-rethink §9.2).
   api.get("/api/services/:id/logs/lines", async (c) => {
     const p = await authenticate(c, "view");
     if (p instanceof Response) return p;
@@ -1306,55 +1356,21 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     if ("error" in q) return reject(c, 400, "logs/search", q.error);
     return c.json(await serviceLogs.search(c.req.param("id"), q));
   });
-  api.get("/api/services/:id/logs/download", async (c) => {
+  // Ops step 3b (§10.2.5): GET alerts and health are gone; the overview and the service page (page-routes.ts) took over.
+  // The timeline and an admin's threshold overrides stay.
+  // S37 step 4 (pages-rethink §4.3): the investigation's evidence over a window (investigate_service). Raw for the page;
+  // the MCP tool asks compact=1 and redacts.
+  api.get("/api/services/:id/investigate", async (c) => {
     const p = await authenticate(c, "view");
     if (p instanceof Response) return p;
-    const id = c.req.param("id"), member = c.req.query("member") ?? "";
-    const files = (c.req.query("files") ?? "nifi-app.log").split(",").filter(Boolean);
-    const got = await serviceLogs.download(id, member, files);
-    store.audit(actorOf(p), "service.logs.download", id, { member, files: got.result.files ?? files, bytes: got.data.length });
-    return c.body(new Uint8Array(got.data), 200, { "content-type": "application/gzip", "content-disposition": `attachment; filename="${got.name}"`, "cache-control": "no-store" });
-  });
-  // §15.2 P7: Server-Sent Events of one member's file: "lines" (text; first the recent lines, backlog) and "state".
-  api.get("/api/services/:id/logs/tail", async (c) => {
-    const p = await authenticate(c, "view");
-    if (p instanceof Response) return p;
-    const id = c.req.param("id"), member = c.req.query("member") ?? "", file = c.req.query("file") || "nifi-app.log";
-    const events: { event: string; data: string }[] = [];
-    let wake: (() => void) | null = null;
-    // Checked before the stream starts, so a refusal is an ordinary error answer.
-    const stop = serviceLogs.tail(id, member, file, (e) => { events.push({ event: e.type, data: JSON.stringify(e) }); wake?.(); });
-    c.header("x-accel-buffering", "no");
-    c.header("cache-control", "no-store");
-    return streamSSE(c, async (stream) => {
-      let open = true;
-      stream.onAbort(() => { open = false; stop(); wake?.(); });
-      try {
-        while (open) {
-          while (events.length) await stream.writeSSE(events.shift()!);
-          await new Promise<void>((resolve) => { const t = setTimeout(resolve, 15_000); wake = () => { clearTimeout(t); resolve(); }; });
-          wake = null;
-          if (open && !events.length) await stream.writeSSE({ event: "ping", data: "{}" });
-        }
-      } finally { stop(); }
-    });
-  });
-  // Phase 2 step 3 (§15.3): a service's alerts (open first, then resolved; state=open|resolved, limit), with the rules and
-  // the thresholds in effect; its timeline; an admin's threshold overrides; every service's alerts.
-  api.get("/api/services/:id/alerts", async (c) => {
-    const p = await authenticate(c, "view");
-    if (p instanceof Response) return p;
-    const id = c.req.param("id");
-    const s = registeredService(id);
-    if (!s) return reject(c, 404, "service/unknown", `No standalone instance or cluster ${id}.`);
-    const state = c.req.query("state");
-    if (state !== undefined && state !== "open" && state !== "resolved") return reject(c, 400, "alerts/state", "state is open or resolved.");
-    const limit = c.req.query("limit") ? Number(c.req.query("limit")) : 200;
-    return c.json({
-      alerts: store.serviceAlerts({ service: id, ...(state ? { state } : {}), limit }).map(alertView),
-      rules: RULES, thresholds: { ...thresholdsOf(store, id, s.profile), info: THRESHOLDS },
-      canEdit: p.permissions.includes("admin") && !isKey(p),
-    });
+    const q = (k: string) => c.req.query(k) || undefined;
+    try {
+      const r = investigate(store, (host) => handoff.executor(host, "service"), c.req.param("id"), { member: q("member"), from: q("from"), to: q("to"), focus: q("focus"), compact: q("compact") === "1" });
+      return r ? c.json(r) : reject(c, 404, "service/unknown", `No standalone instance or cluster ${c.req.param("id")}.`);
+    } catch (e) {
+      if (e instanceof InvestigateError) return reject(c, e.status, e.code, e.message);
+      throw e;
+    }
   });
   api.get("/api/services/:id/events", async (c) => {
     const p = await authenticate(c, "view");
@@ -1439,18 +1455,6 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     const p = await authenticate(c, "admin");
     if (p instanceof Response) return p;
     return c.json(await graph.publish("published again by hand", actorOf(p)));
-  });
-  // Every service's open alerts, and with state=all also those resolved in the last day (since=ISO for longer).
-  api.get("/api/alerts", async (c) => {
-    const p = await authenticate(c, "view");
-    if (p instanceof Response) return p;
-    const state = c.req.query("state") ?? "open";
-    if (!["open", "resolved", "all"].includes(state)) return reject(c, 400, "alerts/state", "state is open, resolved or all.");
-    const since = c.req.query("since") ?? new Date(Date.now() - 86_400_000).toISOString();
-    const services = new Map([...store.standalones(), ...store.clusters()].map((x) => [x.id, { kind: x.kind, environment: x.environment, profile: x.profile }] as const));
-    const alerts = store.serviceAlerts({ ...(state === "all" ? { since } : { state: state as "open" | "resolved" }), limit: Number(c.req.query("limit") ?? 500) })
-      .filter((a) => services.has(a.service)).map((a) => ({ ...alertView(a), ...services.get(a.service)! }));
-    return c.json({ alerts, open: alerts.filter((a) => a.state === "open").length, rules: RULES });
   });
   api.post("/api/services/drafts", async (c) => {
     const p = await authenticate(c, "admin");
@@ -1563,9 +1567,9 @@ export function createApp({ config, store, sessions, observer, deployments, vers
   // MCP (§10.4): every tool is one call to this API as the key's principal.
   api.post("/mcp", async (c) => {
     const bearer = /^Bearer (\S+)$/.exec(c.req.header("authorization") ?? "")?.[1];
-    if (!keys || !bearer || !/^dp[ks]_/.test(bearer)) {
+    if (!keys || !bearer || !KEY_PATTERN.test(bearer)) {
       c.header("www-authenticate", "Bearer");
-      return c.json({ jsonrpc: "2.0", id: null, error: { code: -32001, message: "a Deployer API key (dpk_ or dps_) is required" } }, 401);
+      return c.json({ jsonrpc: "2.0", id: null, error: { code: -32001, message: "a Deployer API key (dpk_, dps_ or dpc_) is required" } }, 401);
     }
     let principal: Principal;
     try { principal = await keys.resolve(bearer); } catch (error) {
@@ -1574,22 +1578,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     }
     let message: unknown;
     try { message = await c.req.json(); } catch { return c.json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } }, 400); }
-    const origin = new URL(c.req.url).origin;
-    const call = async (spec: { method: string; path: string; query?: Record<string, unknown>; body?: unknown; headers?: Record<string, string> }) => {
-      const nonce = randomBytes(12).toString("hex");
-      internal.set(nonce, principal);
-      const query = Object.entries(spec.query ?? {}).filter(([, v]) => v !== undefined && v !== null && v !== "").map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`).join("&");
-      const res = await api.fetch(new Request(`${origin}${spec.path}${query ? `?${query}` : ""}`, {
-        method: spec.method, headers: { ...(spec.headers ?? {}), "x-deployer-internal": `${internalSecret}.${nonce}`, ...(spec.body !== undefined ? { "content-type": "application/json" } : {}) },
-        ...(spec.body !== undefined ? { body: JSON.stringify(spec.body) } : {}),
-      }));
-      internal.delete(nonce);
-      const raw = await res.text();
-      let body: unknown = raw;
-      try { body = raw ? JSON.parse(raw) : null; } catch { /* a text answer, e.g. an nginx configuration */ }
-      return { status: res.status, body };
-    };
-    const reply = await handleMcp(message, { principal, store, call });
+    const reply = await handleMcp(message, { principal, store, call: (spec) => callAs(principal, spec, new URL(c.req.url).origin) });
     return reply ? c.json(reply) : c.body(null, 202);
   });
   api.get("/mcp", (c) => c.json({ jsonrpc: "2.0", id: null, error: { code: -32601, message: "no event stream here; POST JSON-RPC to /mcp" } }, 405));
@@ -1645,7 +1634,8 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     if (!keys) return reject(c, 404, "key/not-configured", "API keys are not enabled.");
     const body = await c.req.json().catch(() => ({})) as { kind?: string; name?: string; days?: number };
     try {
-      const made = keys.create(p, body.kind === "service" ? "service" : "personal", String(body.name ?? ""), Number(body.days ?? 90));
+      const kind: KeyKind = body.kind === "service" || body.kind === "checkup" ? body.kind : "personal";
+      const made = keys.create(p, kind, String(body.name ?? ""), Number(body.days ?? 90));
       c.header("cache-control", "no-store");
       return c.json(made, 201);
     } catch (error) { return keyError(c, error); }

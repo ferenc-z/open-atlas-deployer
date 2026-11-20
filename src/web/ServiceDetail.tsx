@@ -1,43 +1,42 @@
-// A registered service's page (S23), the same frame for a standalone instance and a cluster: a summary line that
-// stays the same in every phase (name, up, findings, soonest certificate; version, environment, ZooKeeper,
-// configuration revision; the NiFi UI on the right), then tabs. Phase 2 step 2 adds Metrics and live states; later
-// steps add theirs to TABS (Logs, Events and alerts, FlowFile trace, Changes) and a tab without data yet is not shown.
-// The configuration and its open drafts are held here: the Configuration and Changes tabs share them.
+// A registered service's page (S23), the same frame for a standalone instance and a cluster: the name and what it runs on,
+// its actions (restart, remove, the NiFi UI), then two tabs: Health (default; ServiceHealth.tsx, prototype screen 2) and
+// Configuration and changes (start/stop, changes, configuration on one tab). The pages of S37 were pruned after the owner
+// turned them down (pages-rethink §9.2) and the Status tab was replaced by Health (§10, step 6a): resolveTab() sends every id
+// of a removed page to Health.
 
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import * as api from "./api.ts";
-import type { Field, MemberStatus, MetricsView, Range, ServiceBulletin, ServiceConfigView, ServiceStatus } from "./api.ts";
-import { LineChart, type Series } from "./Charts.tsx";
+import type { MemberStatus, ServiceConfigView, ServiceStatus } from "./api.ts";
 import { memberName, ServiceChanges, useChanges, useDrafts, type ChangeDesk, type Drafts } from "./ServiceChanges.tsx";
 import { ServiceConfig } from "./ServiceConfig.tsx";
 import { ask } from "./Confirm.tsx";
-import { Logs } from "./Logs.tsx";
-import { FlowFileTrace } from "./Trace.tsx";
 import { NginxAddress } from "./Nginx.tsx";
-import { AlertBadge, EventsAndAlerts, OpenAlerts, Timeline } from "./Alerts.tsx";
-import { ago, CertBadge, certTone, ConfCell, daysLeft, daysText, fmtBytes, fmtNumber, memberKey, serviceName, SEVERITY, STATE, StatusNotes, UpBadge, webPort, when } from "./svc.tsx";
+import { ServiceHealth } from "./ServiceHealth.tsx";
+import { ago, ConfCell, daysLeft, daysText, certTone, memberKey, serviceName, SEVERITY, STATE, webPort, when } from "./svc.tsx";
+import "./ops.css";
 
-type Loaded = { s: ServiceStatus; cfg: ServiceConfigView | null | undefined; reload: () => void; drafts: Drafts; desk: ChangeDesk; saved: () => void; open: (tab: string) => void };
-type Tab = { id: string; label: string; shown: (l: Loaded) => boolean; render: (l: Loaded) => ReactNode };
+type Loaded = { s: ServiceStatus; cfg: ServiceConfigView | null | undefined; reload: () => void; drafts: Drafts; desk: ChangeDesk; saved: () => void; open: (tab: string) => void; sub: string | undefined };
+type Tab = { id: string; label: string; render: (l: Loaded) => ReactNode };
 
-const TABS: Tab[] = [
-  { id: "overview", label: "Overview", shown: () => true, render: (l) => <Overview {...l} /> },
-  { id: "metrics", label: "Metrics", shown: (l) => l.s.members.some((m) => m.live), render: (l) => <Metrics s={l.s} /> },
-  { id: "logs", label: "Logs", shown: (l) => l.s.members.length > 0, render: (l) => <Logs s={l.s} /> },
-  { id: "trace", label: "FlowFile trace", shown: (l) => l.s.members.length > 0, render: (l) => <FlowFileTrace s={l.s} /> },
-  { id: "events", label: "Events and alerts", shown: () => true, render: (l) => <EventsAndAlerts s={l.s} /> },
-  { id: "nodes", label: "Nodes", shown: () => true, render: (l) => <Nodes {...l} /> },
-  { id: "configuration", label: "Configuration", shown: () => true, render: (l) => <ServiceConfig cfg={l.cfg} status={l.s} drafts={l.drafts} onReview={() => l.open("changes")} /> },
-  { id: "changes", label: "Changes", shown: (l) => Boolean(l.cfg), render: (l) => <ServiceChanges s={l.s} cfg={l.cfg!} drafts={l.drafts} desk={l.desk} onSaved={l.saved} onEdit={() => l.open("configuration")} onLogs={() => l.open("logs")} /> },
-];
+/** The tab ids of the old layout and where they went (a tab, and the part of it to show). Any link, `initialTab` or
+ *  `oa:open-service` event that still names one of these lands in the new place. */
+const LEGACY: Record<string, { tab: string; sub?: string }> = {
+  configuration: { tab: "config", sub: "configuration" }, changes: { tab: "config", sub: "changes" },
+};
+/** An id of a page that no longer exists (status, overview, nodes, events, metrics, logs, trace, investigate, tools, …) lands
+ *  on Health; "config" and the two old configuration ids are kept. */
+export const resolveTab = (id: string): { tab: string; sub?: string } => LEGACY[id] ?? (id === "config" ? { tab: "config" } : { tab: "health" });
 
 /** How a member is named on the charts: a node by address and port, a standalone by host. */
 export const memberLabel = (s: ServiceStatus, m: MemberStatus) => (s.kind === "cluster" ? `${m.nodeAddress ?? m.host}:${webPort(m.ports) ?? "?"}` : m.host);
 
-export function ServiceDetail({ id, isAdmin, initialDraft, onBack }: { id: string; isAdmin: boolean; initialDraft?: string; onBack: () => void }) {
+export function ServiceDetail({ id, isAdmin, initialDraft, initialTab, onBack }: { id: string; isAdmin: boolean; initialDraft?: string; initialTab?: string; onBack: () => void }) {
   const [s, setS] = useState<ServiceStatus | undefined>();
   const [cfg, setCfg] = useState<ServiceConfigView | null | undefined>();
-  const [tab, setTab] = useState(initialDraft ? "changes" : "overview");
+  const first = resolveTab(initialDraft ? "changes" : initialTab ?? "health");
+  const [tab, setTab] = useState(first.tab);
+  const [sub, setSub] = useState<string | undefined>(first.sub);
+  const go = useCallback((target: string) => { const r = resolveTab(target); setTab(r.tab); setSub(r.sub); }, []);
   const [error, setError] = useState("");
   const load = useCallback(() => { api.serviceStatus(id).then(setS, (e: Error) => setError(e.message)); }, [id]);
   useEffect(() => { load(); const t = setInterval(load, 10_000); return () => clearInterval(t); }, [load]);
@@ -46,102 +45,75 @@ export function ServiceDetail({ id, isAdmin, initialDraft, onBack }: { id: strin
   const drafts = useDrafts(id, initialDraft);
   const desk0 = useChanges(id, () => { loadCfg(); load(); });
   // Asking for a plan shows it, from wherever it was asked.
-  const desk: ChangeDesk = { ...desk0, plan: (request) => { desk0.plan(request); setTab("changes"); } };
-  const back = <button className="link" onClick={onBack}>← Services</button>;
+  const desk: ChangeDesk = { ...desk0, plan: (request) => { desk0.plan(request); go("changes"); } };
+  const back = <button className="link" onClick={onBack}>← Managed services</button>;
   const remove = async () => {
     if (!(await ask(`Remove ${id} from operations? Deployer stops watching it and its alerts close. NiFi keeps running and no file on the hosts is touched. The history stays, but the name ${id} is not used again: to manage it again, take it over under a new name.`, { confirm: "Remove", danger: true }))) return;
     try { await api.removeService(id); onBack(); } catch (e) { setError((e as Error).message); }
   };
-  if (!s) return <>{back}{error ? <p className="error">{error}</p> : <p className="muted">Loading…</p>}</>;
+  if (!s) return <div className="fl ops">{back}{error ? <p className="fl-error">{error}</p> : <p className="fl-muted">Loading…</p>}</div>;
   const cluster = s.kind === "cluster";
-  const loaded = { s, cfg, reload: load, drafts, desk, open: setTab, saved: () => { loadCfg(); load(); drafts.refresh(); } };
-  const tabs = TABS.filter((t) => t.shown(loaded));
+  const loaded: Loaded = { s, cfg, reload: load, drafts, desk, open: go, sub, saved: () => { loadCfg(); load(); drafts.refresh(); } };
   const driftCount = s.members.reduce((n, m) => n + m.configDrift.length, 0);
+  const tabs: Tab[] = [
+    { id: "health", label: "Health", render: () => (
+      <ServiceHealth id={id} isAdmin={isAdmin} canDraft={Boolean(cfg?.canDraft)} busy={Boolean(desk.active)}
+        onOpenDraft={(draft) => { drafts.choose(draft); drafts.refresh(); go("changes"); }} onOpenConfig={() => go("config")} plan={(r) => desk.plan(r)} />
+    ) },
+    { id: "config", label: "Configuration and changes", render: (l) => <ConfigAndChanges {...l} /> },
+  ];
   const current = tabs.find((t) => t.id === tab) ?? tabs[0]!;
-  const f = s.summary.findings;
   return (
-    <>
-      {back}
-      {error && <p className="error">{error}</p>}
-      <section className="card svc-summary">
-        <div className="svc-summary-main">
-          <div className="svc-summary-line">
-            <h1 className="mono">{s.id}</h1>
-            <span className="badge info">{cluster ? `Cluster · ${s.members.length} nodes` : "Standalone"}</span>
-            <UpBadge s={s.summary} />
-            <CertBadge s={s.summary} />
-            <AlertBadge s={s.summary} />
-            {cluster && s.summary.differences > 0 && <span className="badge warn" title="Configuration differences between the nodes found at takeover">{s.summary.differences} node difference{s.summary.differences > 1 ? "s" : ""}</span>}
-            {f.error > 0 && <span className="badge bad" title="Takeover findings (the alerts are on Events and alerts)">{f.error} error{f.error > 1 ? "s" : ""}</span>}
-            {f.warning > 0 && <span className="badge warn" title="Takeover findings (the alerts are on Events and alerts)">{f.warning} warning{f.warning > 1 ? "s" : ""}</span>}
-            <StatusNotes s={s.summary} />
-          </div>
-          <div className="svc-summary-facts muted small">
-            <span>{serviceName(s.service)} <span className="mono">{s.version}</span> ({s.profile})</span>
-            <span>Environment <strong>{s.environment.toUpperCase()}</strong></span>
-            {cluster && <span title="An external dependency, not managed (S22)">ZooKeeper <span className="mono">{s.zookeeper ?? "—"}{s.zookeeperRoot ?? ""}</span></span>}
-            <span>Configuration {s.configRevision ? <span className="mono">r{s.configRevision}</span> : "none"}</span>
-            <span title={`Sampled every ${s.summary.period} s; a member without a sample for 3 periods is unknown`}>As of {s.summary.asOf ? ago(s.summary.asOf) : "—"}</span>
-          </div>
+    <div className="fl ops">
+      <div className="sv-head">
+        {back}
+        {error && <p className="fl-error">{error}</p>}
+        <div className="line">
+          <h1 className="mono">{s.id}</h1>
+          <span className="fl-muted" style={{ fontSize: 14 }}>{serviceName(s.service)} {s.version} · {cluster ? `cluster, ${s.members.length} nodes` : "standalone"} · {s.environment.toUpperCase()} · {[...new Set(s.members.map((m) => m.host))].join(", ")}</span>
+          <span style={{ flex: 1 }} />
+          <span className="acts">
+            {desk.active ? <button className={`change-now state-${desk.active.state}`} onClick={() => go("changes")} title="Open the change on the Configuration and changes tab">Change {desk.active.state}{desk.active.mode !== "full" && desk.active.plan.members.length > 1 ? ` · ${desk.active.progress.done.length}/${desk.active.plan.members.length} nodes` : ""}</button>
+              : cfg?.canDraft && <button className="fl-btn small" onClick={() => desk.plan({ kind: cluster ? "rolling-restart" : "restart" })} title={cluster ? "Restart every node, one at a time. Shows the plan first." : "Stop and start NiFi. Shows the plan first."}>{cluster ? "Rolling restart" : "Restart"}</button>}
+            {isAdmin && <button className="fl-btn small" style={{ color: "#B3261E" }} onClick={remove} disabled={Boolean(desk.active)} title={desk.active ? "A change holds this service: finish or close it first" : "Stop managing this service (NiFi is not touched)"}>Remove</button>}
+            {s.webUrl && <a className="fl-btn small" href={s.webUrl} target="_blank" rel="noreferrer" title={s.webUrl}>NiFi UI ↗</a>}
+          </span>
         </div>
-        <div className="svc-summary-actions">
-          {desk.active ? <button className={`change-now state-${desk.active.state}`} onClick={() => setTab("changes")} title="Open the change on the Changes tab">Change {desk.active.state}{desk.active.mode !== "full" && desk.active.plan.members.length > 1 ? ` · ${desk.active.progress.done.length}/${desk.active.plan.members.length} nodes` : ""}</button>
-            : cfg?.canDraft && <button onClick={() => desk.plan({ kind: cluster ? "rolling-restart" : "restart" })} title={cluster ? "Restart every node, one at a time. Shows the plan first." : "Stop and start NiFi. Shows the plan first."}>{cluster ? "Rolling restart" : "Restart"}</button>}
-          {isAdmin && <button className="danger" onClick={remove} disabled={Boolean(desk.active)} title={desk.active ? "A change holds this service: finish or close it first" : "Stop managing this service (NiFi is not touched)"}>Remove</button>}
-          {s.webUrl && <a className="button" href={s.webUrl} target="_blank" rel="noreferrer" title={s.webUrl}>NiFi UI ↗</a>}
+        <div className="sv-tabs" role="tablist">
+          {tabs.map((t) => <button key={t.id} type="button" role="tab" aria-selected={t.id === current.id} onClick={() => go(t.id)}>{t.label}{t.id === "config" && driftCount > 0 && <span className="badge warn" title="Files on the hosts are not what is kept">{driftCount}</span>}{t.id === "config" && desk.active && <span className={`badge ${desk.active.state === "running" ? "info" : "bad"}`}>{desk.active.state}</span>}</button>)}
         </div>
-      </section>
-      <div className="subtabs" role="tablist">
-        {tabs.map((t) => <button key={t.id} role="tab" aria-selected={t.id === current.id} className={t.id === current.id ? "active" : ""} onClick={() => setTab(t.id)}>{t.label}{t.id === "changes" && driftCount > 0 && <span className="badge warn" title="Files on the hosts are not what is kept">{driftCount}</span>}{t.id === "changes" && desk.active && <span className={`badge ${desk.active.state === "running" ? "info" : "bad"}`}>{desk.active.state}</span>}</button>)}
       </div>
       {current.render(loaded)}
+    </div>
+  );
+}
+
+// Configuration and changes: start and stop a node, what is being done to the service and what was, then its files, and
+// the installation facts the Health tab leaves out.
+function ConfigAndChanges(l: Loaded) {
+  useEffect(() => { if (l.sub) document.getElementById(`cfg-${l.sub}`)?.scrollIntoView?.({ block: "start" }); }, [l.sub, l.desk.active?.id]);
+  return (
+    <>
+      <section id="cfg-control"><NodeControls s={l.s} cfg={l.cfg} desk={l.desk} reload={l.reload} /></section>
+      {l.cfg && <section id="cfg-changes"><h2>Changes</h2><ServiceChanges s={l.s} cfg={l.cfg} drafts={l.drafts} desk={l.desk} onSaved={l.saved} onEdit={() => l.open("configuration")} /></section>}
+      <section id="cfg-configuration"><h2>Configuration</h2><ServiceConfig cfg={l.cfg} status={l.s} drafts={l.drafts} onReview={() => l.open("changes")} /></section>
+      <section id="cfg-install" className="panel">
+        <NginxAddress s={l.s} onChanged={l.reload} />
+        {l.s.findings.length > 0 && <div>
+          <h3>Found at takeover</h3>
+          <ul className="findings card">{l.s.findings.map((f, i) => (
+            <li key={i}>
+              <span className={`badge ${SEVERITY[f.severity].tone}`}>{SEVERITY[f.severity].mark} {f.severity}</span> <span className="mono small">{f.code}</span> {f.message}
+              {f.values && f.values.length > 0 && <ul className="small">{f.values.map((v) => <li key={`${v.host}:${v.installDir}`}><span className="mono">{v.host}:{v.installDir}</span> {v.value ?? <span className="muted">not set</span>}</li>)}</ul>}
+            </li>
+          ))}</ul>
+        </div>}
+        <details>
+          <summary><strong>{l.s.kind === "cluster" ? "Nodes" : "Installation"} in detail</strong> <span className="muted small">directories, user, ports, executor, certificate</span></summary>
+          <InstallDetails s={l.s} />
+        </details>
+      </section>
     </>
-  );
-}
-
-const pctText = (v: number | null | undefined) => (v === null || v === undefined ? "—" : `${fmtNumber(v)} %`);
-const live = (m: MemberStatus, f: Field) => m.live?.point?.[f] ?? null;
-const sum = (s: ServiceStatus, f: Field) => { const v = s.members.map((m) => live(m, f)).filter((x): x is number => x !== null); return v.length ? v.reduce((a, b) => a + b, 0) : null; };
-const highest = (s: ServiceStatus, f: Field) => { const v = s.members.map((m) => live(m, f)).filter((x): x is number => x !== null); return v.length ? Math.max(...v) : null; };
-
-const everyText = (seconds: number) => (seconds % 60 === 0 ? `${seconds / 60} min` : `${seconds} s`);
-
-// Back pressure (owner 2026-11-07): read every few minutes and kept as a summary (summary.backpressure), not per sample.
-function BackpressureMetric({ s }: { s: ServiceStatus }) {
-  const bp = s.summary.backpressure;
-  const title = `Connections at their back pressure threshold, flow-wide. Read every ${everyText(bp?.everySeconds ?? 300)} by the service executor (EXECUTOR_BACKPRESSURE_SECONDS).`;
-  if (!bp) return <div className="metric" title={title}><span className="muted small">Back pressure</span><strong>—</strong><span className="small muted">not read yet</span></div>;
-  return (
-    <div className="metric" title={`${title} As of ${when(bp.at)}.`}>
-      <span className="muted small">Back pressure</span>
-      <strong>{fmtNumber(bp.full, 0)}{bp.connections !== null && <span className="muted small"> of {fmtNumber(bp.connections, 0)}</span>}</strong>
-      <span className={`small ${bp.stale ? "error" : "muted"}`}>fullest {pctText(bp.maxPercent)} · {ago(bp.at)}{bp.stale ? " (stale)" : ""}</span>
-    </div>
-  );
-}
-
-const queuePct = (q: { percentUseCount?: number; percentUseBytes?: number }) => Math.max(q.percentUseCount ?? 0, q.percentUseBytes ?? 0);
-
-function Congested({ s }: { s: ServiceStatus }) {
-  const bp = s.summary.backpressure;
-  if (!bp?.top.length) return null;
-  return (
-    <div>
-      <h3>Most congested queues</h3>
-      <table>
-        <thead><tr><th>Connection</th><th>Group</th><th>From → to</th><th>Full</th><th>Queued</th></tr></thead>
-        <tbody>{bp.top.map((q, i) => (
-          <tr key={q.id ?? i}>
-            <td>{q.name || <span className="muted mono small">{q.id ?? "?"}</span>}</td>
-            <td>{q.group ?? "—"}</td>
-            <td className="small">{q.sourceName ?? "?"} → {q.destinationName ?? "?"}</td>
-            <td className="mono small"><span className={`badge ${queuePct(q) >= 100 ? "bad" : queuePct(q) >= 80 ? "warn" : "muted"}`} title={`objects ${q.percentUseCount ?? 0} %, size ${q.percentUseBytes ?? 0} %`}>{queuePct(q)} %</span></td>
-            <td className="mono small">{fmtNumber(q.flowFilesQueued ?? null, 0)} · {fmtBytes(q.bytesQueued ?? null)}</td>
-          </tr>
-        ))}</tbody>
-      </table>
-      <p className="muted small">The fullest {bp.top.length} of {fmtNumber(bp.connections, 0)} connections (flow-wide), as of {when(bp.at)}; read every {everyText(bp.everySeconds)}, only this summary is kept.</p>
-    </div>
   );
 }
 
@@ -149,158 +121,6 @@ function StateBadge({ m }: { m: MemberStatus }) {
   const st = STATE[m.state];
   const why = m.source === "discovery" ? " (as of the host's newest discovery: no sample yet)" : m.source === "executor" ? ` (${m.executor.reason ?? "executor offline"})` : "";
   return <span className={`badge ${st.tone}`} title={`${st.title}${why}`}>{st.label}</span>;
-}
-
-// Overview: key numbers, the nodes, certificates, what the takeover found, the newest bulletins, the timeline.
-function Overview({ s, reload }: Loaded) {
-  const cluster = s.kind === "cluster";
-  const [bulletins, setBulletins] = useState<ServiceBulletin[] | undefined>();
-  useEffect(() => { api.serviceBulletins(s.id, 10).then((r) => setBulletins(r.bulletins), () => setBulletins([])); }, [s.id, s.summary.asOf]);
-  const sampled = s.members.some((m) => m.live?.point);
-  const connected = s.members.filter((m) => m.live?.connection === "CONNECTED").length;
-  return (
-    <div className="panel">
-      <OpenAlerts s={s} />
-      <div className="metrics">
-        <div className="metric"><span className="muted small">{cluster ? "Nodes" : "Installations"}</span><strong>{s.summary.running}/{s.summary.members} up</strong><span className="small muted">{cluster ? `${connected} connected · ` : ""}{s.summary.executorsOnline} executor{s.summary.executorsOnline === 1 ? "" : "s"} online</span></div>
-        {sampled && <>
-          <div className="metric" title="The fullest node's heap"><span className="muted small">Heap used</span><strong>{pctText(highest(s, "heapPct"))}</strong><span className="small muted">highest node</span></div>
-          <div className="metric"><span className="muted small">Queued</span><strong>{fmtNumber(sum(s, "queuedCount"), 0)}</strong><span className="small muted">{fmtBytes(sum(s, "queuedBytes"))}</span></div>
-          <BackpressureMetric s={s} />
-          <div className="metric"><span className="muted small">Threads</span><strong>{fmtNumber(sum(s, "threads"), 0)}</strong><span className="small muted">{fmtNumber(sum(s, "activeThreads"), 0)} active</span></div>
-          <div className="metric" title="The fullest repository disk of any node"><span className="muted small">Repository disk</span><strong>{pctText(Math.max(highest(s, "repoContentPct") ?? 0, highest(s, "repoFlowfilePct") ?? 0, highest(s, "repoProvenancePct") ?? 0))}</strong><span className="small muted">fullest</span></div>
-        </>}
-      </div>
-      <div>
-        <h3>{cluster ? "Nodes" : "Installation"}</h3>
-        <table>
-          <thead><tr><th>{cluster ? "Node" : "Host"}</th><th>Host and port</th><th>State</th>{cluster && <th>Cluster</th>}<th>Heap</th><th>Queued</th><th>As of</th></tr></thead>
-          <tbody>{s.members.map((m) => (
-            <tr key={memberKey(m)}>
-              <td className="mono">{cluster ? m.nodeAddress ?? m.host : m.host}</td>
-              <td className="mono">{m.host}{webPort(m.ports) ? `:${webPort(m.ports)}` : ""}</td>
-              <td><StateBadge m={m} />{m.live?.nifi && m.live.nifi !== "ok" && <span className="muted small" title="The collector's verdict on the REST API"> REST {m.live.nifi}</span>}</td>
-              {cluster && <td>{m.live?.connection ? <span className={`badge ${m.live.connection === "CONNECTED" ? "ok" : "bad"}`} title={`In the coordinator's view${m.live.roles.length ? `; ${m.live.roles.join(", ")}` : ""}`}>{m.live.connection.toLowerCase()}</span> : <span className="muted">—</span>}{m.live?.roles.includes("Cluster Coordinator") && <span className="muted small"> coordinator</span>}</td>}
-              <td className="mono small">{pctText(live(m, "heapPct"))}</td>
-              <td className="mono small">{fmtNumber(live(m, "queuedCount"), 0)}</td>
-              <td className="muted small" title={m.asOf ? when(m.asOf) : undefined}>{m.asOf ? <>{ago(m.asOf)}{m.live?.pid ? ` · pid ${m.live.pid}` : m.seen?.pid ? ` · pid ${m.seen.pid}` : ""}</> : "—"}</td>
-            </tr>
-          ))}</tbody>
-        </table>
-      </div>
-      <Congested s={s} />
-      <Certificates s={s} />
-      <NginxAddress s={s} onChanged={reload} />
-      {s.findings.length > 0 && <div>
-        <h3>Found at takeover</h3>
-        <ul className="findings card">{s.findings.map((f, i) => (
-          <li key={i}>
-            <span className={`badge ${SEVERITY[f.severity].tone}`}>{SEVERITY[f.severity].mark} {f.severity}</span> <span className="mono small">{f.code}</span> {f.message}
-            {f.values && f.values.length > 0 && <ul className="small">{f.values.map((v) => <li key={`${v.host}:${v.installDir}`}><span className="mono">{v.host}:{v.installDir}</span> {v.value ?? <span className="muted">not set</span>}</li>)}</ul>}
-          </li>
-        ))}</ul>
-      </div>}
-      {bulletins && bulletins.length > 0 && <div>
-        <h3>Newest bulletins</h3>
-        <table>
-          <thead><tr><th>Time</th><th>Level</th><th>Node</th><th>Source</th><th>Message</th></tr></thead>
-          <tbody>{bulletins.map((b) => (
-            <tr key={`${b.node}:${b.id}:${b.at}`}>
-              <td className="muted small">{when(b.at)}</td>
-              <td><span className={`badge ${b.level === "ERROR" ? "bad" : b.level === "WARNING" || b.level === "WARN" ? "warn" : "muted"}`}>{b.level ?? "?"}</span></td>
-              <td className="mono small">{b.node}</td>
-              <td className="small">{b.source ?? b.category ?? "—"}</td>
-              <td className="small">{b.message}</td>
-            </tr>
-          ))}</tbody>
-        </table>
-      </div>}
-      <div>
-        <h3>Timeline</h3>
-        <p className="muted small">The newest 20; all of it on Events and alerts.</p>
-        <Timeline events={s.events} />
-      </div>
-    </div>
-  );
-}
-
-// S27: every certificate the collector read, soonest expiry first; stores it could not read with the reason.
-function Certificates({ s }: { s: ServiceStatus }) {
-  if (!s.certs.length) return null;
-  const label = (key: string) => { const m = s.members.find((x) => x.key === key); return m ? memberLabel(s, m) : key; };
-  const rows = [...s.certs].sort((a, b) => (a.notAfter ?? "~") < (b.notAfter ?? "~") ? -1 : 1);
-  return (
-    <div>
-      <h3>Certificates</h3>
-      <p className="muted small">Read by each host's service executor from nifi.properties' keystore and truststore (and its own monitor certificate) about once an hour; only the newest reading is kept. {s.summary.certDays.warn} days or less is a warning, {s.summary.certDays.crit} days or less critical (the thresholds on Events and alerts).</p>
-      <table>
-        <thead><tr><th>{s.kind === "cluster" ? "Node" : "Host"}</th><th>Store</th><th>Subject</th><th>Issuer</th><th>Expires</th><th>Left</th><th>Read</th></tr></thead>
-        <tbody>{rows.map((c, i) => {
-          const days = c.notAfter ? daysLeft(c.notAfter) : null;
-          return (
-            <tr key={i}>
-              <td className="mono small">{label(c.member)}</td>
-              <td className="small"><span title={c.path ?? undefined}>{c.store}</span>{c.type ? <span className="muted"> {c.type}</span> : null}{c.alias ? <span className="muted mono"> {c.alias}{c.chain && c.chain > 1 ? ` #${c.chain}` : ""}</span> : null}</td>
-              {c.error ? <td colSpan={4} className="error small">Could not read: {c.error}</td> : <>
-                <td className="mono small">{c.subject}</td>
-                <td className="mono small muted">{c.issuer}</td>
-                <td className="small">{c.notAfter ? new Date(c.notAfter).toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" }) : "—"}</td>
-                <td>{days !== null ? <span className={`badge ${certTone(days, s.summary.certDays)}`}>{daysText(days)}</span> : "—"}</td>
-              </>}
-              <td className="muted small" title={when(c.readAt)}>{ago(c.readAt)}</td>
-            </tr>
-          );
-        })}</tbody>
-      </table>
-    </div>
-  );
-}
-
-// Metrics (§15.3): one chart per number, a line per node, over 1 hour / 6 hours / 2 days (raw samples) or 30 days (5-minute rollups).
-const RANGES: { id: Range; label: string }[] = [{ id: "1h", label: "1 hour" }, { id: "6h", label: "6 hours" }, { id: "2d", label: "2 days" }, { id: "30d", label: "30 days" }];
-// sparse: read only every few minutes (back pressure), so the points that have it are joined and the gaps skipped.
-const CHARTS: { group: string; charts: { field: Field; title: string; max?: number; note?: string; sparse?: boolean }[] }[] = [
-  { group: "JVM", charts: [{ field: "heapPct", title: "Heap used", max: 100 }, { field: "heapUsed", title: "Heap used (bytes)" }, { field: "gcMsPerMin", title: "GC time" }, { field: "threads", title: "JVM threads" }] },
-  { group: "Flow", charts: [{ field: "queuedCount", title: "Queued flowfiles" }, { field: "queuedBytes", title: "Queued bytes" }, { field: "bpFull", title: "Connections at back pressure", note: "No back pressure read in this range (it is read every 5 minutes by default)", sparse: true }, { field: "bpMaxPct", title: "Fullest queue", max: 100, note: "No back pressure read in this range", sparse: true }, { field: "activeThreads", title: "Active threads" }] },
-  { group: "Repositories", charts: [{ field: "repoContentPct", title: "Content repository disk", max: 100 }, { field: "repoFlowfilePct", title: "FlowFile repository disk", max: 100 }, { field: "repoProvenancePct", title: "Provenance repository disk", max: 100 }] },
-  { group: "Host", charts: [{ field: "cpuPct", title: "Process CPU (100 % = one core)" }, { field: "rss", title: "Process RSS" }, { field: "load1", title: "Host load (1 min)" }, { field: "memPct", title: "Host memory used", max: 100 }, { field: "diskPct", title: "Fullest disk", max: 100 }] },
-];
-
-function Metrics({ s }: { s: ServiceStatus }) {
-  const [range, setRange] = useState<Range>("1h");
-  const [view, setView] = useState<MetricsView | undefined>();
-  const [error, setError] = useState("");
-  const load = useCallback(() => { api.serviceMetrics(s.id, range).then((v) => { setView(v); setError(""); }, (e: Error) => setError(e.message)); }, [s.id, range]);
-  useEffect(() => { setView(undefined); load(); const t = setInterval(load, 30_000); return () => clearInterval(t); }, [load]);
-  const from = view ? Date.parse(view.from) : 0, to = view ? Date.parse(view.to) : 0;
-  const series = (f: Field, sparse = false): Series[] => !view ? [] : s.members.map((m) => {
-    const got = view.members.find((x) => x.member === m.key);
-    const at = got ? got.at.map((a) => Date.parse(a)) : [], values = got?.values[f] ?? [];
-    if (!sparse) return { name: memberLabel(s, m), at, values };
-    const keep = values.map((v, i) => (v === null ? -1 : i)).filter((i) => i >= 0);
-    return { name: memberLabel(s, m), at: keep.map((i) => at[i]!), values: keep.map((i) => values[i]!) };
-  });
-  return (
-    <div className="panel">
-      <div className="range-bar">
-        <div className="subtabs inline" role="tablist" aria-label="Time range">
-          {RANGES.map((r) => <button key={r.id} role="tab" aria-selected={range === r.id} className={range === r.id ? "active" : ""} onClick={() => setRange(r.id)}>{r.label}</button>)}
-        </div>
-        {view && <span className="muted small">{view.source === "samples" ? `From the raw samples (kept 2 days), averaged over ${view.step >= 60 ? `${Math.round(view.step / 60)} min` : `${view.step} s`}` : `From the 5-minute rollups (kept 30 days), averaged over ${Math.round(view.step / 3600)} h`}. Sampled every {s.summary.period} s.</span>}
-      </div>
-      {error && <p className="error">{error}</p>}
-      {!view && !error && <p className="muted">Loading…</p>}
-      {view && CHARTS.map((g) => (
-        <section key={g.group} className="chart-section">
-          <h3>{g.group}</h3>
-          <div className="charts">{g.charts.map((c) => (
-            <LineChart key={c.field} title={c.title} unit={view.fields[c.field].unit} series={series(c.field, c.sparse)} from={from} to={to} {...(c.max ? { max: c.max } : {})} {...(c.note ? { note: c.note } : {})} />
-          ))}</div>
-        </section>
-      ))}
-      {view && <p className="muted small">Back pressure is read every {everyText(s.summary.backpressure?.everySeconds ?? 300)} (the service executor's EXECUTOR_BACKPRESSURE_SECONDS), not every sample; its points are joined.{s.kind === "cluster" ? " It is flow-wide (the root group's status), so every node shows the same. A node's queue and active threads are its share in the coordinator's view." : ""}</p>}
-    </div>
-  );
 }
 
 /** Starting and stopping one node or installation (§8): each button shows a plan first. An admin says what it starts with if that is not known. */
@@ -364,13 +184,12 @@ function NodeControls({ s, cfg, desk, reload }: Pick<Loaded, "s" | "cfg" | "desk
   );
 }
 
-function Nodes({ s, cfg, desk, reload }: Loaded) {
+function InstallDetails({ s }: { s: ServiceStatus }) {
   const cluster = s.kind === "cluster";
   const soonest = (m: MemberStatus) => s.certs.filter((c) => c.member === m.key && c.notAfter).sort((a, b) => (a.notAfter! < b.notAfter! ? -1 : 1))[0];
   const unread = (m: MemberStatus) => s.certs.filter((c) => c.member === m.key && c.error).length;
   return (
     <>
-    <NodeControls s={s} cfg={cfg} desk={desk} reload={reload} />
     <table>
       <thead><tr><th>Host</th><th>Install directory</th><th>Conf directory</th>{cluster && <th>Node address</th>}<th>User</th><th>Ports</th><th>Service executor</th><th>State</th><th>Certificate</th><th>As of</th></tr></thead>
       <tbody>

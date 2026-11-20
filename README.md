@@ -53,10 +53,13 @@ Node 22.18 起直接运行 `.ts`（类型剥离），服务端不需要构建；
 | `DEPLOYER_UAT_URL` / `DEPLOYER_UAT_KEY_FILE` | 无 | PROD 设：UAT 的 Deployer 地址（含 base path，如 `http://uat-host:8095/deploy`），以及存只读 key 的文件（600）。key 用 `node bin/peer-key.ts` 生成 |
 | `DEPLOYER_WORKBENCH_API_KEY_FILE` | 无 | Workbench Administration → API keys 里的一把 key（文件 600），`workbench-app`、`oma-agent` 用它装应用包、把 Business Agent 指向新 agent；个人 key、维护提示、Setup 的检查也用它。也可以不设，在 Setup 页贴入（加密存进状态库）；两者都有时以文件为准 |
 | `DEPLOYER_STUDIO_BUILDER_URL` / `DEPLOYER_STUDIO_TOKEN_FILE` | 无 | Studio Builder MCP（如 `https://studio:9631/mcp`）和 workspace token（`oaw_v1.`，read + write），给 `studio-graph`，也用来发布受管 NiFi 的 `nifi-ops` 图（`DEPLOYER_NIFI_OPS_GRAPH`，默认 `nifi-ops`）。Studio 是自签证书时用 `NODE_EXTRA_CA_CERTS` 指向它的证书 |
+| `DEPLOYER_STUDIO_DATA_URL` | 无 | Studio 数据面 MCP（如 `https://studio:9632/mcp`）。受管服务的 e2e_trace 证据源用它和各服务自己的 graph token 读运行记录（S37 第 7 步）；不设时没有服务能配 e2e_trace |
 | `DEPLOYER_OMA_BUILDER_URL` / `DEPLOYER_OMA_BUILDER_KEY_FILE` | 无 | OMA Builder MCP 和它的 `BUILDER_MCP_API_KEY`，给 `oma-agent` |
 | `DEPLOYER_OMA_URL` / `DEPLOYER_OMA_API_KEY_FILE` | 无 | 可选：OMA 的 API 和 key，发布后归档更早的同名 agent；不设就不归档 |
 | `DEPLOYER_OMA_APPLICATION_ID` / `DEPLOYER_OMA_AGENT` / `DEPLOYER_OMA_ENVIRONMENT` / `DEPLOYER_OMA_VAULTS` | 无 | 接法 B：Deployer 自己开 OMA Session（失败诊断）用的 Application、Agent（Deploy Assistant 的 agent id）、Environment、Vault（放只读服务 key）。配了 `DEPLOYER_OMA_URL`、`DEPLOYER_OMA_API_KEY_FILE`、`DEPLOYER_OMA_AGENT` 才诊断 |
 | `DEPLOYER_OMA_ASSESSOR_AGENT` / `DEPLOYER_OMA_ASSESSOR_ENVIRONMENT` / `DEPLOYER_OMA_ASSESSOR_VAULTS` | 无 | 接入评估：Onboarding Assessor 的 agent id、**隔离的** Environment（只放行 git 站点和 Deployer MCP）、Vault（服务 key、私有仓库只读令牌）。不配就不能评估 |
+| `DEPLOYER_OMA_CHECKUP_AGENT` / `DEPLOYER_OMA_CHECKUP_ENVIRONMENT` / `DEPLOYER_OMA_CHECKUP_VAULTS` | 无 | 受管服务的 AI 分析：Service Check-up 的 agent id、Environment、Vault（放体检 key `dpc_`，对应 Deployer 的 MCP 地址）。不配就没有 AI 分析，灯照常亮 |
+| `DEPLOYER_CHECKUP_CRON` / `DEPLOYER_CHECKUP_TIMEZONE` | `0 */4 * * *` / `Asia/Shanghai` | 定时体检：Deployer 启动时和每 15 分钟确保 OMA 里有一条 `deployer-checkup-<环境>` 的 agent schedule 与此一致 |
 | `DEPLOYER_ISSUE_REPO` / `DEPLOYER_ISSUE_TOKEN_FILE` | 无 | 开 Issue 的 Deployer 仓库（owner/name）和 fine-grained token（只有 Issues: write） |
 | `DEPLOYER_BRIEF_HOUR` | `8` | 每日简报在这个钟点之后生成（服务器时间） |
 | `DEPLOYER_RELEASE_REPO` / `DEPLOYER_RELEASE_TAG` | 无 / `v{version}` | D39：Overview 上 Deployer 版本下拉框的来源，写成 `github:owner/name`（以后加 `bitbucket:`）；不设就手填版本 |
