@@ -1,7 +1,8 @@
-// Step 6a: the managed-service pages' structure, against a running Deployer with a registered NiFi service (the local 8097
-// dev instance on the lab). E2E_URL (default http://127.0.0.1:8097) and E2E_PASSWORD (the emergency account's password) say
-// where and how to sign in. Until the overview/page routes exist the pages run on the sample data (ops-data.ts), so the
-// first card is the sample's c250-prod. Run: PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-x64 npx playwright test -c e2e
+// The managed-service pages (overview, service page, flows to confirm, one flow) against a running Deployer on the real
+// routes, with at least one registered NiFi service (the local 8097 dev instance on the lab). E2E_URL (default
+// http://127.0.0.1:8097) and E2E_PASSWORD (the emergency account's password) say where and how to sign in. Tests read the
+// first service on the overview and its flows from the API, so they hold whatever the lab looks like; the flow tests skip
+// when no business has been found yet. Run: PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-x64 npx playwright test -c e2e
 import { expect, test, type Page } from "@playwright/test";
 
 const BASE = process.env.E2E_URL ?? "http://127.0.0.1:8097";
@@ -57,4 +58,41 @@ test("Configuration and changes has start/stop, changes and the configuration on
   await tab(page, "Configuration and changes").click();
   await expect(page.getByRole("heading", { name: "Start and stop" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Configuration", exact: true })).toBeVisible();
+});
+
+/** A service with at least one business found, and that business's id, from the real API (signed in). */
+async function serviceWithFlow(page: Page): Promise<{ service: string; flow: string; name: string } | undefined> {
+  return page.evaluate(async () => {
+    const ov = await (await fetch("/deploy/api/services/overview")).json() as { services: { id: string }[] };
+    for (const s of ov.services) {
+      const r = await (await fetch(`/deploy/api/services/${encodeURIComponent(s.id)}/flows`)).json() as { flows: { id: string; name: string }[] };
+      if (r.flows.length > 0) return { service: s.id, flow: r.flows[0]!.id, name: r.flows[0]!.name };
+    }
+    return undefined;
+  });
+}
+
+test("the flows page draws each business found with its diagram and the confirm buttons", async ({ page }) => {
+  await signIn(page);
+  await expect(page.locator(".ov-card").first()).toBeVisible();
+  const f = await serviceWithFlow(page);
+  test.skip(!f, "no business found on any service yet");
+  await page.goto(`${BASE}/deploy/#/flows/${encodeURIComponent(f!.service)}`);
+  await expect(page.getByRole("heading", { name: `Flows on ${f!.service}`, level: 1 })).toBeVisible();
+  const card = page.locator("section.fl-card").filter({ has: page.getByRole("heading", { name: f!.name, level: 2 }) }).first();
+  await expect(card.locator(".fl-diagram")).toBeVisible();
+  await expect(card.locator(".fl-svclabel").first()).toBeVisible();
+  await expect(card.getByRole("button", { name: /Looks right|Confirmed/ }).first()).toBeVisible();
+});
+
+test("a flow's page has the verdict, the diagram, Problems now and Last 7 days", async ({ page }) => {
+  await signIn(page);
+  await expect(page.locator(".ov-card").first()).toBeVisible();
+  const f = await serviceWithFlow(page);
+  test.skip(!f, "no business found on any service yet");
+  await page.goto(`${BASE}/deploy/#/flow/${encodeURIComponent(f!.flow)}?service=${encodeURIComponent(f!.service)}`);
+  await expect(page.getByRole("heading", { name: f!.name, level: 1 })).toBeVisible();
+  await expect(page.locator(".fl-top .fl-diagram")).toBeVisible();
+  await expect(page.getByRole("heading", { name: /^Problems now \(\d+\)$/ })).toBeVisible();
+  await expect(page.getByText("Last 7 days", { exact: true })).toBeVisible();
 });

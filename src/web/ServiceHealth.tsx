@@ -122,7 +122,7 @@ function BusinessCard({ page }: { page: ServicePage }) {
     <div className={`sv-card sv-business edge-${b.light}`}>
       <div className="sv-title"><b>Business{b.flows.length > 0 ? ` · ${b.flows.length} ${b.flows.length === 1 ? "flow" : "flows"}` : ""}</b><span>is the data right?</span></div>
       <BigLight light={b.light} size={28} />
-      {b.light === "unknown" && <p className="sv-sentence" style={{ fontSize: 15 }}>{b.reason ? `${UNKNOWN_REASON[b.reason]}. ` : ""}{b.sentence}</p>}
+      {b.light === "unknown" && <p className="sv-sentence" style={{ fontSize: 15 }}>{b.reason && b.reason !== "unconfirmed" ? `${UNKNOWN_REASON[b.reason]}. ` : ""}{b.sentence}</p>}
       <div className="sv-flows">
         {b.flows.map((f) => (
           <a key={f.id} className="sv-flow" href={flowHref(f.id, id)}>

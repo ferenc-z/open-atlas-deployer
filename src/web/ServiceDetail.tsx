@@ -70,7 +70,7 @@ export function ServiceDetail({ id, isAdmin, initialDraft, initialTab, onBack }:
         {error && <p className="fl-error">{error}</p>}
         <div className="line">
           <h1 className="mono">{s.id}</h1>
-          <span className="fl-muted" style={{ fontSize: 14 }}>{serviceName(s.service)} {s.version} · {cluster ? `cluster, ${s.members.length} nodes` : "standalone"} · {s.environment.toUpperCase()} · {s.members.map((m) => m.host).join(", ")}</span>
+          <span className="fl-muted" style={{ fontSize: 14 }}>{serviceName(s.service)} {s.version} · {cluster ? `cluster, ${s.members.length} nodes` : "standalone"} · {s.environment.toUpperCase()} · {[...new Set(s.members.map((m) => m.host))].join(", ")}</span>
           <span style={{ flex: 1 }} />
           <span className="acts">
             {desk.active ? <button className={`change-now state-${desk.active.state}`} onClick={() => go("changes")} title="Open the change on the Configuration and changes tab">Change {desk.active.state}{desk.active.mode !== "full" && desk.active.plan.members.length > 1 ? ` · ${desk.active.progress.done.length}/${desk.active.plan.members.length} nodes` : ""}</button>
