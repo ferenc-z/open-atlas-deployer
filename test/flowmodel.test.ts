@@ -348,3 +348,14 @@ test("engine test 2026-11-22: a cross-service business's part here moved to a ne
   assert.notEqual(other, f);
   assert.deepEqual(store.flowSegments(other).map((s) => `${s.service}/${s.segment}`), ["c250/R"]);
 });
+
+test("engine test 2026-11-22: both services already have models; a new S2S hand-over is waited for on either side, a port the other canvas lacks is dangling", () => {
+  const { store } = crossing(() => 10);
+  for (const id of ["n112", "c250"]) store.insertFlowModel(id, 0, { version: 2, service: id, sources: [], segments: [] }, "ai", ai, []);
+  const dangles = (r: ReturnType<typeof runModel>) => r.checks.filter((c) => c.check === "no-dangling" && !c.ok).map((c) => c.text).join(" ");
+  assert.equal(dangles(runModel(store, "n112", sender(store), NOW)), "", "c250's model is not on Receive yet");
+  assert.equal(dangles(runModel(store, "c250", receiver("new:orders"), NOW)), "", "n112's model is not on Send yet");
+  const d = sender(store);
+  const wrong = { ...d, segments: d.segments.map((x) => ({ ...x, exits: x.exits.map((e) => ({ ...e, channel: { ...e.channel, port: "orderz" } })) })) };
+  assert.match(dangles(runModel(store, "n112", wrong, NOW)), /orderz/);
+});

@@ -169,17 +169,24 @@ function problems(model: ModelV2 | null, c: Ctx): Problem[] {
   // no-dangling: an S2S hand-over between managed services has both sides in the models (a side whose service has no
   // model yet is waited for; an entry fed from outside the managed services is not dangling); every exit names its
   // component. MQ may lead to and come from outside, so it is not checked.
+  // The other side is also waited for when its service has a model but none of it is on the group the canvas shows at
+  // the other end yet: two services that already have models each add their side of a new hand-over in their own
+  // publish, and neither could go first (engine test 2026-11-22). A port the other canvas does not have stays dangling.
   const modelled = new Set(all.map((m) => m.service));
+  const covers = (service: string, group: string) => !!all.find((m) => m.service === service)?.segments.some((s) => s.group.id === group);
   for (const d of dangling(all.map(toTraceModel))) {
     if (d.service !== c.service || !d.channel.startsWith("s2s:")) continue;
     const seg = model.segments.find((s) => s.id === d.business);
     if (d.side === "exit") {
-      const target = d.channel.slice(4).split("/")[0]!;
+      const [target, port] = d.channel.slice(4).split("/") as [string, string];
       if (!modelled.has(target) && c.registered.has(target)) continue;
+      const groups = (c.topology(target)?.s2sIn ?? []).filter((p) => p.name === port).map((p) => p.group);
+      if (modelled.has(target) && groups.length && !groups.some((g) => covers(target, g))) continue;
     } else {
       const units = seg ? new Set(unitsOf(c.service, seg, c.skeleton).map((u) => u.id)) : new Set<string>();
-      const senders = new Set(c.skeleton.edges.filter((e) => e.kind === "s2s" && units.has(e.to)).map((e) => e.from.split("/")[0]!));
-      if (![...senders].some((s) => modelled.has(s))) continue;
+      const from = c.skeleton.edges.filter((e) => e.kind === "s2s" && units.has(e.to)).map((e) => e.from.split("/"));
+      if (!from.some(([s]) => modelled.has(s!))) continue;
+      if (!from.some(([s, g]) => modelled.has(s!) && covers(s!, g!))) continue;
     }
     out.push({ check: "no-dangling", flow: seg?.flow ?? null, key: `dangling:${d.side}:${d.channel}:${d.business}:${d.endpoint}`, text: d.side === "exit" ? `${label(seg ?? ({ id: d.business, group: { name: d.business } } as Segment))} 的出口 ${d.endpoint} 发往 ${d.channel.replace(/^s2s:/, "S2S ").replace(/^mq:/, "MQ ")}，没有哪个服务的模型在这条通道上有入口` : `${d.business} 的入口 ${d.endpoint} 在 ${d.channel.replace(/^s2s:/, "S2S ")} 上收，没有哪个服务的模型往这里发` });
   }
