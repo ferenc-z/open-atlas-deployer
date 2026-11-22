@@ -634,6 +634,7 @@ export function draftFromSkeleton(store: Store, service: string, now = new Date(
   const seen = new Set<string>();
   const known = (u: SkeletonSegment) => current?.segments.find((s) => s.group.id === u.group.id && (s.slice === (u.fragment ?? WHOLE) || s.slice === WHOLE));
   const notes: FlowNote[] = [];
+  const units = new Map<string, SkeletonSegment>([...sk.flows.flatMap((f) => f.segments), ...sk.shared].map((x) => [x.id, x]));
   const add = (u: SkeletonSegment, flowKey: string | undefined, role: Segment["role"]) => {
     const k = known(u);
     if (k) { if (!seen.has(k.id)) { segments.push(k); seen.add(k.id); } return k.flow; }
@@ -643,7 +644,15 @@ export function draftFromSkeleton(store: Store, service: string, now = new Date(
     seen.add(id);
     const ins = (topo?.s2sIn ?? []).filter((p) => p.group === u.group.id && (u.fragment === null || p.fragment === u.fragment));
     const outs = (topo?.s2sOut ?? []).filter((o) => o.group === u.group.id && (u.fragment === null || o.fragment === u.fragment));
-    const edgeTo = (o: { name: string }) => sk.edges.find((e) => e.kind === "s2s" && e.from === u.id && sk.flows.some((f) => f.segments.some((x) => x.id === e.to)));
+    // The S2S edge this RPG port is: to a business's or a shared step's unit (dead letters go to a shared one) whose
+    // service has a remote input port of that name on that group (a fan-out has one edge per target service).
+    const edgeTo = (o: { name: string }) => sk.edges.find((e) => {
+      if (e.kind !== "s2s" || e.from !== u.id) return false;
+      const t = units.get(e.to);
+      if (!t) return false;
+      const tt = store.latestTopology(t.service)?.body as Topology | undefined;
+      return !tt || tt.s2sIn.some((p) => p.name === o.name && p.group === t.group.id);
+    });
     const exits: Exit[] = outs.map((o, i) => {
       const target = edgeTo(o)?.to.split("/")[0];
       // Executor 0.9.5 reports what feeds the RPG port: the exit is that component (its first relationship, if any).

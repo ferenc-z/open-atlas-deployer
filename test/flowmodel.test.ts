@@ -368,3 +368,16 @@ test("engine test 2026-11-22: executor 0.9.5 names what feeds an RPG port, and t
   assert.deepEqual([exit.component, exit.relationship, exit.channel.port], ["p-send", "success", "orders"]);
   assert.equal(runModel(store, "n112", draftFromSkeleton(store, "n112", NOW), NOW).checks.find((c) => c.check === "no-dangling")!.ok, true);
 });
+
+test("engine test 2026-11-22: each RPG port of a fan-out exit names its own target service", () => {
+  const { store } = crossing(() => 10);
+  store.addStandalone({ kind: "standalone", id: "n200", service: "nifi", profile: "nifi-2.x", version: "2.0.0", webUrl: null, member: member(18444) } as never, "uat", admin);
+  store.putTopology("n200", "2026-11-19T11:00:00Z", "c", topo("r3", [{ id: "Q", name: "Other", root: false, fragments: [frag("q", { remoteIn: ["other"] })] }], { s2sIn: [{ id: "p-other", name: "other", group: "Q", fragment: "q" }] }));
+  const a = "https://localhost:18445/nifi#orders", b = "https://localhost:18444/nifi#other";
+  const src = (id: string) => [{ id, name: id, kind: "processor", relationships: ["success"] }];
+  store.putTopology("n112", "2026-11-19T12:00:00Z", "a3", topo("r1", [{ id: "S", name: "Send", root: false, fragments: [frag("s", { s2sOut: [a, b] })] }], { s2sOut: [
+    { ref: a, name: "orders", targets: ["https://localhost:18445/nifi"], group: "S", fragment: "s", sources: src("p-a") },
+    { ref: b, name: "other", targets: ["https://localhost:18444/nifi"], group: "S", fragment: "s", sources: src("p-b") }] }));
+  const exits = draftFromSkeleton(store, "n112", NOW).segments.find((x) => x.group.id === "S")!.exits;
+  assert.deepEqual(exits.map((e) => [e.channel.port, e.channel.service, e.component]).sort(), [["orders", "c250", "p-a"], ["other", "n200", "p-b"]]);
+});
