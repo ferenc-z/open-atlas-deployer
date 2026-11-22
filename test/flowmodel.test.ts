@@ -381,3 +381,32 @@ test("engine test 2026-11-22: each RPG port of a fan-out exit names its own targ
   const exits = draftFromSkeleton(store, "n112", NOW).segments.find((x) => x.group.id === "S")!.exits;
   assert.deepEqual(exits.map((e) => [e.channel.port, e.channel.service, e.component]).sort(), [["orders", "c250", "p-a"], ["other", "n200", "p-b"]]);
 });
+
+test("engine test 2026-11-22: a remote input port's status counts what it received as out (in is 0): the hand-over balances", () => {
+  const w = crossing(() => 10);
+  const { store } = w;
+  store.putFlowCounts(Array.from({ length: 6 }, (_, h) => row("c250", new Date(Date.parse("2026-11-19T04:05:00Z") + h * 3_600_000).toISOString().replace(".000Z", "Z"), "s2s-in", "p-orders", 0, 10)));
+  for (const id of ["n112", "c250"]) store.insertFlowModel(id, 0, { version: 2, service: id, sources: [], segments: [] }, "ai", ai, []);
+  store.insertFlowModel("n112", 1, sender(store), "ai", ai, []);
+  const r = runModel(store, "c250", receiver("new:orders"), NOW);
+  assert.equal(r.checks.find((c) => c.check === "s2s-balance")!.ok, true, JSON.stringify(r.checks));
+});
+
+test("engine test round 3: two groups joined only through a shared step are one business (reachable)", () => {
+  const w = world();
+  const { store } = w;
+  store.addStandalone({ kind: "standalone", id: "n1", service: "nifi", profile: "nifi-1.x", version: "1.12.1", webUrl: null, member: member(18443) } as never, "uat", admin);
+  store.putTopology("n1", "2026-11-19T11:00:00Z", "h1", topo("root", [
+    { id: "A", name: "Orders in", root: false, fragments: [frag("a", { outputs: ["out"] })] },
+    { id: "X", name: "Invoices in", root: false, fragments: [frag("x", { outputs: ["out"] })] },
+    { id: "V", name: "Common validate", root: false, fragments: [frag("v", { inputs: ["in"], outputs: ["orders", "invoices"], starts: 0 })] },
+    { id: "B", name: "Orders route", root: false, fragments: [frag("b", { inputs: ["in"], starts: 0 })] },
+    { id: "Y", name: "Invoices extract", root: false, fragments: [frag("y", { inputs: ["in"], starts: 0 })] },
+  ], { links: [link("A", "a", "V", "v"), link("X", "x", "V", "v"), link("V", "v", "B", "b"), link("V", "v", "Y", "y")] }));
+  const d = draftFromSkeleton(store, "n1", NOW);
+  const shared = d.segments.filter((s) => s.role === "shared").map((s) => s.group.id);
+  assert.deepEqual(shared, ["V"], JSON.stringify(d.segments.map((s) => [s.group.id, s.role, s.flow])));
+  const one = { ...d, segments: d.segments.map((s) => ({ ...s, ...(s.group.id === "A" || s.group.id === "B" ? { flow: "new:orders" } : {}), exits: s.exits.map((e) => ({ ...e, component: "p" })) })) };
+  const r = runModel(store, "n1", one, NOW);
+  assert.equal(r.checks.find((c) => c.check === "reachable")!.ok, true, JSON.stringify(r.checks));
+});

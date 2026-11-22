@@ -189,7 +189,7 @@ export function handoverConditions(store: Store, service: string, locate: Return
     const theirs = store.flowCounts(target, from, to).filter((r) => r.kind === "s2s-in" && ids.has(r.ref));
     const ours = mine.filter((r) => r.kind === "s2s-out" && refs.has(r.ref));
     if (!theirs.length || !ours.length) continue;
-    const sent = ours.reduce((n, r) => n + r.flowfilesOut, 0), got = theirs.reduce((n, r) => n + r.flowfilesIn, 0);
+    const sent = ours.reduce((n, r) => n + r.flowfilesOut, 0), got = theirs.reduce((n, r) => n + Math.max(r.flowfilesIn, r.flowfilesOut), 0); // a remote input port's status counts what it received as out
     const bound = Math.max(5, Math.ceil(0.02 * Math.max(sent, got)));
     if (sent - got > bound) out.push({ place, ref: `s2s:${target}:${e.channel.port}`, anomaly: "handover-lost", light: "failing", at: to, count: sent - got, detail: { segment: s.id, component: e.component, target, port: e.channel.port, sent, received: got, from, to } });
   }

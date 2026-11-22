@@ -136,6 +136,10 @@ function problems(model: ModelV2 | null, c: Ctx): Problem[] {
   // the window the next one received.
   const channelLinks = links(all.map(toTraceModel));
   const edges = c.skeleton.edges;
+  // Engine test round 3: two groups whose only link is a shared step between them (a common validation that routes by
+  // an attribute) are joined through it; which business a FlowFile takes there the shared step decides, not a link.
+  const sharedUnits = new Set(c.skeleton.shared.map((u) => u.id));
+  const throughShared = (ua: Set<string>, ub: Set<string>) => edges.some((e1) => ua.has(e1.from) && sharedUnits.has(e1.to) && edges.some((e2) => e2.from === e1.to && ub.has(e2.to)));
   const flowsHere = [...new Set(model.segments.map((s) => s.flow).filter((f): f is string => Boolean(f)))];
   for (const f of flowsHere) {
     const members = all.flatMap((m) => m.segments.filter((s) => s.flow === f).map((s) => ({ service: m.service, s })));
@@ -147,7 +151,7 @@ function problems(model: ModelV2 | null, c: Ctx): Problem[] {
     for (const a of members) for (const b of members) {
       if (a === b) continue;
       const ua = unitIds.get(key(a))!, ub = unitIds.get(key(b))!;
-      if (edges.some((e) => ua.has(e.from) && ub.has(e.to))) join(key(a), key(b));
+      if (edges.some((e) => ua.has(e.from) && ub.has(e.to)) || throughShared(ua, ub)) join(key(a), key(b));
       if (channelLinks.some((l) => l.from.service === a.service && l.from.business === a.s.id && l.to.service === b.service && l.to.business === b.s.id)) join(key(a), key(b));
     }
     const seen = new Set<string>([key(members[0]!)]);
@@ -193,7 +197,8 @@ function problems(model: ModelV2 | null, c: Ctx): Problem[] {
   for (const s of model.segments) for (const e of s.exits) {
     if (!e.component || e.component === UNPLACED) out.push({ check: "no-dangling", flow: s.flow ?? null, key: `exit-component:${s.id}:${e.id}`, text: `${label(s)} 的出口 ${e.id} 没标是哪个组件、哪个关系出去的` });
   }
-  // s2s-balance: each S2S hand-over this service sends or receives, the two sides' hourly counts.
+  // s2s-balance: each S2S hand-over this service sends or receives, the two sides' hourly counts. What a remote input
+  // port received: NiFi's port status counts it as the port's out (in stays 0), its connections' history as in.
   for (const l of channelLinks) {
     if (!l.channel.startsWith("s2s:") || (l.from.service !== c.service && l.to.service !== c.service)) continue;
     const fromModel = all.find((m) => m.service === l.from.service)!, toModel = all.find((m) => m.service === l.to.service)!;
@@ -215,7 +220,7 @@ function problems(model: ModelV2 | null, c: Ctx): Problem[] {
       for (const r of rows) if (r.kind === kind && set.includes(r.ref)) { const h = Math.floor(Date.parse(r.bucket) / HOUR); m.set(h, (m.get(h) ?? 0) + pick(r)); }
       return m;
     };
-    const a = hourly(c.counts(l.from.service), "s2s-out", refs, (r) => r.out), b = hourly(c.counts(l.to.service), "s2s-in", ids, (r) => r.in);
+    const a = hourly(c.counts(l.from.service), "s2s-out", refs, (r) => r.out), b = hourly(c.counts(l.to.service), "s2s-in", ids, (r) => Math.max(r.in, r.out));
     const hours = [...a.keys()].filter((h) => b.has(h)).sort((x, y) => x - y);
     if (!hours.length) continue;
     const sent = hours.reduce((n, h) => n + a.get(h)!, 0), got = hours.reduce((n, h) => n + b.get(h)!, 0);
