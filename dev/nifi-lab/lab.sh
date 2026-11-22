@@ -124,6 +124,9 @@ except Exception as e: print("unavailable", e)')"
       # Owner 2026-11-07: and "view the data" of the whole flow, so provenance events carry the FlowFile attributes
       # (NiFi hides them without it; it would also allow reading content, which the executor never asks for).
       "/data/process-groups/@root|read|$CLIENT_MONITOR"
+      # Engine test 2026-11-22: and "view the component" of the whole flow, or the flow walk (topology) sees ids
+      # instead of group, port and processor names and no RPG contents (n192 had been left without it).
+      "/process-groups/@root|read|$CLIENT_MONITOR"
       "/proxy|read|$CLIENT_NGINX" "/proxy|write|$CLIENT_NGINX"
       # P8: nginx calls NiFi as itself for Studio (S20): monitoring reads (provenance is the Deployer's own since S28).
       "/flow|read|$CLIENT_NGINX" "/system|read|$CLIENT_NGINX" "/controller|read|$CLIENT_NGINX"
