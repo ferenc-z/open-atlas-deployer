@@ -5,6 +5,15 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
 
 ## Unreleased
 
+- Engine test round 2 (2026-11-22/23): service executor 0.9.5 reports, for each S2S sending port, the components whose
+  connections lead into it (`s2sOut[].sources`), and the skeleton's draft gives an S2S exit that component and
+  relationship (before, every S2S exit was left for the AI to place and the gate refused the drafts). The gate waits for
+  the other side of a new S2S hand-over when the other service's model is not on that group yet (two services that both
+  had models could not take a new hand-over: neither could publish first). The check-up prompt says how to join the
+  skeleton's pieces (across a shared validation step by the routing attribute, two pieces handed over by a directory).
+- [ ] Upgrade the service executors to 0.9.5 (the Executors page) so S2S exits are placed by the skeleton.
+- [ ] OMA: publish the Service Check-up again (`agents/service-checkup.md` changed; Skill unchanged) and point
+  `DEPLOYER_OMA_CHECKUP_AGENT` at the new agent.
 - Business skeleton (complex lab flows 2026-11-22): edges to and from a shared step (error handling, audit, dead letters)
   no longer count when deciding whether two segments are one business, so a group that also sends its errors to the
   shared handler still merges with its next group and with the other service's S2S port (before, every such business
