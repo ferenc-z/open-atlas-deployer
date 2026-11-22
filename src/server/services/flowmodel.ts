@@ -251,7 +251,10 @@ function diff(base: ModelV2 | null, draft: ModelV2, c: Ctx): Diff {
     const b = bySeg.get(d.id) ?? byPlace.get(`${d.group.id}\0${d.slice}`);
     if (b && ![...matched.values()].includes(b)) matched.set(d.id, b);
   }
-  // A new key whose segments all were one business no other key keeps is that business under another name.
+  // A new key whose segments all were one business no other key keeps is that business under another name — unless
+  // that business has segments in other services too: then this service's part leaves it (a split, engine test
+  // 2026-11-22: "split" feedback on a cross-service business was taken as a rename and silently undone).
+  const elsewhere = (f: string) => c.others.some((m) => m.segments.some((s) => s.flow === f));
   const resolve = new Map<string, string>();
   const keys = [...new Set(draft.segments.map((s) => s.flow).filter((f): f is string => Boolean(f)))];
   const used = new Set(keys.filter((k) => !k.startsWith("new:")));
@@ -260,12 +263,11 @@ function diff(base: ModelV2 | null, draft: ModelV2, c: Ctx): Diff {
     const was = new Set(draft.segments.filter((s) => s.flow === k).map((s) => matched.get(s.id)?.flow).filter(Boolean));
     const only = was.size === 1 ? [...was][0]! : undefined;
     const all = draft.segments.filter((s) => s.flow === k).every((s) => matched.get(s.id)?.flow);
-    if (only && all && !used.has(only)) { resolve.set(k, only); used.add(only); } else resolve.set(k, k);
+    if (only && all && !used.has(only) && !elsewhere(only)) { resolve.set(k, only); used.add(only); } else resolve.set(k, k);
   }
   const flowOf = (s: Segment) => (s.flow ? resolve.get(s.flow) ?? s.flow : null);
   const topology = c.topology(c.service);
   const onCanvas = (s: Segment) => !topology || s.group.id === UNPLACED || topology.groups.some((g) => g.id === s.group.id);
-  const elsewhere = (f: string) => c.others.some((m) => m.segments.some((s) => s.flow === f));
   for (const d of draft.segments) {
     const b = matched.get(d.id);
     const f = flowOf(d);
@@ -288,6 +290,8 @@ function diff(base: ModelV2 | null, draft: ModelV2, c: Ctx): Diff {
   for (const f of new Set((base?.segments ?? []).map((s) => s.flow).filter((x): x is string => Boolean(x)))) {
     const into = new Set(draft.segments.filter((d) => matched.get(d.id)?.flow === f).map(flowOf));
     if (into.size >= 2) changes.push({ flow: f, kind: "split", text: `一条业务拆成 ${into.size} 条` });
+    // A cross-service business whose part here all goes to another business: split across the services.
+    else if (into.size === 1 && !into.has(f) && elsewhere(f)) changes.push({ flow: f, kind: "split", text: "这条跨服务业务在本服务的部分拆成另一条业务" });
   }
   return { changes, resolve, removed, gone };
 }

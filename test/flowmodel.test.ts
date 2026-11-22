@@ -327,3 +327,24 @@ test("flows page and a person's actions: rename, stuck times (attention < failin
   assert.equal(ok.status, 200);
   assert.equal(ok.body.flow.pending, null);
 });
+
+test("engine test 2026-11-22: a cross-service business's part here moved to a new business is a split, not a rename", async () => {
+  const w = crossing(() => 10);
+  const { store, deps } = w;
+  await publishModel(deps, { service: "n112", base: 0, model: sender(store), note: "first", actor: ai });
+  const f = flowOf(store, "n112", "S");
+  await confirmFlow(deps, f, admin);
+  await publishModel(deps, { service: "c250", base: 0, model: receiver(f), note: "receiver", actor: ai });
+  await confirmFlow(deps, f, admin);
+  assert.deepEqual(store.flowSegments(f).map((s) => `${s.service}/${s.segment}`), ["n112/S", "c250/R"]);
+  const m = store.flowModel("c250")!;
+  const split = { ...m.model, segments: m.model.segments.map((s) => ({ ...s, flow: "new:ingest" })) };
+  assert.deepEqual(runModel(store, "c250", split, NOW).changes.map((c) => [c.flow, c.kind]), [[f, "split"]], "before, the new key was read as f renamed: no change");
+  const held = await publishModel(deps, { service: "c250", base: m.revision, model: split, note: "split", actor: ai });
+  assert.deepEqual([held.verdict, held.pending.map((p) => [p.flow, p.kind])], ["needs-confirmation", [[f, "split"]]]);
+  assert.equal((await confirmFlow(deps, f, admin)).result!.verdict, "published");
+  assert.deepEqual(store.flowSegments(f).map((s) => `${s.service}/${s.segment}`), ["n112/S"], "the part here left the business");
+  const other = flowOf(store, "c250", "R");
+  assert.notEqual(other, f);
+  assert.deepEqual(store.flowSegments(other).map((s) => `${s.service}/${s.segment}`), ["c250/R"]);
+});

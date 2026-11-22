@@ -16,7 +16,8 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   definitions no longer have shows as gap `e2e-gone` (`e2e.gone`) and loses its e2e origin when republished. Two gate
   fixes: a publish drops what an earlier publish of the service held and it does not hold again (and closes the flows
   to-do when nothing waits); a group of one part given its only fragment's key as slice is the whole group (`*`), not a
-  new group plus a gone one. Test data for the definitions changing: `testdata/e2e-trace/change.sql`, `failure.sql`.
+  new group plus a gone one; a cross-service business whose part in one service the draft moves to a new business is a
+  split waiting for a person (it was read as the same business renamed, so "split" feedback was silently undone). Test data for the definitions changing: `testdata/e2e-trace/change.sql`, `failure.sql`.
   - [ ] OMA: publish the Service Check-up agent again (`agents/service-checkup.md`: how to place e2e_trace's
     schedules, e2e-gone); switch `DEPLOYER_OMA_CHECKUP_AGENT` to the new id.
 
