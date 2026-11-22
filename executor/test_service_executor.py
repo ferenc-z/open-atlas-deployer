@@ -3453,8 +3453,8 @@ def _e(i, name, **kw):
     return {"id": i, "component": {"name": name, **kw}}
 
 
-def _conn(i, s, d):
-    return {"id": i, "sourceId": s, "destinationId": d}
+def _conn(i, s, d, rel="success"):
+    return {"id": i, "sourceId": s, "destinationId": d, "component": {"selectedRelationships": [rel]}}
 
 
 # A flow like the lab's (pages-rethink step 1): on root, a loose piece gen -> rename -> RPG port "orders" (to c250) and a
@@ -3490,6 +3490,7 @@ class FlowCountsTest(unittest.TestCase):
         self.assertEqual(body["links"], [{"connection": "c4", "from": {"group": "A", "fragment": "A-out", "port": "out"}, "to": {"group": "B", "fragment": "B-in", "port": "in"}}])
         self.assertEqual(body["s2sIn"], [{"id": "ri", "name": "in", "group": "root", "fragment": "p-load"}])
         self.assertEqual(body["s2sOut"][0]["targets"], ["https://c250:18445/nifi", "https://c250b:18446/nifi"])
+        self.assertEqual(body["s2sOut"][0]["sources"], [{"id": "p-ren", "name": "rename", "kind": "processor", "relationships": ["success"]}], "0.9.5: what feeds the RPG port")
         self.assertEqual((helper["s2sOut"]["https://c250:18445/nifi#orders"]["connections"], helper["s2sIn"]["ri"], helper["rootSources"], helper["rootOutConns"]),
                          (["c2"], ["c3"], ["p-gen"], ["c2"]))
         # Ops step 3b: a deeper group's unit, and each processor's piece in a unit of several pieces.

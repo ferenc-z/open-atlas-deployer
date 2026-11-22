@@ -86,7 +86,7 @@ from executor_core import (  # noqa: F401
     FINAL, ID_RE, PROTOCOLS, Failed, ProtocolExecutor, Refused, Restarting, load_env_file, now_iso, write_json)
 # <<< executor_core
 
-VERSION = "0.9.4"
+VERSION = "0.9.5"
 # The executor's release (§8.6): one directory in the archive, holding only these files.
 PACKAGE = "open-atlas-service-executor"
 PACKAGE_FILES = ("service_executor.py", "launch.sh", "switch", "install.sh", "open-atlas-service-executor.service", "service-executor.env.example")
@@ -1062,7 +1062,7 @@ def build_topology(root_id, root_name, groups):
 
     names = {g["id"]: g.get("name") or g["id"] for g in groups}
     nodes = {}  # id -> {unit, group, kind, name, remote?, rpg?, targets?}
-    conns = []
+    conns, rels = [], {}
     for g in groups:
         gid, f = g["id"], g.get("flow") or {}
         u = unit_of(gid)
@@ -1086,6 +1086,8 @@ def build_topology(root_id, root_name, groups):
             s, d = e.get("sourceId") or ((e.get("component") or {}).get("source") or {}).get("id"), e.get("destinationId") or ((e.get("component") or {}).get("destination") or {}).get("id")
             if isinstance(s, str) and isinstance(d, str):
                 conns.append((e.get("id"), s, d))
+                r = e.get("selectedRelationships") or (e.get("component") or {}).get("selectedRelationships") or []
+                rels[e.get("id")] = sorted(x for x in r if isinstance(x, str))
     up = {}
 
     def find(x):
@@ -1140,7 +1142,12 @@ def build_topology(root_id, root_name, groups):
             helper["s2sIn"][i] = [cid for cid, s, _ in conns if s == i]
         elif n["kind"] == "rpg-port" and i in incoming:
             ref = f"{(n['targets'] or [''])[0]}#{n['name']}"
-            o = s2s_out.setdefault((ref, n["unit"], frag_of.get(i)), {"ref": ref, "name": n["name"], "targets": n["targets"], "group": n["unit"], "fragment": frag_of.get(i)})
+            o = s2s_out.setdefault((ref, n["unit"], frag_of.get(i)), {"ref": ref, "name": n["name"], "targets": n["targets"], "group": n["unit"], "fragment": frag_of.get(i), "sources": []})
+            # 0.9.5 (engine test 2026-11-22): the components whose connections lead into the RPG port, so the skeleton
+            # can name an S2S exit's component and relationship (the gate wants every exit to name them).
+            for cid, s, d in conns:
+                if d == i and s in nodes and not any(x["id"] == s for x in o["sources"]):
+                    o["sources"].append({"id": s, "name": nodes[s]["name"], "kind": nodes[s]["kind"], "relationships": rels.get(cid, [])})
             helper["s2sOut"].setdefault(ref, {"name": n["name"], "connections": []})["connections"].extend(incoming[i])
             if n["unit"] == root_id:
                 helper["rootOutConns"].extend(incoming[i])

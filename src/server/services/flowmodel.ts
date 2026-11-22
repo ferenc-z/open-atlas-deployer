@@ -646,7 +646,9 @@ export function draftFromSkeleton(store: Store, service: string, now = new Date(
     const edgeTo = (o: { name: string }) => sk.edges.find((e) => e.kind === "s2s" && e.from === u.id && sk.flows.some((f) => f.segments.some((x) => x.id === e.to)));
     const exits: Exit[] = outs.map((o, i) => {
       const target = edgeTo(o)?.to.split("/")[0];
-      return { id: `s2s-${i + 1}`, step: "g", channel: { type: "s2s", service: target ?? "?", port: o.name }, component: UNPLACED };
+      // Executor 0.9.5 reports what feeds the RPG port: the exit is that component (its first relationship, if any).
+      const from = o.sources?.[0];
+      return { id: `s2s-${i + 1}`, step: "g", channel: { type: "s2s", service: target ?? "?", port: o.name }, component: from?.id ?? UNPLACED, ...(from?.relationships[0] ? { relationship: from.relationships[0] } : {}) };
     });
     segments.push({
       id, name: u.group.name, match: [], steps: [{ id: "g", name: u.group.name, position: { kind: "process-group", id: u.group.id, name: u.group.name } }],

@@ -359,3 +359,12 @@ test("engine test 2026-11-22: both services already have models; a new S2S hand-
   const wrong = { ...d, segments: d.segments.map((x) => ({ ...x, exits: x.exits.map((e) => ({ ...e, channel: { ...e.channel, port: "orderz" } })) })) };
   assert.match(dangles(runModel(store, "n112", wrong, NOW)), /orderz/);
 });
+
+test("engine test 2026-11-22: executor 0.9.5 names what feeds an RPG port, and the draft's S2S exit is that component", () => {
+  const { store } = crossing(() => 10);
+  const ref = "https://localhost:18445/nifi#orders";
+  store.putTopology("n112", "2026-11-19T12:00:00Z", "a2", topo("r1", [{ id: "S", name: "Send", root: false, fragments: [frag("s", { s2sOut: [ref] })] }], { s2sOut: [{ ref, name: "orders", targets: ["https://localhost:18445/nifi"], group: "S", fragment: "s", sources: [{ id: "p-send", name: "Send orders", kind: "processor", relationships: ["success"] }] }] }));
+  const exit = draftFromSkeleton(store, "n112", NOW).segments[0]!.exits[0]!;
+  assert.deepEqual([exit.component, exit.relationship, exit.channel.port], ["p-send", "success", "orders"]);
+  assert.equal(runModel(store, "n112", draftFromSkeleton(store, "n112", NOW), NOW).checks.find((c) => c.check === "no-dangling")!.ok, true);
+});

@@ -31,7 +31,8 @@ export interface Topology {
   /** Root-level connections between units. */
   links: { connection: string; from: TopologyEnd; to: TopologyEnd }[];
   s2sIn: { id: string; name: string; group: string; fragment: string | null }[];
-  s2sOut: { ref: string; name: string; targets: string[]; group: string; fragment: string | null }[];
+  /** sources (service executor 0.9.5 on): the components whose connections lead into the RPG port. */
+  s2sOut: { ref: string; name: string; targets: string[]; group: string; fragment: string | null; sources?: { id: string; name: string; kind: string; relationships: string[] }[] }[];
   /** Step 3b (executors from ops step 3b on; older ones leave it out): a group deeper than root's children -> its unit (group under root, or root's id). */
   nested?: Record<string, string>;
   /** Step 3b: in a unit of several fragments, a processor's id -> its fragment key. */
