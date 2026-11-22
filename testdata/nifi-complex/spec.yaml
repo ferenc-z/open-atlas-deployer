@@ -1,0 +1,1207 @@
+# 复杂流程实验（2026-11-22）：lab 四个 NiFi 上的"模拟生产"业务，用来测 Deployer 的业务发现引擎。
+# 设计说明：知识库 designs/open-atlas-deployer-service-ops/complex-lab-flows.md。build.py 按本文件搭建。
+#
+# 写法
+#   groups: 每个实例 root 下的 cx- 组（instance 为 lab 实例名）；sub: 嵌套子组（同样写法，可多层）。
+#   paths:  一行一条链，节点用 " > " 隔开。节点 "K:名字" 是新建（K 见下），只写 "名字" 是引用本组已有的节点，
+#           "子组名/端口名" 引用子组的端口，"名字[rel1,rel2]" 指定这一跳从该节点出去的关系（默认关系见 build.py KINDS）。
+#           K：G GenerateFlowFile、U UpdateAttribute、R RouteOnAttribute、RC RouteOnContent、T ReplaceText、J EvaluateJsonPath、
+#           S SplitText、SJ SplitJson、M MergeContent、L LogAttribute、LM LogMessage、A AttributesToJSON、C ConvertRecord(CSV→JSON)、
+#           F PutFile、GF GetFile、LF ListFile、FF FetchFile、LH ListenHTTP、IH InvokeHTTP、CR ControlRate、Z CompressContent、
+#           H 内容哈希、D DuplicateFlowFile、MT IdentifyMimeType、RF RetryFlowFile（1.11+）、
+#           in 输入端口、out 输出端口、rin 远程输入端口（S2S 接收）、fn 漏斗、rpg 远程输入端口"实例#端口"（S2S 发送）。
+#   props:  按处理器名给属性。通用键 period（调度周期）、state: stopped（不启动）；G 的 text（内容，支持 EL）；
+#           U/R/J 的其余键是动态属性（属性 / 路由 / JSON 路径）；T 的 text（整段替换）；F/GF/LF 的 dir（相对 dirs.out / dirs.mq）；
+#           LH 的 port、path；IH 的 url；M 的 entries、age；RF 的 retries；其余键按 NiFi 属性名或显示名原样设置。
+#           组级 start: false = 搭好但不启动。
+#   每个 F 前自动插一个 U "Set file name (<F 名>)"，文件名按分钟轮换（每个出口目录最多 60 个文件）。
+#   没连出去的关系一律自动终止。c250 上的 G/GF/LF 只在主节点跑。
+#   links:  root 画布上组与组之间的连线 "组.端口 > 组.端口"；"(root).端口" 指 root 画布上的端口（1.9.2 的 S2S 接收端口只能在 root）。
+#
+# answer: 正确答案（业务、各段、入口出口、跨实例交接、公共环节、陷阱的正确判法）。
+
+dirs:
+  out: ~/nifi-lab/cx/out      # 出口（各实例一个子目录）
+  mq: ~/nifi-lab/cx/mq        # 模拟 MQ / 共享目录交接（GetFile 取走即删）
+
+instances:
+  n112: {api: "https://localhost:18443/nifi-api", s2s: "https://localhost:18443/nifi", dn: ["CN=n112.lab, OU=NIFI"], role: "上海边缘网关（订单、发票、报关中转、发货通知）"}
+  n192: {api: "https://localhost:18447/nifi-api", s2s: "https://localhost:18447/nifi", dn: ["CN=n192.lab, OU=NIFI"], role: "老报关网关 1.9.2（报关回执、报关申报、关税表）"}
+  n200: {api: "https://localhost:18444/nifi-api", s2s: "https://localhost:18444/nifi", dn: ["CN=n200.lab, OU=NIFI"], role: "合作方枢纽（库存回传、对账、退货、订单确认）"}
+  c250: {api: "https://localhost:18445/nifi-api", s2s: "https://localhost:18445/nifi", dn: ["CN=node1.lab, OU=NIFI", "CN=node2.lab, OU=NIFI"], cluster: true, role: "核心集成集群（ERP 过账、主数据、审计、死信）"}
+
+groups:
+# ============================== n112 ==============================
+- name: cx-order-intake
+  instance: n112
+  paths:
+    - "G:Receive orders (SFTP) > U:Tag SFTP orders > fn:Collect orders"
+    - "G:Receive orders (EDI VAN) > U:Tag EDI orders > Collect orders"
+    - "LH:Receive orders (B2B API) > U:Tag API orders > Collect orders"
+    - "Collect orders > MT:Detect order format > Normalize/in"
+    - "Normalize/out > U:Stamp order received > out:to-validate"
+    - "Normalize/bad > out:errors"
+  props:
+    Receive orders (SFTP): {period: "40 sec", text: '{"order_id":"SO${random():mod(900000):plus(100000)}","customer":"C${random():mod(500)}","type":"${random():mod(3):equals(0):ifElse(''export'',''domestic'')}","lines":[{"sku":"A1","qty":2},{"sku":"B7","qty":1}]}'}
+    Receive orders (EDI VAN): {period: "75 sec", text: '{"order_id":"EO${random():mod(900000)}","customer":"C${random():mod(500)}","type":"export","lines":[{"sku":"Z9","qty":5}]}'}
+    Receive orders (B2B API): {port: 19081, path: orders}
+    Tag SFTP orders: {order.channel: sftp, biz.type: order}
+    Tag EDI orders: {order.channel: edi, biz.type: order}
+    Tag API orders: {order.channel: api, biz.type: order}
+    Stamp order received: {order.received_at: "${now():format('yyyy-MM-dd HH:mm:ss')}", correlation_id: "${UUID()}"}
+  sub:
+    - name: Normalize
+      paths:
+        - "in:in > J:Extract order header > R:Order complete?[complete] > EDI mapping/in"
+        - "Extract order header[unmatched,failure] > out:bad"
+        - "Order complete?[unmatched] > U:Mark incomplete order > bad"
+        - "EDI mapping/out > U:Set order defaults > out:out"
+      props:
+        Extract order header: {order.id: "$.order_id", order.customer: "$.customer", order.type: "$.type"}
+        Order complete?: {complete: "${order.id:isEmpty():not():and(${order.customer:isEmpty():not()})}"}
+        Mark incomplete order: {error.reason: incomplete-order}
+        Set order defaults: {order.currency: CNY, order.priority: "${order.type:equals('export'):ifElse('high','normal')}"}
+      sub:
+        - name: EDI mapping
+          paths:
+            - "in:in > R:Mapping needed?[orders] > T:Map EDI ORDERS to JSON > fn:Mapped > out:out"
+            - "Mapping needed?[unmatched] > Mapped"
+          props:
+            Mapping needed?: {orders: "${order.channel:equals('edi')}"}
+            Map EDI ORDERS to JSON: {text: '{"order_id":"${order.id}","customer":"${order.customer}","type":"${order.type}","mapped":"edi"}'}
+
+- name: cx-invoice-mail
+  instance: n112
+  paths:
+    - "G:Fetch invoice mails (IMAP) > U:Stamp trace id > U:mail_attachment_reader > S:Split attachments > MT:Detect attachment type > H:Fingerprint attachment > R:Attachment type?[pdf] > U:Tag PDF invoice > out:to-validate"
+    - "Fingerprint attachment[failure] > errors"
+    - "Attachment type?[xml] > U:Tag XML invoice > to-validate"
+    - "Attachment type?[unmatched] > U:Mark unsupported attachment > out:errors"
+    - "Split attachments[failure] > errors"
+  props:
+    Fetch invoice mails (IMAP): {period: "60 sec", text: "invoice-${random():mod(9999)}.pdf\nremittance-${random():mod(9999)}.xml\nlogo.png"}
+    Stamp trace id: {correlation_id: "${UUID()}", schedule_name: invoice_mail_parse, biz.type: invoice}
+    mail_attachment_reader: {e2e.worker: mail_attachment_reader}
+    Split attachments: {Line Split Count: 1}
+    Attachment type?: {pdf: "${filename:isEmpty():not():and(${random():mod(3):equals(0)})}", xml: "${random():mod(3):equals(1)}"}
+    Tag PDF invoice: {invoice.format: pdf}
+    Tag XML invoice: {invoice.format: xml}
+    Mark unsupported attachment: {error.reason: unsupported-attachment}
+
+- name: cx-customs-inbound
+  instance: n112
+  paths:
+    - "rin:cx-customs-in > U:Tag customs receipts > out:to-validate"
+  props:
+    Tag customs receipts: {biz.type: customs, customs.via: n192}
+
+- name: cx-common-validate
+  instance: n112
+  shared: true
+  paths:
+    - "in:in > U:Stamp gateway receipt > H:Fingerprint payload > R:Schema check (simulated)[valid] > R:Dispatch by business type[order] > out:orders"
+    - "Dispatch by business type[invoice] > out:invoices"
+    - "Dispatch by business type[customs] > out:customs"
+    - "Dispatch by business type[unmatched] > U:Mark unknown business > out:rejects"
+    - "Schema check (simulated)[unmatched] > U:Mark schema violation > rejects"
+    - "Fingerprint payload[failure] > rejects"
+  props:
+    Stamp gateway receipt: {gateway.node: n112, gateway.at: "${now():toNumber()}"}
+    Schema check (simulated): {valid: "${random():mod(20):gt(0)}"}
+    Dispatch by business type: {order: "${biz.type:equals('order')}", invoice: "${biz.type:equals('invoice')}", customs: "${biz.type:equals('customs')}"}
+    Mark unknown business: {error.reason: unknown-business}
+    Mark schema violation: {error.reason: schema-violation}
+
+- name: cx-order-route
+  instance: n112
+  paths:
+    - "in:in > U:Prepare order routing > Enrich customer/in"
+    - "Enrich customer/out > R:Order type?[domestic] > M:Batch orders for ERP > U:Name ERP batch > rpg:c250#cx-orders-in"
+    - "Order type?[export] > D:Copy export order > Batch orders for ERP"
+    - "Copy export order > F:Copy export orders for customs broker"
+    - "Order type?[unmatched] > out:errors"
+    - "Batch orders for ERP[failure] > errors"
+    - "Name ERP batch > A:Audit order batch > out:audit"
+  props:
+    Prepare order routing: {route.at: "${now():toNumber()}"}
+    Order type?: {domestic: "${order.type:equals('domestic')}", export: "${order.type:equals('export')}"}
+    Batch orders for ERP: {entries: 5, age: "90 sec", Delimiter Strategy: Text, Demarcator: "\n"}
+    Name ERP batch: {erp.batch: "ORD-${now():format('yyyyMMddHHmm')}", biz.type: order}
+    Copy export order: {Number of Copies: 1}
+    Copy export orders for customs broker: {dir: broker-orders}
+  sub:
+    - name: Enrich customer
+      paths:
+        - "in:in > U:Look up customer (cache) > R:Customer known?[known] > Credit check/in"
+        - "Customer known?[unmatched] > U:Default customer terms > Credit check/in"
+        - "Credit check/out > out:out"
+      props:
+        Look up customer (cache): {customer.segment: "${random():mod(3)}"}
+        Customer known?: {known: "${random():mod(10):gt(0)}"}
+        Default customer terms: {customer.terms: NET30}
+      sub:
+        - name: Credit check
+          paths:
+            - "in:in > U:Read credit limit > R:Within credit limit?[ok] > out:out"
+            - "Within credit limit?[unmatched] > U:Flag credit hold > out"
+          props:
+            Read credit limit: {credit.limit: "${random():mod(100000)}"}
+            Within credit limit?: {ok: "${credit.limit:toNumber():gt(5000)}"}
+            Flag credit hold: {order.hold: credit}
+
+- name: cx-invoice-extract
+  instance: n112
+  paths:
+    - "in:in > U:invoice_pdf_extractor > T:Render invoice JSON > J:Read invoice totals > R:Amount plausible?[ok] > rpg:c250#cx-invoice-in"
+    - "Read invoice totals[unmatched,failure] > out:errors"
+    - "Amount plausible?[unmatched] > U:Hold for manual check > errors"
+    - "invoice_pdf_extractor > A:Audit invoice extract > out:audit"
+  props:
+    invoice_pdf_extractor: {e2e.worker: invoice_pdf_extractor}
+    Render invoice JSON: {text: '{"invoice_no":"INV${random():mod(99999)}","amount":${random():mod(50000)},"currency":"CNY"}'}
+    Read invoice totals: {invoice.no: "$.invoice_no", invoice.amount: "$.amount"}
+    Amount plausible?: {ok: "${invoice.amount:toNumber():lt(49000)}"}
+    Hold for manual check: {error.reason: invoice-amount}
+
+- name: cx-customs-forward
+  instance: n112
+  paths:
+    - "in:in > U:customs_status_mapper > RC:Receipt accepted?[accepted] > U:Mark accepted receipt > fn:To core > rpg:c250#cx-customs-in"
+    - "Receipt accepted?[unmatched] > U:Mark rejected receipt > To core"
+    - "customs_status_mapper > L:Log customs receipt"
+  props:
+    customs_status_mapper: {e2e.worker: customs_status_mapper}
+    Receipt accepted?: {accepted: "(?s).*ACK.*"}
+    Mark accepted receipt: {customs.status: accepted}
+    Mark rejected receipt: {customs.status: rejected}
+    Log customs receipt: {Log Level: debug}
+
+- name: cx-asn-deliver
+  instance: n112
+  paths:
+    - "LF:Consume ASN queue (MQ) > FF:Fetch ASN message > U:Look up customer channel > T:Map ASN to EDI DESADV > H:Checksum DESADV > R:Customer channel?[as2] > F:Send ASN to customer (AS2)"
+    - "Customer channel?[mail] > F:Send ASN by mail (outbox)"
+    - "Customer channel?[unmatched] > out:errors"
+    - "Fetch ASN message[failure,not.found,permission.denied] > errors"
+    - "Map ASN to EDI DESADV > A:Audit ASN > out:audit"
+  props:
+    Consume ASN queue (MQ): {dir: asn, period: "15 sec", Minimum File Age: "5 sec"}
+    Fetch ASN message: {Completion Strategy: Delete File}
+    Look up customer channel: {asn.partner: "${random():mod(50)}"}
+    Map ASN to EDI DESADV: {text: "UNH+1+DESADV:D:96A:UN'BGM+351+${filename}'"}
+    Customer channel?: {as2: "${random():mod(2):equals(0)}", mail: "${random():mod(2):equals(1)}"}
+    Send ASN to customer (AS2): {dir: asn-as2}
+    Send ASN by mail (outbox): {dir: asn-mail}
+
+- name: cx-wms-bridge
+  instance: n112
+  paths:
+    - "G:Poll WMS stock deltas (DB) > T:Render stock delta CSV > U:Stamp stock batch > IH:Push stock updates to partner hub (HTTP)[Response] > L:Log hub answer"
+    - "Push stock updates to partner hub (HTTP)[Retry,Failure,No Retry] > U:Count push retries > R:Retry push?[retry] > Push stock updates to partner hub (HTTP)"
+    - "Retry push?[unmatched] > out:errors"
+  props:
+    Poll WMS stock deltas (DB): {period: "50 sec", text: "x"}
+    Render stock delta CSV: {text: "sku,warehouse,qty\nA1,SH01,${random():mod(100)}\nB7,SH01,${random():mod(100)}\nZ9,SH02,${random():mod(100)}"}
+    Stamp stock batch: {stock.batch: "WMS-${now():format('HHmmss')}", mime.type: text/csv}
+    Push stock updates to partner hub (HTTP): {url: "http://127.0.0.1:19090/stock", HTTP Method: POST}
+    Count push retries: {retry.count: "${retry.count:replaceNull(0):plus(1)}"}
+    Retry push?: {retry: "${retry.count:lt(3)}"}
+    Log hub answer: {Log Level: debug}
+
+- name: cx-mdm-apply
+  instance: n112
+  paths:
+    - "rin:cx-mdm-n112 > J:Read MDM entity > R:Entity type?[product] > U:Map product master > F:Apply product master (local cache)"
+    - "Entity type?[customer] > U:Map customer master > F:Apply customer master (local cache)"
+    - "Entity type?[unmatched] > out:errors"
+    - "Read MDM entity[unmatched,failure] > errors"
+  props:
+    Read MDM entity: {mdm.entity: "$.entity", mdm.key: "$.key"}
+    Entity type?: {product: "${mdm.entity:equals('product')}", customer: "${mdm.entity:equals('customer')}"}
+    Map product master: {mdm.target: product-cache}
+    Map customer master: {mdm.target: customer-cache}
+    Apply product master (local cache): {dir: mdm-product}
+    Apply customer master (local cache): {dir: mdm-customer}
+
+- name: cx-common-errors
+  instance: n112
+  shared: true
+  paths:
+    - "in:in > U:Classify error > R:Retryable?[transient] > U:Count error retries > R:Retry budget left?[retry] > CR:Throttle error replays > L:Log transient error"
+    - "Retry budget left?[unmatched] > Serialize error context"
+    - "Retryable?[unmatched] > A:Serialize error context > U:Tag dead letter > rpg:c250#cx-dlq-in"
+    - "Serialize error context > F:Write local error log"
+  props:
+    Classify error: {error.node: n112, error.class: "${error.reason:replaceNull('unknown')}"}
+    Retryable?: {transient: "${error.class:equals('unknown')}"}
+    Count error retries: {error.retries: "${error.retries:replaceNull(0):plus(1)}"}
+    Retry budget left?: {retry: "${error.retries:lt(3)}"}
+    Throttle error replays: {Rate Control Criteria: flowfile count, Maximum Rate: 10, Time Duration: "1 min"}
+    Log transient error: {Log Level: debug}
+    Tag dead letter: {dlq.from: n112}
+    Write local error log: {dir: errors}
+
+- name: cx-common-audit
+  instance: n112
+  shared: true
+  paths:
+    - "in:in > U:Stamp audit source > M:Batch audit records > Z:Compress audit batch > F:Write audit trail"
+  props:
+    Stamp audit source: {audit.node: n112}
+    Batch audit records: {entries: 10, age: "2 min"}
+    Write audit trail: {dir: audit}
+
+- name: cx-order-intake-replay
+  instance: n112
+  trap: "名字像 cx-order-intake，是人工重放工具，目录平时是空的（运行中但无流量）"
+  paths:
+    - "GF:Pick up replay files (manual) > U:Tag replay > L:Log replayed order"
+  props:
+    Pick up replay files (manual): {dir: order-replay, period: "60 sec"}
+    Tag replay: {order.replay: "true"}
+    Log replayed order: {Log Level: debug}
+
+# ============================== n192 (1.9.2) ==============================
+- name: (root)
+  instance: n192
+  paths:
+    - "rin:cx-declare-in"
+    - "rin:cx-mdm-n192"
+
+- name: cx-customs-receipt
+  instance: n192
+  paths:
+    - "G:Receive customs receipts (EDI) > U:Stamp receipt trace id > U:customs_receipt_reader > S:Split receipt lines > Validate receipt syntax/in"
+    - "Validate receipt syntax/ok > RC:Receipt line type?[receipt] > U:Tag receipt line > out:to-validate"
+    - "Receipt line type?[unmatched] > LM:Note ignored receipt line"
+    - "Split receipt lines[failure] > out:errors"
+    - "Receive customs receipts (EDI) > Archive raw receipt/in"
+  props:
+    Receive customs receipts (EDI): {period: "45 sec", text: "UNB+UNOC:3+CUSTOMS+SHGW'\nRCPT+DEC${random():mod(99999)}+${random():mod(4):equals(0):ifElse('REJ','ACK')}'\nUNZ+1'"}
+    Stamp receipt trace id: {correlation_id: "${UUID()}", schedule_name: customs_receipt, biz.type: customs-receipt}
+    customs_receipt_reader: {e2e.worker: customs_receipt_reader}
+    Split receipt lines: {Line Split Count: 1}
+    Receipt line type?: {receipt: "^RCPT.*"}
+    Tag receipt line: {customs.decl: "${random():mod(99999)}"}
+    Note ignored receipt line: {log-message: "ignored line ${filename}", log-level: debug}
+  sub:
+    - name: Validate receipt syntax
+      paths:
+        - "in:in > U:Count receipt segments > RC:Segment terminator present?[ok] > U:Mark syntax ok > out:ok"
+        - "Segment terminator present?[unmatched] > U:Mark syntax warning > ok"
+      props:
+        Count receipt segments: {edi.segments: "${random():mod(5):plus(1)}"}
+        Segment terminator present?: {ok: "(?s).*'.*"}
+        Mark syntax ok: {edi.syntax: ok}
+        Mark syntax warning: {edi.syntax: warning}
+    - name: Archive raw receipt
+      paths:
+        - "in:in > Z:Compress raw receipt > U:Name raw receipt > F:Archive raw receipt (legacy NAS)"
+      props:
+        Name raw receipt: {archive.kind: customs-receipt}
+        Archive raw receipt (legacy NAS): {dir: receipt-archive}
+
+- name: cx-customs-receipt-send
+  instance: n192
+  paths:
+    - "in:in > U:Prepare receipt for edge > M:Bundle receipts > U:Set bundle id > H:Sign receipt bundle (hash) > rpg:n112#cx-customs-in"
+    - "Sign receipt bundle (hash)[failure] > errors"
+    - "Bundle receipts[failure] > out:errors"
+  props:
+    Prepare receipt for edge: {customs.route: edge-sh}
+    Bundle receipts: {entries: 3, age: "60 sec"}
+    Set bundle id: {bundle.id: "${UUID()}", biz.type: customs}
+
+- name: cx-customs-declare-edi
+  instance: n192
+  paths:
+    - "in:in > U:Tag declaration > J:Read declaration > CUSDEC segments/in"
+    - "CUSDEC segments/out > T:Map to customs EDI CUSDEC > U:Stamp declaration id > out:to-validate"
+    - "Read declaration[unmatched,failure] > out:errors"
+  props:
+    Tag declaration: {biz.type: customs-declaration}
+    Read declaration: {decl.shipment: "$.shipment", decl.country: "$.country"}
+    Map to customs EDI CUSDEC: {text: "UNH+1+CUSDEC:D:96B:UN'BGM+929+${decl.shipment}'LOC+${decl.country}'"}
+    Stamp declaration id: {decl.id: "DEC${random():mod(99999)}"}
+  sub:
+    - name: CUSDEC segments
+      paths:
+        - "in:in > U:Build BGM segment > U:Build LOC segment > U:Build GIS segment > R:Licence needed?[licence] > U:Attach export licence > fn:Segments done > out:out"
+        - "Licence needed?[unmatched] > Segments done"
+      props:
+        Build BGM segment: {edi.bgm: "929"}
+        Build LOC segment: {edi.loc: "${decl.country}"}
+        Build GIS segment: {edi.gis: "23"}
+        Licence needed?: {licence: "${decl.country:equals('US')}"}
+        Attach export licence: {edi.licence: "EL${random():mod(9999)}"}
+
+- name: cx-customs-declare-send
+  instance: n192
+  paths:
+    - "in:in > R:Declaration channel?[edi] > F:Send declaration to customs (EDI outbox) "
+    - "Declaration channel?[edi] > U:Build declaration ack > T:Render declaration ack > rpg:c250#cx-declare-ack"
+    - "Build declaration ack > out:audit"
+    - "Declaration channel?[unmatched] > out:errors"
+  props:
+    Declaration channel?: {edi: "${random():mod(10):lt(9)}"}
+    Send declaration to customs (EDI outbox): {dir: customs-outbox}
+    Build declaration ack: {decl.status: submitted}
+    Render declaration ack: {text: '{"decl_id":"${decl.id}","status":"submitted"}'}
+
+- name: cx-tariff-sync
+  instance: n192
+  paths:
+    - "G:Download tariff tables (customs portal) > T:Render tariff CSV > U:Load previous tariff version > R:Tariff changed?[changed] > C:Convert tariff CSV to JSON > U:Tag tariff table > out:to-validate"
+    - "Tariff changed?[unmatched] > LM:Note unchanged tariff"
+    - "Convert tariff CSV to JSON[failure] > out:errors"
+  props:
+    Download tariff tables (customs portal): {period: "90 sec", text: "x"}
+    Render tariff CSV: {text: "hs_code,rate,country\n8471300000,0.0,CN\n6403990000,0.1,CN\n9403600000,0.05,DE"}
+    Tag tariff table: {biz.type: tariff}
+    Load previous tariff version: {tariff.prev: "${now():format('yyyyMMdd')}"}
+    Tariff changed?: {changed: "${random():mod(4):gt(0)}"}
+    Note unchanged tariff: {log-message: "tariff unchanged", log-level: debug}
+
+- name: cx-tariff-publish
+  instance: n192
+  paths:
+    - "in:in > SJ:Split tariff rows > U:Key tariff row > M:Collect tariff rows > F:Publish tariff table (customs share)"
+    - "Split tariff rows[failure] > out:errors"
+  props:
+    Split tariff rows: {JsonPath Expression: "$.*"}
+    Key tariff row: {tariff.version: "${now():format('yyyyMMdd')}"}
+    Collect tariff rows: {entries: 3, age: "60 sec"}
+    Publish tariff table (customs share): {dir: tariff}
+
+- name: cx-mdm-apply
+  instance: n192
+  paths:
+    - "in:in > J:Read MDM entity > R:Relevant for customs?[product] > U:Map HS master data > U:Convert to legacy code page > T:Render legacy DB record > F:Apply HS master data (legacy DB)"
+    - "Relevant for customs?[unmatched] > LM:Skip non-customs master data"
+    - "Read MDM entity[unmatched,failure] > out:errors"
+  props:
+    Read MDM entity: {mdm.entity: "$.entity", mdm.key: "$.key"}
+    Relevant for customs?: {product: "${mdm.entity:equals('product')}"}
+    Map HS master data: {mdm.target: hs-master}
+    Convert to legacy code page: {legacy.codepage: GBK}
+    Render legacy DB record: {text: "HS|${mdm.key}|${mdm.entity}"}
+    Skip non-customs master data: {log-message: "skip ${mdm.entity}", log-level: debug}
+    Apply HS master data (legacy DB): {dir: mdm-hs}
+
+- name: cx-common-legacy-validate
+  instance: n192
+  shared: true
+  paths:
+    - "in:in > U:Stamp legacy gateway > U:Detect legacy charset > RC:GBK content?[gbk] > T:Transcode GBK to UTF-8 > fn:Charset ok > R:Legacy schema check (simulated)[valid] > R:Dispatch legacy business[receipt] > out:receipts"
+    - "GBK content?[unmatched] > Charset ok"
+    - "Dispatch legacy business[declaration] > out:declarations"
+    - "Dispatch legacy business[tariff] > out:tariffs"
+    - "Dispatch legacy business[unmatched] > out:rejects"
+    - "Legacy schema check (simulated)[unmatched] > U:Mark legacy schema violation > rejects"
+  props:
+    Stamp legacy gateway: {gateway.node: n192}
+    Detect legacy charset: {legacy.charset: "${random():mod(5):equals(0):ifElse('GBK','UTF-8')}"}
+    GBK content?: {gbk: "(?s)^NEVER-MATCHES$"}
+    Transcode GBK to UTF-8: {text: "${legacy.charset}"}
+    Legacy schema check (simulated): {valid: "${random():mod(25):gt(0)}"}
+    Dispatch legacy business: {receipt: "${biz.type:equals('customs-receipt')}", declaration: "${biz.type:equals('customs-declaration')}", tariff: "${biz.type:equals('tariff')}"}
+    Mark legacy schema violation: {error.reason: schema-violation}
+
+- name: cx-common-legacy-errors
+  instance: n192
+  shared: true
+  paths:
+    - "in:in > U:Classify legacy error > R:Legacy retryable?[transient] > U:Count legacy retries > R:Legacy retry budget left?[retry] > LM:Log legacy transient error"
+    - "Legacy retry budget left?[unmatched] > Serialize legacy error"
+    - "Legacy retryable?[unmatched] > A:Serialize legacy error > U:Tag legacy dead letter > rpg:c250#cx-dlq-in"
+    - "Serialize legacy error > F:Write legacy error log"
+  props:
+    Classify legacy error: {error.node: n192, error.class: "${error.reason:replaceNull('unknown')}"}
+    Legacy retryable?: {transient: "${error.class:equals('unknown')}"}
+    Count legacy retries: {error.retries: "${error.retries:replaceNull(0):plus(1)}"}
+    Legacy retry budget left?: {retry: "${error.retries:lt(3)}"}
+    Log legacy transient error: {log-message: "transient ${error.class}", log-level: debug}
+    Tag legacy dead letter: {dlq.from: n192}
+    Write legacy error log: {dir: errors}
+
+- name: cx-tariff-sync-old
+  instance: n192
+  trap: "旧版关税同步，组件都停着（从没跑过），名字像 cx-tariff-sync"
+  start: false
+  paths:
+    - "G:Download tariff tables (old portal) > U:Tag old tariff > F:Publish tariff table (old share)"
+  props:
+    Download tariff tables (old portal): {period: "1 day"}
+    Tag old tariff: {tariff.source: old-portal}
+    Publish tariff table (old share): {dir: tariff-old}
+
+# ============================== n200 (2.0.0) ==============================
+- name: cx-partner-gateway
+  instance: n200
+  paths:
+    - "G:Receive partner orders (portal) > J:Read partner order > R:Partner allowed?[ok] > U:Map partner order > IH:Forward partner orders to edge (HTTP)[Response] > L:Log edge answer"
+    - "Partner allowed?[unmatched] > U:Reject unknown partner > errors"
+    - "Forward partner orders to edge (HTTP)[Retry,Failure,No Retry] > RF:Retry forward to edge[retry] > Forward partner orders to edge (HTTP)"
+    - "Retry forward to edge[retries_exceeded,failure] > out:errors"
+    - "Read partner order[unmatched,failure] > errors"
+  props:
+    Receive partner orders (portal): {period: "70 sec", text: '{"order_id":"PO${random():mod(900000)}","customer":"P${random():mod(50)}","type":"domestic","lines":[{"sku":"A1","qty":1}]}'}
+    Read partner order: {partner.order: "$.order_id", partner.id: "$.customer"}
+    Partner allowed?: {ok: "${partner.id:startsWith('P')}"}
+    Reject unknown partner: {error.reason: unknown-partner}
+    Map partner order: {order.channel: partner-portal, mime.type: application/json}
+    Forward partner orders to edge (HTTP): {url: "http://127.0.0.1:19081/orders", HTTP Method: POST}
+    Retry forward to edge: {retries: 3}
+    Log edge answer: {Log Level: debug}
+
+- name: cx-stock-feedback
+  instance: n200
+  paths:
+    - "LH:Receive stock updates (WMS API) > U:Tag WMS stock > CR:Throttle WMS bursts > fn:Stock in"
+    - "G:Poll 3PL stock snapshot (SFTP) > T:Render 3PL snapshot CSV > U:Tag 3PL stock > LM:Log 3PL snapshot > Stock in"
+    - "Stock in > C:Convert stock CSV to JSON > SJ:Split stock records > J:Read stock record > U:Normalize warehouse codes > R:Stock record valid?[valid] > M:Batch stock for ERP > rpg:c250#cx-stock-in"
+    - "Stock record valid?[unmatched] > out:errors"
+    - "Convert stock CSV to JSON[failure] > errors"
+    - "Read stock record[unmatched,failure] > errors"
+    - "Batch stock for ERP > A:Audit stock batch > out:audit"
+  props:
+    Receive stock updates (WMS API): {port: 19090, path: stock}
+    Tag WMS stock: {stock.source: wms}
+    Poll 3PL stock snapshot (SFTP): {period: "80 sec", text: "x"}
+    Render 3PL snapshot CSV: {text: "sku,warehouse,qty\nC3,3PL-SZ,${random():mod(500)}\nD4,3PL-SZ,${random():mod(500)}"}
+    Tag 3PL stock: {stock.source: 3pl}
+    Throttle WMS bursts: {Rate Control Criteria: flowfile count, Maximum Rate: 20, Time Duration: "1 min"}
+    Log 3PL snapshot: {log-message: "3PL snapshot ${filename}", log-level: debug}
+    Normalize warehouse codes: {stock.warehouse: "${stock.source:toUpper()}"}
+    Split stock records: {JsonPath Expression: "$.*"}
+    Read stock record: {stock.sku: "$.sku", stock.qty: "$.qty"}
+    Stock record valid?: {valid: "${stock.sku:isEmpty():not()}"}
+    Batch stock for ERP: {entries: 6, age: "90 sec", Delimiter Strategy: Text, Header: "[", Footer: "]", Demarcator: ","}
+
+- name: cx-order-confirm
+  instance: n200
+  paths:
+    - "rin:cx-order-confirm-in > U:Prepare confirmation > U:Look up partner channel > T:Render order confirmation > H:Checksum confirmation > R:Confirmation channel?[as2] > F:Send confirmation to partner (AS2)"
+    - "Confirmation channel?[mail] > F:Send confirmation by mail (outbox)"
+    - "Confirmation channel?[unmatched] > out:errors"
+    - "Render order confirmation > A:Audit confirmation > out:audit"
+  props:
+    Prepare confirmation: {confirm.at: "${now():toNumber()}"}
+    Look up partner channel: {confirm.partner: "P${random():mod(50)}"}
+    Render order confirmation: {text: '{"batch":"${erp.batch}","status":"confirmed"}'}
+    Confirmation channel?: {as2: "${random():mod(3):lt(2)}", mail: "${random():mod(3):equals(2)}"}
+    Send confirmation to partner (AS2): {dir: confirm-as2}
+    Send confirmation by mail (outbox): {dir: confirm-mail}
+
+- name: cx-recon
+  instance: n200
+  note: "两片：A 收银行流水写暂存目录，B 从暂存目录和账务队列取数配对；两片经目录交接，是一件事"
+  paths:
+    - "G:Receive bank statements (SWIFT MT940) > U:Tag bank statement > T:Normalize MT940 > F:Stage statements for matching"
+    - "GF:Consume ledger queue (MQ) > U:Tag ledger extract > fn:Recon input"
+    - "GF:Load staged statements > Recon input"
+    - "Recon input > U:Tag recon run > M:Pair statements with ledger > H:Fingerprint recon pair > U:Match entries (simulated) > R:Reconciled?[matched] > U:Build recon result > rpg:c250#cx-recon-result"
+    - "Reconciled?[unmatched] > U:Mark open items > LM:Report open items > out:errors"
+    - "Fingerprint recon pair[failure] > errors"
+    - "Pair statements with ledger[failure] > errors"
+  props:
+    Receive bank statements (SWIFT MT940): {period: "60 sec", text: ":20:STMT${random():mod(9999)}\n:25:CN0012345\n:61:2611220C${random():mod(9999)},00NTRF"}
+    Tag bank statement: {recon.part: statement}
+    Normalize MT940: {text: "statement;${filename};${random():mod(9999)}"}
+    Stage statements for matching: {dir: "../../mq/recon-staging"}
+    Consume ledger queue (MQ): {dir: ledger, period: "20 sec"}
+    Tag ledger extract: {recon.part: ledger}
+    Load staged statements: {dir: recon-staging, period: "20 sec"}
+    Pair statements with ledger: {entries: 2, age: "2 min"}
+    Match entries (simulated): {recon.score: "${random():mod(100)}"}
+    Reconciled?: {matched: "${recon.score:toNumber():gt(10)}"}
+    Build recon result: {recon.result: matched}
+    Mark open items: {error.reason: recon-open-items}
+    Tag recon run: {recon.run: "${now():format('yyyyMMddHH')}"}
+    Report open items: {log-message: "open items ${recon.run}", log-level: debug}
+
+- name: cx-returns
+  instance: n200
+  paths:
+    - "G:Receive return requests (portal) > U:Tag portal return > fn:Returns in"
+    - "G:Receive return requests (call center) > U:Tag call center return > Returns in"
+    - "Returns in > J:Read return request > U:Look up original order > R:Within return window?[ok] > R:Return reason?[damaged]"
+    - "Within return window?[unmatched] > Manual review/in"
+    - "Return reason?[damaged] > U:Flag damaged goods > fn:Approved returns > rpg:c250#cx-returns-in"
+    - "Return reason?[wrong_item] > U:Flag wrong item > Approved returns"
+    - "Return reason?[unmatched] > Manual review/in"
+    - "Manual review/approved > Approved returns"
+    - "Manual review/rejected > out:errors"
+    - "Read return request[unmatched,failure] > errors"
+    - "Approved returns > A:Audit return > out:audit"
+  props:
+    Receive return requests (portal): {period: "55 sec", text: '{"rma":"RMA${random():mod(99999)}","reason":"${random():mod(3):equals(0):ifElse(''damaged'',''wrong_item'')}","order":"SO${random():mod(900000)}"}'}
+    Receive return requests (call center): {period: "95 sec", text: '{"rma":"CC${random():mod(99999)}","reason":"other","order":"SO${random():mod(900000)}"}'}
+    Tag portal return: {return.channel: portal}
+    Tag call center return: {return.channel: call-center}
+    Read return request: {return.rma: "$.rma", return.reason: "$.reason"}
+    Return reason?: {damaged: "${return.reason:equals('damaged')}", wrong_item: "${return.reason:equals('wrong_item')}"}
+    Flag damaged goods: {return.inspect: "true"}
+    Look up original order: {return.order_age_days: "${random():mod(40)}"}
+    Within return window?: {ok: "${return.order_age_days:toNumber():lt(30)}"}
+    Flag wrong item: {return.inspect: "false"}
+  sub:
+    - name: Manual review
+      paths:
+        - "in:in > U:Queue for agent review > R:Agent decision (simulated)[approve] > U:Mark approved by agent > out:approved"
+        - "Agent decision (simulated)[unmatched] > U:Mark rejected by agent > out:rejected"
+      props:
+        Queue for agent review: {review.queue: returns}
+        Agent decision (simulated): {approve: "${random():mod(4):gt(0)}"}
+        Mark approved by agent: {review.result: approved}
+        Mark rejected by agent: {review.result: rejected, error.reason: return-rejected}
+
+- name: cx-mdm-apply
+  instance: n200
+  paths:
+    - "rin:cx-mdm-n200 > LM:Log MDM delivery > J:Read MDM entity > U:Convert to hub schema > R:Entity for partners?[customer] > U:Map partner master > F:Apply partner master (hub DB)"
+    - "Entity for partners?[product] > U:Map catalog item > F:Apply catalog item (hub DB)"
+    - "Entity for partners?[unmatched] > out:errors"
+    - "Read MDM entity[unmatched,failure] > errors"
+  props:
+    Read MDM entity: {mdm.entity: "$.entity", mdm.key: "$.key"}
+    Entity for partners?: {customer: "${mdm.entity:equals('customer')}", product: "${mdm.entity:equals('product')}"}
+    Map partner master: {mdm.target: partner}
+    Log MDM delivery: {log-message: "MDM delivery", log-level: debug}
+    Convert to hub schema: {mdm.schema: hub-v2}
+    Map catalog item: {mdm.target: catalog}
+    Apply partner master (hub DB): {dir: mdm-partner}
+    Apply catalog item (hub DB): {dir: mdm-catalog}
+
+- name: cx-common-audit
+  instance: n200
+  shared: true
+  paths:
+    - "in:in > U:Stamp hub audit source > A:Serialize hub audit record > M:Batch hub audit records > Z:Compress hub audit batch > F:Write hub audit trail"
+  props:
+    Stamp hub audit source: {audit.node: n200}
+    Batch hub audit records: {entries: 10, age: "2 min"}
+    Write hub audit trail: {dir: audit}
+
+- name: cx-common-errors
+  instance: n200
+  shared: true
+  paths:
+    - "in:in > U:Classify hub error > R:Hub retryable?[transient] > U:Count hub retries > R:Hub retry budget left?[retry] > L:Log hub transient error"
+    - "Hub retry budget left?[unmatched] > Serialize hub error"
+    - "Hub retryable?[unmatched] > A:Serialize hub error > U:Tag hub dead letter > rpg:c250#cx-dlq-in"
+    - "Serialize hub error > F:Write hub error log"
+  props:
+    Classify hub error: {error.node: n200, error.class: "${error.reason:replaceNull('unknown')}"}
+    Hub retryable?: {transient: "${error.class:equals('unknown')}"}
+    Count hub retries: {error.retries: "${error.retries:replaceNull(0):plus(1)}"}
+    Hub retry budget left?: {retry: "${error.retries:lt(3)}"}
+    Log hub transient error: {Log Level: debug}
+    Tag hub dead letter: {dlq.from: n200}
+    Write hub error log: {dir: errors}
+
+- name: cx-invoice-post-test
+  instance: n200
+  trap: "名字像 c250 的 cx-invoice-post，是合作方枢纽本地的 QA 造数，和发票业务无关"
+  paths:
+    - "G:Generate test invoices (QA) > U:Mark as test data > L:Log test invoice"
+  props:
+    Generate test invoices (QA): {period: "120 sec", text: '{"invoice_no":"TEST${random():mod(999)}"}'}
+    Mark as test data: {test: "true"}
+    Log test invoice: {Log Level: debug}
+
+# ============================== c250 (2.5.0 cluster) ==============================
+- name: cx-erp-order-post
+  instance: c250
+  paths:
+    - "rin:cx-orders-in > U:Receive order batch > Map to IDoc/in"
+    - "Map to IDoc/out > R:Post to ERP (simulated)[ok] > U:Record ERP document no > rpg:n200#cx-order-confirm-in"
+    - "Post to ERP (simulated)[unmatched] > RF:Retry ERP post[retry] > Post to ERP (simulated)"
+    - "Retry ERP post[retries_exceeded,failure] > out:errors"
+    - "Record ERP document no > F:Write ERP order file"
+    - "Record ERP document no > out:audit"
+    - "Map to IDoc/bad > errors"
+  props:
+    Receive order batch: {erp.received: "${now():toNumber()}"}
+    Post to ERP (simulated): {ok: "${random():mod(5):gt(0)}"}
+    Retry ERP post: {retries: 3}
+    Record ERP document no: {erp.docno: "45${random():mod(99999999)}"}
+    Write ERP order file: {dir: erp-orders}
+  sub:
+    - name: Map to IDoc
+      paths:
+        - "in:in > S:Split order batch > Header mapping/in"
+        - "Header mapping/out > Line mapping/in"
+        - "Line mapping/out > M:Assemble IDoc > out:out"
+        - "Split order batch[failure] > out:bad"
+        - "Assemble IDoc[failure] > bad"
+      props:
+        Split order batch: {Line Split Count: 1}
+        Assemble IDoc: {entries: 3, age: "60 sec"}
+      sub:
+        - name: Header mapping
+          paths:
+            - "in:in > J:Read order header > U:Map ORDERS05 header > out:out"
+            - "Read order header[unmatched,failure] > out:out"
+          props:
+            Read order header: {idoc.order: "$.order_id", idoc.customer: "$.customer"}
+            Map ORDERS05 header: {idoc.type: ORDERS05, idoc.partner: "${idoc.customer}"}
+        - name: Line mapping
+          paths:
+            - "in:in > T:Map ORDERS05 lines > U:Set IDoc segment count > out:out"
+          props:
+            Map ORDERS05 lines: {text: "E1EDP01|${idoc.order}|${random():mod(9)}"}
+            Set IDoc segment count: {idoc.segments: "${random():mod(9):plus(1)}"}
+
+- name: cx-invoice-post
+  instance: c250
+  paths:
+    - "rin:cx-invoice-in > U:invoice_erp_poster > Map to FI document/in"
+    - "Map to FI document/out > R:Invoice posted (simulated)?[posted] > F:Write invoice to ERP inbox"
+    - "Invoice posted (simulated)?[unmatched] > out:errors"
+    - "invoice_erp_poster > out:audit"
+    - "invoice_erp_poster > out:archive"
+  props:
+    invoice_erp_poster: {e2e.worker: invoice_erp_poster}
+    Invoice posted (simulated)?: {posted: "${random():mod(10):gt(0)}"}
+    Write invoice to ERP inbox: {dir: erp-invoices}
+  sub:
+    - name: Map to FI document
+      paths:
+        - "in:in > U:Determine company code > U:Determine tax code > R:Foreign currency?[fx] > U:Convert to local currency > fn:FI ready > out:out"
+        - "Foreign currency?[unmatched] > FI ready"
+      props:
+        Determine company code: {fi.bukrs: CN01}
+        Determine tax code: {fi.mwskz: J1}
+        Foreign currency?: {fx: "${random():mod(5):equals(0)}"}
+        Convert to local currency: {fi.rate: "7.1"}
+
+- name: cx-customs-update
+  instance: c250
+  paths:
+    - "rin:cx-customs-in > U:customs_erp_updater > R:Declaration known?[known] > U:Set customs status > F:Update customs status (ERP)"
+    - "Declaration known?[unmatched] > out:errors"
+    - "customs_erp_updater > out:audit"
+    - "Set customs status > out:archive"
+  props:
+    customs_erp_updater: {e2e.worker: customs_erp_updater}
+    Declaration known?: {known: "${random():mod(10):gt(0)}"}
+    Set customs status: {erp.customs: "${customs.status:replaceNull('accepted')}"}
+    Update customs status (ERP): {dir: erp-customs}
+
+- name: cx-customs-declare
+  instance: c250
+  paths:
+    - "G:Poll export shipments (ERP) > J:Read shipment > R:Needs declaration?[export] > U:Build declaration request > rpg:n192#cx-declare-in"
+    - "Needs declaration?[unmatched] > L:Log domestic shipment"
+    - "Read shipment[unmatched,failure] > out:errors"
+  props:
+    Poll export shipments (ERP): {period: "65 sec", text: '{"shipment":"SH${random():mod(99999)}","country":"${random():mod(2):equals(0):ifElse(''DE'',''US'')}","export":true}'}
+    Read shipment: {ship.no: "$.shipment", ship.export: "$.export"}
+    Needs declaration?: {export: "${ship.export:equals('true')}"}
+    Build declaration request: {decl.requested: "${now():toNumber()}"}
+    Log domestic shipment: {Log Level: debug}
+
+- name: cx-customs-declare-ack
+  instance: c250
+  paths:
+    - "rin:cx-declare-ack > J:Read declaration ack > U:Map declaration status > F:Update declaration status (ERP)"
+    - "Read declaration ack[unmatched,failure] > out:errors"
+  props:
+    Read declaration ack: {decl.id: "$.decl_id", decl.status: "$.status"}
+    Map declaration status: {erp.decl: "${decl.status}"}
+    Update declaration status (ERP): {dir: erp-declarations}
+
+- name: cx-erp-batch
+  instance: c250
+  note: "两片互不相连：总账导出（对账业务的起点）和成本中心同步，是两件事"
+  paths:
+    - "G:Nightly GL export > T:Render ledger extract > U:Tag ledger extract > F:Publish ledger to queue (MQ)"
+    - "G:Nightly cost center sync > T:Render cost center list > U:Tag cost centers > F:Write cost center file"
+  props:
+    Nightly GL export: {period: "100 sec", text: "x"}
+    Render ledger extract: {text: "ledger;${now():format('yyyyMMddHHmmss')};${random():mod(99999)}"}
+    Tag ledger extract: {ledger.kind: gl}
+    Publish ledger to queue (MQ): {dir: "../../mq/ledger"}
+    Nightly cost center sync: {period: "150 sec", text: "x"}
+    Render cost center list: {text: "cc,owner\nCC100,finance\nCC200,ops"}
+    Tag cost centers: {cc.version: "${now():format('yyyyMMdd')}"}
+    Write cost center file: {dir: cost-centers}
+
+- name: cx-recon-post
+  instance: c250
+  paths:
+    - "rin:cx-recon-result > U:Read recon result > R:Auto-post allowed?[auto] > F:Post reconciliation result (ERP)"
+    - "Auto-post allowed?[unmatched] > F:Queue recon result for accountant"
+    - "Read recon result > out:audit"
+  props:
+    Read recon result: {recon.posted: "${now():toNumber()}"}
+    Auto-post allowed?: {auto: "${random():mod(3):gt(0)}"}
+    Post reconciliation result (ERP): {dir: erp-recon}
+    Queue recon result for accountant: {dir: recon-review}
+
+- name: cx-stock-post
+  instance: c250
+  paths:
+    - "rin:cx-stock-in > SJ:Split stock batch > J:Read stock line > R:Warehouse known?[known] > U:Map ERP stock movement > F:Update ERP stock"
+    - "Warehouse known?[unmatched] > out:errors"
+    - "Split stock batch[failure] > errors"
+    - "Read stock line[unmatched,failure] > errors"
+    - "Map ERP stock movement > out:audit"
+  props:
+    Split stock batch: {JsonPath Expression: "$.*"}
+    Read stock line: {stock.sku: "$.sku"}
+    Warehouse known?: {known: "${random():mod(10):gt(0)}"}
+    Map ERP stock movement: {erp.movement: "561"}
+    Update ERP stock: {dir: erp-stock}
+
+- name: cx-returns-credit
+  instance: c250
+  paths:
+    - "rin:cx-returns-in > J:Read return > R:Credit type?[full] > U:Full credit note > fn:Credit notes > F:Create credit note (ERP)"
+    - "Credit type?[partial] > U:Partial credit note > Credit notes"
+    - "Credit type?[unmatched] > out:errors"
+    - "Read return[unmatched,failure] > errors"
+    - "Credit notes > out:audit"
+  props:
+    Read return: {credit.rma: "$.rma", credit.reason: "$.reason"}
+    Credit type?: {full: "${credit.reason:equals('damaged')}", partial: "${credit.reason:equals('wrong_item'):or(${credit.reason:equals('other')})}"}
+    Full credit note: {credit.kind: full}
+    Partial credit note: {credit.kind: partial}
+    Create credit note (ERP): {dir: erp-credit}
+
+- name: cx-shipment-notice
+  instance: c250
+  paths:
+    - "G:Poll shipped deliveries (ERP) > J:Read delivery > U:Build ASN > T:Render ASN message > F:Publish ASN to queue (MQ)"
+    - "Read delivery[unmatched,failure] > out:errors"
+  props:
+    Poll shipped deliveries (ERP): {period: "50 sec", text: '{"delivery":"80${random():mod(999999)}","customer":"C${random():mod(500)}"}'}
+    Read delivery: {asn.delivery: "$.delivery", asn.customer: "$.customer"}
+    Build ASN: {asn.id: "ASN${random():mod(99999)}"}
+    Render ASN message: {text: "ASN;${asn.id};${asn.delivery};${asn.customer}"}
+    Publish ASN to queue (MQ): {dir: "../../mq/asn"}
+
+- name: cx-mdm-publish
+  instance: c250
+  paths:
+    - "G:Poll MDM changes (CDC) > J:Read MDM change > R:Change relevant?[upsert] > U:Stamp MDM version > fn:Fan out > rpg:n112#cx-mdm-n112"
+    - "Fan out > rpg:n200#cx-mdm-n200"
+    - "Fan out > rpg:n192#cx-mdm-n192"
+    - "Fan out > F:Snapshot MDM change"
+    - "Change relevant?[unmatched] > L:Log ignored MDM change"
+    - "Read MDM change[unmatched,failure] > out:errors"
+  props:
+    Poll MDM changes (CDC): {period: "70 sec", text: '{"entity":"${random():mod(2):equals(0):ifElse(''product'',''customer'')}","key":"K${random():mod(9999)}","op":"upsert"}'}
+    Read MDM change: {mdm.entity: "$.entity", mdm.op: "$.op"}
+    Change relevant?: {upsert: "${mdm.op:equals('upsert')}"}
+    Stamp MDM version: {mdm.version: "${now():toNumber()}"}
+    Log ignored MDM change: {Log Level: debug}
+    Snapshot MDM change: {dir: mdm-snapshots}
+
+- name: cx-common-audit
+  instance: c250
+  shared: true
+  paths:
+    - "in:in > U:Stamp core audit source > A:Serialize audit record > M:Batch core audit records > Z:Compress core audit batch > F:Archive audit batch"
+  props:
+    Stamp core audit source: {audit.node: c250}
+    Batch core audit records: {entries: 20, age: "3 min"}
+    Archive audit batch: {dir: audit}
+
+- name: cx-common-archive
+  instance: c250
+  shared: true
+  paths:
+    - "in:in > H:Hash business document > U:Set retention class > Z:Compress business document > F:Archive business document (WORM)"
+  props:
+    Set retention class: {retention: "10y"}
+    Archive business document (WORM): {dir: archive}
+
+- name: cx-common-dlq
+  instance: c250
+  shared: true
+  paths:
+    - "rin:cx-dlq-in > U:Tag remote dead letter > fn:Dead letters"
+    - "in:in > U:Tag local dead letter > Dead letters"
+    - "Dead letters > R:Alert needed?[alert] > LM:Raise DLQ alert"
+    - "Dead letters > R:Replayable?[replay] > U:Prepare DLQ replay > L:Log DLQ replay candidate"
+    - "Dead letters > F:Write dead letter"
+  props:
+    Tag remote dead letter: {dlq.kind: remote}
+    Tag local dead letter: {dlq.kind: local, dlq.from: c250}
+    Alert needed?: {alert: "${error.class:equals('schema-violation')}"}
+    Raise DLQ alert: {log-message: "DLQ ${dlq.from} ${error.class}", log-level: debug}
+    Write dead letter: {dir: dlq}
+    Replayable?: {replay: "${error.class:equals('recon-open-items')}"}
+    Prepare DLQ replay: {dlq.replay: "true"}
+    Log DLQ replay candidate: {Log Level: debug}
+
+- name: cx-legacy-fax-orders
+  instance: c250
+  trap: "名字像订单接入，是老传真订单入口，运行中但目录一直是空的（无流量）"
+  paths:
+    - "GF:Receive fax orders (legacy) > U:Tag fax order > F:Write fax order for keying"
+  props:
+    Receive fax orders (legacy): {dir: fax-orders, period: "60 sec"}
+    Tag fax order: {order.channel: fax}
+    Write fax order for keying: {dir: fax-keying}
+
+# ------------------------------ 第二批（加复杂度）------------------------------
+- name: cx-price-list
+  instance: n112
+  paths:
+    - "G:Receive price lists (SFTP) > T:Render price list CSV > C:Convert price list to JSON > SJ:Split price rows > J:Read price row > R:Price change size?[big] > U:Flag big price change > fn:Prices out"
+    - "Price change size?[unmatched] > Prices out"
+    - "Prices out > M:Collect store price file > F:Publish price list to stores"
+    - "Flag big price change > LM:Notify pricing team"
+    - "Convert price list to JSON[failure] > out:errors"
+    - "Read price row[unmatched,failure] > errors"
+  props:
+    Receive price lists (SFTP): {period: "120 sec", text: "x"}
+    Render price list CSV: {text: "sku,price,old_price\nA1,${random():mod(100):plus(10)},20\nB7,35,${random():mod(60)}\nZ9,99,99"}
+    Split price rows: {JsonPath Expression: "$.*"}
+    Read price row: {price.sku: "$.sku", price.new: "$.price", price.old: "$.old_price"}
+    Price change size?: {big: "${price.new:toNumber():minus(${price.old:toNumber()}):gt(30)}"}
+    Flag big price change: {price.review: "true"}
+    Notify pricing team: {log-message: "big change ${price.sku}", log-level: debug}
+    Collect store price file: {entries: 3, age: "60 sec"}
+    Publish price list to stores: {dir: store-prices}
+
+- name: cx-manifest-legacy
+  instance: n192
+  paths:
+    - "G:Receive cargo manifests (EDI) > U:Tag manifest > S:Split manifest lines > RC:Manifest line kind?[container] > Manifest checks/in"
+    - "Manifest line kind?[unmatched] > LM:Note manifest header line"
+    - "Manifest checks/ok > T:Map to CUSCAR > U:Stamp manifest no > F:Submit manifest to customs (EDI outbox)"
+    - "Stamp manifest no > rpg:c250#cx-manifest-in"
+    - "Stamp manifest no > out:audit"
+    - "Manifest checks/bad > out:errors"
+    - "Split manifest lines[failure] > errors"
+  props:
+    Receive cargo manifests (EDI): {period: "70 sec", text: "HDR+VESSEL${random():mod(99)}\nCNT+MSKU${random():mod(9999999)}+22G1\nCNT+TGHU${random():mod(9999999)}+45G1"}
+    Tag manifest: {biz.type: manifest}
+    Split manifest lines: {Line Split Count: 1}
+    Manifest line kind?: {container: "^CNT.*"}
+    Note manifest header line: {log-message: "header ${filename}", log-level: debug}
+    Map to CUSCAR: {text: "UNH+1+CUSCAR:D:95B:UN'EQD+CN+${manifest.container}'"}
+    Stamp manifest no: {manifest.no: "MF${random():mod(99999)}"}
+    Submit manifest to customs (EDI outbox): {dir: manifest-outbox}
+  sub:
+    - name: Manifest checks
+      paths:
+        - "in:in > U:Read container no > R:Container no valid?[valid] > R:Dangerous goods?[dg] > U:Flag dangerous goods > out:ok"
+        - "Dangerous goods?[unmatched] > ok"
+        - "Container no valid?[unmatched] > U:Mark bad container no > out:bad"
+      props:
+        Read container no: {manifest.container: "${random():mod(9999999)}"}
+        Container no valid?: {valid: "${random():mod(15):gt(0)}"}
+        Dangerous goods?: {dg: "${random():mod(8):equals(0)}"}
+        Flag dangerous goods: {manifest.dg: "true"}
+        Mark bad container no: {error.reason: bad-container-no}
+
+- name: cx-origin-cert
+  instance: n192
+  paths:
+    - "G:Receive certificate of origin requests (portal) > J:Read origin request > R:Preferential origin?[form_e] > U:Fill FORM E > fn:Certificates"
+    - "Preferential origin?[unmatched] > U:Fill general certificate > Certificates"
+    - "Certificates > T:Render certificate > Z:Pack certificate > H:Sign certificate (hash) > F:Issue certificate (CIQ share)"
+    - "Sign certificate (hash) > out:audit"
+    - "Read origin request[unmatched,failure] > out:errors"
+    - "Sign certificate (hash)[failure] > errors"
+  props:
+    Receive certificate of origin requests (portal): {period: "100 sec", text: '{"req":"CO${random():mod(9999)}","dest":"${random():mod(2):equals(0):ifElse(''TH'',''DE'')}"}'}
+    Read origin request: {co.req: "$.req", co.dest: "$.dest"}
+    Preferential origin?: {form_e: "${co.dest:equals('TH')}"}
+    Fill FORM E: {co.form: E}
+    Fill general certificate: {co.form: general}
+    Render certificate: {text: "CERT;${co.req};${co.form};${co.dest}"}
+    Issue certificate (CIQ share): {dir: origin-certs}
+
+- name: cx-common-legacy-audit
+  instance: n192
+  shared: true
+  paths:
+    - "in:in > U:Stamp legacy audit source > A:Serialize legacy audit record > M:Batch legacy audit > Z:Compress legacy audit > F:Write legacy audit trail"
+  props:
+    Stamp legacy audit source: {audit.node: n192}
+    Batch legacy audit: {entries: 10, age: "3 min"}
+    Write legacy audit trail: {dir: audit}
+
+- name: cx-carrier-tracking
+  instance: n200
+  paths:
+    - "G:Poll carrier tracking (DHL API) > U:Tag DHL events > fn:Tracking events"
+    - "G:Poll carrier tracking (SF Express API) > U:Tag SF events > Tracking events"
+    - "Tracking events > J:Read tracking event > R:Tracking status?[delivered] > U:Mark delivered > fn:To ERP"
+    - "Tracking status?[exception] > U:Mark delivery exception > LM:Alert customer service > To ERP"
+    - "Tracking status?[unmatched] > CR:Thin out in-transit events > L:Log in-transit event"
+    - "To ERP > M:Batch tracking updates > rpg:c250#cx-tracking-in"
+    - "Mark delivered > F:Write proof of delivery"
+    - "Read tracking event[unmatched,failure] > out:errors"
+  props:
+    Poll carrier tracking (DHL API): {period: "45 sec", text: '{"awb":"JD${random():mod(99999999)}","status":"${random():mod(4):equals(0):ifElse(''exception'',''delivered'')}"}'}
+    Poll carrier tracking (SF Express API): {period: "60 sec", text: '{"awb":"SF${random():mod(99999999)}","status":"in_transit"}'}
+    Tag DHL events: {carrier: dhl}
+    Tag SF events: {carrier: sf-express}
+    Read tracking event: {track.awb: "$.awb", track.status: "$.status"}
+    Tracking status?: {delivered: "${track.status:equals('delivered')}", exception: "${track.status:equals('exception')}"}
+    Mark delivered: {track.pod: "true"}
+    Mark delivery exception: {track.exception: "true"}
+    Alert customer service: {log-message: "exception ${track.awb}", log-level: debug}
+    Thin out in-transit events: {Rate Control Criteria: flowfile count, Maximum Rate: 5, Time Duration: "1 min"}
+    Log in-transit event: {Log Level: debug}
+    Batch tracking updates: {entries: 4, age: "90 sec"}
+    Write proof of delivery: {dir: pod}
+
+- name: cx-tracking-update
+  instance: c250
+  paths:
+    - "rin:cx-tracking-in > S:Split tracking batch > U:Map delivery status > R:Delivery closed?[closed] > F:Close delivery (ERP)"
+    - "Delivery closed?[unmatched] > F:Update delivery status (ERP)"
+    - "Map delivery status > out:audit"
+    - "Split tracking batch[failure] > out:errors"
+  props:
+    Split tracking batch: {Line Split Count: 1}
+    Map delivery status: {erp.delivery: "${track.status:replaceNull('in_transit')}"}
+    Delivery closed?: {closed: "${track.pod:equals('true')}"}
+    Close delivery (ERP): {dir: erp-delivery-closed}
+    Update delivery status (ERP): {dir: erp-delivery-status}
+
+- name: cx-manifest-track
+  instance: c250
+  paths:
+    - "rin:cx-manifest-in > U:Read manifest status > R:Dangerous cargo?[dg] > F:Notify HSE of dangerous cargo"
+    - "Dangerous cargo?[unmatched] > F:Update manifest status (ERP)"
+    - "Read manifest status > out:audit"
+  props:
+    Read manifest status: {erp.manifest: "${manifest.no}"}
+    Dangerous cargo?: {dg: "${manifest.dg:equals('true')}"}
+    Notify HSE of dangerous cargo: {dir: hse-dg}
+    Update manifest status (ERP): {dir: erp-manifest}
+
+links:
+  n112:
+    - "cx-order-intake.to-validate > cx-common-validate.in"
+    - "cx-invoice-mail.to-validate > cx-common-validate.in"
+    - "cx-customs-inbound.to-validate > cx-common-validate.in"
+    - "cx-common-validate.orders > cx-order-route.in"
+    - "cx-common-validate.invoices > cx-invoice-extract.in"
+    - "cx-common-validate.customs > cx-customs-forward.in"
+    - "cx-common-validate.rejects > cx-common-errors.in"
+    - "cx-order-intake.errors > cx-common-errors.in"
+    - "cx-invoice-mail.errors > cx-common-errors.in"
+    - "cx-order-route.errors > cx-common-errors.in"
+    - "cx-invoice-extract.errors > cx-common-errors.in"
+    - "cx-asn-deliver.errors > cx-common-errors.in"
+    - "cx-wms-bridge.errors > cx-common-errors.in"
+    - "cx-mdm-apply.errors > cx-common-errors.in"
+    - "cx-order-route.audit > cx-common-audit.in"
+    - "cx-invoice-extract.audit > cx-common-audit.in"
+    - "cx-asn-deliver.audit > cx-common-audit.in"
+    - "cx-price-list.errors > cx-common-errors.in"
+  n192:
+    - "cx-manifest-legacy.errors > cx-common-legacy-errors.in"
+    - "cx-origin-cert.errors > cx-common-legacy-errors.in"
+    - "cx-manifest-legacy.audit > cx-common-legacy-audit.in"
+    - "cx-origin-cert.audit > cx-common-legacy-audit.in"
+    - "cx-customs-declare-send.audit > cx-common-legacy-audit.in"
+    - "(root).cx-declare-in > cx-customs-declare-edi.in"
+    - "(root).cx-mdm-n192 > cx-mdm-apply.in"
+    - "cx-customs-receipt.to-validate > cx-common-legacy-validate.in"
+    - "cx-customs-declare-edi.to-validate > cx-common-legacy-validate.in"
+    - "cx-tariff-sync.to-validate > cx-common-legacy-validate.in"
+    - "cx-common-legacy-validate.receipts > cx-customs-receipt-send.in"
+    - "cx-common-legacy-validate.declarations > cx-customs-declare-send.in"
+    - "cx-common-legacy-validate.tariffs > cx-tariff-publish.in"
+    - "cx-common-legacy-validate.rejects > cx-common-legacy-errors.in"
+    - "cx-customs-receipt.errors > cx-common-legacy-errors.in"
+    - "cx-customs-receipt-send.errors > cx-common-legacy-errors.in"
+    - "cx-customs-declare-edi.errors > cx-common-legacy-errors.in"
+    - "cx-customs-declare-send.errors > cx-common-legacy-errors.in"
+    - "cx-tariff-sync.errors > cx-common-legacy-errors.in"
+    - "cx-tariff-publish.errors > cx-common-legacy-errors.in"
+    - "cx-mdm-apply.errors > cx-common-legacy-errors.in"
+  n200:
+    - "cx-partner-gateway.errors > cx-common-errors.in"
+    - "cx-stock-feedback.errors > cx-common-errors.in"
+    - "cx-order-confirm.errors > cx-common-errors.in"
+    - "cx-recon.errors > cx-common-errors.in"
+    - "cx-returns.errors > cx-common-errors.in"
+    - "cx-mdm-apply.errors > cx-common-errors.in"
+    - "cx-stock-feedback.audit > cx-common-audit.in"
+    - "cx-order-confirm.audit > cx-common-audit.in"
+    - "cx-returns.audit > cx-common-audit.in"
+    - "cx-carrier-tracking.errors > cx-common-errors.in"
+  c250:
+    - "cx-tracking-update.errors > cx-common-dlq.in"
+    - "cx-tracking-update.audit > cx-common-audit.in"
+    - "cx-manifest-track.audit > cx-common-audit.in"
+    - "cx-erp-order-post.errors > cx-common-dlq.in"
+    - "cx-invoice-post.errors > cx-common-dlq.in"
+    - "cx-customs-update.errors > cx-common-dlq.in"
+    - "cx-customs-declare.errors > cx-common-dlq.in"
+    - "cx-customs-declare-ack.errors > cx-common-dlq.in"
+    - "cx-stock-post.errors > cx-common-dlq.in"
+    - "cx-returns-credit.errors > cx-common-dlq.in"
+    - "cx-shipment-notice.errors > cx-common-dlq.in"
+    - "cx-mdm-publish.errors > cx-common-dlq.in"
+    - "cx-erp-order-post.audit > cx-common-audit.in"
+    - "cx-invoice-post.audit > cx-common-audit.in"
+    - "cx-customs-update.audit > cx-common-audit.in"
+    - "cx-recon-post.audit > cx-common-audit.in"
+    - "cx-stock-post.audit > cx-common-audit.in"
+    - "cx-returns-credit.audit > cx-common-audit.in"
+    - "cx-invoice-post.archive > cx-common-archive.in"
+    - "cx-customs-update.archive > cx-common-archive.in"
+
+e2e:
+  # ClickHouse e2e_trace 的 schedule（seed-cx.sql 造定义和运行记录）；worker 名 = 画布上处理器名
+  - id: 201
+    name: invoice_mail_parse
+    workers: [mail_attachment_reader, invoice_pdf_extractor, invoice_erp_poster, invoice_approval_notifier]
+    trigger: {exchange: ex.trigger, routing_key: invoice.mail}
+    note: "invoice_approval_notifier 只在 schedule 里（画布上没有，是审批系统里的步骤）"
+  - id: 202
+    name: customs_receipt
+    workers: [customs_receipt_reader, customs_status_mapper, customs_erp_updater]
+    trigger: {exchange: ex.trigger, routing_key: customs.receipt}
+
+answer:
+  # seg 写法：实例/组（组内多片时 "实例/组#片"，片用该片里一个处理器名指代）；hop：s2s / mq（共享目录）/ http / link（同实例 root 连线）
+  businesses:
+    - id: B1
+      name: 订单接入到 ERP 并回确认
+      segments: [n112/cx-order-intake, n112/cx-order-route, c250/cx-erp-order-post, n200/cx-order-confirm]
+      shared: [n112/cx-common-validate, n112/cx-common-errors, n112/cx-common-audit, c250/cx-common-audit, c250/cx-common-dlq, n200/cx-common-audit, n200/cx-common-errors]
+      entries: ["Receive orders (SFTP)", "Receive orders (EDI VAN)", "Receive orders (B2B API)（由 n200 cx-partner-gateway 经 HTTP 推入）"]
+      exits: ["Copy export orders for customs broker", "Write ERP order file", "Send confirmation to partner (AS2)", "Send confirmation by mail (outbox)"]
+      hops: ["n112 cx-order-intake -link-> cx-common-validate -link(orders)-> cx-order-route", "n112 -s2s cx-orders-in-> c250", "c250 -s2s cx-order-confirm-in-> n200"]
+      judge: "三个实例一条业务。cx-order-intake 和 cx-order-route 中间隔着公共校验（按 biz.type 分发），骨架不会自动合，要靠 AI 合；n200 的 cx-partner-gateway 经 HTTP 推到 ListenHTTP，是第三个入口（HTTP 交接引擎认不出时，分成单独一条也算可接受，但要标成外部出口）。"
+    - id: B2
+      name: 发票邮件解析入 ERP
+      segments: [n112/cx-invoice-mail, n112/cx-invoice-extract, c250/cx-invoice-post]
+      shared: [n112/cx-common-validate, n112/cx-common-errors, n112/cx-common-audit, c250/cx-common-audit, c250/cx-common-archive, c250/cx-common-dlq]
+      entries: ["Fetch invoice mails (IMAP)"]
+      exits: ["Write invoice to ERP inbox", "（schedule）invoice_approval_notifier"]
+      hops: ["n112 经公共校验分发(invoices)", "n112 -s2s cx-invoice-in-> c250"]
+      e2e: 201
+      judge: "按 schedule 201 认：worker 在 n112 两个组和 c250 一个组上；invoice_approval_notifier 只在 schedule 里，作为 schedule 步骤保留、不放到画布上、不当缺口。"
+    - id: B3
+      name: 银行对账
+      segments: ["c250/cx-erp-batch#Nightly GL export", "n200/cx-recon#Receive bank statements (SWIFT MT940)", "n200/cx-recon#Consume ledger queue (MQ)", c250/cx-recon-post]
+      shared: [n200/cx-common-errors, c250/cx-common-audit]
+      entries: ["Nightly GL export", "Receive bank statements (SWIFT MT940)"]
+      exits: ["Post reconciliation result (ERP)", "Queue recon result for accountant"]
+      hops: ["c250 -mq ledger-> n200", "n200 cx-recon 两片经 recon-staging 目录交接", "n200 -s2s cx-recon-result-> c250"]
+      judge: "c250→n200→c250 来回跳。cx-recon 的两片骨架会拆开并提问，正确答案是一件事（目录交接）；c250 cx-erp-batch 的总账导出片属于这条，不属于成本中心同步。"
+    - id: B4
+      name: 报关回执回写 ERP
+      segments: [n192/cx-customs-receipt, n192/cx-customs-receipt-send, n112/cx-customs-inbound, n112/cx-customs-forward, c250/cx-customs-update]
+      shared: [n192/cx-common-legacy-validate, n192/cx-common-legacy-errors, n112/cx-common-validate, n112/cx-common-errors, c250/cx-common-audit, c250/cx-common-archive, c250/cx-common-dlq]
+      entries: ["Receive customs receipts (EDI)"]
+      exits: ["Archive raw receipt (legacy NAS)", "Update customs status (ERP)"]
+      hops: ["n192 经公共校验分发(receipts)", "n192 -s2s cx-customs-in-> n112", "n112 经公共校验分发(customs)", "n112 -s2s cx-customs-in-> c250"]
+      e2e: 202
+      judge: "经过 3 个实例、两次公共校验。n192 不在 UAT 里时，n112 的 cx-customs-in 是入口（上游未接管）；schedule 202 的 customs_receipt_reader 在 n192 上，n192 未接管时该 worker 放不下（e2e-unplaced 合理）。"
+    - id: B5
+      name: 出口报关申报
+      segments: [c250/cx-customs-declare, "n192/(root)#cx-declare-in", n192/cx-customs-declare-edi, n192/cx-customs-declare-send, c250/cx-customs-declare-ack]
+      shared: [n192/cx-common-legacy-validate, n192/cx-common-legacy-errors, c250/cx-common-dlq]
+      entries: ["Poll export shipments (ERP)"]
+      exits: ["Send declaration to customs (EDI outbox)", "Update declaration status (ERP)"]
+      hops: ["c250 -s2s cx-declare-in(n192 root)-> n192", "n192 经公共校验分发(declarations)", "n192 -s2s cx-declare-ack-> c250"]
+      judge: "c250→n192→c250 来回跳。名字和 B4 都带 customs，但是两件事（申报 vs 回执）。n192 未接管时 c250 发往 n192 的 S2S 是对不上的外部出口，cx-declare-ack 是 c250 上的入口。"
+    - id: B6
+      name: 库存回传 ERP
+      segments: [n112/cx-wms-bridge, n200/cx-stock-feedback, c250/cx-stock-post]
+      shared: [n112/cx-common-errors, n200/cx-common-errors, n200/cx-common-audit, c250/cx-common-audit, c250/cx-common-dlq]
+      entries: ["Poll WMS stock deltas (DB)", "Receive stock updates (WMS API)（n112 经 HTTP 推入）", "Poll 3PL stock snapshot (SFTP)"]
+      exits: ["Update ERP stock"]
+      hops: ["n112 -http 19090-> n200", "n200 -s2s cx-stock-in-> c250"]
+      judge: "n200→c250 段骨架能连；n112 cx-wms-bridge 经 HTTP 交接，认成单独一条（出口外部 HTTP）可接受，连上更好。"
+    - id: B7
+      name: 主数据分发
+      segments: [c250/cx-mdm-publish, n112/cx-mdm-apply, n200/cx-mdm-apply, n192/cx-mdm-apply, "n192/(root)#cx-mdm-n192"]
+      shared: [n112/cx-common-errors, n200/cx-common-errors, n192/cx-common-legacy-errors, c250/cx-common-dlq]
+      entries: ["Poll MDM changes (CDC)"]
+      exits: ["Snapshot MDM change", "Apply product master (local cache)", "Apply customer master (local cache)", "Apply partner master (hub DB)", "Apply catalog item (hub DB)", "Apply HS master data (legacy DB)"]
+      hops: ["c250 -s2s-> n112 / n200 / n192（一处 fan-out 到三个实例）"]
+      judge: "一条业务跨 4 个实例（fan-out）。骨架因 fan-out 不合并并提问，正确答案是一条；三个 cx-mdm-apply 同名不同实例，不能当成三条独立业务，也不能互相合并成别的。"
+    - id: B8
+      name: 发货通知（ASN）
+      segments: [c250/cx-shipment-notice, n112/cx-asn-deliver]
+      shared: [n112/cx-common-errors, n112/cx-common-audit, c250/cx-common-dlq]
+      entries: ["Poll shipped deliveries (ERP)"]
+      exits: ["Send ASN to customer (AS2)", "Send ASN by mail (outbox)"]
+      hops: ["c250 -mq asn-> n112"]
+      judge: "经共享目录（模拟 MQ）交接，引擎当外部交接：分成两段两条也可以，但最好按目录名把 Publish ASN to queue (MQ) 和 Consume ASN queue (MQ) 对上。"
+    - id: B9
+      name: 退货退款
+      segments: [n200/cx-returns, c250/cx-returns-credit]
+      shared: [n200/cx-common-errors, n200/cx-common-audit, c250/cx-common-audit, c250/cx-common-dlq]
+      entries: ["Receive return requests (portal)", "Receive return requests (call center)"]
+      exits: ["Create credit note (ERP)"]
+      hops: ["n200 -s2s cx-returns-in-> c250"]
+      judge: "两个入口 fan-in，带嵌套子组 Manual review。"
+    - id: B10
+      name: 关税表同步
+      segments: [n192/cx-tariff-sync, n192/cx-tariff-publish]
+      shared: [n192/cx-common-legacy-validate, n192/cx-common-legacy-errors]
+      entries: ["Download tariff tables (customs portal)"]
+      exits: ["Publish tariff table (customs share)"]
+      hops: ["n192 经公共校验分发(tariffs)"]
+      judge: "只在 n192（1.9.2）上；n192 未接管时看不到。"
+    - id: B11
+      name: 成本中心同步
+      segments: ["c250/cx-erp-batch#Nightly cost center sync"]
+      entries: ["Nightly cost center sync"]
+      exits: ["Write cost center file"]
+      judge: "和 B3 的总账导出同在 cx-erp-batch 组里、互不相连，是单独一条。"
+    - id: B12
+      name: 合作方枢纽 QA 测试发票（陷阱）
+      segments: [n200/cx-invoice-post-test]
+      entries: ["Generate test invoices (QA)"]
+      exits: ["（自动终止）"]
+      judge: "名字像 c250 cx-invoice-post，但不是发票业务的一段；单独一条（测试造数），不能并进 B2。"
+    - id: B13
+      name: 舱单申报
+      segments: [n192/cx-manifest-legacy, c250/cx-manifest-track]
+      shared: [n192/cx-common-legacy-errors, n192/cx-common-legacy-audit, c250/cx-common-audit]
+      entries: ["Receive cargo manifests (EDI)"]
+      exits: ["Submit manifest to customs (EDI outbox)", "Notify HSE of dangerous cargo", "Update manifest status (ERP)"]
+      hops: ["n192 -s2s cx-manifest-in-> c250"]
+      judge: "n192 未接管时，c250 的 cx-manifest-in 是入口。"
+    - id: B14
+      name: 原产地证签发
+      segments: [n192/cx-origin-cert]
+      shared: [n192/cx-common-legacy-errors, n192/cx-common-legacy-audit]
+      entries: ["Receive certificate of origin requests (portal)"]
+      exits: ["Issue certificate (CIQ share)"]
+    - id: B15
+      name: 门店价格表下发
+      segments: [n112/cx-price-list]
+      shared: [n112/cx-common-errors]
+      entries: ["Receive price lists (SFTP)"]
+      exits: ["Publish price list to stores"]
+    - id: B16
+      name: 物流轨迹回写
+      segments: [n200/cx-carrier-tracking, c250/cx-tracking-update]
+      shared: [n200/cx-common-errors, c250/cx-common-audit, c250/cx-common-dlq]
+      entries: ["Poll carrier tracking (DHL API)", "Poll carrier tracking (SF Express API)"]
+      exits: ["Write proof of delivery", "Close delivery (ERP)", "Update delivery status (ERP)"]
+      hops: ["n200 -s2s cx-tracking-in-> c250"]
+      judge: "两个入口 fan-in、组内分支（delivered / exception / in transit 限流）。"
+  shared:
+    n112: [cx-common-validate, cx-common-errors, cx-common-audit]
+    n192: [cx-common-legacy-validate, cx-common-legacy-errors, cx-common-legacy-audit]
+    n200: [cx-common-audit, cx-common-errors]
+    c250: [cx-common-audit, cx-common-archive, cx-common-dlq]
+  idle:
+    - {seg: n112/cx-order-intake-replay, judge: "运行中、无流量；单独一条或标空跑，不能并进 B1"}
+    - {seg: c250/cx-legacy-fax-orders, judge: "运行中、无流量；单独一条或标空跑，不能并进 B1"}
+    - {seg: n192/cx-tariff-sync-old, judge: "组件全停、无流量；标停用/空跑，不能并进 B10"}
+  notes:
+    - "S2S 汇入公共环节：c250 cx-common-dlq 的远程端口 cx-dlq-in 收 n112、n200、n192 三处公共错误处理发来的死信，加本地 9 个组的 errors，是公共环节，不是业务。"
+    - "公共错误/审计环节没有自己的起点，被 ≥2 个组喂，应识别为 shared；不能把公共环节算成某条业务独有的一段。"
+    - "既有组（ops-lab、n112 gen/rename、c250 load、e2e gen 链等）不属于本实验，答案里不列。"

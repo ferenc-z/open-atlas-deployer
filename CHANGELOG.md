@@ -5,6 +5,11 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
 
 ## Unreleased
 
+- Business skeleton (complex lab flows 2026-11-22): edges to and from a shared step (error handling, audit, dead letters)
+  no longer count when deciding whether two segments are one business, so a group that also sends its errors to the
+  shared handler still merges with its next group and with the other service's S2S port (before, every such business
+  stayed in pieces with a fan-out question). Test bed: `testdata/nifi-complex/` (spec with the right answers,
+  `build.py` for the lab NiFis, `seed-cx.sql` for two cross-instance e2e_trace schedules).
 - Business discovery from e2e_trace (engine test 2026-11-22): `describe {service}` has the gap `e2e-unplaced` when the
   service has e2e_trace and some schedule is in no service's model, and `look kind model` lists the schedules under `e2e`
   (id `schedule-<n>`, workers, entry, the services whose model places each), so the check-up can publish with

@@ -1,7 +1,7 @@
 // pages-rethink A7, §10.2 step 1: the business skeleton the code finds (certain), for the AI to name and judge and the
 // gate to check (step 2). By default a group directly under root is one business, or one segment of one; four
 // exceptions come from the wiring and the counts:
-//   ① merge: A's output ports go only to B (and B is fed by A alone) -> one business, A before B;
+//   ① merge: A's output ports go only to B (and B is fed by A alone; edges to shared steps aside) -> one business, A before B;
 //   ② split: a group's pieces are not connected to each other -> one candidate per piece, and a question;
 //   ③ shared: no start of its own, fed by several groups -> a shared step, not a business;
 //   ④ idle: no traffic for 7 days -> maybe nothing to watch.
@@ -174,7 +174,9 @@ export function identify(services: SkeletonInput[], now: Date): Skeleton {
   for (const e of out.edges) {
     if (shared.has(e.from) || shared.has(e.to)) continue;
     const a = segs.get(e.from)!, b = segs.get(e.to)!;
-    const nDown = downs.get(e.from)!.size, nUp = ups.get(e.to)!.size;
+    // Edges to and from shared steps (error handling, audit) do not count: a business that also sends its errors to
+    // the shared error handler still goes only to its next segment.
+    const nDown = [...downs.get(e.from)!].filter((d) => !shared.has(d)).length, nUp = [...ups.get(e.to)!].filter((u) => !shared.has(u)).length;
     if (nDown === 1 && nUp === 1) {
       up[find(e.from)] = find(e.to);
       const cross = a.service !== b.service;

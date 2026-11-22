@@ -173,3 +173,17 @@ test("flow counts and topology from samples: buckets, sample over history, topol
   assert.equal(store.latestTopology("n112")?.hash, "h3");
   assert.ok(store.latestTopology("c250"));
 });
+
+test("skeleton: edges to a shared step (errors, audit) do not stop the merge or the S2S pair", () => {
+  // A -> B, and both A and B also send to the shared error handler E (fed by A, B and C); C is another business.
+  const t = topo("root", [
+    { id: "A", name: "Intake", root: false, fragments: [frag("a", { outputs: ["out", "errors"] })] },
+    { id: "B", name: "Route", root: false, fragments: [frag("b", { inputs: ["in"], outputs: ["errors"], starts: 0 })] },
+    { id: "C", name: "Other", root: false, fragments: [frag("c", { outputs: ["errors"] })] },
+    { id: "E", name: "Errors", root: false, fragments: [frag("e", { inputs: ["in"], starts: 0 })] },
+  ], { links: [link("A", "a", "B", "b"), link("A", "a", "E", "e"), link("B", "b", "E", "e"), link("C", "c", "E", "e")] });
+  const sk = identify([svc("n1", t, busy("A", "B", "C", "E"))], NOW);
+  assert.deepEqual(sk.flows.map((f) => f.segments.map((s) => s.group.name).join(" > ")).sort(), ["Intake > Route", "Other"]);
+  assert.deepEqual(sk.shared.map((s) => [s.group.name, s.feeders]), [["Errors", ["n1/A", "n1/C"]]]);
+  assert.deepEqual(sk.questions, [], "no fan-out question for the error output");
+});
