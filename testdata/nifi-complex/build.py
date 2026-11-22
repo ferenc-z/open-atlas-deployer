@@ -170,6 +170,7 @@ class Builder:
         # run that stops half-way (or --only without the target) picks them up next time
         self.state = f"{LAB}/cx/pending-s2s.json"
         self.pending = json.load(open(self.state)) if os.path.exists(self.state) else []
+        self.group = ""
         self.pos = {}
 
     def place(self, pg):
@@ -247,6 +248,13 @@ class Builder:
             ent = nf.call("POST", f"/process-groups/{pg}/controller-services", {"revision": {"version": 0}, "component": {
                 "type": typ, "name": f"cx {'CSV reader' if key == 'reader' else 'JSON writer'}"}})
             got[key] = ent["id"]
+            if key == "reader":
+                # The CSV has a header line. NiFi 1.9 infers the schema without reading it as one (hs_code parsed as a
+                # number, every file to failure); the property is "Skip Header Line" on 1.x, renamed on 2.x: by display name.
+                desc = ent["component"].get("descriptors") or {}
+                k = next((k for k, d in desc.items() if d.get("displayName") == "Treat First Line as Header"), None)
+                if k:
+                    nf.call("PUT", f"/controller-services/{ent['id']}", {"revision": ent["revision"], "component": {"id": ent["id"], "properties": {k: "true"}}})
         return got
 
     def build_group(self, inst, nf, parent, gspec, top):
@@ -444,6 +452,11 @@ class Builder:
     # ------------------------------------------------------------ run state
 
     def cx_groups(self, nf):
+        root, groups = self._cx_groups(nf)
+        # --group: only that top-level group (delete / start / stop of one group).
+        return root, [g for g in groups if not self.group or nm(g) == self.group]
+
+    def _cx_groups(self, nf):
         root = nf.root()
         return root, [g for g in root["flow"]["processGroups"] if nm(g).startswith(PREFIX)]
 
@@ -484,20 +497,31 @@ class Builder:
 
     def delete(self, only):
         self.start(only, False)
-        self.pending = [p for p in self.pending if p[0] not in only]
-        self.save()
+        if not self.group:
+            self.pending = [p for p in self.pending if p[0] not in only]
+            self.save()
         for inst, nf in self.n.items():
             if inst not in only:
                 continue
             root, groups = self.cx_groups(nf)
             ids = {g["id"] for g in groups}
-            cx_root_ports = {p["id"] for p in root["flow"]["inputPorts"] if nm(p).startswith(PREFIX)}
+            cx_root_ports = {p["id"] for p in root["flow"]["inputPorts"] if nm(p).startswith(PREFIX) and not self.group}
             for c in root["flow"]["connections"]:
                 cc = c["component"]
                 if cc["source"]["groupId"] in ids or cc["destination"]["groupId"] in ids or cc["source"]["id"] in cx_root_ports:
                     self.drop(nf, c["id"])
+                    # --group: the other end is a running group's port; stop it for the delete, then run it again.
+                    other = [e for e in (cc["source"], cc["destination"]) if e["groupId"] not in ids and e["type"] in ("INPUT_PORT", "OUTPUT_PORT")] if self.group else []
+                    for e in other:
+                        kind = "input-ports" if e["type"] == "INPUT_PORT" else "output-ports"
+                        pe = nf.call("GET", f"/{kind}/{e['id']}")
+                        nf.call("PUT", f"/{kind}/{e['id']}/run-status", {"revision": pe["revision"], "state": "STOPPED"})
                     ent = nf.call("GET", f"/connections/{c['id']}")
                     nf.call("DELETE", f"/connections/{c['id']}?version={ent['revision']['version']}")
+                    for e in other:
+                        kind = "input-ports" if e["type"] == "INPUT_PORT" else "output-ports"
+                        pe = nf.call("GET", f"/{kind}/{e['id']}")
+                        nf.call("PUT", f"/{kind}/{e['id']}/run-status", {"revision": pe["revision"], "state": "RUNNING"})
             for g in groups:
                 for pg, f in self.walk(nf, g["id"]):
                     for c in f["connections"]:
@@ -565,6 +589,7 @@ def main():
     for f in ("status", "stop", "start", "delete", "rebuild"):
         ap.add_argument(f"--{f}", action="store_true")
     ap.add_argument("--only", default="")
+    ap.add_argument("--group", default="", help="with --rebuild / --delete / --stop / --start: only this top-level cx- group")
     ap.add_argument("--spec", default=f"{HERE}/spec.yaml")
     ap.add_argument("--plan", action="store_true", help="parse the spec and count processors, no NiFi calls")
     a = ap.parse_args()
@@ -580,6 +605,7 @@ def main():
     only = set(a.only.split(",")) if a.only else set(spec["instances"])
     nifis = {k: Nifi(k, v) for k, v in spec["instances"].items()}  # all: S2S targets may sit outside --only
     b = Builder(spec, nifis)
+    b.group = a.group
     if a.status:
         b.status(only)
     elif a.stop:
