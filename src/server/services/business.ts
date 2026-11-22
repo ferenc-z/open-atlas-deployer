@@ -397,18 +397,20 @@ export function businessLight(store: Store, service: string): BusinessLightView 
   const toConfirm = rows.filter((f) => f.status === "proposed" || f.status === "gone" || f.pending).length;
   const confirmed = rows.map((f) => f.confirmedAt).filter((x): x is string => !!x).sort().at(-1);
   const base = { flows, toConfirm, ...(confirmed ? { confirmedAt: confirmed } : {}) };
+  // What waits for a person does not light the lamp; the sentence says so, so the lamp and the list do not seem to disagree.
+  const also = (s: string) => (toConfirm > 0 ? `${s.replace(/\.?$/, ".")} ${toConfirm} more ${toConfirm === 1 ? "flow waits" : "flows wait"} for you to confirm (not counted in the light).` : s);
   const bad = lights.filter((l) => l.light === "failing" || l.light === "attention");
   if (bad.length) {
     const light = bad[0]!.light;
     const n = bad.filter((l) => l.light === light).length;
-    return { light, sentence: `${light === "failing" ? "Failing" : "Needs attention"}: ${bad[0]!.flow.name}: ${bad[0]!.sentence}${n > 1 ? ` (+${n - 1} more)` : ""}`, ...base };
+    return { light, sentence: also(`${light === "failing" ? "Failing" : "Needs attention"}: ${bad[0]!.flow.name}: ${bad[0]!.sentence}${n > 1 ? ` (+${n - 1} more)` : ""}`), ...base };
   }
   if (!rows.length) return { light: "unknown", reason: "no-evidence", sentence: "Not known: no business has been found yet.", ...base };
   const watched = lights.filter((l) => l.flow.status !== "proposed");
   for (const reason of REASON_ORDER.slice(0, 3)) {
     const l = watched.find((x) => x.reason === reason);
-    if (l) return { light: "unknown", reason, sentence: `${REASON_TEXT[reason]} (${l.flow.name})`, ...base };
+    if (l) return { light: "unknown", reason, sentence: also(`${REASON_TEXT[reason]} (${l.flow.name})`), ...base };
   }
   if (!watched.length) return { light: "unknown", reason: "unconfirmed", sentence: `Not known: ${rows.length} business${rows.length > 1 ? "es" : ""} found, none confirmed yet.`, ...base };
-  return { light: "healthy", sentence: `All ${watched.length} confirmed business${watched.length > 1 ? "es" : ""} run without problems.`, ...base };
+  return { light: "healthy", sentence: also(watched.length === 1 ? "The confirmed business runs without problems." : `All ${watched.length} confirmed businesses run without problems.`), ...base };
 }

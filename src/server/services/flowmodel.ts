@@ -95,6 +95,24 @@ function unitsOf(service: string, s: Segment, sk: Skeleton): SkeletonSegment[] {
 
 const label = (s: Segment) => (s.group.name && s.group.name !== s.id ? `${s.group.name}` : s.id);
 
+const NEW_FLOW = "新的业务：";
+/** The flows to-do's one sentence: what waits for a person, counted by kind (diff's texts are per segment, too many to list). */
+export function pendingText(held: { flow: string | null; kind: string; text: string }[]): string {
+  const distinct = (xs: { flow: string | null; text: string }[]) => new Set(xs.map((x) => x.flow ?? x.text)).size;
+  const of = (k: string) => held.filter((x) => x.kind === k);
+  const newFlows = held.filter((x) => x.kind === "new" && x.text.startsWith(NEW_FLOW));
+  const names = [...new Set(newFlows.map((x) => x.text.slice(NEW_FLOW.length)))];
+  const parts = [
+    newFlows.length ? `${names.length} 条新业务（${names.slice(0, 5).join("、")}${names.length > 5 ? " 等" : ""}）` : "",
+    of("new").length > newFlows.length ? `${of("new").length - newFlows.length} 处新增的组或公共环节` : "",
+    of("cross-service").length ? `${of("cross-service").length} 处跨服务连接` : "",
+    of("gone").length ? `${distinct(of("gone"))} 条业务的一部分在画布上已没有` : "",
+    of("merge").length ? `${of("merge").length} 处要合并的业务` : "",
+    of("split").length ? `${of("split").length} 处要拆开的业务` : "",
+  ].filter(Boolean);
+  return `AI 识别出${parts.length ? ` ${parts.join("、")}` : "业务清单的变化"}，等你在流程页确认。`;
+}
+
 function problems(model: ModelV2 | null, c: Ctx): Problem[] {
   if (!model) return [];
   const out: Problem[] = [];
@@ -251,7 +269,7 @@ function diff(base: ModelV2 | null, draft: ModelV2, c: Ctx): Diff {
     const f = flowOf(d);
     if (!b) {
       if (f && !f.startsWith("new:") && elsewhere(f) && !(base?.segments.some((s) => s.flow === f))) changes.push({ flow: f, kind: "cross-service", text: `${label(d)} 接进别的服务已有的业务，成为它的一段` });
-      else changes.push({ flow: f, kind: "new", text: f && !f.startsWith("new:") ? `新的组 ${label(d)} 加进这条业务` : d.role === "shared" ? `新的公共环节 ${label(d)}` : `新的业务：${label(d)}` });
+      else changes.push({ flow: f, kind: "new", text: f && !f.startsWith("new:") ? `新的组 ${label(d)} 加进这条业务` : d.role === "shared" ? `新的公共环节 ${label(d)}` : `${NEW_FLOW}${label(d)}` });
       continue;
     }
     if (!onCanvas(d)) changes.push({ flow: f, kind: "gone", text: `${label(d)} 在画布上已没有` });
@@ -490,7 +508,7 @@ export async function publishModel(d: ModelDeps, input: { service: string; base:
     if (input.confirm) for (const f of after.keys()) { const row = store.flow(f); if (row?.pending) store.putFlow({ ...row, pending: null }); }
   });
   const todo = pendingOut.length
-    ? d.todos?.open({ service, source: "flows", key: `flows:${service}`, severity: "attention", title: "业务清单有变化，等你确认", detail: pendingOut.map((p) => p.text).join("\n").slice(0, 2000), action: { kind: "confirm-flows", label: "Review flows" } }) ?? null
+    ? d.todos?.open({ service, source: "flows", key: `flows:${service}`, severity: "attention", title: "Confirm the flows the AI found", detail: pendingText(held), action: { kind: "confirm-flows", label: "Review flows" } }) ?? null
     : null;
   return { verdict: held.length ? "needs-confirmation" : "published", revision, reasons, pending: pendingOut, todo };
 }

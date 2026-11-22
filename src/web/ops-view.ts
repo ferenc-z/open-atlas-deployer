@@ -1,7 +1,7 @@
 // Pure helpers of the overview and service page (kept apart from the components so they can be tested).
 
 import { LIGHT_ORDER } from "../server/services/ops-types.ts";
-import type { AnalysisTrigger, ConfigChange, Light, ServiceCard, TodoAction } from "../server/services/ops-types.ts";
+import type { AnalysisTrigger, ConfigChange, Light, ServiceCard, ServicesOverview, TodoAction } from "../server/services/ops-types.ts";
 
 /** The worse of two lights. */
 export const worstLight = (a: Light, b: Light): Light => (LIGHT_ORDER[a] <= LIGHT_ORDER[b] ? a : b);
@@ -11,7 +11,7 @@ export const cardLight = (c: ServiceCard): Light => worstLight(c.machine.light, 
 
 /** What waits for the person on one card: the open to-dos, else the flows to confirm. */
 export function nextLine(c: ServiceCard): string | null {
-  if (c.todoCount > 0) return `${c.todoCount} ${c.todoCount === 1 ? "thing" : "things"} for you`;
+  if (c.todoCount > 0) return `${c.todoCount} ${c.todoCount === 1 ? "thing" : "things"} for you${c.aiHasPlan ? " · AI has a plan" : ""}`;
   if (c.business.toConfirm > 0) return "Confirm the flows the AI found";
   return null;
 }
@@ -36,9 +36,18 @@ export const TRIGGER_TEXT: Record<AnalysisTrigger, string> = {
   schedule: "the scheduled check-up",
   "machine-red": "the machine light turning red",
   "user-visit": "you opening this page",
-  "check-now": "a Check now",
+  "check-now": "Check now",
   "flows-feedback": "your feedback on the flows",
 };
+
+/** The overview's check-up line (prototype "AI check-up 10:00 · next 14:00"); without a schedule, why it ran. */
+export function checkupLine(o: Pick<ServicesOverview, "lastCheckup" | "running" | "services">): string {
+  const last = o.lastCheckup;
+  if (o.running || last?.state === "running") return "AI check-up running…";
+  if (!last) return "No AI check-up yet";
+  const next = o.services.find((s) => s.nextCheckAt)?.nextCheckAt;
+  return `AI check-up ${clock(last.at)}${last.state === "failed" ? " (failed)" : ""} · ${next ? `next ${clock(next)}` : TRIGGER_TEXT[last.trigger]}`;
+}
 
 /** The button of a to-do's one action: Apply the AI's change is fixed text (the prototype); the rest use the AI's own label. */
 export function actionLabel(a: TodoAction): string {

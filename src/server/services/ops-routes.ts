@@ -248,7 +248,7 @@ export function mountOps(api: Hono, d: OpsRouteDeps) {
     try {
       const input = parseRecord(id, await c.req.json().catch(() => ({})));
       const at = now();
-      return c.json(record({ store: d.store, actor: d.actorOf(p), scope: p.via === "service" && p.keyKind !== "checkup" ? "todos" : "full", lights: () => lightsOf(id, at), now }, input));
+      return c.json(record({ store: d.store, actor: d.actorOf(p), scope: p.via === "service" && p.keyKind !== "checkup" ? "todos" : "full", lights: () => lightsOf(id, at), flowLights: () => Object.fromEntries(business(id, at).flows.map((f) => [f.id, f.light])), now }, input));
     } catch (e) { return failed(c, e); }
   });
 

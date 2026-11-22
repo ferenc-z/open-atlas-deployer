@@ -5,6 +5,20 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
 
 ## Unreleased
 
+- Managed-service pages (UAT feedback 2026-11-22): the sentence beside each light is the AI's. `record` takes
+  `analysis.machineSentence` and `analysis.businessSentence` (one plain Chinese sentence each, at most 200 characters)
+  and uses `analysis.flows[].sentence` beside each business; the overview and the service page show them while that light
+  is still the one recorded with the analysis (and for 6 hours at most), else the rules' sentence. `record` now keeps the
+  two lights (and each business's) as they are when it writes, so an analysis is no longer "out of date" right after the
+  AI published a model. The rules' business sentence says how many flows wait for confirmation (they do not light the
+  lamp); the service page always shows it. The flows to-do the gate opens is one sentence ("AI 识别出 2 条新业务（…）、1 处
+  跨服务连接，等你在流程页确认。") under the fixed title "Confirm the flows the AI found". The overview's check-up line reads
+  "AI check-up 15:47 · next 19:47" (the prototype), the analysis line "started by Check now"; a card with an AI action
+  says "· AI has a plan"; the business card says when you confirmed the flows.
+  - [ ] OMA: publish the Service Check-up agent again (`agents/service-checkup.md`) and the Deploy Assistant (Skill
+    `nifi-ops` changed: the check-up's record fields); switch `DEPLOYER_OMA_CHECKUP_AGENT`, `DEPLOYER_OMA_AGENT` and the
+    Workbench business agent to the new ids.
+
 - Ops step 5 (pages-rethink A1): the AI's analyses of the managed services, by the Service Check-up agent
   (`DEPLOYER_OMA_CHECKUP_AGENT`, `_ENVIRONMENT`, `_VAULTS` with its `dpc_` key). Each is a running row in
   `service_analyses` first, then an OMA session whose first message names the analysis ids; the agent writes back with

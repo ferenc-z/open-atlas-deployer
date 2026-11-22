@@ -17,6 +17,8 @@ export const ANOMALIES: readonly Anomaly[] = ["processing-failed", "invalid-data
 /** A1: an analysis is out of date an hour after it ended, or once a light changed after it started. */
 export const STALE_MS = 3_600_000;
 const MAX_TODOS = 20;
+/** analysis.machineSentence / businessSentence: one sentence. */
+const SENTENCE_MAX = 200;
 
 
 export const todoView = (t: TodoRecord): TodoView => ({
@@ -72,6 +74,29 @@ export function analysisView(a: AnalysisRecord, now: Date, lights?: Lights): Ana
   };
 }
 
+/** The AI's sentences shown beside the lights stay this long after the analysis, while the lights stay as they were then. */
+export const SENTENCE_MS = 6 * 3_600_000;
+/** The AI's one sentence per light (record analysis.machineSentence, businessSentence) and per business (flows[].sentence)
+ *  from the newest finished analysis, each only while its light is still the one recorded with it (record keeps the lights
+ *  at write time) and the analysis is under SENTENCE_MS old; otherwise left out and the page shows the rules' sentence. */
+export interface AiSentences { machine?: string; business?: string; flows: Record<string, string> }
+export function aiSentences(a: AnalysisRecord | null | undefined, now: Date, lights: Lights, flowLights: Record<string, string> = {}): AiSentences {
+  const out: AiSentences = { flows: {} };
+  if (!a || a.state !== "done" || now.getTime() - Date.parse(a.finishedAt ?? a.startedAt) > SENTENCE_MS) return out;
+  const body = (a.body && typeof a.body === "object" ? a.body : {}) as Record<string, any>;
+  const said = (v: unknown) => (typeof v === "string" && v.trim() ? v.trim() : undefined);
+  const m = said(body.machineSentence);
+  if (m && lights.machine === a.machineLight) out.machine = m;
+  const b = said(body.businessSentence);
+  if (b && lights.business === a.businessLight) out.business = b;
+  const was = (body.flowLights && typeof body.flowLights === "object" ? body.flowLights : {}) as Record<string, string>;
+  for (const f of Array.isArray(body.flows) ? body.flows : []) {
+    const s = said(f?.sentence);
+    if (s && typeof f.flow === "string" && was[f.flow] && was[f.flow] === flowLights[f.flow]) out.flows[f.flow] = s;
+  }
+  return out;
+}
+
 /** What step 3b's page and overview builders read (and describe): the open to-dos and the newest analysis of a service. */
 export interface OpsReads {
   todos(service: string): TodoView[];
@@ -80,6 +105,8 @@ export interface OpsReads {
   analysis(service: string, lights?: Lights): AnalysisView | null;
   /** The newest analysis's own record (body: what record wrote), for the AI sentences on the pages. */
   analysisRecord(service: string): AnalysisRecord | null;
+  /** The AI's sentences beside the lights, while they still hold (aiSentences). */
+  sentences(service: string, lights: Lights, flowLights?: Record<string, string>): AiSentences;
   /** The flows page's intro the AI wrote (record analysis.intro), newest first; null: none yet. */
   intro(service: string): string | null;
   /** §10.2.2 #1: the newest check-up round over all services (analyses sharing a run): running while any is, failed when any failed. */
@@ -93,6 +120,8 @@ export function opsReads(store: Store, now: () => Date = () => new Date()): OpsR
     todoCount: (service) => store.todos(service).length,
     analysis: (service, lights) => { const a = store.analyses(service, 1)[0]; return a ? analysisView(a, now(), lights) : null; },
     analysisRecord: (service) => store.analyses(service, 1)[0] ?? null,
+    // A running or failed analysis does not hide the sentences of the one before it.
+    sentences: (service, lights, flowLights) => aiSentences(store.analyses(service, 5).find((a) => a.state === "done"), now(), lights, flowLights),
     intro: (service) => {
       for (const a of store.analyses(service, 20)) {
         const intro = (a.body as { intro?: unknown } | null)?.intro;
@@ -159,6 +188,8 @@ export function parseTodoAction(v: unknown): TodoAction | string {
 export interface TodoInput { key: string; flow: string | null; severity: "failing" | "attention"; title: string; detail: string; action: TodoAction | null }
 export interface AnalysisInput {
   trigger: AnalysisTrigger; machine: string; business: string; summary: string; lookedAt: string[];
+  /** The one plain sentence beside each light on the pages (Chinese). */
+  machineSentence?: string; businessSentence?: string;
   flows?: { flow: string; sentence: string; problems?: { anomaly: Anomaly; cause: string; advice: string[] }[]; risks?: { text: string; component?: string }[] }[];
   stuckSuggestions?: { flow: string; attentionMinutes: number; failingMinutes: number; basis: string }[];
   intro?: string;
@@ -180,7 +211,8 @@ export function parseRecord(service: string, body: unknown): RecordInput {
       && (f.risks === undefined || (Array.isArray(f.risks) && f.risks.every((r: any) => isObj(r) && text(r.text, 1000))))))) errors.push("analysis.flows: each {flow, sentence, problems?: [{anomaly, cause, advice[]}], risks?: [{text, component?}]}");
     if (a.stuckSuggestions !== undefined && (!Array.isArray(a.stuckSuggestions) || !a.stuckSuggestions.every((s: any) => isObj(s) && text(s.flow, 80) && Number.isInteger(s.attentionMinutes) && Number.isInteger(s.failingMinutes) && s.attentionMinutes >= 1 && s.attentionMinutes < s.failingMinutes && s.failingMinutes <= 43_200 && text(s.basis, 1000)))) errors.push("analysis.stuckSuggestions: each {flow, attentionMinutes < failingMinutes (whole minutes, at most 30 days), basis}");
     if (a.intro !== undefined && !text(a.intro, 2000)) errors.push("analysis.intro is 1 to 2000 characters");
-    if (!errors.length) analysis = { trigger: a.trigger, machine: a.machine, business: a.business, summary: a.summary, lookedAt: a.lookedAt, ...(a.flows ? { flows: a.flows } : {}), ...(a.stuckSuggestions ? { stuckSuggestions: a.stuckSuggestions } : {}), ...(a.intro ? { intro: a.intro } : {}) };
+    for (const k of ["machineSentence", "businessSentence"] as const) if (a[k] !== undefined && !text(a[k], SENTENCE_MAX)) errors.push(`analysis.${k} is one plain sentence, 1 to ${SENTENCE_MAX} characters`);
+    if (!errors.length) analysis = { trigger: a.trigger, machine: a.machine, business: a.business, summary: a.summary, lookedAt: a.lookedAt, ...(a.machineSentence ? { machineSentence: a.machineSentence.trim() } : {}), ...(a.businessSentence ? { businessSentence: a.businessSentence.trim() } : {}), ...(a.flows ? { flows: a.flows } : {}), ...(a.stuckSuggestions ? { stuckSuggestions: a.stuckSuggestions } : {}), ...(a.intro ? { intro: a.intro } : {}) };
   }
   const todos: TodoInput[] = [];
   if (b.todos !== undefined) {
@@ -229,6 +261,8 @@ export interface RecordContext {
   scope: "full" | "todos";
   /** The lights now: kept with a new analysis to tell later whether it is out of date. */
   lights: () => Lights;
+  /** Each business's light now, kept with the analysis (its per-business sentence shows while that light stays). */
+  flowLights?: () => Record<string, string>;
   now?: () => Date;
 }
 export interface RecordResult { analysis: number | null; todos: string[]; resolved: string[] }
@@ -252,14 +286,16 @@ export function record(ctx: RecordContext, input: RecordInput): RecordResult {
   return store.flowTransaction(() => {
     let analysis: number | null = null;
     if (input.analysis) {
-      const body = redactStrings(input.analysis);
+      // The lights as they are when the AI writes (it may have published a model meanwhile): "out of date" and the AI's
+      // sentences on the pages compare with these, not with the lights when the analysis started.
+      const l = ctx.lights();
+      const body = { ...redactStrings(input.analysis), ...(ctx.flowLights ? { flowLights: ctx.flowLights() } : {}) };
       // Step 5: the scheduled check-up has no ids (OMA opened its session); it never fills another start's running row.
       const running = target ?? (input.analysis.trigger === "schedule" ? null : store.analyses(service, 5).find((a) => a.state === "running") ?? null);
       if (running) {
-        store.setAnalysis({ id: running.id, state: "done", session: running.session, finishedAt: now, body, error: null });
+        store.setAnalysis({ id: running.id, state: "done", session: running.session, finishedAt: now, body, error: null, machineLight: l.machine, businessLight: l.business });
         analysis = running.id;
       } else {
-        const l = ctx.lights();
         const run = input.analysis.trigger === "schedule" ? scheduleRun(store, service, Date.parse(now)) : null;
         analysis = store.addAnalysis({ service, run, trigger: input.analysis.trigger, state: "done", session: null, requestedBy: actor.id, startedAt: now, finishedAt: now, machineLight: l.machine, businessLight: l.business, body, error: null });
       }

@@ -73,7 +73,7 @@ The Deployer's code finds the skeleton (by default a root process group is one b
 
 ## The scheduled check-up (its own agent and key)
 
-The check-up's first message gives the services and, per service, the analysis id. For each service: `describe` → `look` what the lights and gaps point at → fix what you may (`publish_model` for the model; never a configuration change) → `record {service, analysis_id, analysis: {trigger, machine, business, summary, lookedAt, flows?, stuckSuggestions?, intro?}, todos, resolve}`: machine and business one sentence each, summary the cause in a short paragraph, all in Chinese; `resolve` the ids of open to-dos that are no longer true.
+The check-up's first message gives the services and, per service, the analysis id. For each service: `describe` → `look` what the lights and gaps point at → fix what you may (`publish_model` for the model; never a configuration change) → `record {service, analysis_id, analysis: {trigger, machine, business, machineSentence, businessSentence, summary, lookedAt, flows?, stuckSuggestions?, intro?}, todos, resolve}`, after the last `publish_model`: machine and business the conclusion each; machineSentence, businessSentence and each `flows[].sentence` the one plain sentence the page shows beside that light or business (short, no rule text; say when businesses wait for confirmation); summary the cause in a short paragraph, all in Chinese; `resolve` the ids of open to-dos that are no longer true.
 
 ## Changing a configuration
 

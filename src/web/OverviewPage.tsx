@@ -6,7 +6,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { LightBadge } from "./OpsParts.tsx";
 import { ops } from "./ops-data.ts";
-import { businessLabel, cardLight, clock, nextLine, summaryParts, TRIGGER_TEXT } from "./ops-view.ts";
+import { businessLabel, cardLight, checkupLine, nextLine, summaryParts } from "./ops-view.ts";
 import type { Light, ServiceCard, ServicesOverview } from "../server/services/ops-types.ts";
 
 export function OverviewPage({ onOpen, onTakeover }: { onOpen: (id: string) => void; onTakeover: () => void }) {
@@ -22,7 +22,6 @@ export function OverviewPage({ onOpen, onTakeover }: { onOpen: (id: string) => v
   };
   if (!data) return <div className="fl ops ops-wide">{error ? <p className="fl-error">{error}</p> : <p className="fl-muted">Loading…</p>}</div>;
   const { failing, attention, waiting } = summaryParts(data.services);
-  const last = data.lastCheckup;
   return (
     <div className="fl ops ops-wide">
       <section className="ov-head">
@@ -41,7 +40,7 @@ export function OverviewPage({ onOpen, onTakeover }: { onOpen: (id: string) => v
           </p>
         </div>
         <div className="ov-check">
-          <span>{data.running || last?.state === "running" ? "AI check-up running…" : last ? `AI check-up ${clock(last.at)} · ${TRIGGER_TEXT[last.trigger]}` : "No AI check-up yet"}</span>
+          <span>{checkupLine(data)}</span>
           <button type="button" className="fl-btn" disabled={data.running || starting} onClick={() => void checkNow()}>Check now</button>
         </div>
       </section>

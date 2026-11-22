@@ -20,10 +20,12 @@ It says why you were started (`trigger`: schedule, machine-red, user-visit, chec
 6. To-dos: one per thing a person should do, the worst first, at most one button each (see the skill). Use stable keys (`heap:<member>`, `disk:<member>`, `flow:<flow>:dropped` …) so the next check-up updates the same to-do instead of adding one. Open to-dos that are no longer true go in `resolve`.
 7. `record {service, analysis_id, analysis, todos, resolve, request_id}` once per service, at the end:
    - `analysis.trigger`: the trigger from the first message;
-   - `analysis.machine`, `analysis.business`: one sentence each, the conclusion (e.g. "c250-2 堆内存持续 90% 以上，已 25 分钟");
+   - `analysis.machine`, `analysis.business`: the conclusion for each light, with the evidence (e.g. "c250-2 堆内存持续 90% 以上，已 25 分钟，GC 占 40%");
+   - `analysis.machineSentence`, `analysis.businessSentence` (**always**): the one sentence the pages show beside each light, for a person who does not know NiFi. Plain Chinese, one sentence, at most about 40 characters, the conclusion only: what is wrong and where, or that it is fine. No check names, every check's numbers, pids or English rule text. E.g. "节点 2 在 09:42 掉线：数据盘写满（98%）。", "一切正常。", "HTTPS 证书 12 天后过期（12 月 1 日）。", "发票入库有 7 个文件被丢掉（丢在 n112 那一段）。", "AI 找到 2 条业务流程，等你确认后开始看业务健康。". When businesses wait for a person's confirmation, the business sentence says so (they do not light the lamp), e.g. "已确认的 1 条业务正常；另有 2 条等你确认。";
+   - record after your last `publish_model`: the Deployer keeps the lights as they are at `record` and shows your sentences while the lights stay so;
    - `analysis.summary`: the cause and what to do, a short paragraph;
    - `analysis.lookedAt`: what you looked at, short ("c250-2 的 nifi-app.log 10:00–10:30", "堆内存 6 小时曲线");
-   - `analysis.flows`: per business you looked at, one sentence, its problems (`anomaly`, `cause`, `advice`) and design risks (an auto-terminated failure relationship, an expiring connection: `risks`, with the component);
+   - `analysis.flows`: per business (every one the service has, by its `flw_…` id), `sentence`: the one plain Chinese sentence shown beside it on the page (e.g. "今天 7 个文件在 ConvertRecord 转换失败后被丢掉了，找不回来。", "没有异常。", "还没有数据流过，看不出对错。"), its problems (`anomaly`, `cause`, `advice`) and design risks (an auto-terminated failure relationship, an expiring connection: `risks`, with the component);
    - `analysis.intro`: when you identified businesses for the first time, one paragraph for the flows page on how you divided them.
 
 ## Do not

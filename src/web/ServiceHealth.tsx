@@ -9,14 +9,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import * as api from "./api.ts";
 import type { ChangeKind } from "./api.ts";
 import { ask } from "./Confirm.tsx";
-import { ANOMALY_LABEL, LIGHT_LABEL, UNKNOWN_REASON } from "./FlowParts.tsx";
+import { ANOMALY_LABEL, LIGHT_LABEL } from "./FlowParts.tsx";
 import { BigLight, LightBadge } from "./OpsParts.tsx";
 import { flowHref, flowsHref, openAskAi } from "./flow-routes.ts";
 import { usePageFocus } from "./focus.ts";
 import { ops } from "./ops-data.ts";
 import type { AnalysisView, FlowRow, MachineCheck, ServicePage, TodoView } from "../server/services/ops-types.ts";
 import { actionLabel, changeRow, clock, TRIGGER_TEXT } from "./ops-view.ts";
-import { shortTime } from "./FlowParts.tsx";
+import { shortDay, shortTime } from "./FlowParts.tsx";
 
 const MARK = { failing: "✕", attention: "!", healthy: "✓", unknown: "?" } as const;
 const CHECK_NAME = (check: MachineCheck, cluster: boolean) => ({ process: cluster ? "Nodes" : "Process", disk: "Disk", heap: "Memory", certificate: "Certificate", coordinator: "Cluster", collection: "Collection" })[check];
@@ -122,7 +122,7 @@ function BusinessCard({ page }: { page: ServicePage }) {
     <div className={`sv-card sv-business edge-${b.light}`}>
       <div className="sv-title"><b>Business{b.flows.length > 0 ? ` · ${b.flows.length} ${b.flows.length === 1 ? "flow" : "flows"}` : ""}</b><span>is the data right?</span></div>
       <BigLight light={b.light} size={28} />
-      {b.light === "unknown" && <p className="sv-sentence" style={{ fontSize: 15 }}>{b.reason && b.reason !== "unconfirmed" ? `${UNKNOWN_REASON[b.reason]}. ` : ""}{b.sentence}</p>}
+      <p className="sv-sentence" style={{ fontSize: 15 }}>{b.sentence}</p>
       <div className="sv-flows">
         {b.flows.map((f) => (
           <a key={f.id} className="sv-flow" href={flowHref(f.id, id)}>
@@ -137,7 +137,7 @@ function BusinessCard({ page }: { page: ServicePage }) {
         {b.flows.length === 0 && <p className="fl-muted" style={{ margin: 0 }}>No confirmed flows yet.</p>}
         {b.toConfirm > 0 && <a className="sv-flow" href={flowsHref(id)}><span className="dot d-unknown" /><span className="body"><span className="name"><b>{b.toConfirm} {b.toConfirm === 1 ? "flow" : "flows"} to confirm</b></span><span className="text">The AI found {b.toConfirm === 1 ? "it" : "them"} on the canvas; the business light waits for you.</span></span><span style={{ fontSize: 13, color: "#1F4FB8", paddingTop: 2 }}>›</span></a>}
       </div>
-      <div className="sv-foot">The AI found these flows on the canvas. If one is wrong, open it and tell the AI.</div>
+      <div className="sv-foot">The AI found these flows on the canvas{b.confirmedAt ? `; you confirmed them on ${shortDay(b.confirmedAt)}` : ""}. If one is wrong, open it and tell the AI.</div>
     </div>
   );
 }

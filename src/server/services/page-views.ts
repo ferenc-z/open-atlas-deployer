@@ -7,10 +7,10 @@ import type { ExecutorInfo } from "../handoff.ts";
 import type { Store } from "../store.ts";
 import { ANOMALY_LABEL, anomalyText, businessLight, flowLight } from "./business.ts";
 import { flowCard, type GraphExtras } from "./flow-views.ts";
-import { LIGHT_ORDER, type AnalysisState, type AnalysisTrigger, type AnalysisView, type Anomaly, type FlowNote, type BusinessLightView, type FlowCard, type FlowDetail, type FlowProblem, type GateVerdict, type Light, type Lights, type ServiceCard, type ServicePage, type ServicesOverview, type TodoView, type UnknownReason } from "./ops-types.ts";
+import { LIGHT_ORDER, type AnalysisState, type AnalysisTrigger, type AnalysisView, type Anomaly, type FlowNote, type BusinessLightView, type FlowCard, type FlowDetail, type FlowProblem, type FlowRow, type GateVerdict, type Light, type Lights, type ServiceCard, type ServicePage, type ServicesOverview, type TodoView, type UnknownReason } from "./ops-types.ts";
 import type { BusinessHooks } from "./ops-routes.ts";
 import { machineLight } from "./rules.ts";
-import { opsReads } from "./todos.ts";
+import { opsReads, type AiSentences } from "./todos.ts";
 import { CUES, type Cue } from "./trace/model.ts";
 
 
@@ -24,6 +24,18 @@ export interface PageSources {
     running(): boolean;
     /** The next scheduled checkup (A1, step 5), if one is set. */
     nextCheckAt?(): string | null;
+    /** The AI's sentences beside the lights while they hold (todos.ts aiSentences); left out, the rules' sentences show. */
+    sentences?(service: string, lights: Lights, flowLights: Record<string, string>): AiSentences;
+  };
+}
+
+/** The page's sentences: the AI's where it has one that still holds, else the rules'. */
+function withAi<M extends { light: Light; sentence: string }, B extends { light: Light; sentence: string; flows: FlowRow[] }>(src: PageSources, service: string, machine: M, business: B): { machine: M; business: B } {
+  const ai = src.analyses?.sentences?.(service, { machine: machine.light, business: business.light }, Object.fromEntries(business.flows.map((f) => [f.id, f.light])));
+  if (!ai) return { machine, business };
+  return {
+    machine: ai.machine ? { ...machine, sentence: ai.machine } : machine,
+    business: { ...business, ...(ai.business ? { sentence: ai.business } : {}), flows: business.flows.map((f) => (ai.flows[f.id] ? { ...f, sentence: ai.flows[f.id]! } : f)) },
   };
 }
 
@@ -34,6 +46,7 @@ export function opsPageSources(store: Store, nextCheckAt?: () => string | null):
     todos: { open: (service) => reads.todos(service) },
     analyses: {
       latest: (service, lights) => reads.analysis(service, lights), lastCheckup: () => reads.lastCheckup(), running: () => reads.running(),
+      sentences: (service, lights, flowLights) => reads.sentences(service, lights, flowLights),
       ...(nextCheckAt ? { nextCheckAt: () => { const n = nextCheckAt(); return n && Date.parse(n) > Date.now() ? n : null; } } : {}),
     },
   };
@@ -60,14 +73,13 @@ export function servicesOverview(store: Store, executor: Executor, src: PageSour
   const cards: ServiceCard[] = [];
   const next = src.analyses?.nextCheckAt?.() ?? null;
   for (const s of services(store)) {
-    const m = machineLight(store, executor, s.id, now);
-    if (!m) continue;
-    const b = businessLight(store, s.id);
+    const rules = machineLight(store, executor, s.id, now);
+    if (!rules) continue;
+    const { machine: m, business: b } = withAi(src, s.id, rules, businessLight(store, s.id));
     const todos = src.todos?.open(s.id) ?? [];
     const latest = src.analyses?.latest(s.id, { machine: m.light, business: b.light }) ?? null;
     cards.push({
       id: s.id, kind: s.kind, environment: s.environment, label: s.label,
-      // The AI's sentence when its analysis is fresh is step 4's (AnalysisView has no per-light sentence yet).
       machine: { light: m.light, sentence: m.sentence },
       business: { light: b.light, ...(b.reason ? { reason: b.reason } : {}), sentence: b.sentence, flowCount: b.flows.length, toConfirm: b.toConfirm, ...(b.confirmedAt ? { confirmedAt: b.confirmedAt } : {}) },
       todoCount: todos.length,
@@ -83,11 +95,11 @@ export function servicesOverview(store: Store, executor: Executor, src: PageSour
 /** #2 GET /api/services/:id/page; undefined for an unknown service. */
 export function servicePage(store: Store, executor: Executor, id: string, src: PageSources = {}, now: Date = new Date()): ServicePage | undefined {
   const s = services(store).find((x) => x.id === id);
-  const machine = s && machineLight(store, executor, id, now);
-  if (!s || !machine) return undefined;
+  const rules = s && machineLight(store, executor, id, now);
+  if (!s || !rules) return undefined;
   const change = store.serviceChanges(id, 1)[0];
   const ORDER = { failing: 0, attention: 1 } as const;
-  const business = businessLight(store, id);
+  const { machine, business } = withAi(src, id, rules, businessLight(store, id));
   return {
     service: { id, kind: s.kind, environment: s.environment, label: s.label, webUrl: s.webUrl },
     machine, business,

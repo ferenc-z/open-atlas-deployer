@@ -2098,9 +2098,9 @@ export class Store {
   }
 
   /** An analysis's outcome (state, session, end, body, error). */
-  setAnalysis(a: Pick<AnalysisRecord, "id" | "state" | "session" | "finishedAt" | "body" | "error">) {
-    this.db.prepare("UPDATE service_analyses SET state = ?, session = ?, finished_at = ?, body = ?, error = ? WHERE id = ?")
-      .run(a.state, a.session, a.finishedAt, a.body === null || a.body === undefined ? null : JSON.stringify(a.body), a.error, a.id);
+  setAnalysis(a: Pick<AnalysisRecord, "id" | "state" | "session" | "finishedAt" | "body" | "error"> & Partial<Pick<AnalysisRecord, "machineLight" | "businessLight">>) {
+    this.db.prepare("UPDATE service_analyses SET state = ?, session = ?, finished_at = ?, body = ?, error = ?, machine_light = COALESCE(?, machine_light), business_light = COALESCE(?, business_light) WHERE id = ?")
+      .run(a.state, a.session, a.finishedAt, a.body === null || a.body === undefined ? null : JSON.stringify(a.body), a.error, a.machineLight ?? null, a.businessLight ?? null, a.id);
   }
 }
 
