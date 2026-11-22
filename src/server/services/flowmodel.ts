@@ -41,6 +41,8 @@ export interface PublishResult {
 /** Where the gate's to-dos go (service_todos is step 4's; until then nothing is written and todo is null). */
 export interface TodoSink {
   open(t: { service: string; flow?: string; source: "gate" | "flows"; key: string; severity: "failing" | "attention"; title: string; detail: string; action?: TodoAction }): string | null;
+  /** Closes the open to-do of that key (a later publish holds nothing any more). */
+  close?(service: string, key: string): void;
 }
 export interface ModelDeps {
   store: Store;
@@ -339,6 +341,11 @@ export function parseDraft(store: Store, service: string, body: unknown): { mode
   if ("errors" in got) throw new ModelError(400, "flow-model/invalid", "The model is not a valid business model v2.", got.errors);
   const unknown = [...new Set([...got.model.segments.map((s) => s.flow), ...got.notes.map((n) => n.flow)].filter((f): f is string => Boolean(f) && f!.startsWith("flw_") && !store.flow(f!)))];
   if (unknown.length) throw new ModelError(400, "flow-model/unknown-flow", `No business ${unknown.join(", ")}: use an id describe gave, or new:<key> for a new one.`);
+  // A group of one part is the whole group: its only fragment's key as the slice means "*" (engine test 2026-11-22:
+  // the key made the same place look like a new group and a gone one).
+  const topo = store.latestTopology(service)?.body as { groups?: { id: string; fragments?: { key: string }[] }[] } | undefined;
+  const only = new Map((topo?.groups ?? []).filter((g) => g.fragments?.length === 1).map((g) => [g.id, g.fragments![0]!.key]));
+  got.model.segments = got.model.segments.map((s) => (s.slice !== WHOLE && only.get(s.group.id) === s.slice ? { ...s, slice: WHOLE } : s));
   return got;
 }
 
@@ -362,7 +369,10 @@ async function withE2e(d: ModelDeps, service: string, draft: ModelV2, base: Mode
   const imported = new Map(businesses.map((b) => [b.id, b]));
   const segments = draft.segments.map((s) => {
     const b = imported.get(s.id);
-    return b ? { ...s, name: b.name, match: b.match, steps: b.steps.map(({ maxSeconds: _m, ...x }) => x), entries: b.entries, origin: "e2e_trace" as const } : s;
+    if (b) return { ...s, name: b.name, match: b.match, steps: b.steps.map(({ maxSeconds: _m, ...x }) => x), entries: b.entries, origin: "e2e_trace" as const };
+    // A schedule the definitions no longer have: the segment is the AI's from now on (its own steps).
+    if (s.origin === "e2e_trace") { const { origin: _o, ...rest } = s; notes.push(`${s.id} is no longer in e2e_trace's definitions: kept as an ordinary segment.`); return rest; }
+    return s;
   });
   const sources = draft.sources.includes("e2e_trace") ? draft.sources : ["e2e_trace", ...(draft.sources.length ? draft.sources : ["provenance"])];
   return { model: { ...draft, sources, segments }, notes };
@@ -484,6 +494,9 @@ export async function publishModel(d: ModelDeps, input: { service: string; base:
       if (left.length) store.setFlowSegments(f, left);
       else { store.addFlowChange({ flow: f, service, by, kind: "updated", text: "这条业务已没有段（并进了别的业务或已从画布上去掉），从清单里去掉", revision, verdict: run.verdict }); store.deleteFlow(f); }
     }
+    // A publish is the AI's whole picture: what an earlier publish of this service held and this one does not hold
+    // again is dropped (engine test 2026-11-22: a corrected draft left the first draft's "new / gone" waiting).
+    for (const f of store.flows(service)) if (f.pending && f.pending.service === service) store.putFlow({ ...f, pending: null });
     for (const x of run.changes) {
       const f = x.flow ? real(x.flow) ?? null : null;
       if (x.kind === "new" && f && !before.has(f)) continue; // said as "found"
@@ -513,6 +526,8 @@ export async function publishModel(d: ModelDeps, input: { service: string; base:
   const todo = pendingOut.length
     ? d.todos?.open({ service, source: "flows", key: `flows:${service}`, severity: "attention", title: "Confirm the flows the AI found", detail: pendingText(held), action: { kind: "confirm-flows", label: "Review flows" } }) ?? null
     : null;
+  // Nothing waits any more (no held change, no proposed business): the flows to-do is done.
+  if (!pendingOut.length && !store.flows(service).some((f) => f.status === "proposed" || f.pending)) d.todos?.close?.(service, `flows:${service}`);
   return { verdict: held.length ? "needs-confirmation" : "published", revision, reasons, pending: pendingOut, todo };
 }
 

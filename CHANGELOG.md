@@ -12,9 +12,13 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   environment's, not one service's: a schedule the draft does not place is left out with a note (placing none is still
   refused). e2e-failed works (P3): the Studio graph has a new saved query `e2e_failures` (failure records in a time
   range), the business scan reads it and places a failure on the segment whose step is that worker. Studio graphs made
-  with `testdata/e2e-trace/studio-setup.ts` need it run again for the new saved query.
+  with `testdata/e2e-trace/studio-setup.ts` need it run again for the new saved query. A segment from a schedule the
+  definitions no longer have shows as gap `e2e-gone` (`e2e.gone`) and loses its e2e origin when republished. Two gate
+  fixes: a publish drops what an earlier publish of the service held and it does not hold again (and closes the flows
+  to-do when nothing waits); a group of one part given its only fragment's key as slice is the whole group (`*`), not a
+  new group plus a gone one. Test data for the definitions changing: `testdata/e2e-trace/change.sql`, `failure.sql`.
   - [ ] OMA: publish the Service Check-up agent again (`agents/service-checkup.md`: how to place e2e_trace's
-    schedules); switch `DEPLOYER_OMA_CHECKUP_AGENT` to the new id.
+    schedules, e2e-gone); switch `DEPLOYER_OMA_CHECKUP_AGENT` to the new id.
 
 - Managed-service pages (UAT feedback 2026-11-22): the sentence beside each light is the AI's. `record` takes
   `analysis.machineSentence` and `analysis.businessSentence` (one plain Chinese sentence each, at most 200 characters)

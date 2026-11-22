@@ -45,7 +45,7 @@ export interface OpsRouteDeps {
   now?: () => Date;
 }
 
-export type GapCode = "no-model" | "unconfirmed" | "gate-rejected" | "topology-changed" | "no-exit" | "no-stuck-times" | "s2s-unpaired" | "no-counts" | "e2e-unplaced";
+export type GapCode = "no-model" | "unconfirmed" | "gate-rejected" | "topology-changed" | "no-exit" | "no-stuck-times" | "s2s-unpaired" | "no-counts" | "e2e-unplaced" | "e2e-gone";
 export interface Gap { code: GapCode; text: string; fix: { verb: "publish_model" | "run_model" | "look" | "record"; args?: Record<string, unknown> } }
 
 /** The stand-in business light (before 3b): what is confirmed and what waits; the light is unknown, never guessed. */
@@ -93,8 +93,19 @@ export async function e2eSchedules(store: Store, model: ModelDeps, service: stri
     const placedIn = models.filter((m) => m.segments.some((s) => s.id === b.id || (s.origin === "e2e_trace" && s.match.some((x) => x.attr === "schedule_name" && x.value === b.name)))).map((m) => m.id);
     return { id: b.id, name: b.name, workers: b.steps.map((s) => s.name), entry: b.entries[0]?.channel ?? null, placedIn };
   });
-  return { schedules, notes: got.notes, how: `Place each schedule that runs on ${service} as a segment with the schedule's id (group and slice where components named after its workers are), then publish_model with source e2e_trace: its steps, entry and match come from the schedule. A schedule whose workers are not on this canvas is left out.` };
+  // Segments imported from a schedule the definitions no longer have (removed from e2e_trace).
+  const known = new Set(got.businesses.flatMap((b) => [b.id, `name:${b.name}`]));
+  const gone = (store.flowModel(service)?.model.segments ?? []).filter((s) => s.origin === "e2e_trace" && !known.has(s.id) && !s.match.some((x) => x.attr === "schedule_name" && known.has(`name:${x.value}`)))
+    .map((s) => ({ segment: s.id, flow: s.flow ?? null, name: s.name }));
+  return { schedules, gone, notes: got.notes, how: `Place each schedule that runs on ${service} as a segment with the schedule's id (group and slice where components named after its workers are), then publish_model with source e2e_trace: its steps, entry and match come from the schedule. A schedule whose workers are not on this canvas is left out.` };
 }
+const e2eGaps = (service: string, e: Awaited<ReturnType<typeof e2eSchedules>>): Gap[] => {
+  const gone = (e && "gone" in e ? e.gone : undefined) ?? [];
+  const out: Gap[] = [];
+  if (gone.length) out.push({ code: "e2e-gone", text: `Segments imported from schedules e2e_trace no longer defines: ${gone.slice(0, 8).map((g) => `${g.segment} (${g.name})`).join(", ")}. Where that part is still on the canvas, keep it as an ordinary segment (its own steps) and publish with source e2e_trace; where it is gone from the canvas too, leave it out (a person confirms the business gone).`, fix: { verb: "look", args: { service, kind: "model" } } });
+  const one = e2eGap(service, e);
+  return one ? [...out, one] : out;
+};
 const e2eGap = (service: string, e: Awaited<ReturnType<typeof e2eSchedules>>): Gap | null => {
   const open = (e?.schedules ?? []).filter((s) => !s.placedIn.length);
   if (!open.length) return null;
@@ -151,8 +162,8 @@ export function mountOps(api: Hono, d: OpsRouteDeps) {
       if (!d.registered(service)) return unknown(c, service);
       if (flow && !d.store.flowSegments(flow).some((x) => x.service === service)) return d.reject(c, 404, "flow/unknown", `No business ${flow} in ${service}.`);
       const one = describeOne(service, flow, at);
-      const gap = e2eGap(service, await e2eSchedules(d.store, d.model, service));
-      return c.json(gap ? { ...one, gaps: [...one.gaps, gap] } : one);
+      const more = e2eGaps(service, await e2eSchedules(d.store, d.model, service));
+      return c.json(more.length ? { ...one, gaps: [...one.gaps, ...more] } : one);
     }
     if (flow) return d.reject(c, 400, "describe/flow-needs-service", "Give service with flow.");
     const ids = [...d.store.standalones(), ...d.store.clusters()].map((x) => x.id).sort();

@@ -143,6 +143,7 @@ export function opsReads(store: Store, now: () => Date = () => new Date()): OpsR
 /** Step 2's gate opens its to-dos here (rejected: source gate; held for a person: source flows). */
 export const todoSink = (store: Store): TodoSink => ({
   open: (t) => store.upsertTodo({ service: t.service, flow: t.flow ?? null, source: t.source, key: t.key, severity: t.severity, title: t.title, detail: t.detail, action: t.action ?? null, analysis: null }, "deployer").id,
+  close: (service, key) => { for (const t of store.todos(service)) if (t.key === key) store.closeTodo(t.id, "done", { id: "deployer", via: "service" }); },
 });
 
 // ---- record --------------------------------------------------------------------------------------------------------
