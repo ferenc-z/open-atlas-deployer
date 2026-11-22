@@ -270,8 +270,8 @@ export function businessCheckAll(store: Store, now: Date = new Date()) {
 // ---- the provenance scan (data dropped, processing failed, invalid data) and e2e_trace's failures ---------------------
 
 export interface ProvenanceReader { search(id: string, q: { field: string; value: string; from: string; to: string; maxResults: number }): Promise<Any> }
-/** P3: e2e_trace's failure records in a time range, placed by the worker's component when there is one. No saved
- *  query gives them yet (E2E_SAVED_QUERIES); until one does, nothing is passed and e2e-failed is never found. */
+/** P3: e2e_trace's failure records in a time range (saved query e2e_failures), placed by the component when there is
+ *  one, else by the worker: an imported schedule's step is that worker. */
 export interface E2eFailures { failures(service: string, from: string, to: string): Promise<{ at: string; worker: string; component?: string; group?: string; text: string }[]> }
 const SCAN_AT = "businessScanAt";
 const SEARCHES = [["EventType", "DROP"], ["EventType", "EXPIRE"], ["Relationship", "failure"], ["Relationship", "invalid"]] as const;
@@ -282,6 +282,8 @@ export class BusinessScanner {
   private provenance: ProvenanceReader;
   private e2e: E2eFailures | undefined;
   constructor(store: Store, provenance: ProvenanceReader, e2e?: E2eFailures) { this.store = store; this.provenance = provenance; this.e2e = e2e; }
+  /** The e2e_trace source is made inside createApp, after the scanner. */
+  useE2e(e2e: E2eFailures) { this.e2e = e2e; }
 
   /** One service: the window since its last scan (at most SCAN_BACK_MINUTES back). */
   async scan(service: string, now: Date = new Date()): Promise<{ observations: number; notes: string[] }> {
@@ -306,7 +308,7 @@ export class BusinessScanner {
     if (this.e2e && this.store.traceSource(service, "e2e_trace")) {
       try {
         for (const f of await this.e2e.failures(service, from, to)) {
-          const place = locate({ component: f.component ?? null, group: f.group ?? null });
+          const place = locate({ component: f.component ?? f.worker, group: f.group ?? null });
           if (place) observations.push({ place, ref: f.component ?? `worker:${f.worker}`, anomaly: "e2e-failed", light: "attention", at: f.at, count: 1, detail: { segment: place.segment, worker: f.worker, text: f.text.slice(0, 300) } });
         }
       } catch (error) { notes.push(`e2e_trace: ${(error as Error).message}`); }

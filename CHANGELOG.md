@@ -5,6 +5,17 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
 
 ## Unreleased
 
+- Business discovery from e2e_trace (engine test 2026-11-22): `describe {service}` has the gap `e2e-unplaced` when the
+  service has e2e_trace and some schedule is in no service's model, and `look kind model` lists the schedules under `e2e`
+  (id `schedule-<n>`, workers, entry, the services whose model places each), so the check-up can publish with
+  `source: "e2e_trace"` (before, nothing told the AI the source or the schedule ids). The graph's definitions are the
+  environment's, not one service's: a schedule the draft does not place is left out with a note (placing none is still
+  refused). e2e-failed works (P3): the Studio graph has a new saved query `e2e_failures` (failure records in a time
+  range), the business scan reads it and places a failure on the segment whose step is that worker. Studio graphs made
+  with `testdata/e2e-trace/studio-setup.ts` need it run again for the new saved query.
+  - [ ] OMA: publish the Service Check-up agent again (`agents/service-checkup.md`: how to place e2e_trace's
+    schedules); switch `DEPLOYER_OMA_CHECKUP_AGENT` to the new id.
+
 - Managed-service pages (UAT feedback 2026-11-22): the sentence beside each light is the AI's. `record` takes
   `analysis.machineSentence` and `analysis.businessSentence` (one plain Chinese sentence each, at most 200 characters)
   and uses `analysis.flows[].sentence` beside each business; the overview and the service page show them while that light

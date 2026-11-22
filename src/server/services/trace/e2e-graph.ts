@@ -104,6 +104,13 @@ export function e2eTraceContract(): string {
     resolver(`records-${w.entity.replace("_", "-")}`, w.label, ids.map((c) => A(w.entity, c[0])), A(w.entity, "records"), "record", RECORD,
       `${RECORD_SQL} AND ${w.where}`, ids.map((c): [unknown, string] => [A(w.entity, c[0]), c[0]]), w.limit, "received_at");
   }
+  // P3 (2026-11-22): the failure records in a time range, for the business light's e2e-failed (BusinessScanner).
+  const fIds: Col[] = [["from", "From (ISO time, inclusive)", "string", false], ["to", "To (ISO time, exclusive)", "string", false]];
+  entities["e2e.failures"] = { ":entity/label": "Failure records in a window", ":entity/identity": fIds.map((c) => A("failures", c[0])), ":entity/attributes": [...fIds.map((c) => A("failures", c[0])), A("failures", "records")] };
+  fIds.forEach((c) => attr("failures", c));
+  ref("failures", "records", "Run records that ended in failure, oldest first", "record");
+  resolver("records-failures", "Failure records in a window", fIds.map((c) => A("failures", c[0])), A("failures", "records"), "record", RECORD,
+    `${RECORD_SQL} AND process_status = 'failure'`, fIds.map((c): [unknown, string] => [A("failures", c[0]), c[0]]), 200, "received_at");
   // The definitions (FINAL: the latest entry_datetime of each key) and the per-worker durations for T10.
   addRow("schedule", "Schedule (business process)", HEADER, "schedule_id");
   addRow("step", "Schedule step (a worker)", DETAIL, "row_key");
@@ -173,6 +180,8 @@ export const E2E_SAVED_QUERIES: E2eSavedQuery[] = [
     params: [{ name: w.key, type: "string", required: true, description: `The ${w.key.replace("_", " ")} to look for.`, example: w.key === "correlation_id" ? "aaaaaaaa-0000-4000-8000-00000000000a" : w.key === "file_name" ? "INV-A-001.pdf" : w.key === "email_subject" ? "Invoice" : "billing" }, ...range(EX.from, EX.to)],
     eql: `{:entity {:e2e.${w.entity}/${w.key} ?${w.key} :e2e.${w.entity}/from ?from :e2e.${w.entity}/to ?to} :query [{:e2e.${w.entity}/records ${RECORD_EQL}}]}`,
   })),
+  { name: "e2e_failures", description: "Run records that ended in failure (process_status failure), in a time range (required), oldest first; at most 200.", params: range(EX.from, EX.to),
+    eql: `{:entity {:e2e.failures/from ?from :e2e.failures/to ?to} :query [{:e2e.failures/records ${RECORD_EQL}}]}` },
   { name: "e2e_schedules", description: "Every schedule (business process) with its manager, trigger and final worker: schedule_header, latest revision.", params: [],
     eql: `[{:e2e.schedule/all [${HEADER.map((c) => `:e2e.schedule/${c[0]}`).join(" ")}]}]` },
   { name: "e2e_schedule_steps", description: "Every schedule's steps in order (worker, exchanges, routing keys): schedule_detail, latest revision.", params: [],

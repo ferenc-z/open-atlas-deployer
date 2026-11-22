@@ -45,7 +45,7 @@ export interface OpsRouteDeps {
   now?: () => Date;
 }
 
-export type GapCode = "no-model" | "unconfirmed" | "gate-rejected" | "topology-changed" | "no-exit" | "no-stuck-times" | "s2s-unpaired" | "no-counts";
+export type GapCode = "no-model" | "unconfirmed" | "gate-rejected" | "topology-changed" | "no-exit" | "no-stuck-times" | "s2s-unpaired" | "no-counts" | "e2e-unplaced";
 export interface Gap { code: GapCode; text: string; fix: { verb: "publish_model" | "run_model" | "look" | "record"; args?: Record<string, unknown> } }
 
 /** The stand-in business light (before 3b): what is confirmed and what waits; the light is unknown, never guessed. */
@@ -80,6 +80,26 @@ export function gapsOf(store: Store, service: string, flows: FlowRecord[], now: 
   if (!store.hasFlowCounts(service)) gaps.push({ code: "no-counts", text: "No flow counts collected yet: the replay and the idle check have nothing to go on.", fix: { verb: "look", args: { service, kind: "flow-counts" } } });
   return gaps;
 }
+
+/** 2026-11-22 engine test: e2e_trace's schedules (the environment's, not only this service's) and which service's
+ *  model already places each, so the AI can publish with source e2e_trace (look kind model) and describe can say what
+ *  no model places yet (gap e2e-unplaced). Null when the service has no e2e_trace source. */
+export async function e2eSchedules(store: Store, model: ModelDeps, service: string) {
+  if (!store.traceSource(service, "e2e_trace") || !model.e2e) return null;
+  let got: Awaited<ReturnType<NonNullable<ModelDeps["e2e"]>>>;
+  try { got = await model.e2e(service); } catch (error) { return { error: (error as Error).message, schedules: [], notes: [] }; }
+  const models = [...store.standalones(), ...store.clusters()].map((s) => ({ id: s.id, segments: store.flowModel(s.id)?.model.segments ?? [] }));
+  const schedules = got.businesses.map((b) => {
+    const placedIn = models.filter((m) => m.segments.some((s) => s.id === b.id || (s.origin === "e2e_trace" && s.match.some((x) => x.attr === "schedule_name" && x.value === b.name)))).map((m) => m.id);
+    return { id: b.id, name: b.name, workers: b.steps.map((s) => s.name), entry: b.entries[0]?.channel ?? null, placedIn };
+  });
+  return { schedules, notes: got.notes, how: `Place each schedule that runs on ${service} as a segment with the schedule's id (group and slice where components named after its workers are), then publish_model with source e2e_trace: its steps, entry and match come from the schedule. A schedule whose workers are not on this canvas is left out.` };
+}
+const e2eGap = (service: string, e: Awaited<ReturnType<typeof e2eSchedules>>): Gap | null => {
+  const open = (e?.schedules ?? []).filter((s) => !s.placedIn.length);
+  if (!open.length) return null;
+  return { code: "e2e-unplaced", text: `e2e_trace schedules no service's model places yet: ${open.slice(0, 8).map((s) => `${s.id} (${s.name}: ${s.workers.join(" → ")})`).join(", ")}. Place those that run on ${service}: look kind model (e2e), then publish_model with source e2e_trace.`, fix: { verb: "look", args: { service, kind: "model" } } };
+};
 
 export function mountOps(api: Hono, d: OpsRouteDeps) {
   const now = () => d.now?.() ?? new Date();
@@ -130,7 +150,9 @@ export function mountOps(api: Hono, d: OpsRouteDeps) {
     if (service) {
       if (!d.registered(service)) return unknown(c, service);
       if (flow && !d.store.flowSegments(flow).some((x) => x.service === service)) return d.reject(c, 404, "flow/unknown", `No business ${flow} in ${service}.`);
-      return c.json(describeOne(service, flow, at));
+      const one = describeOne(service, flow, at);
+      const gap = e2eGap(service, await e2eSchedules(d.store, d.model, service));
+      return c.json(gap ? { ...one, gaps: [...one.gaps, gap] } : one);
     }
     if (flow) return d.reject(c, 400, "describe/flow-needs-service", "Give service with flow.");
     const ids = [...d.store.standalones(), ...d.store.clusters()].map((x) => x.id).sort();
@@ -158,6 +180,7 @@ export function mountOps(api: Hono, d: OpsRouteDeps) {
       base: m?.revision ?? 0,
       draft: draftFromSkeleton(d.store, id, now()),
       flows: d.store.flows(id).map((f) => ({ id: f.id, name: f.name, nameBy: f.nameBy, status: f.status, summary: f.summary, stuck: f.stuck, pending: f.pending ? { kind: f.pending.kind, text: f.pending.text } : null })),
+      e2e: await e2eSchedules(d.store, d.model, id),
     });
   });
 

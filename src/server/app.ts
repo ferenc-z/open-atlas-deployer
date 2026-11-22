@@ -120,6 +120,8 @@ export interface Dependencies {
   nginxFetcher?: typeof fetch;
   /** S37 step 7: the e2e_trace evidence source (tests pass one with a fake data plane). */
   e2eTrace?: E2eTraceSource;
+  /** Ops step 3b's business scan (index.ts): handed the e2e_trace source for e2e-failed (P3). */
+  businessScanner?: { useE2e(e2e: E2eTraceSource): void };
   /** pages-rethink §10.2 step 4: step 3b's business light and business detail for describe (opsHooks(); stand-ins without them). */
   businessHooks?: import("./services/ops-routes.ts").BusinessHooks;
   /** Ops step 3b: the to-dos and analyses the overview and the service page show (opsReads(store); none without it). */
@@ -1324,6 +1326,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
   // Without adapters from the caller, both built-in sources (provenance, e2e_trace) are registered.
   deps.traceAdapters ??= new Map<string, EvidenceAdapter>([[PROVENANCE_SOURCE, new ProvenanceAdapter(provenance)]]);
   if (!deps.traceAdapters.has(E2E_ID)) deps.traceAdapters.set(E2E_ID, e2eTrace.adapter);
+  deps.businessScanner?.useE2e(e2eTrace);
   mountE2eTrace(api, { store, source: e2eTrace, authenticate, reject, registered: registeredService, actorOf });
   // S37 step 5 (§4.2.0): the business data trace — a service's model, position search, trace_business_data.
   mountTrace(api, { store, provenance, authenticate, reject, registered: registeredService, actorOf, adapters: deps.traceAdapters ?? new Map<string, EvidenceAdapter>([[PROVENANCE_SOURCE, new ProvenanceAdapter(provenance)]]) });

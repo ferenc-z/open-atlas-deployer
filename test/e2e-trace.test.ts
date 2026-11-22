@@ -11,6 +11,7 @@ import { SecretBox } from "../src/server/secretbox.ts";
 import { Store } from "../src/server/store.ts";
 import { e2eImport, mountE2eTrace } from "../src/server/services/trace/e2e-routes.ts";
 import { publishModel } from "../src/server/services/flowmodel.ts";
+import { e2eSchedules } from "../src/server/services/ops-routes.ts";
 import { E2E_SAVED_QUERIES, e2eTraceContract } from "../src/server/services/trace/e2e-graph.ts";
 import { businessesFrom, E2eTraceSource, E2E_ID, recordEvent } from "../src/server/services/trace/e2e-trace.ts";
 import { TraceEngine } from "../src/server/services/trace/engine.ts";
@@ -66,6 +67,7 @@ function fakeStudio(opts: { durations?: { worker_name: string; p95_seconds: numb
       if (name === "e2e_records_by_file") return by((r) => r.file_name === params.file_name, "e2e.by_file/records");
       if (name === "e2e_records_by_subject") return by((r) => r.email_subject.toLowerCase().includes(params.email_subject!.toLowerCase()), "e2e.by_subject/records");
       if (name === "e2e_records_by_sender") return by((r) => r.email_from.includes(params.email_from!), "e2e.by_sender/records");
+      if (name === "e2e_failures") return by((r) => r.process_status === "failure", "e2e.failures/records");
       if (name === "e2e_schedules") return { result: { "e2e.schedule/all": ns("e2e.schedule", HEADERS) } };
       if (name === "e2e_schedule_steps") return { result: { "e2e.step/all": ns("e2e.step", DETAILS) } };
       if (name === "e2e_worker_durations") return { result: { "e2e.durations/workers": ns("e2e.duration", (opts.durations ?? []).map((d) => ({ row_key: `invoice_email|${d.worker_name}`, schedule_name: "invoice_email", ...d }))) } };
@@ -268,7 +270,8 @@ test("e2e_trace routes: an admin sets the Graph and token (sealed), viewers read
     steps: [{ id: "x", name: "made up", position: { kind: "worker", id: "x" } }], entries: [{ id: "e", step: "x", channel: { type: "external", system: "x" } }], exits: [] })) };
   const deps = { store, e2e: e2eImport(source), now: () => NOW };
   const ai = { id: "assistant", via: "key" } as const;
-  await assert.rejects(publishModel(deps, { service: "c250", base: 0, model: { ...placed, segments: placed.segments.slice(0, 1) }, note: "e2e", source: "e2e_trace", actor: ai }), /Place every e2e_trace schedule: .*schedule-102/);
+  // 2026-11-22: the definitions are the environment's, so a schedule not on this canvas is left out; placing none is refused.
+  await assert.rejects(publishModel(deps, { service: "c250", base: 0, model: { ...placed, segments: placed.segments.map((s) => ({ ...s, id: s.id.replace("schedule", "canvas") })) }, note: "e2e", source: "e2e_trace", actor: ai }), /Place the e2e_trace schedules that run on c250: .*schedule-101/);
   await assert.rejects(publishModel({ store }, { service: "c250", base: 0, model: placed, note: "e2e", source: "e2e_trace", actor: ai }), /no e2e_trace source/);
   const got = await publishModel(deps, { service: "c250", base: 0, model: placed, note: "e2e", source: "e2e_trace", actor: ai });
   assert.equal(got.verdict, "needs-confirmation", "a first model's businesses are new: a person confirms them");
@@ -295,4 +298,15 @@ test("e2e_trace routes: without a token the Builder MCP issues one for the graph
   assert.equal(r.body.issued, true);
   assert.deepEqual(asked, [["issue_graph_token", { graph: "s37/e2e-trace", label: "open-atlas-deployer c250 e2e_trace" }]]);
   assert.ok(!JSON.stringify(r.body).includes("oat_v1."), "the token is not sent back");
+});
+
+test("2026-11-22: the failure records for e2e-failed, and the schedules look kind model shows the AI", async () => {
+  const { store, source } = configured();
+  const got = await source.failures("c250", ago(3600), NOW.toISOString());
+  assert.deepEqual(got.map((f) => f.worker), ["pdf_parser"], "case B ended in failure at pdf_parser");
+  assert.match(got[0]!.text, /invoice_email: pdf_parser ended in failure on c250-2 \(correlation_id bbbbbbbb-.*INV-B-001\.pdf\)/);
+  assert.deepEqual(await source.failures("other", ago(3600), NOW.toISOString()), [], "a service without the source has none");
+  const e = await e2eSchedules(store, { store, e2e: e2eImport(source) }, "c250");
+  assert.deepEqual(e?.schedules.map((s) => [s.id, s.workers, s.placedIn]), [["schedule-101", WORKERS, []], ["schedule-102", ["sftp_fetcher", "order_loader"], []]]);
+  assert.equal(await e2eSchedules(store, { store, e2e: e2eImport(source) }, "n112"), null, "no source, no schedules");
 });

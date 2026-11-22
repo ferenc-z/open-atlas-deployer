@@ -354,8 +354,11 @@ async function withE2e(d: ModelDeps, service: string, draft: ModelV2, base: Mode
   let got: Awaited<ReturnType<NonNullable<ModelDeps["e2e"]>>>;
   try { got = await d.e2e(service); } catch (error) { throw new ModelError(409, "flow-model/e2e", `e2e_trace: ${(error as Error).message}`); }
   const { businesses, notes } = got;
+  // The graph's definitions are every schedule of the environment, not this service's: one whose workers are not on
+  // this canvas is left out (2026-11-22 engine test; describe's e2e-unplaced keeps it in view). Placing none is refused.
   const unplaced = businesses.filter((b) => !draft.segments.some((s) => s.id === b.id)).map((b) => `${b.id}（${b.name}）`);
-  if (unplaced.length) throw new ModelError(400, "flow-model/e2e-unplaced", `Place every e2e_trace schedule: give a segment with its id (group, slice, flow) for ${unplaced.join(", ")}.`, notes);
+  if (businesses.length && unplaced.length === businesses.length) throw new ModelError(400, "flow-model/e2e-unplaced", `Place the e2e_trace schedules that run on ${service}: a segment with the schedule's id (group, slice, flow) for each, e.g. ${unplaced.slice(0, 5).join(", ")}; publish with source "ai" when none of them runs here.`, notes);
+  if (unplaced.length) notes.push(`Not placed in ${service} (left out): ${unplaced.join(", ")}.`);
   const imported = new Map(businesses.map((b) => [b.id, b]));
   const segments = draft.segments.map((s) => {
     const b = imported.get(s.id);

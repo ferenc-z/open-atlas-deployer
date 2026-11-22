@@ -208,6 +208,19 @@ export class E2eTraceSource {
     } catch { this.durations.delete(service); return undefined; }
   }
 
+  /** P3 (BusinessScanner's E2eFailures): the failure records in a time range. The worker is the position; the scan
+   *  places it on the segment whose step is that worker (an imported schedule), so other services' schedules in the
+   *  same graph are nobody's here. */
+  async failures(service: string, from: string, to: string): Promise<{ at: string; worker: string; text: string }[]> {
+    if (!this.client(service)) return [];
+    const { rows } = await this.run(service, "e2e_failures", { from, to });
+    return rows.map((r) => {
+      const e = recordEvent(service, r);
+      const clue = e.attrs.file_name ? `, file ${e.attrs.file_name}` : e.attrs.email_subject ? `, mail "${e.attrs.email_subject}"` : "";
+      return { at: e.at, worker: String(r.worker_name ?? ""), text: `${e.attrs.schedule_name ?? "schedule"}: ${e.attrs.error} (correlation_id ${r.correlation_id}${clue})` };
+    }).filter((f) => f.worker);
+  }
+
   /** T6: the schedules as businesses (schedule_header + schedule_detail, latest revisions), merged into the stored model. */
   async importModel(service: string, current: TraceModel): Promise<{ model: TraceModel; imported: string[]; replaced: string[]; notes: string[] }> {
     const [headers, details] = await Promise.all([this.run(service, "e2e_schedules", {}), this.run(service, "e2e_schedule_steps", {})]);

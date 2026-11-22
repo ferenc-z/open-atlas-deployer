@@ -141,7 +141,7 @@ const serviceLogs = new ServiceLogs(store, deployments.handoff);
 const serviceProvenance = new ServiceProvenance(store, deployments.handoff, serviceLogs);
 const businessScanner = new BusinessScanner(store, serviceProvenance);
 // Steps 3b + 4: the pages read the to-dos and analyses (opsReads); describe reads the real business light.
-const app = createApp({ config, store, takeover, changes: serviceChanges, ...(configReview ? { configReview } : {}), graph: nifiOpsGraph, logs: serviceLogs, provenance: serviceProvenance, pageSources, businessHooks, analyses, sessions: new WorkbenchSessions(config.workbenchUrl), observer, deployments, versions, env, peer, onboarding, drift, briefs, keys, workbench, workbenchKey, deployerSettings,
+const app = createApp({ config, store, takeover, changes: serviceChanges, ...(configReview ? { configReview } : {}), graph: nifiOpsGraph, logs: serviceLogs, provenance: serviceProvenance, pageSources, businessHooks, businessScanner, analyses, sessions: new WorkbenchSessions(config.workbenchUrl), observer, deployments, versions, env, peer, onboarding, drift, briefs, keys, workbench, workbenchKey, deployerSettings,
   // D45: the image sets DEPLOYER_RESTART_BY_EXIT; the container's restart policy starts it again with the new settings.
   ...(process.env.DEPLOYER_RESTART_BY_EXIT === "true" ? { restart: () => setTimeout(() => { store.close(); process.exit(75); }, 300) } : {}) });
 // Job records follow the executor's status files even while nobody has the page open.
