@@ -11,6 +11,11 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   the other side of a new S2S hand-over when the other service's model is not on that group yet (two services that both
   had models could not take a new hand-over: neither could publish first). The check-up prompt says how to join the
   skeleton's pieces (across a shared validation step by the routing attribute, two pieces handed over by a directory).
+- Engine test round 3 (2026-11-23): what a remote input port received is counted from its status's out (NiFi leaves
+  its in at 0), so the S2S balance check and handover-lost no longer see every hand-over as lost (the check-up had
+  turned the S2S hops into external ones to get past the gate). The skeleton draft gives each RPG port of a fan-out its
+  own target, and exits to a shared step (dead letters) theirs. reachable joins two groups linked only through a shared
+  step. The check-up prompt: a directory hand-over is modelled as an `mq` exit and entry.
 - [ ] Upgrade the service executors to 0.9.5 (the Executors page) so S2S exits are placed by the skeleton.
 - [ ] OMA: publish the Service Check-up again (`agents/service-checkup.md` changed; Skill unchanged) and point
   `DEPLOYER_OMA_CHECKUP_AGENT` at the new agent.
