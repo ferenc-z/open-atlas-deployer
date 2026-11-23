@@ -5,6 +5,8 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
 
 ## Unreleased
 
+- `bin/publish-assistant.ts`: `OMA_CONTEXT_WINDOW_TOKENS` / `OMA_CONTEXT_OUTPUT_TOKENS` put the model's context into the agent's metadata (`context_window_tokens` / `context_output_tokens`), for a model OMA's own table does not know (deepseek: OMA fell back to a 32K window and failed compacting).
+
 - Check-up token savings, round 2 (⑰): `run_model` / `publish_model` take `{from: "skeleton" | "current", changes}`
   (assign, share, remove, add-segment, set, add/set/remove-entry and -exit, rekey, note): the Deployer builds the draft
   and answers the gate's result with the built draft in a line per segment, not the model (the whole `model` stays as

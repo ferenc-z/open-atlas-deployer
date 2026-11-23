@@ -13,7 +13,12 @@
 // The Service Check-up (pages-rethink A1, P7: service-checkup) is published the same way, with the same Skills, and its
 // Vault holds the Deployer's check-up key (dpc_) instead of the service key.
 //
-// Usage: OMA_URL=<OMA API> OMA_API_KEY_FILE=<key file> [NIFI_OPS_MCP_URL=<Studio data plane MCP of the nifi-ops graph>] node bin/publish-assistant.ts <builder MCP url> <builder key file> <model> <Deployer MCP url> <state file> [deploy-assistant | onboarding-assessor | service-checkup]
+// The model's context: OMA knows the windows of some models only; for another (deepseek, say) it falls back to a 32K
+// window and compacts early (and fails compacting). OMA_CONTEXT_WINDOW_TOKENS / OMA_CONTEXT_OUTPUT_TOKENS (whole
+// numbers, from the model provider's documentation) go into the agent's metadata as context_window_tokens /
+// context_output_tokens, which OMA reads before its own table.
+//
+// Usage: OMA_URL=<OMA API> OMA_API_KEY_FILE=<key file> [OMA_CONTEXT_WINDOW_TOKENS=<n> OMA_CONTEXT_OUTPUT_TOKENS=<n>] [NIFI_OPS_MCP_URL=<Studio data plane MCP of the nifi-ops graph>] node bin/publish-assistant.ts <builder MCP url> <builder key file> <model> <Deployer MCP url> <state file> [deploy-assistant | onboarding-assessor | service-checkup]
 //   e.g. OMA_URL=https://oma:3000 OMA_API_KEY_FILE=/etc/oa/oma-api.key node bin/publish-assistant.ts https://oma:3008/mcp /etc/oa/oma-builder.key claude-x https://wb.example/deploy/mcp ./assistant-uat.json
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -46,6 +51,15 @@ const filled = JSON.parse(readFileSync(join(root, "templates", `${agentName}.oma
   return r.text;
 });
 if (missing.size) { console.error(`the package names ${[...missing].join(", ")} with no value`); process.exit(2); }
+const context: Record<string, number> = {};
+for (const [env, key] of [["OMA_CONTEXT_WINDOW_TOKENS", "context_window_tokens"], ["OMA_CONTEXT_OUTPUT_TOKENS", "context_output_tokens"]] as const) {
+  const raw = process.env[env]?.trim();
+  if (!raw) continue;
+  const n = Number(raw);
+  if (!Number.isSafeInteger(n) || n <= 0) { console.error(`${env} must be a whole number above 0`); process.exit(2); }
+  context[key] = n;
+}
+if (Object.keys(context).length) for (const agent of filled.agents) agent.metadata = { ...(agent.metadata ?? {}), ...context };
 // Service ops §9.4 (phase 2 step 6): with NIFI_OPS_MCP_URL (Studio's data plane MCP of the nifi-ops graph, e.g.
 // https://studio:9632/mcp/<graph uuid>) the Deploy Assistant also gets that graph's read tools, for drilling down to one
 // queue, processor or process group; its graph token (oat_v1.) is a second credential, kept in OMA's Vault.
