@@ -12,8 +12,10 @@
 // A hand-over to another managed service is the exception (engine test 2026-11-23): a model published while the other
 // side had no model yet (or could not be seen) keeps such a hand-over as an external source or system, and the canvas
 // never changes to say otherwise. So the model is rebuilt too when the canvas has an S2S link with another service
-// (the skeleton's edges) that the model does not carry as S2S on that group, and that service published a model after
-// this one. Once the model carries the link, or while the other side publishes nothing new, it is left alone.
+// (the skeleton's edges) that the model does not carry as S2S on that group (to that service and port), and that service
+// published a model after this one or its model already carries the hand-over as S2S on its side (an S2S link has two
+// ends, so the other model naming the port is what this one lacks, whichever was published last). Once the model
+// carries the link it is left alone; while neither holds, nothing new is known about the other side.
 
 import type { Store } from "../store.ts";
 import { topologyFingerprint, type Topology } from "./flowcounts.ts";
@@ -36,12 +38,13 @@ export interface ModelState {
 
 export interface StaleHandover { peer: string; group: string; side: "in" | "out" }
 
-interface ModelLike { publishedAt: string; model: { segments: { group: { id: string }; entries: { channel: { type: string } }[]; exits: { channel: { type: string } }[] }[] } }
+type ChannelLike = { type: string; service?: string; port?: string };
+interface ModelLike { publishedAt: string; model: { segments: { group: { id: string }; entries: { channel: ChannelLike }[]; exits: { channel: ChannelLike }[] }[] } }
 
 /** The canvas' S2S links between this service and another (sk.edges) that the published model does not carry as S2S on the
- *  group's side (an entry for what comes in, an exit for what goes out), counted only when the other service published a
- *  model after this one (else nothing new is known about that side). */
-export function staleHandovers(sk: Skeleton, service: string, m: ModelLike, peerPublishedAt: (service: string) => string | null): StaleHandover[] {
+ *  group's side (an entry on that port for what comes in, an exit to that service and port for what goes out), counted
+ *  when the other service published a model after this one or its model (peerModel) carries the link on its side. */
+export function staleHandovers(sk: Skeleton, service: string, m: ModelLike, peerPublishedAt: (service: string) => string | null, peerModel?: (service: string) => ModelLike["model"] | null): StaleHandover[] {
   const segs = new Map([...sk.flows.flatMap((f) => f.segments), ...sk.shared].map((s) => [s.id, s]));
   const out = new Map<string, StaleHandover>();
   for (const e of sk.edges) {
@@ -50,11 +53,17 @@ export function staleHandovers(sk: Skeleton, service: string, m: ModelLike, peer
     if (!a || !b || a.service === b.service) continue;
     const pair = a.service === service ? { mine: a, peer: b, side: "out" as const } : b.service === service ? { mine: b, peer: a, side: "in" as const } : null;
     if (!pair) continue;
+    // An S2S channel for this link: an entry names its port, an exit the receiving service and port.
+    const s2s = (c: ChannelLike | undefined, to: string, entry: boolean) => c?.type === "s2s" && (!e.port || !c.port || c.port === e.port) && (entry || !c.service || c.service === to);
+    const carries = (model: ModelLike["model"] | null | undefined, group: string, entry: boolean, to: string) =>
+      Boolean(model?.segments.some((s) => s.group.id === group && (entry ? s.entries : s.exits).some((x) => s2s(x.channel, to, entry))));
+    // Only a hand-over the model keeps as something else: a group the model leaves out is the AI's call, not stale.
+    if (!m.model.segments.some((s) => s.group.id === pair.mine.group.id)) continue;
+    if (carries(m.model, pair.mine.group.id, pair.side === "in", pair.peer.service)) continue;
     const peerAt = peerPublishedAt(pair.peer.service);
-    if (!peerAt || peerAt <= m.publishedAt) continue;
-    const carried = m.model.segments.filter((s) => s.group.id === pair.mine.group.id)
-      .some((s) => (pair.side === "in" ? s.entries : s.exits).some((x) => x.channel?.type === "s2s"));
-    if (!carried) out.set(`${pair.peer.service}\0${pair.mine.group.id}\0${pair.side}`, { peer: pair.peer.service, group: pair.mine.group.name, side: pair.side });
+    const newer = Boolean(peerAt && peerAt > m.publishedAt);
+    if (!newer && !carries(peerModel?.(pair.peer.service), pair.peer.group.id, pair.side === "out", service)) continue;
+    out.set(`${pair.peer.service}\0${pair.mine.group.id}\0${pair.side}`, { peer: pair.peer.service, group: pair.mine.group.name, side: pair.side });
   }
   return [...out.values()];
 }
@@ -74,12 +83,15 @@ export function modelState(store: Store, service: string, sk?: Skeleton): ModelS
   const feedback = store.flowChanges({ service, limit: 200 })
     .filter((c) => (c.kind === "split-asked" || c.kind === "not-right") && c.at > m.publishedAt)
     .map((c) => ({ flow: c.flow, kind: c.kind, at: c.at, text: clip(c.text, 200) }));
-  const handovers = staleHandovers(sk ?? skeletonOf(store, new Date()), service, m as ModelLike, (s) => store.flowModel(s)?.publishedAt ?? null);
+  // A hand-over a publish of this service already holds for a person (pending) is waiting there, not stale.
+  const waiting = store.flows(service).flatMap((f) => (f.pending?.service === service ? f.pending.segments : []));
+  const mine = { publishedAt: m.publishedAt, model: { segments: [...m.model.segments, ...waiting] } } as ModelLike;
+  const handovers = staleHandovers(sk ?? skeletonOf(store, new Date()), service, mine, (s) => store.flowModel(s)?.publishedAt ?? null, (s) => (store.flowModel(s)?.model as ModelLike["model"] | undefined) ?? null);
   const rebuild = topology !== "unchanged" || feedback.length > 0 || handovers.length > 0;
   const note = !rebuild
     ? `拓扑未变，沿用已发布模型 r${m.revision}: the canvas has not changed since revision ${m.revision} and nobody gave feedback since. Do not rebuild the business model (no look kind model, run_model or publish_model for it); look at the machine and the businesses' health only.`
     : topology === "unchanged" && !feedback.length
-      ? `拓扑未变，但跨服务交接要更新: the canvas has S2S links with ${[...new Set(handovers.map((h) => h.peer))].join(", ")} that revision ${m.revision} does not carry as S2S (${handovers.map((h) => `${h.group} ${h.side}`).join("; ")}), and that service published a model since. Rebuild the model for these hand-overs only (from: "current", changes → run_model → publish_model).`
+      ? `拓扑未变，但跨服务交接要更新: the canvas has S2S links with ${[...new Set(handovers.map((h) => h.peer))].join(", ")} that revision ${m.revision} does not carry as S2S (${handovers.map((h) => `${h.group} ${h.side}`).join("; ")}), and that service published a model since or already carries them as S2S. Rebuild the model for these hand-overs only (from: "current", changes → run_model → publish_model).`
     : feedback.length
       ? `A person gave feedback on ${feedback.length} business(es) since revision ${m.revision}: rebuild the model for it (look kind model → run_model → publish_model).`
       : topology === "changed"

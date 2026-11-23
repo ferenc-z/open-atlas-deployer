@@ -7,7 +7,9 @@
 //   ④ idle: no traffic for 7 days -> maybe nothing to watch.
 // Across services: an RPG's target address and port name pair it with the other service's remote input port, the two
 // groups then two segments of one business (T1, T2); a pair found by the port name alone is asked once. Components on
-// the root canvas itself are taken piece by piece (each piece a candidate, no question).
+// the root canvas itself are taken piece by piece (each piece a candidate, no question). An input port on the root canvas
+// (S2S or local) that leads straight into groups belongs to those groups, not to the root canvas: in NiFi a port only
+// passes on what it gets, so the units it connects to are where the data is received (several of them: a fan-out).
 
 import type { Store } from "../store.ts";
 import type { Topology, TopologyFragment } from "./flowcounts.ts";
@@ -42,7 +44,7 @@ export interface Skeleton {
   /** Groups with nothing in them. */
   empty: { service: string; group: { id: string; name: string } }[];
   /** Every edge between segments: root-level links and S2S pairs (match: how the pair was found). */
-  edges: { from: string; to: string; kind: "link" | "s2s"; match?: "address" | "name" }[];
+  edges: { from: string; to: string; kind: "link" | "s2s"; match?: "address" | "name"; port?: string }[];
   questions: { kind: QuestionKind; service: string; group: string; text: string }[];
   /** Services without a topology yet. */
   noTopology: string[];
@@ -70,6 +72,19 @@ function trafficOf(s: SkeletonInput, group: string, now: Date): Traffic {
   if (!t) return "unknown";
   if (t.total > 0) return "yes";
   return Date.parse(t.first) <= now.getTime() - IDLE_DAYS * DAY ? "none-7d" : "none-short";
+}
+
+/** Input ports on the root canvas that are in no piece of it (they only lead into groups) -> the ends they lead to.
+ *  Such a port belongs to the groups it connects to (the gate counts it for them too). */
+export function rootPortTargets(t: Topology): Map<string, { group: string; fragment: string | null }[]> {
+  const out = new Map<string, { group: string; fragment: string | null }[]>();
+  for (const l of t.links) {
+    if (l.from.group !== t.root.id || l.from.fragment !== null || !l.from.port || l.to.group === t.root.id) continue;
+    const list = out.get(l.from.port) ?? [];
+    if (!list.some((x) => x.group === l.to.group && x.fragment === l.to.fragment)) list.push({ group: l.to.group, fragment: l.to.fragment });
+    out.set(l.from.port, list);
+  }
+  return out;
 }
 
 export function identify(services: SkeletonInput[], now: Date): Skeleton {
@@ -112,10 +127,21 @@ export function identify(services: SkeletonInput[], now: Date): Skeleton {
   const addEdge = (e: Skeleton["edges"][number]) => { if (e.from !== e.to && !edges.has(`${e.from}\0${e.to}`)) edges.set(`${e.from}\0${e.to}`, e); };
   /** Remote input ports (segment id -> names) that a paired S2S feeds: not a start of their own. */
   const fedPorts = new Map<string, Set<string>>();
+  const rootPorts = new Map(services.map((s) => [s.id, s.topology ? rootPortTargets(s.topology) : new Map<string, { group: string; fragment: string | null }[]>()]));
+  /** The segments a port of service b (group, fragment, name) receives into: a root-level port's targets, else its own. */
+  const receivers = (b: string, group: string, fragment: string | null, name: string): string[] => {
+    const t = services.find((x) => x.id === b)?.topology;
+    const via = t && group === t.root.id && fragment === null ? rootPorts.get(b)?.get(name) : undefined;
+    if (via?.length) return [...new Set(via.map((x) => resolve(b, x.group, x.fragment)).filter((x): x is string => Boolean(x)))];
+    const one = resolve(b, group, fragment);
+    return one ? [one] : [];
+  };
   for (const s of services) {
     const t = s.topology;
     if (!t) continue;
     for (const l of t.links) {
+      // A root-level port's own link is its hand-over, not a link from the root canvas' pieces.
+      if (l.from.group === t.root.id && l.from.fragment === null && l.from.port && rootPorts.get(s.id)?.has(l.from.port)) continue;
       const from = resolve(s.id, l.from.group, l.from.fragment), to = resolve(s.id, l.to.group, l.to.fragment);
       if (from && to) addEdge({ from, to, kind: "link" });
     }
@@ -131,8 +157,8 @@ export function identify(services: SkeletonInput[], now: Date): Skeleton {
         candidates = services.filter((b) => b.id !== s.id && b.topology).flatMap((b) => b.topology!.s2sIn.filter((p) => p.name === o.name).map((p) => ({ b, p })));
       }
       const pair = candidates.length === 1 ? candidates[0] : undefined;
-      const to = pair && resolve(pair.b.id, pair.p.group, pair.p.fragment);
-      if (!pair || !to) {
+      const tos = pair ? receivers(pair.b.id, pair.p.group, pair.p.fragment, pair.p.name) : [];
+      if (!pair || !tos.length) {
         out.questions.push({ kind: "s2s-unpaired", service: s.id, group: o.group,
           text: byAddress.length
             ? `发往 ${o.targets.join(", ")} 端口 ${o.name} 的 S2S 在对方服务里找不到同名的远程输入端口。`
@@ -141,8 +167,10 @@ export function identify(services: SkeletonInput[], now: Date): Skeleton {
               : `发往 ${o.targets.join(", ")} 端口 ${o.name} 的 S2S 对不上任何受管服务（可能发往没接管的 NiFi）。` });
         continue;
       }
-      addEdge({ from, to, kind: "s2s", match });
-      fedPorts.set(to, new Set([...(fedPorts.get(to) ?? []), pair.p.name]));
+      for (const to of tos) {
+        addEdge({ from, to, kind: "s2s", match, port: o.name });
+        fedPorts.set(to, new Set([...(fedPorts.get(to) ?? []), pair.p.name]));
+      }
       if (match === "name") {
         out.questions.push({ kind: "s2s-name-only", service: s.id, group: o.group,
           text: `发往 ${o.targets.join(", ")} 端口 ${o.name} 的 S2S 地址对不上受管服务，按端口名接到了 ${pair.b.id} 的 ${o.name}，要确认一次。` });

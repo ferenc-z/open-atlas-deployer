@@ -440,3 +440,21 @@ test("executor 0.9.6: a unit's ends (writing processors that lead nowhere) are t
   assert.deepEqual(exits("C"), [["external", "Publish", "p-pub", null]]);
   assert.deepEqual(exits("A"), []);
 });
+
+test("engine test 2026-11-23: a kept segment's S2S hand-over the model has as external becomes S2S in the skeleton draft, on both sides", () => {
+  const { store } = crossing(() => 10);
+  const ref = "https://localhost:18445/nifi#orders";
+  store.putTopology("n112", "2026-11-19T12:00:00Z", "a2", topo("r1", [{ id: "S", name: "Send", root: false, fragments: [frag("s", { s2sOut: [ref] })] }], { s2sOut: [{ ref, name: "orders", targets: ["https://localhost:18445/nifi"], group: "S", fragment: "s", sources: [{ id: "p-send", name: "Send orders", kind: "processor", relationships: ["success"] }] }] }));
+  const first = draftFromSkeleton(store, "n112", NOW);
+  // Published while c250 had no model: the hand-over was written down as an external system.
+  const ext = { ...first, segments: first.segments.map((s) => ({ ...s, flow: "flw_send", exits: s.exits.map((e) => ({ ...e, channel: { type: "external" as const, system: "c250 的 orders 端口" } })) })) } as ModelV2;
+  store.insertFlowModel("n112", 0, ext, "ai", ai, []);
+  const rcv = receiver("flw_rcv");
+  store.insertFlowModel("c250", 0, { ...rcv, segments: rcv.segments.map((s) => ({ ...s, entries: [{ id: "in", step: "g", channel: { type: "external", system: "外部来源" } }] })) }, "ai", ai, []);
+  const out = draftFromSkeleton(store, "n112", NOW).segments[0]!.exits;
+  assert.deepEqual(out.map((e) => [e.id, e.channel, e.component]), [["s2s-1", { type: "s2s", service: "c250", port: "orders" }, "p-send"]], "the same exit, now S2S: no second exit");
+  const ins = draftFromSkeleton(store, "c250", NOW).segments.find((s) => s.id === "R")!.entries;
+  assert.deepEqual(ins.map((e) => [e.id, e.channel]), [["in", { type: "s2s", port: "orders" }]], "no start of its own: its one entry is the port");
+  const run = runModel(store, "n112", draftFromSkeleton(store, "n112", NOW), NOW);
+  assert.ok(run.changes.some((c) => c.kind === "cross-service"), "the gate sees it as a change across services (held for a person, never dropped)");
+});

@@ -99,7 +99,7 @@ test("skeleton across services: RPG target address + port name pairs two groups 
   assert.deepEqual(cross.segments.map((s) => [s.service, s.names[0]]), [["n112", "n112 gen"], ["c250", "c250 load"]]);
   assert.deepEqual(cross.exceptions, ["cross-service"]);
   assert.match(cross.reason!, /n112 的 NiFi Flow 经 S2S 送到 c250 的 NiFi Flow/);
-  assert.deepEqual(sk.edges.filter((e) => e.kind === "s2s"), [{ from: "n112/r112/g", to: "c250/r250/p", kind: "s2s", match: "address" }]);
+  assert.deepEqual(sk.edges.filter((e) => e.kind === "s2s"), [{ from: "n112/r112/g", to: "c250/r250/p", kind: "s2s", match: "address", port: "from-n112" }]);
   assert.deepEqual(sk.questions.map((q) => q.kind), ["s2s-unpaired"], "the RPG to an unmanaged NiFi");
   assert.equal(sk.flows.length, 3, "n112+c250, Exports, c250's other piece");
 
@@ -186,4 +186,23 @@ test("skeleton: edges to a shared step (errors, audit) do not stop the merge or 
   assert.deepEqual(sk.flows.map((f) => f.segments.map((s) => s.group.name).join(" > ")).sort(), ["Intake > Route", "Other"]);
   assert.deepEqual(sk.shared.map((s) => [s.group.name, s.feeders]), [["Errors", ["n1/A", "n1/C"]]]);
   assert.deepEqual(sk.questions, [], "no fan-out question for the error output");
+});
+
+test("skeleton: an input port on the root canvas belongs to the groups it leads into, not to the root canvas' pieces", () => {
+  // n2's root canvas: a piece of its own (gen), and two remote input ports in no piece, each linked straight into a group;
+  // "both" leads into two groups (a fan-out). n1 sends to all three ports.
+  const rpg = (name: string) => ({ ref: `https://h2:8443/nifi#${name}`, name, targets: ["https://h2:8443/nifi"], group: "S", fragment: "s" });
+  const n1 = topo("r1", [{ id: "S", name: "Send", root: false, fragments: [frag("s")] }], { s2sOut: [rpg("to-a"), rpg("both")] });
+  const rootLink = (port: string, to: string) => ({ connection: `${port}-${to}`, from: { group: "r2", fragment: null, port }, to: { group: to, fragment: to.toLowerCase(), port: "in" } });
+  const n2 = topo("r2", [
+    { id: "r2", name: "NiFi Flow", root: true, fragments: [frag("gen")] },
+    { id: "A", name: "Apply", root: false, fragments: [frag("a", { inputs: ["in"], starts: 0 })] },
+    { id: "B", name: "Book", root: false, fragments: [frag("b", { inputs: ["in"], starts: 0 })] },
+  ], { s2sIn: [{ id: "p1", name: "to-a", group: "r2", fragment: null }, { id: "p2", name: "both", group: "r2", fragment: null }],
+    links: [rootLink("to-a", "A"), rootLink("both", "A"), rootLink("both", "B")] });
+  const sk = identify([svc("n1", n1, busy("S")), svc("n2", n2, busy("r2", "A", "B"), ["h2:8443"])], NOW);
+  assert.deepEqual(sk.edges.map((e) => [e.from, e.to, e.kind, e.port]), [["n1/S", "n2/A", "s2s", "to-a"], ["n1/S", "n2/B", "s2s", "both"]]);
+  assert.equal(sk.edges.some((e) => e.from.startsWith("n2/r2") || e.to.startsWith("n2/r2")), false, "the root canvas' own piece is not in the hand-over");
+  assert.deepEqual(sk.questions.map((q) => [q.kind, q.service, q.group]), [["fan-out", "n1", "S"]], "the fan-out is the sender's, as for any port leading to two units");
+  assert.ok(sk.flows.some((f) => f.key === "n2/r2/gen" && f.segments.length === 1), "the root piece stays a business of its own");
 });

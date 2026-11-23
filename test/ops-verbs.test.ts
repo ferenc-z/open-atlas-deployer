@@ -349,4 +349,15 @@ test("⑰ stale hand-overs: an S2S link the model keeps as external is rebuilt o
   assert.deepEqual(staleHandovers(sk, "b", modelB(s2s), () => "2026-11-23T07:00:00Z"), [], "carried as S2S already: no ping-pong");
   const modelA = { publishedAt: "2026-11-23T02:00:00Z", model: { segments: [{ group: { id: "g1" }, entries: [], exits: [ext] }] } };
   assert.deepEqual(staleHandovers(sk, "a", modelA, () => "2026-11-23T07:00:00Z"), [{ peer: "b", group: "g1", side: "out" }], "the sending side too");
+
+  // The other side published before this one, but its model already has the hand-over as S2S on that port: rebuild.
+  const portSk = { ...sk, edges: [{ from: "a/g1", to: "b/g2", kind: "s2s" as const, port: "p" }] };
+  const modelOf = (exits: object[], entries: object[] = []) => ({ publishedAt: "2026-11-23T02:00:00Z", model: { segments: [{ group: { id: "g1" }, entries, exits }] } }) as never;
+  const bHas = (port: string) => () => ({ segments: [{ group: { id: "g2" }, entries: [{ channel: { type: "s2s", port } }], exits: [] }] });
+  const older = () => "2026-11-23T01:00:00Z";
+  assert.deepEqual(staleHandovers(portSk, "a", modelOf([ext]), older, bHas("p")), [{ peer: "b", group: "g1", side: "out" }], "the other model carries it");
+  assert.deepEqual(staleHandovers(portSk, "a", modelOf([ext]), older, bHas("other")), [], "the other model has another port only");
+  assert.deepEqual(staleHandovers(portSk, "a", modelOf([{ channel: { type: "s2s", service: "c", port: "q" } }, ext]), older, bHas("p")), [{ peer: "b", group: "g1", side: "out" }], "an S2S exit to a third service does not carry this one");
+  assert.deepEqual(staleHandovers(portSk, "a", modelOf([{ channel: { type: "s2s", service: "b", port: "p" } }]), older, bHas("p")), [], "carried: no ping-pong");
+  assert.deepEqual(staleHandovers(portSk, "a", { publishedAt: "2026-11-23T02:00:00Z", model: { segments: [] } }, older, bHas("p")), [], "a group the model leaves out is the AI's call");
 });

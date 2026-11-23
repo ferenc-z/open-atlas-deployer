@@ -10,7 +10,7 @@
 import { newFlowId, StoreError, type Actor, type FlowPending, type FlowRecord, type Store } from "../store.ts";
 import { topologyFingerprint, type Topology } from "./flowcounts.ts";
 import type { GateVerdict, TodoAction } from "./ops-types.ts";
-import { skeletonOf, type Skeleton, type SkeletonSegment } from "./skeleton.ts";
+import { rootPortTargets, skeletonOf, type Skeleton, type SkeletonSegment } from "./skeleton.ts";
 import { dangling, links } from "./trace/channels.ts";
 import { parseModelV2, toTraceModel, UNPLACED, WHOLE, type Business, type Exit, type FlowNote, type ModelDraft, type ModelV2, type Segment } from "./trace/model.ts";
 
@@ -642,7 +642,11 @@ const segIdOf = (group: string, slice: string) => (slice === WHOLE ? group : `${
 /** The skeleton of a service as a draft over its current model: segments the model has (by group and slice) are kept,
  *  units it lacks become segments with one step on their group, an entry and the S2S exits the topology shows; a
  *  business the model does not know yet gets new:<skeleton key>. For the AI to name, judge and complete (exits'
- *  components) before run_model. */
+ *  components) before run_model.
+ *  A kept segment still gets the S2S hand-overs the canvas now pairs with another managed service (engine test
+ *  2026-11-23: an exit kept as external while the other side had no model stayed external in every later draft): an
+ *  RPG port is where its feeding component's data goes, so a non-S2S exit on that component (and relationship) is
+ *  that hand-over and becomes S2S; with none, an S2S exit is added. The gate then judges it like any other change. */
 export function draftFromSkeleton(store: Store, service: string, now = new Date()): ModelDraft {
   const sk = skeletonOf(store, now);
   const current = store.flowModel(service)?.model ?? null;
@@ -652,24 +656,54 @@ export function draftFromSkeleton(store: Store, service: string, now = new Date(
   const known = (u: SkeletonSegment) => current?.segments.find((s) => s.group.id === u.group.id && (s.slice === (u.fragment ?? WHOLE) || s.slice === WHOLE));
   const notes: FlowNote[] = [];
   const units = new Map<string, SkeletonSegment>([...sk.flows.flatMap((f) => f.segments), ...sk.shared].map((x) => [x.id, x]));
+  const rootPorts = topo ? rootPortTargets(topo) : new Map<string, { group: string; fragment: string | null }[]>();
   const add = (u: SkeletonSegment, flowKey: string | undefined, role: Segment["role"]) => {
+    const outs = (topo?.s2sOut ?? []).filter((o) => o.group === u.group.id && (u.fragment === null || o.fragment === u.fragment));
+    // The S2S edge this RPG port is (the skeleton names the port): to a business's or a shared step's unit (dead letters
+    // go to a shared one); a fan-out has one edge per target service.
+    const edgeTo = (o: { name: string }) => sk.edges.find((e) => e.kind === "s2s" && e.from === u.id && e.port === o.name && units.has(e.to));
     const k = known(u);
-    if (k) { if (!seen.has(k.id)) { segments.push(k); seen.add(k.id); } return k.flow; }
+    if (k) {
+      if (!seen.has(k.id)) { segments.push(structuredClone(k)); seen.add(k.id); }
+      const seg = segments.find((x) => x.id === k.id)!;
+      for (const o of outs) {
+        const target = edgeTo(o)?.to.split("/")[0];
+        if (!target || seg.exits.some((x) => x.channel.type === "s2s" && x.channel.service === target && x.channel.port === o.name)) continue;
+        const channel = { type: "s2s" as const, service: target, port: o.name };
+        const feeds = (x: Exit) => (o.sources?.length ? o.sources.some((f) => f.id === x.component && (!f.relationships.length || !x.relationship || f.relationships.includes(x.relationship))) : x.component === UNPLACED);
+        const stand = seg.exits.filter((x) => x.channel.type !== "s2s" && feeds(x));
+        const named = stand.filter((x) => [x.channel.system, x.channel.port].some((t) => t && (t.includes(o.name) || t.includes(target))));
+        const pick = named.length === 1 ? named[0] : stand.length === 1 ? stand[0] : undefined;
+        if (pick) { const { system: _s, ...rest } = pick.channel; pick.channel = { ...rest, ...channel }; continue; }
+        const from = o.sources?.[0];
+        let n = seg.exits.length + 1;
+        while (seg.exits.some((x) => x.id === `s2s-${n}`)) n++;
+        seg.exits.push({ id: `s2s-${n}`, step: seg.steps[0]?.id ?? "g", channel, component: from?.id ?? UNPLACED, ...(from?.relationships[0] ? { relationship: from.relationships[0] } : {}) });
+      }
+      // The receiving side: a remote input port another managed service sends to. A unit with no start of its own (no
+      // processor without an incoming connection) gets data only through its ports, so its one non-S2S entry is that port.
+      const frags = topo?.groups.find((g) => g.id === u.group.id)?.fragments.filter((f) => u.fragment === null || f.key === u.fragment) ?? [];
+      const ownStart = frags.some((f) => f.starts - f.remoteIn.length > 0);
+      for (const e of sk.edges) {
+        if (e.kind !== "s2s" || e.to !== u.id || !e.port || seg.entries.some((x) => x.channel.type === "s2s" && x.channel.port === e.port)) continue;
+        const sender = e.from.split("/")[0]!;
+        const stand = seg.entries.filter((x) => x.channel.type !== "s2s");
+        const named = stand.filter((x) => [x.channel.system, x.channel.service].some((t) => t && (t.includes(e.port!) || t.includes(sender))));
+        const pick = named.length === 1 ? named[0] : !ownStart && stand.length === 1 ? stand[0] : undefined;
+        if (pick) { pick.channel = { type: "s2s", port: e.port }; continue; }
+        let n = seg.entries.length + 1;
+        while (seg.entries.some((x) => x.id === `s2s-in-${n}`)) n++;
+        seg.entries.push({ id: `s2s-in-${n}`, step: seg.steps[0]?.id ?? "g", channel: { type: "s2s", port: e.port } });
+      }
+      return k.flow;
+    }
     const slice = u.fragment ?? WHOLE;
     const id = segIdOf(u.group.id, slice);
     if (seen.has(id)) return flowKey;
     seen.add(id);
-    const ins = (topo?.s2sIn ?? []).filter((p) => p.group === u.group.id && (u.fragment === null || p.fragment === u.fragment));
-    const outs = (topo?.s2sOut ?? []).filter((o) => o.group === u.group.id && (u.fragment === null || o.fragment === u.fragment));
-    // The S2S edge this RPG port is: to a business's or a shared step's unit (dead letters go to a shared one) whose
-    // service has a remote input port of that name on that group (a fan-out has one edge per target service).
-    const edgeTo = (o: { name: string }) => sk.edges.find((e) => {
-      if (e.kind !== "s2s" || e.from !== u.id) return false;
-      const t = units.get(e.to);
-      if (!t) return false;
-      const tt = store.latestTopology(t.service)?.body as Topology | undefined;
-      return !tt || tt.s2sIn.some((p) => p.name === o.name && p.group === t.group.id);
-    });
+    // Its remote input ports, and those on the root canvas that lead straight into it.
+    const into = (name: string) => (rootPorts.get(name) ?? []).some((x) => x.group === u.group.id && (u.fragment === null || x.fragment === null || x.fragment === u.fragment));
+    const ins = (topo?.s2sIn ?? []).filter((p) => (p.group === u.group.id && (u.fragment === null || p.fragment === u.fragment)) || (p.group === topo?.root.id && p.fragment === null && into(p.name)));
     const exits: Exit[] = outs.map((o, i) => {
       const target = edgeTo(o)?.to.split("/")[0];
       // Executor 0.9.5 reports what feeds the RPG port: the exit is that component (its first relationship, if any).
