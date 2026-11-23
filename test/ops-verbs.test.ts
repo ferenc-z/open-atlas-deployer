@@ -336,3 +336,17 @@ test("⑰ run_model / publish_model with from + changes: the Deployer builds the
   const lines = Object.fromEntries(shared.draft.lines.map((l: { id: string }) => [l.id, l]));
   assert.deepEqual([lines.C.role, lines.C.flow, lines.B.exits.at(-1)], ["shared", null, "out-1 external:Warehouse @b"]);
 });
+
+test("⑰ stale hand-overs: an S2S link the model keeps as external is rebuilt once the other side published since", async () => {
+  const { staleHandovers } = await import("../src/server/services/checkup-brief.ts");
+  const seg = (service: string, group: string) => ({ id: `${service}/${group}`, service, group: { id: group, name: group }, fragment: null, root: false, processors: 3, names: [], traffic: "yes" as const });
+  const sk = { flows: [{ key: "a/g1", segments: [seg("a", "g1"), seg("b", "g2")], exceptions: [], reason: null }], shared: [], empty: [], edges: [{ from: "a/g1", to: "b/g2", kind: "s2s" as const }], questions: [], noTopology: [] };
+  const ext = { channel: { type: "external" } }, s2s = { channel: { type: "s2s" } };
+  const modelB = (entry: { channel: { type: string } }) => ({ publishedAt: "2026-11-23T02:00:00Z", model: { segments: [{ group: { id: "g2" }, entries: [entry], exits: [] }] } });
+  assert.deepEqual(staleHandovers(sk, "b", modelB(ext), () => "2026-11-23T07:00:00Z"), [{ peer: "a", group: "g2", side: "in" }], "kept as external, the other side newer: rebuild");
+  assert.deepEqual(staleHandovers(sk, "b", modelB(ext), () => "2026-11-23T01:00:00Z"), [], "the other side published nothing since: leave it");
+  assert.deepEqual(staleHandovers(sk, "b", modelB(ext), () => null), [], "the other side has no model");
+  assert.deepEqual(staleHandovers(sk, "b", modelB(s2s), () => "2026-11-23T07:00:00Z"), [], "carried as S2S already: no ping-pong");
+  const modelA = { publishedAt: "2026-11-23T02:00:00Z", model: { segments: [{ group: { id: "g1" }, entries: [], exits: [ext] }] } };
+  assert.deepEqual(staleHandovers(sk, "a", modelA, () => "2026-11-23T07:00:00Z"), [{ peer: "b", group: "g1", side: "out" }], "the sending side too");
+});
