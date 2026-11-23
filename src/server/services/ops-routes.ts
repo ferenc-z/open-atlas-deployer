@@ -180,7 +180,17 @@ export function mountOps(api: Hono, d: OpsRouteDeps) {
       failed = r.checks.filter((x) => !x.ok).map((x) => ({ check: x.check, text: x.text }));
       run = { verdict: r.verdict, failed, regressions: r.regressions, changes: compactDeep(r.changes, 200, 15), window: r.window };
     } catch (e) { run = { error: (e as Error).message, ...(e instanceof ModelError ? { details: e.details.slice(0, 8) } : {}) }; }
-    const rebuild = !state || state.rebuild;
+    // A segment the skeleton's draft moves into another business (the two sides of an S2S hand-over join one, whichever
+    // went first), where neither business waits for a person already: the canvas did not change, but the model should.
+    const curById = new Map((current?.segments ?? []).map((s) => [s.id, s]));
+    const joins = draft.segments.filter((s) => {
+      const c = curById.get(s.id);
+      return Boolean(c && s.flow && c.flow && s.flow !== c.flow && !d.store.flow(s.flow)?.pending && !d.store.flow(c.flow)?.pending);
+    });
+    const model = state && !state.rebuild && joins.length
+      ? { ...state, rebuild: true, note: `拓扑未变，但骨架要把 ${joins.length} 段并进另一条业务: the skeleton's draft moves ${joins.map((s) => `${s.group.name} → ${s.flow}`).slice(0, 6).join("; ")} (an S2S hand-over joins the two businesses). Rebuild for these joins only (from: "skeleton", changes → run_model → publish_model); a join of confirmed businesses waits for a person.` }
+      : state;
+    const rebuild = !model || model.rebuild;
     const e2e = gaps.filter((g) => g.code === "e2e-unplaced" || g.code === "e2e-gone");
     const out = compactDeep({
       service: one.service,
@@ -189,7 +199,7 @@ export function mountOps(api: Hono, d: OpsRouteDeps) {
       todos: one.todos.map((x) => ({ id: x.id, flow: x.flow, severity: x.severity, title: x.title, detail: clip(x.detail, 160), ...(x.action ? { action: x.action.kind } : {}) })),
       analysis: one.analysis ? { id: one.analysis.id, trigger: one.analysis.trigger, state: one.analysis.state, startedAt: one.analysis.startedAt, stale: one.analysis.stale, summary: clip(one.analysis.summary, 300), error: one.analysis.error } : null,
       provenance: one.provenance,
-      model: state ?? { revision: 0, rebuild: true, note: "No business model yet: build it (look kind model → run_model → publish_model)." },
+      model: model ?? { revision: 0, rebuild: true, note: "No business model yet: build it (look kind model → run_model → publish_model)." },
       topology: topo ? {
         takenAt: t!.takenAt, fingerprint: topologyFingerprint(topo),
         counts: { units: topo.groups.length, links: topo.links.length, s2sIn: topo.s2sIn.length, s2sOut: topo.s2sOut.length, ends: (topo.ends ?? []).length },
