@@ -115,7 +115,8 @@ export function pendingText(held: { flow: string | null; kind: string; text: str
   return `AI 识别出${parts.length ? ` ${parts.join("、")}` : "业务清单的变化"}，等你在流程页确认。`;
 }
 
-function problems(model: ModelV2 | null, c: Ctx): Problem[] {
+/** absorbed: business -> the businesses the draft moves this service's segments out of into it. */
+function problems(model: ModelV2 | null, c: Ctx, absorbed?: Map<string, Set<string>>): Problem[] {
   if (!model) return [];
   const out: Problem[] = [];
   const all = [model, ...c.others];
@@ -142,7 +143,10 @@ function problems(model: ModelV2 | null, c: Ctx): Problem[] {
   const throughShared = (ua: Set<string>, ub: Set<string>) => edges.some((e1) => ua.has(e1.from) && sharedUnits.has(e1.to) && edges.some((e2) => e2.from === e1.to && ub.has(e2.to)));
   const flowsHere = [...new Set(model.segments.map((s) => s.flow).filter((f): f is string => Boolean(f)))];
   for (const f of flowsHere) {
-    const members = all.flatMap((m) => m.segments.filter((s) => s.flow === f).map((s) => ({ service: m.service, s })));
+    // Two businesses joined (a merge): another service's part of the one taken in is judged with it, since that
+    // service's next draft moves it too, whichever service publishes first (the person confirms the merge).
+    const taken = absorbed?.get(f);
+    const members = all.flatMap((m) => m.segments.filter((s) => s.flow === f || (m !== model && m.service !== c.service && !!s.flow && !!taken?.has(s.flow))).map((s) => ({ service: m.service, s })));
     if (members.length < 2) continue;
     const key = (x: { service: string; s: Segment }) => `${x.service}\0${x.s.id}`;
     const unitIds = new Map(members.map((x) => [key(x), new Set(unitsOf(x.service, x.s, c.skeleton).map((u) => u.id))]));
@@ -264,6 +268,8 @@ interface Diff {
   resolve: Map<string, string>;
   /** Segment ids of the base the draft drops, and those whose group is gone from the canvas. */
   removed: string[]; gone: string[];
+  /** Resolved business -> the base businesses whose segments the draft moves into it. */
+  absorbed: Map<string, Set<string>>;
 }
 
 function diff(base: ModelV2 | null, draft: ModelV2, c: Ctx): Diff {
@@ -306,18 +312,25 @@ function diff(base: ModelV2 | null, draft: ModelV2, c: Ctx): Diff {
   const removed = (base?.segments ?? []).filter((b) => ![...matched.values()].includes(b)).map((b) => b.id);
   for (const id of removed) { const b = bySeg.get(id)!; changes.push({ flow: b.flow ?? null, kind: "gone", text: `${label(b)} 不在新模型里了` }); }
   const gone = draft.segments.filter((d) => matched.has(d.id) && !onCanvas(d)).map((d) => matched.get(d.id)!.id);
-  // merge: one draft business made of several; split: one business spread over several.
+  // merge: one draft business made of several; split: one business spread over several. A business with segments in
+  // other services that takes this service's part of another one is a merge too, though this service had none of it
+  // (engine test 2026-11-23: the two sides of an S2S hand-over were in two businesses).
+  const absorbed = new Map<string, Set<string>>();
+  const merged = new Set<string>();
   for (const k of new Set(draft.segments.map(flowOf).filter((f): f is string => Boolean(f)))) {
     const from = new Set(draft.segments.filter((s) => flowOf(s) === k).map((s) => matched.get(s.id)?.flow).filter((f): f is string => Boolean(f)));
-    if (from.size >= 2) changes.push({ flow: k, kind: "merge", text: `${[...from].length} 条业务合成一条` });
+    const moved = [...from].filter((x) => x !== k);
+    if (!k.startsWith("new:") && elsewhere(k) && moved.length) from.add(k);
+    if (from.size >= 2) { changes.push({ flow: k, kind: "merge", text: `${[...from].length} 条业务合成一条` }); merged.add(k); absorbed.set(k, new Set(moved)); }
   }
   for (const f of new Set((base?.segments ?? []).map((s) => s.flow).filter((x): x is string => Boolean(x)))) {
     const into = new Set(draft.segments.filter((d) => matched.get(d.id)?.flow === f).map(flowOf));
     if (into.size >= 2) changes.push({ flow: f, kind: "split", text: `一条业务拆成 ${into.size} 条` });
-    // A cross-service business whose part here all goes to another business: split across the services.
-    else if (into.size === 1 && !into.has(f) && elsewhere(f)) changes.push({ flow: f, kind: "split", text: "这条跨服务业务在本服务的部分拆成另一条业务" });
+    // A cross-service business whose part here all goes to another business: split across the services — unless that
+    // business is one this merges it into (said once, as the merge).
+    else if (into.size === 1 && !into.has(f) && elsewhere(f) && !merged.has([...into][0] ?? "")) changes.push({ flow: f, kind: "split", text: "这条跨服务业务在本服务的部分拆成另一条业务" });
   }
-  return { changes, resolve, removed, gone };
+  return { changes, resolve, removed, gone, absorbed };
 }
 
 function verdictOf(base: Problem[], draft: Problem[], baseModel: ModelV2 | null, draftModel: ModelV2): Omit<RunResult, "window" | "changes" | "verdict"> {
@@ -355,7 +368,7 @@ function replay(c: Ctx, base: ModelV2 | null, draft: ModelV2): RunResult {
   const d = diff(base, draft, c);
   // The draft's own business keys resolved, so problems compare by business.
   const resolved: ModelV2 = { ...draft, segments: draft.segments.map((s) => (s.flow ? { ...s, flow: d.resolve.get(s.flow) ?? s.flow } : s)) };
-  const pb = problems(base, c), pd = problems(resolved, c);
+  const pb = problems(base, c), pd = problems(resolved, c, d.absorbed);
   const v = verdictOf(pb, pd, base, resolved);
   const verdict: GateVerdict = v.checks.some((x) => !x.ok) ? "rejected" : d.changes.some((x) => NEEDS_PERSON.includes(x.kind)) ? "needs-confirmation" : "published";
   return { window: { from: c.from, to: c.to }, verdict, ...v, changes: d.changes };
@@ -735,7 +748,52 @@ export function draftFromSkeleton(store: Store, service: string, now = new Date(
   for (const u of sk.shared) if (u.service === service) add(u, undefined, "shared");
   // Segments the canvas no longer has stay (the gate holds their removal for a person).
   for (const s of current?.segments ?? []) if (!seen.has(s.id)) segments.push(s);
-  return { version: 2, service, sources: current?.sources ?? [], segments, flows: notes };
+  const joined = joinedFlows(store, sk);
+  return { version: 2, service, sources: current?.sources ?? [], segments: segments.map((s) => (s.flow && joined.has(s.flow) ? { ...s, flow: joined.get(s.flow)! } : s)), flows: notes };
+}
+
+/** One business across an S2S hand-over (engine test 2026-11-23: the skeleton put both sides of a hand-over in one
+ *  business, but each service's model kept the business it had, so a part modelled before the other side's never
+ *  joined it, whichever side went first): businesses the skeleton joins over an S2S pair inside one of its businesses
+ *  are one, over every service's model. Of several, the one holding most segments takes the others (fewest moves;
+ *  then the older, then the id), so every service's draft picks the same one and a move never changes the pick. The
+ *  gate holds it as a merge for a person. A fan-out the skeleton left apart stays apart (it asks); a business a person
+ *  said is really two (split-asked) is not joined this way. Returns business -> the one it joins. */
+function joinedFlows(store: Store, sk: Skeleton): Map<string, string> {
+  const unitFlows = new Map<string, Set<string>>();
+  for (const svc of new Set(sk.flows.flatMap((f) => f.segments.map((u) => u.service)))) {
+    for (const s of store.flowModel(svc)?.model.segments ?? []) {
+      if (!s.flow?.startsWith("flw_")) continue;
+      for (const u of unitsOf(svc, s, sk)) unitFlows.set(u.id, new Set([...(unitFlows.get(u.id) ?? []), s.flow]));
+    }
+  }
+  const asked = new Map<string, boolean>();
+  const splitAsked = (f: string) => { if (!asked.has(f)) asked.set(f, store.flowChanges({ flow: f }).some((x) => x.kind === "split-asked")); return asked.get(f)!; };
+  const up = new Map<string, string>();
+  const find = (x: string): string => { while ((up.get(x) ?? x) !== x) x = up.get(x)!; return x; };
+  for (const f of sk.flows) {
+    const ids = new Set(f.segments.map((u) => u.id));
+    for (const e of sk.edges) {
+      if (e.kind !== "s2s" || !ids.has(e.from) || !ids.has(e.to)) continue;
+      const a = unitFlows.get(e.from), b = unitFlows.get(e.to);
+      if (a?.size !== 1 || b?.size !== 1) continue;
+      const [x] = [...a], [y] = [...b];
+      if (x === y || splitAsked(x!) || splitAsked(y!)) continue;
+      const rx = find(x!), ry = find(y!);
+      if (!up.has(ry)) up.set(ry, ry);
+      if (rx !== ry) up.set(rx, ry);
+    }
+  }
+  const groups = new Map<string, Set<string>>();
+  for (const f of up.keys()) groups.set(find(f), new Set([...(groups.get(find(f)) ?? []), f]));
+  const out = new Map<string, string>();
+  for (const fs of groups.values()) {
+    if (fs.size < 2) continue;
+    const rank = [...fs].map((f) => ({ f, n: store.flowSegments(f).length, at: store.flow(f)?.createdAt ?? "" }))
+      .sort((p, q) => q.n - p.n || (p.at < q.at ? -1 : p.at > q.at ? 1 : 0) || (p.f < q.f ? -1 : 1));
+    for (const f of fs) if (f !== rank[0]!.f) out.set(f, rank[0]!.f);
+  }
+  return out;
 }
 
 /** B3 "data dropped": whether a DROP at (component, relationship) is one of the service's marked exits (a normal end). */

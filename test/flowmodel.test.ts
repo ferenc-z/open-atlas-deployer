@@ -349,6 +349,54 @@ test("engine test 2026-11-22: a cross-service business's part here moved to a ne
   assert.deepEqual(store.flowSegments(other).map((s) => `${s.service}/${s.segment}`), ["c250/R"]);
 });
 
+// Engine test 2026-11-23 (B4/B5): each side of an S2S hand-over already in a confirmed business of its own; the draft
+// kept each service's business, so the two never joined. Now either side's draft joins them, held as a merge.
+async function twoBusinesses(first: "n112" | "c250") {
+  const w = crossing(() => 10);
+  const { store, deps } = w;
+  const n112 = async () => {
+    const d = sender(store);
+    await publishModel(deps, { service: "n112", base: 0, model: { ...d, segments: d.segments.map((s) => ({ ...s, flow: "new:send" })), flows: [] }, note: "n112", actor: ai });
+    await confirmFlow(deps, flowOf(store, "n112", "S"), admin);
+  };
+  const c250 = async () => {
+    await publishModel(deps, { service: "c250", base: 0, model: receiver("new:recv"), note: "c250", actor: ai });
+    await confirmFlow(deps, flowOf(store, "c250", "R"), admin);
+  };
+  if (first === "n112") { await n112(); w.tick(60_000); await c250(); } else { await c250(); w.tick(60_000); await n112(); }
+  const send = flowOf(store, "n112", "S"), recv = flowOf(store, "c250", "R");
+  assert.notEqual(send, recv, "two confirmed businesses across the hand-over");
+  return { ...w, send, recv };
+}
+
+test("engine test 2026-11-23: two confirmed businesses across an S2S hand-over join, whichever side went first; the merge waits for a person", async () => {
+  for (const first of ["n112", "c250"] as const) {
+    const { store, deps, send, recv } = await twoBusinesses(first);
+    // Equal size: the older business takes the other; the service whose part moves drafts the move.
+    const [keep, moves, svc, group] = first === "n112" ? [send, recv, "c250", "R"] as const : [recv, send, "n112", "S"] as const;
+    const other = svc === "c250" ? "n112" : "c250";
+    assert.equal(draftFromSkeleton(store, other, NOW).segments[0]!.flow, keep, `${first} first: the other side stays`);
+    const d = draftFromSkeleton(store, svc, NOW);
+    assert.equal(d.segments.find((s) => s.group.id === group)!.flow, keep, `${first} first: before, the draft kept ${moves}`);
+    const run = runModel(store, svc, d, NOW);
+    assert.ok(run.checks.every((c) => c.ok), JSON.stringify(run.checks));
+    assert.deepEqual([run.verdict, run.changes.map((c) => [c.flow, c.kind])], ["needs-confirmation", [[keep, "merge"]]]);
+    const held = await publishModel(deps, { service: svc, base: store.flowModel(svc)!.revision, model: d, note: "join", actor: ai });
+    assert.deepEqual(held.pending.map((p) => [p.flow, p.kind]), [[keep, "merge"]]);
+    assert.equal(flowOf(store, svc, group), moves, "never merged on its own");
+    assert.equal((await confirmFlow(deps, keep, admin)).result!.verdict, "published");
+    assert.deepEqual(store.flowSegments(keep).map((s) => `${s.service}/${s.segment}`), ["n112/S", "c250/R"]);
+    assert.ok(!store.flow(moves), "the business taken in is gone");
+  }
+});
+
+test("engine test 2026-11-23: a business a person said is really two is not joined across the hand-over", async () => {
+  const { store, send, recv } = await twoBusinesses("n112");
+  store.addFlowChange({ flow: recv, service: "c250", by: "admin", kind: "split-asked", text: "人说这其实是两条业务", revision: null, verdict: null });
+  assert.equal(draftFromSkeleton(store, "c250", NOW).segments[0]!.flow, recv);
+  assert.equal(draftFromSkeleton(store, "n112", NOW).segments[0]!.flow, send);
+});
+
 test("engine test 2026-11-22: both services already have models; a new S2S hand-over is waited for on either side, a port the other canvas lacks is dangling", () => {
   const { store } = crossing(() => 10);
   for (const id of ["n112", "c250"]) store.insertFlowModel(id, 0, { version: 2, service: id, sources: [], segments: [] }, "ai", ai, []);
