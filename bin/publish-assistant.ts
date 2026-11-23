@@ -16,7 +16,8 @@
 // The model's context: OMA knows the windows of some models only; for another (deepseek, say) it falls back to a 32K
 // window and compacts early (and fails compacting). OMA_CONTEXT_WINDOW_TOKENS / OMA_CONTEXT_OUTPUT_TOKENS (whole
 // numbers, from the model provider's documentation) go into the agent's metadata as context_window_tokens /
-// context_output_tokens, which OMA reads before its own table.
+// context_output_tokens, which OMA reads before its own table. A package publish writes the metadata itself (only
+// agent_package), so they are put on afterwards with POST /v1/agents/<id> (the agent's version 2).
 //
 // Usage: OMA_URL=<OMA API> OMA_API_KEY_FILE=<key file> [OMA_CONTEXT_WINDOW_TOKENS=<n> OMA_CONTEXT_OUTPUT_TOKENS=<n>] [NIFI_OPS_MCP_URL=<Studio data plane MCP of the nifi-ops graph>] node bin/publish-assistant.ts <builder MCP url> <builder key file> <model> <Deployer MCP url> <state file> [deploy-assistant | onboarding-assessor | service-checkup]
 //   e.g. OMA_URL=https://oma:3000 OMA_API_KEY_FILE=/etc/oa/oma-api.key node bin/publish-assistant.ts https://oma:3008/mcp /etc/oa/oma-builder.key claude-x https://wb.example/deploy/mcp ./assistant-uat.json
@@ -59,7 +60,7 @@ for (const [env, key] of [["OMA_CONTEXT_WINDOW_TOKENS", "context_window_tokens"]
   if (!Number.isSafeInteger(n) || n <= 0) { console.error(`${env} must be a whole number above 0`); process.exit(2); }
   context[key] = n;
 }
-if (Object.keys(context).length) for (const agent of filled.agents) agent.metadata = { ...(agent.metadata ?? {}), ...context };
+if (Object.keys(context).length && (!omaUrl || !omaKeyFile)) { console.error("OMA_CONTEXT_* go into the agent through OMA's API: set OMA_URL and OMA_API_KEY_FILE"); process.exit(2); }
 // Service ops §9.4 (phase 2 step 6): with NIFI_OPS_MCP_URL (Studio's data plane MCP of the nifi-ops graph, e.g.
 // https://studio:9632/mcp/<graph uuid>) the Deploy Assistant also gets that graph's read tools, for drilling down to one
 // queue, processor or process group; its graph token (oat_v1.) is a second credential, kept in OMA's Vault.
@@ -94,6 +95,17 @@ const validation = await builder.call("validate_package", { package_id: state.pa
 if (validation?.valid === false) { console.error(JSON.stringify(validation)); process.exit(1); }
 const published = await builder.call("publish_package", { package_id: state.packageId });
 const agent = String(published.agents[0].agent_id);
+if (Object.keys(context).length) {
+  const key = readToken(omaKeyFile!);
+  const api = async (method: string, path: string, body?: unknown) => {
+    const r = await fetch(`${omaUrl!.replace(/\/+$/, "")}${path}`, { method, headers: { "x-api-key": key ?? "", "content-type": "application/json" }, ...(body !== undefined ? { body: JSON.stringify(body) } : {}) });
+    if (!r.ok) throw new Error(`OMA ${method} ${path} returned HTTP ${r.status}: ${(await r.text()).slice(0, 300)}`);
+    return r.json() as Promise<{ version: number; metadata?: Record<string, unknown> }>;
+  };
+  const current = await api("GET", `/v1/agents/${encodeURIComponent(agent)}`);
+  const updated = await api("POST", `/v1/agents/${encodeURIComponent(agent)}`, { version: current.version, metadata: { ...(current.metadata ?? {}), ...context } });
+  console.log(`agent ${agent} version ${updated.version}: ${Object.entries(context).map(([k, v]) => `${k} ${v}`).join(", ")}`);
+}
 state.agents = [...(state.agents ?? []), agent];
 writeFileSync(stateFile, JSON.stringify(state, null, 2) + "\n");
 console.log(`package ${state.packageId} revision ${published.revision ?? "?"} agent ${agent}`);
