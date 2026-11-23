@@ -427,3 +427,16 @@ test("engine test round 4: a port two services send to balances against their su
   const r = runModel(store, "c250", receiver("new:orders"), NOW);
   assert.equal(r.checks.find((c) => c.check === "s2s-balance")!.ok, true, JSON.stringify(r.checks));
 });
+
+test("executor 0.9.6: a unit's ends (writing processors that lead nowhere) are the draft's external exits", () => {
+  const { store } = single();
+  const body = store.latestTopology("n1")!.body as Record<string, unknown>;
+  store.putTopology("n1", "2026-11-19T12:00:00Z", "h2", { ...body, ends: [
+    { id: "p-put", name: "Write to store", type: "org.apache.nifi.processors.standard.PutFile", group: "B", fragment: "b", relationships: ["failure", "success"] },
+    { id: "p-pub", name: "Publish", type: "org.apache.nifi.processors.kafka.pubsub.PublishKafka", group: "C", fragment: "c", relationships: [] }] } as never);
+  const d = draftFromSkeleton(store, "n1", NOW);
+  const exits = (g: string) => d.segments.find((x) => x.group.id === g)!.exits.map((e) => [e.channel.type, e.channel.system, e.component, e.relationship ?? null]);
+  assert.deepEqual(exits("B"), [["external", "Write to store", "p-put", "success"]]);
+  assert.deepEqual(exits("C"), [["external", "Publish", "p-pub", null]]);
+  assert.deepEqual(exits("A"), []);
+});

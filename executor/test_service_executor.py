@@ -3462,7 +3462,7 @@ def _conn(i, s, d, rel="success"):
 # child group C) linked at root by A.out -> B.in.
 FLOW_GROUPS = [
     {"id": "root", "name": "NiFi Flow", "parent": None, "flow": {
-        "processors": [_e("p-gen", "gen"), _e("p-ren", "rename"), _e("p-load", "load")],
+        "processors": [_e("p-gen", "gen"), _e("p-ren", "rename"), _e("p-load", "load", type="org.apache.nifi.processors.standard.PutFile", relationships=[{"name": "success", "autoTerminate": True}, {"name": "failure", "autoTerminate": False}])],
         "inputPorts": [_e("ri", "in")],  # 1.x: no allowRemoteAccess, a root input port is remote
         "remoteProcessGroups": [{"id": "rpg", "component": {"targetUris": "https://C250:18445/nifi/,https://c250b:18446/nifi",
                                                             "contents": {"inputPorts": [{"id": "rp", "name": "orders", "connected": True}]}}}],
@@ -3490,6 +3490,8 @@ class FlowCountsTest(unittest.TestCase):
         self.assertEqual(body["links"], [{"connection": "c4", "from": {"group": "A", "fragment": "A-out", "port": "out"}, "to": {"group": "B", "fragment": "B-in", "port": "in"}}])
         self.assertEqual(body["s2sIn"], [{"id": "ri", "name": "in", "group": "root", "fragment": "p-load"}])
         self.assertEqual(body["s2sOut"][0]["targets"], ["https://c250:18445/nifi", "https://c250b:18446/nifi"])
+        self.assertEqual(body["ends"], [{"id": "p-load", "name": "load", "type": "org.apache.nifi.processors.standard.PutFile", "group": "root", "fragment": "p-load", "relationships": ["success"]}],
+                         "0.9.6: a writing processor that leads nowhere is an end; gen (no type) and rename (leads to the RPG) are not")
         self.assertEqual(body["s2sOut"][0]["sources"], [{"id": "p-ren", "name": "rename", "kind": "processor", "relationships": ["success"]}], "0.9.5: what feeds the RPG port")
         self.assertEqual((helper["s2sOut"]["https://c250:18445/nifi#orders"]["connections"], helper["s2sIn"]["ri"], helper["rootSources"], helper["rootOutConns"]),
                          (["c2"], ["c3"], ["p-gen"], ["c2"]))

@@ -86,7 +86,7 @@ from executor_core import (  # noqa: F401
     FINAL, ID_RE, PROTOCOLS, Failed, ProtocolExecutor, Refused, Restarting, load_env_file, now_iso, write_json)
 # <<< executor_core
 
-VERSION = "0.9.5"
+VERSION = "0.9.6"
 # The executor's release (§8.6): one directory in the archive, holding only these files.
 PACKAGE = "open-atlas-service-executor"
 PACKAGE_FILES = ("service_executor.py", "launch.sh", "switch", "install.sh", "open-atlas-service-executor.service", "service-executor.env.example")
@@ -700,6 +700,10 @@ TOPOLOGY_SECONDS = 3600
 TOPOLOGY_GROUPS_MAX = 500
 HISTORY_CALLS_MAX = 200
 FLOW_NAMES_MAX = 5
+# 0.9.6: a processor that hands data out of NiFi, told by NiFi's naming convention for its type (PutFile, PutSFTP,
+# PublishKafka, PostHTTP, SendTrapSNMP …); EXECUTOR_EXIT_TYPES (a regular expression on the type's simple name)
+# replaces it where a flow uses other processors to write out.
+EXIT_TYPES = re.compile(os.environ.get("EXECUTOR_EXIT_TYPES") or r"^(Put|Publish|Post|Send|Transmit|Write|Insert|Upsert|Store|Upload|Export)[A-Z0-9]")
 FIVE_MINUTES_MS = 300_000
 # Per NiFi and round, and per REST request: a NiFi that hangs costs its own sample at most this, never the others'.
 NIFI_BUDGET = 10.0
@@ -1068,7 +1072,9 @@ def build_topology(root_id, root_name, groups):
         u = unit_of(gid)
         name_of = lambda e: ((e.get("component") or {}).get("name")) or e.get("id")
         for e in f.get("processors") or []:
-            nodes[e["id"]] = {"unit": u, "group": gid, "kind": "processor", "name": name_of(e)}
+            comp = e.get("component") or {}
+            auto = sorted(r.get("name") for r in comp.get("relationships") or [] if isinstance(r, dict) and r.get("autoTerminate") and isinstance(r.get("name"), str))
+            nodes[e["id"]] = {"unit": u, "group": gid, "kind": "processor", "name": name_of(e), "type": comp.get("type") or "", "auto": auto}
         for e in f.get("inputPorts") or []:
             remote = (e.get("component") or {}).get("allowRemoteAccess", e.get("allowRemoteAccess"))
             # NiFi 1.x has no allowRemoteAccess: its root-level input ports are the remote ones.
@@ -1155,6 +1161,13 @@ def build_topology(root_id, root_name, groups):
             helper["rootSources"].append(i)
     body = {"root": {"id": root_id, "name": root_name or root_id}, "groups": body_groups, "links": body_links,
             "s2sIn": s2s_in, "s2sOut": sorted(s2s_out.values(), key=lambda o: (o["ref"], o["group"], o["fragment"] or ""))}
+    # 0.9.6: the flow's ends, where data leaves NiFi: a processor of a writing type (EXIT_TYPES) whose connections lead
+    # nowhere else on the canvas (none, or only back to itself), with the relationships it auto-terminates. Generic
+    # NiFi semantics: no flow's names or layout are assumed.
+    leads = {s for _, s, d in conns if s != d and d in nodes}
+    body["ends"] = sorted(({"id": i, "name": n["name"], "type": n["type"], "group": n["unit"], "fragment": frag_of.get(i), "relationships": n["auto"]}
+                           for i, n in nodes.items() if n["kind"] == "processor" and i not in leads and EXIT_TYPES.match(n["type"].rsplit(".", 1)[-1])),
+                          key=lambda x: (x["group"], x["id"]))
     # Ops step 3b (B3): where a bulletin's, a provenance event's or a queue's component is. nested: a group deeper than
     # root's children -> its unit; split: in a unit of several fragments, each processor -> its fragment.
     body["nested"] = {gid: unit_of(gid) for gid in sorted(parent) if gid != root_id and parent.get(gid) not in (None, root_id)}

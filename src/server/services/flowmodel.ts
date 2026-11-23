@@ -676,6 +676,9 @@ export function draftFromSkeleton(store: Store, service: string, now = new Date(
       const from = o.sources?.[0];
       return { id: `s2s-${i + 1}`, step: "g", channel: { type: "s2s", service: target ?? "?", port: o.name }, component: from?.id ?? UNPLACED, ...(from?.relationships[0] ? { relationship: from.relationships[0] } : {}) };
     });
+    // Executor 0.9.6: the unit's ends (writing processors that lead nowhere on the canvas) are its external exits.
+    const ends = (topo?.ends ?? []).filter((x) => x.group === u.group.id && (u.fragment === null || x.fragment === u.fragment));
+    exits.push(...ends.map((x, i): Exit => ({ id: `out-${i + 1}`, step: "g", channel: { type: "external", system: x.name }, component: x.id, ...(x.relationships.includes("success") ? { relationship: "success" } : x.relationships[0] ? { relationship: x.relationships[0] } : {}) })));
     segments.push({
       id, name: u.group.name, match: [], steps: [{ id: "g", name: u.group.name, position: { kind: "process-group", id: u.group.id, name: u.group.name } }],
       entries: ins.length ? ins.map((p, i) => ({ id: `s2s-in-${i + 1}`, step: "g", channel: { type: "s2s", port: p.name } })) : [{ id: "in", step: "g", channel: { type: "external", system: "外部来源（待 AI 写明）" } }],
