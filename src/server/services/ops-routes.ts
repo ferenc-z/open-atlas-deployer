@@ -13,7 +13,9 @@ import { StoreError, type Actor, type FlowRecord, type Store } from "../store.ts
 import { topologyFingerprint, type Topology } from "./flowcounts.ts";
 import { modelState, publishedFingerprint } from "./checkup-brief.ts";
 import { draftFromSkeleton, gateRejected, ModelError, publishModel, runModel, parseDraft, type ModelDeps } from "./flowmodel.ts";
-import { clip, compactDeep, skeletonSummary } from "./look-summary.ts";
+import { clip, compactDeep, INLINE_BUDGET, inlineBytes } from "./look-summary.ts";
+import { applyChanges, CHANGE_OPS, draftLines } from "./model-changes.ts";
+import type { ModelDraft } from "./trace/model.ts";
 import { flowCard } from "./flow-views.ts";
 import type { AnalysisView, Anomaly, BusinessLightView, FlowRow, FlowStatus, Light, Lights, TodoView, UnknownReason } from "./ops-types.ts";
 import { provenanceSupport } from "./provenance.ts";
@@ -164,6 +166,7 @@ export function mountOps(api: Hono, d: OpsRouteDeps) {
     const topo = (t?.body as Topology | undefined) ?? null;
     const sk = skeletonOf(d.store, at, [id]);
     const mine = { flows: sk.flows.filter((f) => f.segments.some((s) => s.service === id)), shared: sk.shared.filter((s) => s.service === id), empty: sk.empty.filter((e) => e.service === id), questions: sk.questions.filter((q) => q.service === id) };
+    const pieces = mine.flows.filter((f) => f.exceptions.length || f.reason).map((f) => ({ key: f.key, exceptions: f.exceptions, ...(f.reason ? { reason: f.reason } : {}) }));
     const state = modelState(d.store, id);
     const current = d.store.flowModel(id)?.model ?? null;
     // The skeleton draft against the current model, and this check-up's replay of it (the gate's own words).
@@ -190,24 +193,34 @@ export function mountOps(api: Hono, d: OpsRouteDeps) {
       topology: topo ? {
         takenAt: t!.takenAt, fingerprint: topologyFingerprint(topo),
         counts: { units: topo.groups.length, links: topo.links.length, s2sIn: topo.s2sIn.length, s2sOut: topo.s2sOut.length, ends: (topo.ends ?? []).length },
-        // The units, the skeleton and its questions only matter when the model is rebuilt (the S2S ones are gaps anyway).
-        ...(rebuild ? { skeleton: skeletonSummary(mine) } : {}),
+        // The skeleton's questions and its pieces' reasons only matter when the model is rebuilt (the S2S ones are gaps
+        // anyway); which unit is in which proposed business is the draft's lines below.
+        ...(rebuild ? { questions: mine.questions, ...(pieces.length ? { pieces } : {}), ...(mine.empty.length ? { empty: mine.empty.map((e) => e.group.name) } : {}) } : {}),
       } : null,
-      skeletonDraft: { segments: draft.segments.length, sameAsModel: draft.segments.length - added.length, added, newBusinesses: draft.flows ?? [], run },
+      skeletonDraft: rebuild
+        ? { segments: draft.segments.length, sameAsModel: draft.segments.length - added.length, lines: draftLines(draft).lines.map((l) => (curIds.has(l.id) ? l : { ...l, new: true })), newBusinesses: draft.flows ?? [], run }
+        : { segments: draft.segments.length, sameAsModel: draft.segments.length - added.length, added, run },
       next: rebuild
-        ? "Rebuild: this brief has the skeleton's units and the replay of its draft; look kind model gives the draft to edit, run_model it again after any change."
+        ? "Rebuild: skeletonDraft has the skeleton's draft in a line per segment and this check-up's run_model of it. Write only the changes it needs: run_model {from: \"skeleton\", changes}, then publish_model with the same from and changes. look kind model only for what the lines do not show."
         : `Do not rebuild the model.${e2e.length ? ` Only the e2e gaps (${e2e.map((g) => g.code).join(", ")}) are model work this time.` : ""} Record from this brief; look only for what it does not say (a check that is not healthy, a business with anomalies).`,
     }, 300, 25) as Record<string, any>;
     // The gate's words stay whole: which check failed on which segment, port or business.
     if (failed.length) out.skeletonDraft.run.failed = failed;
+    // Every segment's line (changes name them), not the first 25.
+    if (rebuild) out.skeletonDraft.lines = draftLines(draft).lines.map((l) => (curIds.has(l.id) ? l : { ...l, new: true }));
     out.gaps = gaps.map((g) => ({ code: g.code, text: clip(g.text, 800) }));
     return out;
   };
+  /** Every service's brief when they fit inline together (OMA's limit); else a line each, to ask one by one. */
   const briefAll = async (at: Date) => {
     const ids = [...d.store.standalones(), ...d.store.clusters()].map((x) => x.id).sort();
-    const out = [];
+    const out: Record<string, any>[] = [];
     for (const id of ids) out.push(await briefOne(id, at));
-    return out;
+    if (inlineBytes({ services: out }) <= INLINE_BUDGET) return { services: out };
+    return {
+      services: out.map((b) => ({ service: b.service, machine: { light: b.machine?.light, sentence: b.machine?.sentence }, business: { light: b.business?.light, sentence: b.business?.sentence }, rebuild: b.model?.rebuild, todos: b.todos?.length ?? 0, gaps: (b.gaps ?? []).map((g: { code: string }) => g.code) })),
+      next: "The briefs together are too big for one answer: call describe {service, brief: true} for each service, one at a time.",
+    };
   };
 
   // describe (§10.2.3): one service (and one business), or every service's card; brief=1: the check-up's brief.
@@ -219,7 +232,7 @@ export function mountOps(api: Hono, d: OpsRouteDeps) {
     if (c.req.query("brief") === "1") {
       if (flow) return d.reject(c, 400, "describe/brief-flow", "brief is per service: leave flow out.");
       if (service && !d.registered(service)) return unknown(c, service);
-      return c.json(service ? await briefOne(service, at) : { services: await briefAll(at) });
+      return c.json(service ? await briefOne(service, at) : await briefAll(at));
     }
     if (service) {
       if (!d.registered(service)) return unknown(c, service);
@@ -311,14 +324,39 @@ export function mountOps(api: Hono, d: OpsRouteDeps) {
     try { return c.json(await d.flowSearch(id, q)); } catch (e) { return failed(c, e); }
   });
 
+  /** ⑰ the draft a run_model / publish_model body means: the whole model as sent, or {from, changes, flows?} built here
+   *  (model-changes.ts) on the skeleton's draft or the current model. Not both. */
+  const draftOf = (id: string, b: Record<string, unknown>, at: Date): { model: unknown; built: boolean } => {
+    if (b.from === undefined && b.changes === undefined) return { model: b.model, built: false };
+    if (b.model !== undefined) throw new ModelError(400, "flow-model/both", "Give model (the whole draft) or from with changes, not both.");
+    if (b.from !== "skeleton" && b.from !== "current") throw new ModelError(400, "flow-model/from", "from is skeleton (the skeleton's draft over the current model) or current (the published model).");
+    let base: ModelDraft;
+    if (b.from === "skeleton") base = draftFromSkeleton(d.store, id, at);
+    else {
+      const m = d.store.flowModel(id);
+      if (!m) throw new ModelError(400, "flow-model/no-current", `${id} has no published model yet: start from skeleton.`);
+      base = { ...m.model, flows: [] };
+    }
+    const flows = b.flows === undefined ? [] : Array.isArray(b.flows) ? b.flows.map((f) => ({ ...(f as object), op: "note" })) : null;
+    if (!flows) throw new ModelError(400, "flow-model/flows", "flows is a list of business notes {flow, name?, …}.");
+    const got = applyChanges(base, [...(Array.isArray(b.changes) ? b.changes : b.changes === undefined ? [] : [b.changes]), ...flows]);
+    if (got.errors.length) throw new ModelError(400, "flow-model/changes", `${got.errors.length} change(s) could not be applied; nothing was run (the ops: ${CHANGE_OPS.join(", ")}; see the tool's changes description).`, got.errors.slice(0, 20));
+    return { model: got.draft, built: true };
+  };
+
   // run_model: the draft replayed against the last 7 days; nothing is saved.
   api.post("/api/services/:id/model/run", async (c) => {
     const p = await d.authenticate(c, "view");
     if (p instanceof Response) return p;
     const id = c.req.param("id");
     if (!d.registered(id)) return unknown(c, id);
-    const b = await c.req.json().catch(() => ({})) as { model?: unknown };
-    try { return c.json(runModel(d.store, id, parseDraft(d.store, id, b.model).model, now())); } catch (e) { return failed(c, e); }
+    const b = await c.req.json().catch(() => ({})) as Record<string, unknown>;
+    try {
+      const at = now();
+      const draft = draftOf(id, b, at);
+      const r = runModel(d.store, id, parseDraft(d.store, id, draft.model).model, at);
+      return c.json(draft.built ? { ...r, draft: draftLines(draft.model as ModelDraft) } : r);
+    } catch (e) { return failed(c, e); }
   });
 
   // publish_model: the gate, then A8's line (flowmodel.publishModel); a to-do when it is rejected or waits for a person.
@@ -327,12 +365,14 @@ export function mountOps(api: Hono, d: OpsRouteDeps) {
     if (p instanceof Response) return p;
     const id = c.req.param("id");
     if (!d.registered(id)) return unknown(c, id);
-    const b = await c.req.json().catch(() => ({})) as { base?: unknown; model?: unknown; note?: unknown; source?: unknown };
+    const b = await c.req.json().catch(() => ({})) as { base?: unknown; model?: unknown; note?: unknown; source?: unknown; from?: unknown; changes?: unknown; flows?: unknown };
     if (!Number.isInteger(b.base)) return d.reject(c, 400, "flow-model/base", "base is the revision the draft was made on (look kind model: base; 0 when there is none).");
     if (typeof b.note !== "string" || !b.note.trim() || b.note.length > 2000) return d.reject(c, 400, "flow-model/note", "note says what changed and why (1 to 2000 characters).");
     if (b.source !== undefined && b.source !== "ai" && b.source !== "e2e_trace") return d.reject(c, 400, "flow-model/source", "source is ai or e2e_trace.");
     try {
-      return c.json(await publishModel(d.model, { service: id, base: b.base as number, model: b.model, note: b.note.trim(), ...(b.source ? { source: b.source as "ai" | "e2e_trace" } : {}), actor: d.actorOf(p) }));
+      const draft = draftOf(id, b, now());
+      const r = await publishModel(d.model, { service: id, base: b.base as number, model: draft.model, note: b.note.trim(), ...(b.source ? { source: b.source as "ai" | "e2e_trace" } : {}), actor: d.actorOf(p) });
+      return c.json(draft.built ? { ...r, draft: draftLines(draft.model as ModelDraft) } : r);
     } catch (e) { return failed(c, e); }
   });
 

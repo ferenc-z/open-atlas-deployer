@@ -22,6 +22,7 @@ import { SecretBox } from "../src/server/secretbox.ts";
 import { topologyFingerprint, topologyHash, type Topology, type TopologyFragment } from "../src/server/services/flowcounts.ts";
 import { analysisMessage } from "../src/server/services/analyses.ts";
 import { CHECKUP_MESSAGE } from "../src/server/services/checkup-schedule.ts";
+import { INLINE_BUDGET, inlineBytes } from "../src/server/services/look-summary.ts";
 import { opsReads, todoSink } from "../src/server/services/todos.ts";
 import { Store, type FlowCountRow } from "../src/server/store.ts";
 import { Versions } from "../src/server/versions.ts";
@@ -114,7 +115,8 @@ test("describe and look: the lights, gaps pointing at their fix, and look's kind
   assert.equal((await t.tool("dps_assistant", "describe", { flow: "flw_x" })).value.finding.code, "describe/flow-needs-service");
 
   const model = (await t.tool("dps_assistant", "look", { service: "n1", kind: "model" })).value;
-  assert.deepEqual([model.kind, model.data.base, model.data.current, model.data.draft.segments.map((s: { id: string }) => s.id)], ["model", 0, null, ["A", "B", "C"]]);
+  assert.deepEqual([model.kind, model.data.base, model.data.current, model.data.draft.lines.map((s: { id: string; new?: boolean }) => [s.id, s.new])], ["model", 0, null, [["A", true], ["B", true], ["C", true]]], "⑰ a line per segment, no whole draft");
+  assert.equal(model.data.draft.segments, 3);
   const topo = (await t.tool("dps_assistant", "look", { service: "n1", kind: "topology" })).value.data;
   assert.deepEqual([topo.counts.units, topo.units.length, topo.links, topo.skeleton.flows.length], [3, 3, ["Ingest:out → Load:in"], 2], "⑰ a summary by default");
   const whole = (await t.tool("dps_assistant", "look", { service: "n1", kind: "topology", detail: "full" })).value.data;
@@ -132,7 +134,7 @@ test("describe and look: the lights, gaps pointing at their fix, and look's kind
 
 test("run_model and publish_model: the gate's verdicts, the to-do it opens, a stale base refused", async () => {
   const t = setup();
-  const draft = (await t.tool("dps_assistant", "look", { service: "n1", kind: "model" })).value.data.draft;
+  const draft = (await t.tool("dps_assistant", "look", { service: "n1", kind: "model", detail: "full" })).value.data.draft;
   const run = (await t.tool("dpc_checkup", "run_model", { service: "n1", model: draft })).value;
   assert.equal(run.verdict, "needs-confirmation");
   assert.ok(run.checks.every((c: { ok: boolean }) => c.ok));
@@ -171,7 +173,7 @@ test("record: the Assistant saves to-dos only; the check-up writes the analysis,
 
   // The check-up: into the running analysis the session was opened for; to-dos linked to it; one resolved.
   const running = t.store.addAnalysis({ service: "n1", run: "run-1", trigger: "schedule", state: "running", session: "s1", requestedBy: "deployer", startedAt: new Date().toISOString(), finishedAt: null, machineLight: "unknown", businessLight: "unknown", body: null, error: null });
-  const draft = (await t.tool("dpc_checkup", "look", { service: "n1", kind: "model" })).value.data.draft;
+  const draft = (await t.tool("dpc_checkup", "look", { service: "n1", kind: "model", detail: "full" })).value.data.draft;
   await t.tool("dpc_checkup", "publish_model", { service: "n1", base: 0, model: draft, note: "first" });
   const flow = t.store.flows("n1")[0]!.id;
   const wrote = (await t.tool("dpc_checkup", "record", { service: "n1", analysis_id: running, analysis: { ...analysis, stuckSuggestions: [{ flow, attentionMinutes: 20, failingMinutes: 120, basis: "平时 5 分钟内处理完" }], intro: "按 root 下的组分。" }, todos: [{ key: "disk:n1", severity: "failing", title: "磁盘快满", detail: "content 仓库 96%" }], resolve: [saved.todos[0]] })).value;
@@ -248,11 +250,12 @@ const later = (minutes: number) => new Date(Date.now() + minutes * 60_000).toISO
 test("⑰ brief: the model kept while the canvas keeps its structure; rebuilt after a change or a person's feedback", async () => {
   const t = setup();
   const before = (await t.tool("dpc_checkup", "describe", { service: "n1", brief: true })).value;
-  assert.deepEqual([before.model.revision, before.model.rebuild, before.skeletonDraft.segments, before.skeletonDraft.added.length], [0, true, 3, 3], "no model yet: build it");
+  assert.deepEqual([before.model.revision, before.model.rebuild, before.skeletonDraft.segments, before.skeletonDraft.lines.filter((l: { new?: boolean }) => l.new).length], [0, true, 3, 3], "no model yet: build it, from the draft's lines");
   assert.equal(before.skeletonDraft.run.verdict, "needs-confirmation", "the brief has this check-up's replay of the skeleton draft");
-  assert.ok(before.topology.skeleton.flows.length === 2 && before.topology.fingerprint);
+  assert.ok(Array.isArray(before.topology.questions) && before.topology.fingerprint);
+  assert.match(before.next, /from: "skeleton", changes/);
 
-  const draft = (await t.tool("dpc_checkup", "look", { service: "n1", kind: "model" })).value.data.draft;
+  const draft = (await t.tool("dpc_checkup", "look", { service: "n1", kind: "model", detail: "full" })).value.data.draft;
   await t.tool("dpc_checkup", "publish_model", { service: "n1", base: 0, model: draft, note: "first" });
   assert.ok(t.store.flowModel("n1")!.topologyFp, "the fingerprint is kept with the revision");
   // The executor walks the canvas again in another order, the link drawn again: a new snapshot, the same structure.
@@ -262,7 +265,7 @@ test("⑰ brief: the model kept while the canvas keeps its structure; rebuilt af
   assert.deepEqual([kept.model.topology, kept.model.rebuild], ["unchanged", false]);
   assert.match(kept.model.note, /^拓扑未变，沿用已发布模型 r1/);
   assert.ok(!kept.gaps.some((g: { code: string }) => g.code === "topology-changed"), "a new snapshot of the same structure is no change");
-  assert.equal(kept.topology.skeleton, undefined, "no rebuild: no skeleton units in the brief");
+  assert.deepEqual([kept.topology.questions, kept.skeletonDraft.lines], [undefined, undefined], "no rebuild: no skeleton questions or draft lines in the brief");
   assert.match(kept.next, /^Do not rebuild/);
   assert.ok(Buffer.byteLength(JSON.stringify(kept)) < 6000, `the brief stays small (${Buffer.byteLength(JSON.stringify(kept))} bytes)`);
 
@@ -303,4 +306,33 @@ test("⑰ the first message carries the briefs; the scheduled one asks describe 
   assert.match(withBrief, /Each service's brief/);
   assert.match(withBrief, /拓扑未变，沿用已发布模型 r3/);
   assert.match(CHECKUP_MESSAGE, /describe \{brief: true\}/);
+});
+
+test("⑰ run_model / publish_model with from + changes: the Deployer builds the draft, the gate judges it as a whole one", async () => {
+  const t = setup();
+  const whole = (await t.tool("dpc_checkup", "look", { service: "n1", kind: "model", detail: "full" })).value.data.draft;
+  const byWhole = (await t.tool("dpc_checkup", "run_model", { service: "n1", model: whole })).value;
+  const bySkeleton = (await t.tool("dpc_checkup", "run_model", { service: "n1", from: "skeleton", changes: [] })).value;
+  assert.deepEqual([bySkeleton.verdict, bySkeleton.checks, bySkeleton.changes], [byWhole.verdict, byWhole.checks, byWhole.changes], "the same draft, the same gate");
+  assert.equal(bySkeleton.draft.lines.length, 3);
+  assert.equal(byWhole.draft, undefined, "a whole model sent gets no lines back");
+  assert.ok(inlineBytes(bySkeleton) < INLINE_BUDGET);
+
+  // Join Reports into Ingest's business, name it, then share it back; a change that names no segment is refused.
+  const key = bySkeleton.draft.lines.find((l: { id: string }) => l.id === "A").flow;
+  const joined = (await t.tool("dpc_checkup", "run_model", { service: "n1", from: "skeleton", changes: [{ op: "assign", segments: ["C"], flow: key }, { op: "note", flow: key, name: "Ingest and reports" }] })).value;
+  assert.equal(joined.draft.lines.find((l: { id: string }) => l.id === "C").flow, key);
+  assert.deepEqual(joined.draft.flows.find((f: { flow: string }) => f.flow === key)?.name, "Ingest and reports");
+  const bad = (await t.tool("dpc_checkup", "run_model", { service: "n1", from: "skeleton", changes: [{ op: "remove", segments: ["nope"] }] })).value;
+  assert.equal(bad.finding.code, "flow-model/changes");
+  assert.match(bad.details[0], /no segment nope/);
+  assert.equal((await t.tool("dpc_checkup", "run_model", { service: "n1", from: "current", changes: [] })).value.finding.code, "flow-model/no-current");
+  assert.equal((await t.tool("dpc_checkup", "run_model", { service: "n1", model: whole, from: "skeleton" })).value.finding.code, "mcp/arguments");
+  assert.equal((await t.tool("dpc_checkup", "run_model", { service: "n1" })).value.finding.code, "mcp/arguments");
+
+  const pub = (await t.tool("dpc_checkup", "publish_model", { service: "n1", base: 0, from: "skeleton", changes: [], flows: [{ flow: key, name: "Ingest" }], note: "first" })).value;
+  assert.deepEqual([pub.revision, pub.draft.segments], [1, 3]);
+  const shared = (await t.tool("dpc_checkup", "run_model", { service: "n1", from: "current", changes: [{ op: "share", segments: ["C"] }, { op: "add-exit", segment: "B", exit: { channel: { type: "external", system: "Warehouse" }, component: "b" } }] })).value;
+  const lines = Object.fromEntries(shared.draft.lines.map((l: { id: string }) => [l.id, l]));
+  assert.deepEqual([lines.C.role, lines.C.flow, lines.B.exits.at(-1)], ["shared", null, "out-1 external:Warehouse @b"]);
 });

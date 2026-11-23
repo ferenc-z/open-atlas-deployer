@@ -6,8 +6,29 @@
 // the routes' bodies; mcp.ts calls them in look's and describe's shapes, and the check-up brief reuses the topology one.
 
 import { topologyFingerprint, type Topology, type TopologyGroup } from "./flowcounts.ts";
+import { draftLines } from "./model-changes.ts";
 
 type Any = Record<string, any>;
+
+/** OMA (agent harness, INLINE_RESULT_BYTES) keeps a tool result in the conversation only up to 16 KiB of its model
+ *  text — the MCP content list as JSON, our JSON text escaped once more inside it; a bigger one becomes a reference the
+ *  agent reads back 2 KB a turn. Every default answer stays under INLINE_BUDGET of that measure. */
+export const OMA_INLINE_BYTES = 16 * 1024;
+export const INLINE_BUDGET = 15 * 1024;
+export const inlineBytes = (value: unknown) => Buffer.byteLength(JSON.stringify([{ type: "text", text: JSON.stringify(value) }]));
+
+/** A default answer still over the budget: strings and lists cut harder until it fits, with a mark saying so. */
+export function fitInline(value: unknown, budget = INLINE_BUDGET): unknown {
+  if (inlineBytes(value) <= budget) return value;
+  for (const [str, arr] of [[200, 15], [120, 10], [80, 6], [60, 4], [40, 2]] as const) {
+    const cut = compactDeep(value, str, arr);
+    const marked = cut && typeof cut === "object" && !Array.isArray(cut)
+      ? { ...(cut as Any), cut: `Cut to stay inline (texts at ${str} characters, lists at ${arr} items): ask a narrower part (service, group, offset, a shorter from–to) rather than detail "full".` }
+      : cut;
+    if (inlineBytes(marked) <= budget) return marked;
+  }
+  return { cut: "Too big to give inline even cut down: ask a narrower part (service, group, offset, a shorter from–to)." };
+}
 
 /** At most n characters, with a mark of how much was cut. */
 export function clip(v: unknown, n: number): string | null {
@@ -133,20 +154,20 @@ export function topologyShape(body: Any, a: Record<string, unknown>) {
 
 const segLine = (s: Any) => ({ id: s.id, flow: s.flow ?? null, group: s.group?.name ?? s.group?.id, slice: s.slice, role: s.role });
 
-/** look kind model: the draft whole (it is what run_model and publish_model take, and it carries every segment of the
- *  current model that is still on the canvas as it is), the current model in one line per segment. */
+/** look kind model: the skeleton's draft and the current model in a line per segment (ids, business keys, entries and
+ *  exits with their components: what changes name). run_model / publish_model take {from, changes}, so the whole draft
+ *  is needed only to write a model whole (detail "full"). */
 export function modelShape(body: Any, a: Record<string, unknown>) {
-  if (full(a) || !body?.current) return body;
-  const draftIds = new Set(((body.draft?.segments ?? []) as Any[]).map((s) => s.id));
-  const cur = body.current;
-  const segs = (cur.model?.segments ?? []) as Any[];
+  if (full(a)) return body;
+  const cur = body?.current;
+  const curIds = new Set(((cur?.model?.segments ?? []) as Any[]).map((s) => s.id));
+  const draft = body?.draft ? draftLines(body.draft) : null;
   return {
-    ...body,
-    current: {
-      revision: cur.revision, publishedAt: cur.publishedAt, publishedBy: cur.publishedBy, source: cur.source, sources: cur.model?.sources ?? [],
-      segments: segs.map(segLine),
-      note: `Segments of the current model are in draft as they are (${segs.filter((s) => draftIds.has(s.id)).length} of ${segs.length}); ${FULL_HINT} (current.model too).`,
-    },
+    base: body?.base ?? 0,
+    current: cur ? { revision: cur.revision, publishedAt: cur.publishedAt, publishedBy: cur.publishedBy, source: cur.source, sources: cur.model?.sources ?? [], segments: ((cur.model?.segments ?? []) as Any[]).map(segLine) } : null,
+    draft: draft ? { ...draft, lines: draft.lines.map((l) => (curIds.has(l.id) ? l : { ...l, new: true })) } : null,
+    flows: body?.flows ?? [], e2e: body?.e2e ?? null,
+    more: `run_model / publish_model take {from: "skeleton"|"current", changes}: name segments, entries and exits by these ids. ${FULL_HINT} (the whole draft and current model).`,
   };
 }
 

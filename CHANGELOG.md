@@ -5,6 +5,16 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
 
 ## Unreleased
 
+- Check-up token savings, round 2 (⑰): `run_model` / `publish_model` take `{from: "skeleton" | "current", changes}`
+  (assign, share, remove, add-segment, set, add/set/remove-entry and -exit, rekey, note): the Deployer builds the draft
+  and answers the gate's result with the built draft in a line per segment, not the model (the whole `model` stays as
+  a fallback). `look kind model` gives the drafts in lines (the whole draft with `detail: "full"`); the brief's
+  `skeletonDraft` lists the skeleton draft's segments when the model is rebuilt. Every default answer of the service
+  verbs stays under OMA's 16 KiB inline limit (a longer one is cut, saying so); `describe {brief: true}` without a
+  service gives a line per service when the briefs together do not fit.
+- [ ] OMA: publish the Service Check-up and the Deploy Assistant again (`agents/service-checkup.md` and the Skill
+  `nifi-ops` changed: changes instead of the whole model) and point `DEPLOYER_OMA_CHECKUP_AGENT` and the Workbench
+  Business Agent at the new agents.
 - Check-up token savings (⑰): the first message of a check-up the Deployer opens carries each service's brief (the
   lights and the checks that are not healthy, the businesses, to-dos, gaps, the model's state, a topology summary, the
   skeleton draft against the model and its `run_model`); the scheduled one gets it from `describe {brief: true}` (its

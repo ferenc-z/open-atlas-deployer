@@ -5,9 +5,22 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Topology } from "../src/server/services/flowcounts.ts";
-import { bulletinsShape, describeShape, logsShape, modelShape, provenanceShape, topologyShape } from "../src/server/services/look-summary.ts";
+import { bulletinsShape, describeShape, fitInline, INLINE_BUDGET, inlineBytes, logsShape, modelShape, OMA_INLINE_BYTES, provenanceShape, topologyShape } from "../src/server/services/look-summary.ts";
 
 const size = (v: unknown) => Buffer.byteLength(JSON.stringify(v));
+
+test("OMA's inline limit: the budget is under it, measured as OMA does (the content list as JSON); fitInline cuts to it", () => {
+  // OMA main-node INLINE_RESULT_BYTES = 16 KiB of JSON.stringify(output.value): our text escaped once more.
+  assert.equal(OMA_INLINE_BYTES, 16 * 1024);
+  assert.ok(INLINE_BUDGET < OMA_INLINE_BYTES);
+  assert.equal(inlineBytes({ a: "\"" }), Buffer.byteLength(JSON.stringify([{ type: "text", text: JSON.stringify({ a: "\"" }) }])));
+  const huge = { rows: Array.from({ length: 400 }, (_, i) => ({ i, text: "说明".repeat(200) })) };
+  const fit = fitInline(huge) as any;
+  assert.ok(inlineBytes(fit) <= INLINE_BUDGET, `${inlineBytes(fit)}`);
+  assert.match(fit.cut, /narrower/);
+  const small = { a: 1 };
+  assert.equal(fitInline(small), small);
+});
 const id = (i: number) => `0${String(i).padStart(7, "0")}-01a2-1000-ffff-ffffa655a7b8`;
 
 function bigCanvas(n: number): { topology: Topology; skeleton: any; takenAt: string } {
@@ -30,6 +43,7 @@ test("look topology: a summary under its cap with every unit, link and question;
   const sum = topologyShape(body, {}) as any;
   assert.ok(size(body) > 60_000, `the body is big (${size(body)})`);
   assert.ok(size(sum) < 16_000, `summary ${size(sum)} bytes`);
+  assert.ok(inlineBytes(sum) < INLINE_BUDGET, `inline ${inlineBytes(sum)}`);
   assert.deepEqual([sum.units.length, sum.links.length, sum.counts.ends, sum.skeleton.questions.length], [40, 39, 40, 6]);
   assert.deepEqual(sum.skeleton.questions, body.skeleton.questions, "the questions whole");
   assert.match(sum.more, /detail: "full"/);
@@ -38,14 +52,16 @@ test("look topology: a summary under its cap with every unit, link and question;
   assert.equal(topologyShape(body, { detail: "full" }), body);
 });
 
-test("look model: the draft whole (what run_model takes), the current model in a line per segment", () => {
+test("look model: the draft and the current model in a line per segment (ids, entries, exits with components)", () => {
   const seg = (i: number) => ({ id: `seg-${i}`, flow: `flw_${i}`, name: `g${i}`, match: [], steps: [{ id: "g", name: `g${i}`, position: { kind: "process-group", id: id(i), name: `g${i}` } }], entries: [{ id: "in", step: "g", channel: { type: "external", system: "x" } }], exits: [{ id: "out-1", step: "g", channel: { type: "external", system: "Write" }, component: id(500 + i), relationship: "success" }], group: { id: id(i), name: `g${i}` }, slice: "*", role: "segment" });
-  const body = { current: { revision: 3, publishedAt: "t", publishedBy: "ai", source: "ai", model: { version: 2, service: "s", sources: [], segments: Array.from({ length: 20 }, (_, i) => seg(i)) } }, base: 3, draft: { version: 2, service: "s", sources: [], segments: Array.from({ length: 20 }, (_, i) => seg(i)), flows: [] }, flows: [], e2e: null };
+  const body = { current: { revision: 3, publishedAt: "t", publishedBy: "ai", source: "ai", model: { version: 2, service: "s", sources: [], segments: Array.from({ length: 20 }, (_, i) => seg(i)) } }, base: 3, draft: { version: 2, service: "s", sources: [], segments: Array.from({ length: 24 }, (_, i) => seg(i)), flows: [] }, flows: [], e2e: null };
   const sum = modelShape(body, {}) as any;
-  assert.deepEqual(sum.draft, body.draft, "the draft untouched");
+  assert.deepEqual([sum.base, sum.draft.segments, sum.draft.lines.length, sum.draft.lines.filter((l: any) => l.new).length], [3, 24, 24, 4]);
+  assert.deepEqual(sum.draft.lines[0].exits, [`out-1 external:Write @${id(500)}/success`]);
   assert.equal(sum.current.segments.length, 20);
   assert.equal(sum.current.model, undefined);
-  assert.ok(size(sum) < size(body) * 0.65, `${size(sum)} of ${size(body)}`);
+  assert.ok(size(sum) < size(body) * 0.4, `${size(sum)} of ${size(body)}`);
+  assert.ok(inlineBytes(sum) < INLINE_BUDGET);
   assert.equal(modelShape(body, { detail: "full" }), body);
 });
 
@@ -60,6 +76,7 @@ test("look provenance: counts and the first events in a line, uuid and event id 
   const sum = provenanceShape(body, {}) as any;
   assert.ok(size(body) > 50_000, `body ${size(body)}`);
   assert.ok(size(sum) < 10_000, `summary ${size(sum)} bytes`);
+  assert.ok(inlineBytes(sum) < INLINE_BUDGET);
   assert.deepEqual([sum.count, sum.flowFiles, sum.byType.DROP, sum.byComponent.length, sum.events.length, sum.shown.rest], [100, 100, 34, 5, 20, 80]);
   assert.ok(sum.events.every((e: any) => e.uuid && Number.isInteger(e.eventId) && e.node === "node-1"), "what look event and lineage take");
   assert.ok(sum.byComponent.every((c: any) => c.component.length === 36 && c.name));
@@ -73,6 +90,7 @@ test("look bulletins and logs: grouped by pattern under their caps; full is ever
   const b = bulletinsShape({ bulletins }, {}) as any;
   assert.ok(size({ bulletins }) > 300_000);
   assert.ok(size(b) < 12_000, `bulletins summary ${size(b)} bytes`);
+  assert.ok(inlineBytes(b) < INLINE_BUDGET);
   assert.deepEqual([b.count, b.groups, b.top.length, b.levels.ERROR], [1000, 14, 14, 250], "one group per source, level and message pattern");
   assert.equal(b.top.reduce((x: number, g: any) => x + g.count, 0), 1000);
   assert.equal(bulletinsShape({ bulletins }, { detail: "full" }).bulletins.length, 1000);
@@ -80,6 +98,7 @@ test("look bulletins and logs: grouped by pattern under their caps; full is ever
   const entries = Array.from({ length: 2000 }, (_, i) => ({ member: `m${i % 2}`, label: "l", file: "nifi-app.log", at: `2026-11-23T01:${String(i % 60).padStart(2, "0")}:00Z`, local: "x", level: i % 10 ? "INFO" : "ERROR", logger: `o.a.n.c.Logger${i % 6}`, thread: "t", text: `Something ${i % 6} happened to FlowFile ${id(i)} after ${i} ms ${"y".repeat(400)}` }));
   const l = logsShape({ from: "a", to: "b", entries, members: [] }, {}) as any;
   assert.ok(size(l) < 14_000, `logs summary ${size(l)} bytes`);
+  assert.ok(inlineBytes(l) < INLINE_BUDGET);
   assert.deepEqual([l.count, l.newest.length, l.levels.ERROR], [2000, 8, 200]);
   assert.ok(l.groups <= 12);
   assert.equal((logsShape({ entries }, { detail: "full" }) as any).entries.length, 2000);
@@ -94,6 +113,7 @@ test("describe: short by default (to-do details clipped, the business detail who
   const sum = describeShape(body, {}) as any;
   assert.ok(size(sum) < 14_000, `describe ${size(sum)} bytes (20 to-dos)`);
   assert.ok(size(sum) < size(body) / 4);
+  assert.ok(inlineBytes(sum) < INLINE_BUDGET);
   assert.equal(sum.todos.length, 20);
   assert.match(sum.todos[0].detail, /…\(\+\d+ chars\)$/);
   assert.equal(sum.flow.detail.length, 3000, "the business asked for, whole");
