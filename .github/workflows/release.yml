@@ -31,9 +31,12 @@ jobs:
           package=$(node -p 'require("./package.json").version')
           executor=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' executor/deployer_executor.py)
           service=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' executor/service_executor.py)
-          offered=$(sed -n 's/^export const EXECUTOR_VERSION = "\(.*\)";/\1/p' src/server/handoff.ts)
+          # handoff.ts offers one version per kind (EXECUTOR_VERSIONS = { deploy: "x", service: "y" }).
+          offered=$(sed -n 's/^export const EXECUTOR_VERSIONS.*deploy: "\([^"]*\)".*/\1/p' src/server/handoff.ts)
+          offered_service=$(sed -n 's/^export const EXECUTOR_VERSIONS.*service: "\([^"]*\)".*/\1/p' src/server/handoff.ts)
           [ "$version" = "$package" ] || { echo "::error::tag $GITHUB_REF_NAME does not match package.json $package"; exit 1; }
           [ "$executor" = "$offered" ] || { echo "::error::handoff.ts offers executor $offered, executor/deployer_executor.py is $executor"; exit 1; }
+          [ "$service" = "$offered_service" ] || { echo "::error::handoff.ts offers service executor $offered_service, executor/service_executor.py is $service"; exit 1; }
           # S18: both executors go out in the same release executor-v<version>.
           [ "$service" = "$executor" ] || { echo "::error::executor/service_executor.py is $service, executor/deployer_executor.py is $executor"; exit 1; }
           case "$version" in *-*) pre=true ;; *) pre=false ;; esac

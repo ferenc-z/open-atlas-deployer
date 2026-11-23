@@ -3,7 +3,7 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
-## Unreleased
+## 0.3.0-rc.15
 
 - `bin/publish-assistant.ts`: `OMA_CONTEXT_WINDOW_TOKENS` / `OMA_CONTEXT_OUTPUT_TOKENS` put the model's context into the agent's metadata (`context_window_tokens` / `context_output_tokens`), for a model OMA's own table does not know (deepseek: OMA fell back to a 32K window and failed compacting).
 
@@ -14,9 +14,6 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   `skeletonDraft` lists the skeleton draft's segments when the model is rebuilt. Every default answer of the service
   verbs stays under OMA's 16 KiB inline limit (a longer one is cut, saying so); `describe {brief: true}` without a
   service gives a line per service when the briefs together do not fit.
-- [ ] OMA: publish the Service Check-up and the Deploy Assistant again (`agents/service-checkup.md` and the Skill
-  `nifi-ops` changed: changes instead of the whole model) and point `DEPLOYER_OMA_CHECKUP_AGENT` and the Workbench
-  Business Agent at the new agents.
 - Check-up token savings (⑰): the first message of a check-up the Deployer opens carries each service's brief (the
   lights and the checks that are not healthy, the businesses, to-dos, gaps, the model's state, a topology summary, the
   skeleton draft against the model and its `run_model`); the scheduled one gets it from `describe {brief: true}` (its
@@ -25,9 +22,6 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   keeps the canvas' structural fingerprint with each published model revision: when it is unchanged and nobody gave
   feedback since, the brief says "拓扑未变，沿用已发布模型 rN" and the check-up does not rebuild the model; the gap
   `topology-changed` now needs a structural change. The gate and the skeleton are unchanged.
-- [ ] OMA: publish the Service Check-up again (`agents/service-checkup.md` and the Skill `nifi-ops` changed) and point
-  `DEPLOYER_OMA_CHECKUP_AGENT` at it; republish the Deploy Assistant for the new Skill version (`describe` / `look`
-  answer summaries).
 - `DEPLOYER_CHECKUP_AUTO=off`: turns the automatic check-ups off (pauses the OMA schedule, no machine-red or user-visit starts); Check now and flows feedback still start one. Default on.
 - A business holds one change waiting for a person per service, not one in all: the downstream services of an S2S
   fan-out no longer overwrite each other's join, a service's new publish replaces only its own, and confirming the
@@ -55,10 +49,6 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
 - Check-up prompt: a model change is checked with `run_model` in the same check-up, and a gate result or refusal
   reason quotes only what this check-up's `run_model` / `publish_model` returned (check and object); nothing is
   carried over from an earlier analysis ("本次未检查" when it did not run).
-- [ ] OMA: publish the Service Check-up again for the prompt above and point `DEPLOYER_OMA_CHECKUP_AGENT` at it.
-- [ ] Upgrade the service executors to 0.9.6 (the Executors page) so the skeleton places S2S exits and the flow's ends.
-- [ ] OMA: publish the Service Check-up again (`agents/service-checkup.md` changed; Skill unchanged) and point
-  `DEPLOYER_OMA_CHECKUP_AGENT` at the new agent.
 - Business skeleton (complex lab flows 2026-11-22): edges to and from a shared step (error handling, audit, dead letters)
   no longer count when deciding whether two segments are one business, so a group that also sends its errors to the
   shared handler still merges with its next group and with the other service's S2S port (before, every such business
@@ -77,8 +67,6 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   to-do when nothing waits); a group of one part given its only fragment's key as slice is the whole group (`*`), not a
   new group plus a gone one; a cross-service business whose part in one service the draft moves to a new business is a
   split waiting for a person (it was read as the same business renamed, so "split" feedback was silently undone). Test data for the definitions changing: `testdata/e2e-trace/change.sql`, `failure.sql`.
-  - [ ] OMA: publish the Service Check-up agent again (`agents/service-checkup.md`: how to place e2e_trace's
-    schedules, e2e-gone); switch `DEPLOYER_OMA_CHECKUP_AGENT` to the new id.
 
 - Managed-service pages (UAT feedback 2026-11-22): the sentence beside each light is the AI's. `record` takes
   `analysis.machineSentence` and `analysis.businessSentence` (one plain Chinese sentence each, at most 200 characters)
@@ -90,9 +78,6 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   跨服务连接，等你在流程页确认。") under the fixed title "Confirm the flows the AI found". The overview's check-up line reads
   "AI check-up 15:47 · next 19:47" (the prototype), the analysis line "started by Check now"; a card with an AI action
   says "· AI has a plan"; the business card says when you confirmed the flows.
-  - [ ] OMA: publish the Service Check-up agent again (`agents/service-checkup.md`) and the Deploy Assistant (Skill
-    `nifi-ops` changed: the check-up's record fields); switch `DEPLOYER_OMA_CHECKUP_AGENT`, `DEPLOYER_OMA_AGENT` and the
-    Workbench business agent to the new ids.
 
 - Ops step 5 (pages-rethink A1): the AI's analyses of the managed services, by the Service Check-up agent
   (`DEPLOYER_OMA_CHECKUP_AGENT`, `_ENVIRONMENT`, `_VAULTS` with its `dpc_` key). Each is a running row in
@@ -123,14 +108,6 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   `service_todos`; `POST /api/todos/:todo/state` and `POST /api/todos/:todo/draft` (a to-do's change drafted as the
   person). `POST trace-business-data` is now `POST /api/services/:id/trace`. The cases are gone (their five routes, the
   CRIT alerts' own analysis; `service_cases` is kept but no longer used).
-- [ ] OMA: republish the Deploy Assistant (allowed tools: the deploy and assessment tools plus `describe`, `look`,
-  `trace`, `run_model`, `publish_model`, `record`, `draft_change`; prompt without the "Service case" and "Clue from a
-  sentence" sections; Skill `nifi-ops` new version, rewritten for the seven verbs), then point `DEPLOYER_OMA_AGENT` and
-  the Workbench Business Agent "Deploy Assistant" at the new agent.
-- [ ] OMA: create the Service Check-up agent (`bin/publish-assistant.ts … service-checkup`, prompt
-  `agents/service-checkup.md`, template `templates/service-checkup.oma.json`, Skill `nifi-ops`) with a `dpc_` key in its
-  Vault; then set `DEPLOYER_OMA_CHECKUP_AGENT`, `DEPLOYER_OMA_CHECKUP_ENVIRONMENT` and `DEPLOYER_OMA_CHECKUP_VAULTS`
-  (ops step 5: the Deployer then keeps its OMA schedule).
 - S37 step 9 (Q4, S9): "Let the AI analyse" on the Investigate and Data trace tabs sends the page's result (the
   investigation worked out again compact and redacted; the trace answer trimmed and redacted) to the Deploy Assistant
   in a background OMA session; the answer comes in three parts (likely cause, evidence, next steps) and the person can
@@ -142,10 +119,6 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   restart shows its plan there for a person to confirm. The Data trace's "Investigate" button opens the Investigate
   tab on the node and time where the data stopped. A trace source that cannot be asked a key (provenance and a key its
   NiFi does not index) is skipped quietly; only when no source could be asked does "insufficient evidence" say so.
-- [ ] OMA: republish the Deploy Assistant (allowed tools `get_service_health`, `investigate_service`,
-  `trace_business_data`, `list_service_cases`; prompt sections "Service case task" and "Clue from a sentence"; Skill
-  `nifi-ops` new version: the new tools, FLOW_CONTROLLER bulletins vs processor errors, the service case, sentence to
-  conditions), then point `DEPLOYER_OMA_AGENT` and the Workbench Business Agent "Deploy Assistant" at the new agent.
 - S37 step 3: a service page opens on a new Status tab: verdict, the to-do list with next-step buttons, the node strip
   (Start, Restart, Stop with a plan first), preventive risks and the newest changes and restarts, all from
   `GET /api/services/:id/health`. The Business model tab is read-only for non-admins (`canEdit` in the model response).
@@ -215,9 +188,17 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
 
 ### After upgrading
 
-- [ ] OMA: republish the Onboarding Assessor (`get_draft`, `keys` for env keys, shorter reading rules), then set
-  `DEPLOYER_OMA_ASSESSOR_AGENT` to the new agent. Not published to PROD automatically (D47).
-- [ ] Upgrade the service executors to 0.9.4 (the Executors page) so clusters on one port get their numbers.
+- [ ] OMA: publish the Service Check-up, the Deploy Assistant and the Onboarding Assessor again (`agents/*.md`, the Skill
+  `nifi-ops` and the templates changed since 0.3.0-rc.14: the seven service verbs, changes instead of whole models, summaries,
+  the check-up's record fields, `get_draft` / `keys` for the Assessor). Run `bin/publish-assistant.ts` for each against this
+  environment's OMA (`OMA_CONTEXT_WINDOW_TOKENS` / `OMA_CONTEXT_OUTPUT_TOKENS` put the model's context into the agent), then
+  point `DEPLOYER_OMA_CHECKUP_AGENT`, `DEPLOYER_OMA_AGENT` (and the Workbench Business Agent "Deploy Assistant") and
+  `DEPLOYER_OMA_ASSESSOR_AGENT` at the new agents. An environment with no Service Check-up agent yet creates it
+  (`bin/publish-assistant.ts … service-checkup`, with a `dpc_` key in its Vault) and sets `DEPLOYER_OMA_CHECKUP_AGENT`,
+  `DEPLOYER_OMA_CHECKUP_ENVIRONMENT` and `DEPLOYER_OMA_CHECKUP_VAULTS`. Not published to PROD automatically (D47).
+- [ ] Upgrade the service executors to 0.9.6 (the Executors page) so clusters on one port get their numbers, and the skeleton
+  places S2S exits and the flow's ends. The deploy executor is moved to 0.9.6 as well (no code change) so both go out in one
+  executor release.
 
 ## 0.3.0-rc.14
 
