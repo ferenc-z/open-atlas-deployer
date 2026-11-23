@@ -430,6 +430,57 @@ test("engine test 2026-11-22: each RPG port of a fan-out exit names its own targ
   assert.deepEqual(exits.map((e) => [e.channel.port, e.channel.service, e.component]).sort(), [["orders", "c250", "p-a"], ["other", "n200", "p-b"]]);
 });
 
+// owner 2026-11-23: an S2S fan-out to other services, each downstream fed by it alone, is one business; the downstream
+// parts join the upstream's (held as a merge). Fed by several (with a start of its own, so not a shared step), it stays
+// the skeleton's question.
+function fanOut(alsoFeedsQ: boolean) {
+  const w = crossing(() => 10);
+  const { store } = w;
+  store.addStandalone({ kind: "standalone", id: "n200", service: "nifi", profile: "nifi-2.x", version: "2.0.0", webUrl: null, member: member(18444) } as never, "uat", admin);
+  store.putTopology("n200", "2026-11-19T11:00:00Z", "c", topo("r3", [{ id: "Q", name: "Other", root: false, fragments: [frag("q", { remoteIn: ["other"], starts: alsoFeedsQ ? 2 : 0 })] }], { s2sIn: [{ id: "p-other", name: "other", group: "Q", fragment: "q" }] }));
+  const a = "https://localhost:18445/nifi#orders", b = "https://localhost:18444/nifi#other";
+  const src = (id: string) => [{ id, name: id, kind: "processor", relationships: ["success"] }];
+  store.putTopology("n112", "2026-11-19T12:00:00Z", "a3", topo("r1", [
+    { id: "S", name: "Send", root: false, fragments: [frag("s", { s2sOut: [a, b] })] },
+    ...(alsoFeedsQ ? [{ id: "T", name: "Also", root: false, fragments: [frag("t", { s2sOut: [b] })] }] : []),
+  ], { s2sOut: [
+    { ref: a, name: "orders", targets: ["https://localhost:18445/nifi"], group: "S", fragment: "s", sources: src("p-a") },
+    { ref: b, name: "other", targets: ["https://localhost:18444/nifi"], group: "S", fragment: "s", sources: src("p-b") },
+    ...(alsoFeedsQ ? [{ ref: b, name: "other", targets: ["https://localhost:18444/nifi"], group: "T", fragment: "t", sources: src("p-t") }] : [])] }));
+  return w;
+}
+
+test("owner 2026-11-23: an S2S fan-out to other services joins the downstream parts into the upstream's business, held as a merge", async () => {
+  const { store, deps } = fanOut(false);
+  const d = draftFromSkeleton(store, "n112", NOW);
+  const model = { ...d, segments: d.segments.map((s) => ({ ...s, flow: s.role === "segment" ? `new:${s.group.id}` : s.flow, exits: s.exits.map((e) => ({ ...e, component: "p-send" })) })), flows: [] };
+  await publishModel(deps, { service: "n112", base: 0, model, note: "n112", actor: ai });
+  const f = flowOf(store, "n112", "S");
+  await confirmFlow(deps, f, admin);
+  await publishModel(deps, { service: "c250", base: 0, model: receiver("new:recv"), note: "c250", actor: ai });
+  const g = flowOf(store, "c250", "R");
+  await confirmFlow(deps, g, admin);
+  assert.notEqual(f, g);
+  assert.equal(draftFromSkeleton(store, "n200", NOW).segments.find((s) => s.group.id === "Q")!.flow, f, "a part with no model yet joins the upstream's business");
+  const c = draftFromSkeleton(store, "c250", NOW);
+  assert.equal(c.segments.find((s) => s.group.id === "R")!.flow, f, "before, the draft kept the receiver's own business");
+  const run = runModel(store, "c250", c, NOW);
+  assert.ok(run.checks.every((x) => x.ok), JSON.stringify(run.checks));
+  assert.deepEqual([run.verdict, run.changes.map((x) => [x.flow, x.kind])], ["needs-confirmation", [[f, "merge"]]]);
+  assert.equal(draftFromSkeleton(store, "n112", NOW).segments.find((s) => s.group.id === "S")!.flow, f, "the upstream keeps its business");
+});
+
+test("owner 2026-11-23: a fan-out to a part fed by several stays apart (the skeleton asks)", async () => {
+  const { store, deps } = fanOut(true);
+  const d = draftFromSkeleton(store, "n112", NOW);
+  const model = { ...d, segments: d.segments.map((s) => ({ ...s, flow: s.role === "segment" ? `new:${s.group.id}` : s.flow, exits: s.exits.map((e) => ({ ...e, component: "p-send" })) })), flows: [] };
+  await publishModel(deps, { service: "n112", base: 0, model, note: "n112", actor: ai });
+  await publishModel(deps, { service: "c250", base: 0, model: receiver("new:recv"), note: "c250", actor: ai });
+  const g = flowOf(store, "c250", "R");
+  assert.equal(draftFromSkeleton(store, "c250", NOW).segments.find((s) => s.group.id === "R")!.flow, g);
+  assert.match(draftFromSkeleton(store, "n200", NOW).segments.find((s) => s.group.id === "Q")!.flow!, /^new:/);
+});
+
 test("engine test 2026-11-22: a remote input port's status counts what it received as out (in is 0): the hand-over balances", () => {
   const w = crossing(() => 10);
   const { store } = w;

@@ -287,6 +287,34 @@ test("⑰ brief: the model kept while the canvas keeps its structure; rebuilt af
   assert.equal((await t.tool("dpc_checkup", "describe", { service: "n1", flow: flow.id, brief: true })).value.finding.code, "describe/brief-flow");
 });
 
+test("⑰ brief (b2f33fc): the skeleton's draft moves a segment into another business across an S2S hand-over: rebuild, unless one of them waits for a person", async () => {
+  const t = setup();
+  const { store } = t;
+  store.addStandalone({ kind: "standalone", id: "n2", service: "nifi", profile: "nifi-1.x", version: "1.12.1", webUrl: null, member: { host: "local", installDir: "/lab/n2", serviceUser: "nifi", startEnvironment: null, ports: { https: 18444 }, discovery: null } } as never, "uat", { id: "admin", via: "cli" });
+  const ref = "https://local:18444/nifi#rep";
+  const t1: Topology = { ...CANVAS, groups: CANVAS.groups.map((g) => (g.id === "C" ? { ...g, fragments: [frag("c", { s2sOut: [ref] })] } : g)), s2sOut: [{ ref, name: "rep", targets: ["https://local:18444/nifi"], group: "C", fragment: "c", sources: [{ id: "p-c", name: "p-c", kind: "processor", relationships: ["success"] }] }] };
+  const t2: Topology = { root: { id: "root2", name: "NiFi Flow" }, links: [], s2sOut: [], groups: [{ id: "R", name: "Archive", root: false, fragments: [frag("r", { remoteIn: ["rep"], starts: 1 })] }], s2sIn: [{ id: "p-rep", name: "rep", group: "R", fragment: "r" }] };
+  store.putTopology("n1", later(1), topologyHash(t1), t1);
+  store.putTopology("n2", later(1), topologyHash(t2), t2);
+  const seg = (id: string, flow: string, entry: object, exit: object) => ({ id, name: id, match: [], steps: [{ id: "g", name: id, position: { kind: "process-group", id } }], entries: [{ id: "in", step: "g", channel: entry }], exits: [{ id: "out", step: "g", channel: exit, component: `p-${id.toLowerCase()}`, relationship: "success" }], flow, group: { id, name: id }, slice: "*", role: "segment" });
+  const ext = (system: string) => ({ type: "external", system });
+  const actor = { id: "assistant", via: "key" } as const;
+  store.insertFlowModel("n1", 0, { version: 2, service: "n1", sources: [], segments: [seg("A", "flw_ab", ext("src"), { type: "local" }), seg("B", "flw_ab", ext("a"), ext("db")), seg("C", "flw_c", ext("src"), { type: "s2s", service: "n2", port: "rep" })] } as never, "ai", actor, [], topologyFingerprint(t1));
+  store.insertFlowModel("n2", 0, { version: 2, service: "n2", sources: [], segments: [seg("R", "flw_r", { type: "s2s", port: "rep" }, ext("archive"))] } as never, "ai", actor, [], topologyFingerprint(t2));
+  const flow = (id: string, at: string) => store.putFlow({ id, name: id, nameBy: "ai", status: "confirmed", summary: "", reason: null, risks: [], pending: null, stuck: null, createdAt: at, confirmedAt: at, confirmedBy: "admin", updatedAt: at } as never);
+  flow("flw_ab", "2026-11-19T08:00:00Z"); flow("flw_c", "2026-11-19T09:00:00Z"); flow("flw_r", "2026-11-19T10:00:00Z");
+  store.setFlowSegments("flw_ab", [{ service: "n1", segment: "A" }, { service: "n1", segment: "B" }]);
+  store.setFlowSegments("flw_c", [{ service: "n1", segment: "C" }]);
+  store.setFlowSegments("flw_r", [{ service: "n2", segment: "R" }]);
+  const brief = async () => (await t.tool("dpc_checkup", "describe", { service: "n2", brief: true })).value.model;
+  const join = await brief();
+  assert.deepEqual([join.topology, join.rebuild], ["unchanged", true], JSON.stringify(join));
+  assert.match(join.note, /^拓扑未变，但骨架要把 1 段并进另一条业务.*R → flw_c/);
+  store.putFlow({ ...store.flow("flw_c")!, pending: { id: "pnd_x", kind: "merge", text: "2 条业务合成一条", service: "n2", at: later(0), segments: [], remove: [], notes: [] } } as never);
+  const held = await brief();
+  assert.deepEqual([held.topology, held.rebuild], ["unchanged", false], "the join already waits for a person: no rebuild");
+});
+
 test("⑰ topologyFingerprint: order, connection ids and extra fields do not count; structure does", () => {
   const fp = topologyFingerprint(CANVAS)!;
   assert.match(fp, /^[0-9a-f]{16}$/);

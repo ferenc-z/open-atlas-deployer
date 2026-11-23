@@ -733,9 +733,11 @@ export function draftFromSkeleton(store: Store, service: string, now = new Date(
     });
     return flowKey;
   };
+  const joined = joinedFlows(store, sk);
   for (const f of sk.flows) {
     if (!f.segments.some((s) => s.service === service)) continue;
     const existing = f.segments.map((u) => (u.service === service ? known(u)?.flow : undefined)).find(Boolean)
+      ?? f.segments.map((u) => joined.fanIn.get(u.id)).find(Boolean)
       ?? store.flows().find((x) => store.flowSegments(x.id).some((s) => s.service !== service && f.segments.some((u) => {
         // The other service's part by group and, in a group of several pieces, by the piece (two businesses can share a group).
         const m = u.service === s.service ? store.flowModel(s.service)?.model.segments.find((y) => y.id === s.segment) : undefined;
@@ -748,8 +750,7 @@ export function draftFromSkeleton(store: Store, service: string, now = new Date(
   for (const u of sk.shared) if (u.service === service) add(u, undefined, "shared");
   // Segments the canvas no longer has stay (the gate holds their removal for a person).
   for (const s of current?.segments ?? []) if (!seen.has(s.id)) segments.push(s);
-  const joined = joinedFlows(store, sk);
-  return { version: 2, service, sources: current?.sources ?? [], segments: segments.map((s) => (s.flow && joined.has(s.flow) ? { ...s, flow: joined.get(s.flow)! } : s)), flows: notes };
+  return { version: 2, service, sources: current?.sources ?? [], segments: segments.map((s) => (s.flow && joined.canon.has(s.flow) ? { ...s, flow: joined.canon.get(s.flow)! } : s)), flows: notes };
 }
 
 /** One business across an S2S hand-over (engine test 2026-11-23: the skeleton put both sides of a hand-over in one
@@ -757,9 +758,12 @@ export function draftFromSkeleton(store: Store, service: string, now = new Date(
  *  joined it, whichever side went first): businesses the skeleton joins over an S2S pair inside one of its businesses
  *  are one, over every service's model. Of several, the one holding most segments takes the others (fewest moves;
  *  then the older, then the id), so every service's draft picks the same one and a move never changes the pick. The
- *  gate holds it as a merge for a person. A fan-out the skeleton left apart stays apart (it asks); a business a person
- *  said is really two (split-asked) is not joined this way. Returns business -> the one it joins. */
-function joinedFlows(store: Store, sk: Skeleton): Map<string, string> {
+ *  gate holds it as a merge for a person. A business a person said is really two (split-asked) is not joined this way.
+ *  An S2S fan-out (owner 2026-11-23): a unit that sends only to other services' units (shared steps aside), each fed by
+ *  it alone, is one business with them — its downstream parts join its business (it takes them, before any size);
+ *  a fan-out within a service, or to a unit fed by several, is still the skeleton's question for a person.
+ *  canon: business -> the one it joins; fanIn: a downstream unit of such a fan-out -> its upstream's business. */
+function joinedFlows(store: Store, sk: Skeleton): { canon: Map<string, string>; fanIn: Map<string, string> } {
   const unitFlows = new Map<string, Set<string>>();
   for (const svc of new Set(sk.flows.flatMap((f) => f.segments.map((u) => u.service)))) {
     for (const s of store.flowModel(svc)?.model.segments ?? []) {
@@ -767,33 +771,50 @@ function joinedFlows(store: Store, sk: Skeleton): Map<string, string> {
       for (const u of unitsOf(svc, s, sk)) unitFlows.set(u.id, new Set([...(unitFlows.get(u.id) ?? []), s.flow]));
     }
   }
+  const one = (u: string) => { const fs = unitFlows.get(u); return fs?.size === 1 ? [...fs][0]! : undefined; };
   const asked = new Map<string, boolean>();
   const splitAsked = (f: string) => { if (!asked.has(f)) asked.set(f, store.flowChanges({ flow: f }).some((x) => x.kind === "split-asked")); return asked.get(f)!; };
   const up = new Map<string, string>();
   const find = (x: string): string => { while ((up.get(x) ?? x) !== x) x = up.get(x)!; return x; };
+  const join = (x: string | undefined, y: string | undefined) => {
+    if (!x || !y || x === y || splitAsked(x) || splitAsked(y)) return;
+    const rx = find(x), ry = find(y);
+    if (!up.has(ry)) up.set(ry, ry);
+    if (rx !== ry) up.set(rx, ry);
+  };
   for (const f of sk.flows) {
     const ids = new Set(f.segments.map((u) => u.id));
-    for (const e of sk.edges) {
-      if (e.kind !== "s2s" || !ids.has(e.from) || !ids.has(e.to)) continue;
-      const a = unitFlows.get(e.from), b = unitFlows.get(e.to);
-      if (a?.size !== 1 || b?.size !== 1) continue;
-      const [x] = [...a], [y] = [...b];
-      if (x === y || splitAsked(x!) || splitAsked(y!)) continue;
-      const rx = find(x!), ry = find(y!);
-      if (!up.has(ry)) up.set(ry, ry);
-      if (rx !== ry) up.set(rx, ry);
-    }
+    for (const e of sk.edges) if (e.kind === "s2s" && ids.has(e.from) && ids.has(e.to)) join(one(e.from), one(e.to));
+  }
+  // The S2S fan-outs: downstream units (not shared) of each unit, and their upstreams (not shared).
+  const shared = new Set(sk.shared.map((u) => u.id));
+  const serviceOf = (u: string) => u.split("/")[0];
+  const downs = new Map<string, Set<string>>(), ups = new Map<string, Set<string>>();
+  for (const e of sk.edges) {
+    if (shared.has(e.from) || shared.has(e.to)) continue;
+    downs.set(e.from, new Set([...(downs.get(e.from) ?? []), e.to]));
+    ups.set(e.to, new Set([...(ups.get(e.to) ?? []), e.from]));
+  }
+  const anchors = new Set<string>();
+  const fanIn = new Map<string, string>();
+  for (const [a, ds] of downs) {
+    if (ds.size < 2 || [...ds].some((b) => serviceOf(b) === serviceOf(a) || ups.get(b)?.size !== 1)) continue;
+    const fa = one(a);
+    if (!fa || splitAsked(fa)) continue;
+    anchors.add(fa);
+    for (const b of ds) { join(one(b), fa); if (!unitFlows.has(b)) fanIn.set(b, fa); }
   }
   const groups = new Map<string, Set<string>>();
   for (const f of up.keys()) groups.set(find(f), new Set([...(groups.get(find(f)) ?? []), f]));
-  const out = new Map<string, string>();
+  const canon = new Map<string, string>();
   for (const fs of groups.values()) {
     if (fs.size < 2) continue;
-    const rank = [...fs].map((f) => ({ f, n: store.flowSegments(f).length, at: store.flow(f)?.createdAt ?? "" }))
-      .sort((p, q) => q.n - p.n || (p.at < q.at ? -1 : p.at > q.at ? 1 : 0) || (p.f < q.f ? -1 : 1));
-    for (const f of fs) if (f !== rank[0]!.f) out.set(f, rank[0]!.f);
+    const rank = [...fs].map((f) => ({ f, anchor: anchors.has(f) ? 0 : 1, n: store.flowSegments(f).length, at: store.flow(f)?.createdAt ?? "" }))
+      .sort((p, q) => p.anchor - q.anchor || q.n - p.n || (p.at < q.at ? -1 : p.at > q.at ? 1 : 0) || (p.f < q.f ? -1 : 1));
+    for (const f of fs) if (f !== rank[0]!.f) canon.set(f, rank[0]!.f);
   }
-  return out;
+  for (const [b, f] of fanIn) fanIn.set(b, canon.get(f) ?? f);
+  return { canon, fanIn };
 }
 
 /** B3 "data dropped": whether a DROP at (component, relationship) is one of the service's marked exits (a normal end). */
