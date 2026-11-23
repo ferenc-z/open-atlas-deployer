@@ -428,6 +428,8 @@ export class Store {
       AND NOT EXISTS (SELECT 1 FROM service_events e WHERE e.service = c.service AND e.kind = 'config-imported' AND json_extract(e.detail, '$.revision') = c.revision)`);
     // §10.2.4 step 1 added the counts; §10.3: the FlowFiles moved inside a group.
     if (!(this.db.prepare("PRAGMA table_info(service_flow_counts)").all() as Row[]).some((c) => c.name === "transferred")) this.db.exec("ALTER TABLE service_flow_counts ADD COLUMN transferred INTEGER NOT NULL DEFAULT 0");
+    // ⑰: the canvas' fingerprint (flowcounts.topologyFingerprint) when the revision was published; older rows have none.
+    if (!(this.db.prepare("PRAGMA table_info(flow_models)").all() as Row[]).some((c) => c.name === "topology_fp")) this.db.exec("ALTER TABLE flow_models ADD COLUMN topology_fp TEXT");
     this.migrateTraceModels();
   }
 
@@ -1912,12 +1914,12 @@ export class Store {
   }
 
   /** Adds the next revision over `base` (0: none yet); another publish in between is refused. Call inside flowTransaction. */
-  insertFlowModel(service: string, base: number, model: ModelV2, source: "ai" | "e2e_trace" | "migrated", actor: Actor, gate: unknown): number {
+  insertFlowModel(service: string, base: number, model: ModelV2, source: "ai" | "e2e_trace" | "migrated", actor: Actor, gate: unknown, topologyFp: string | null = null): number {
     const was = (this.db.prepare("SELECT MAX(revision) AS r FROM flow_models WHERE service = ?").get(service) as Row | undefined)?.r ?? 0;
     if (was !== base) throw new StoreError("flow-model/stale", `${service}'s model is at revision ${was}, not ${base}: read it again (describe) and redo the draft on it.`);
     const revision = base + 1;
-    this.db.prepare("INSERT INTO flow_models (service, revision, body, source, published_at, published_by, gate) VALUES (?, ?, ?, ?, ?, ?, ?)")
-      .run(service, revision, JSON.stringify(model), source, this.stamp(), actor.id, JSON.stringify(gate));
+    this.db.prepare("INSERT INTO flow_models (service, revision, body, source, published_at, published_by, gate, topology_fp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(service, revision, JSON.stringify(model), source, this.stamp(), actor.id, JSON.stringify(gate), topologyFp);
     this.insertAudit(actor, "service.flow-model", service, { revision, source });
     return revision;
   }
@@ -2152,8 +2154,8 @@ export interface FlowCountRow {
   source: "sample" | "nifi-history";
 }
 /** §10.2.4 step 2: a stored v2 model revision. gate: the checks it was published with. */
-export interface StoredFlowModel { service: string; revision: number; model: ModelV2; source: "ai" | "e2e_trace" | "migrated"; publishedAt: string; publishedBy: string; gate: unknown }
-const toFlowModel = (r: Row): StoredFlowModel => ({ service: r.service, revision: r.revision, model: JSON.parse(r.body), source: r.source, publishedAt: r.published_at, publishedBy: r.published_by, gate: parse(r.gate) });
+export interface StoredFlowModel { service: string; revision: number; model: ModelV2; source: "ai" | "e2e_trace" | "migrated"; publishedAt: string; publishedBy: string; gate: unknown; topologyFp?: string | null }
+const toFlowModel = (r: Row): StoredFlowModel => ({ service: r.service, revision: r.revision, model: JSON.parse(r.body), source: r.source, publishedAt: r.published_at, publishedBy: r.published_by, gate: parse(r.gate), topologyFp: r.topology_fp ?? null });
 /** A change the gate held for a person (A8): the draft's segments of this service it would apply, those it removes. */
 export interface FlowPending {
   id: string; kind: "new" | "gone" | "merge" | "split" | "cross-service"; text: string; service: string; at: string;

@@ -10,8 +10,10 @@ import type { Permission, Principal } from "../auth.ts";
 import { isKey } from "../keys.ts";
 import type { ExecutorInfo } from "../handoff.ts";
 import { StoreError, type Actor, type FlowRecord, type Store } from "../store.ts";
-import type { Topology } from "./flowcounts.ts";
+import { topologyFingerprint, type Topology } from "./flowcounts.ts";
+import { modelState, publishedFingerprint } from "./checkup-brief.ts";
 import { draftFromSkeleton, gateRejected, ModelError, publishModel, runModel, parseDraft, type ModelDeps } from "./flowmodel.ts";
+import { clip, compactDeep, skeletonSummary } from "./look-summary.ts";
 import { flowCard } from "./flow-views.ts";
 import type { AnalysisView, Anomaly, BusinessLightView, FlowRow, FlowStatus, Light, Lights, TodoView, UnknownReason } from "./ops-types.ts";
 import { provenanceSupport } from "./provenance.ts";
@@ -70,7 +72,9 @@ export function gapsOf(store: Store, service: string, flows: FlowRecord[], now: 
   const rejected = flows.filter((f) => gateRejected(store, f.id));
   if (rejected.length) gaps.push({ code: "gate-rejected", text: `The last model change for ${rejected.map((f) => f.name).join(", ")} failed the replay check: their lights are unknown until a publish passes.`, fix: { verb: "publish_model", args: { service } } });
   const topo = store.latestTopology(service);
-  if (m && topo && topo.takenAt > m.publishedAt) gaps.push({ code: "topology-changed", text: `The canvas changed at ${topo.takenAt}, after model revision ${m.revision} (${m.publishedAt}).`, fix: { verb: "look", args: { service, kind: "topology" } } });
+  // ⑰: a newer snapshot whose structure is the one the revision was published on (another walk order, say) is no change.
+  const fpWas = m ? publishedFingerprint(store, service, m) : null, fpNow = topo ? topologyFingerprint(topo.body as Topology) : null;
+  if (m && topo && topo.takenAt > m.publishedAt && !(fpWas && fpNow && fpWas === fpNow)) gaps.push({ code: "topology-changed", text: `The canvas changed at ${topo.takenAt}, after model revision ${m.revision} (${m.publishedAt}).`, fix: { verb: "look", args: { service, kind: "topology" } } });
   const noExit = (m?.model.segments ?? []).filter((s) => s.role !== "shared" && (!s.exits?.length || s.exits.some((e) => !e.component || e.component === UNPLACED)));
   if (noExit.length) gaps.push({ code: "no-exit", text: `Segments without a placed exit: ${noExit.slice(0, 8).map((s) => s.id).join(", ")} (a drop outside the exits counts as data dropped).`, fix: { verb: "publish_model", args: { service } } });
   const noStuck = flows.filter((f) => f.status !== "ignored" && !f.stuck);
@@ -152,12 +156,71 @@ export function mountOps(api: Hono, d: OpsRouteDeps) {
     };
   };
 
-  // describe (§10.2.3): one service (and one business), or every service's card.
+  /** ⑰ the check-up's brief of one service (checkup-brief.ts): what describe and the first looks would have given, short. */
+  const briefOne = async (id: string, at: Date) => {
+    const one = describeOne(id, undefined, at);
+    const gaps = [...one.gaps, ...e2eGaps(id, await e2eSchedules(d.store, d.model, id))];
+    const t = d.store.latestTopology(id);
+    const topo = (t?.body as Topology | undefined) ?? null;
+    const sk = skeletonOf(d.store, at, [id]);
+    const mine = { flows: sk.flows.filter((f) => f.segments.some((s) => s.service === id)), shared: sk.shared.filter((s) => s.service === id), empty: sk.empty.filter((e) => e.service === id), questions: sk.questions.filter((q) => q.service === id) };
+    const state = modelState(d.store, id);
+    const current = d.store.flowModel(id)?.model ?? null;
+    // The skeleton draft against the current model, and this check-up's replay of it (the gate's own words).
+    const draft = draftFromSkeleton(d.store, id, at);
+    const curIds = new Set((current?.segments ?? []).map((s) => s.id));
+    const added = draft.segments.filter((s) => !curIds.has(s.id)).map((s) => ({ id: s.id, flow: s.flow ?? null, group: s.group.name, slice: s.slice, role: s.role, exits: s.exits.length }));
+    let run: Record<string, unknown>;
+    let failed: { check: string; text: string }[] = [];
+    try {
+      const r = runModel(d.store, id, parseDraft(d.store, id, draft).model, at);
+      failed = r.checks.filter((x) => !x.ok).map((x) => ({ check: x.check, text: x.text }));
+      run = { verdict: r.verdict, failed, regressions: r.regressions, changes: compactDeep(r.changes, 200, 15), window: r.window };
+    } catch (e) { run = { error: (e as Error).message, ...(e instanceof ModelError ? { details: e.details.slice(0, 8) } : {}) }; }
+    const rebuild = !state || state.rebuild;
+    const e2e = gaps.filter((g) => g.code === "e2e-unplaced" || g.code === "e2e-gone");
+    const out = compactDeep({
+      service: one.service,
+      machine: { light: one.machine.light, sentence: one.machine.sentence, asOf: one.machine.asOf, notHealthy: one.machine.checks.filter((x) => x.light !== "healthy"), members: one.machine.members },
+      business: { light: one.business.light, ...(one.business.reason ? { reason: one.business.reason } : {}), sentence: one.business.sentence, toConfirm: one.business.toConfirm, flows: one.business.flows.map((f) => ({ id: f.id, name: f.name, status: f.status, light: f.light, sentence: f.sentence, ...(f.anomalies.length ? { anomalies: f.anomalies } : {}) })) },
+      todos: one.todos.map((x) => ({ id: x.id, flow: x.flow, severity: x.severity, title: x.title, detail: clip(x.detail, 160), ...(x.action ? { action: x.action.kind } : {}) })),
+      analysis: one.analysis ? { id: one.analysis.id, trigger: one.analysis.trigger, state: one.analysis.state, startedAt: one.analysis.startedAt, stale: one.analysis.stale, summary: clip(one.analysis.summary, 300), error: one.analysis.error } : null,
+      provenance: one.provenance,
+      model: state ?? { revision: 0, rebuild: true, note: "No business model yet: build it (look kind model → run_model → publish_model)." },
+      topology: topo ? {
+        takenAt: t!.takenAt, fingerprint: topologyFingerprint(topo),
+        counts: { units: topo.groups.length, links: topo.links.length, s2sIn: topo.s2sIn.length, s2sOut: topo.s2sOut.length, ends: (topo.ends ?? []).length },
+        // The units, the skeleton and its questions only matter when the model is rebuilt (the S2S ones are gaps anyway).
+        ...(rebuild ? { skeleton: skeletonSummary(mine) } : {}),
+      } : null,
+      skeletonDraft: { segments: draft.segments.length, sameAsModel: draft.segments.length - added.length, added, newBusinesses: draft.flows ?? [], run },
+      next: rebuild
+        ? "Rebuild: this brief has the skeleton's units and the replay of its draft; look kind model gives the draft to edit, run_model it again after any change."
+        : `Do not rebuild the model.${e2e.length ? ` Only the e2e gaps (${e2e.map((g) => g.code).join(", ")}) are model work this time.` : ""} Record from this brief; look only for what it does not say (a check that is not healthy, a business with anomalies).`,
+    }, 300, 25) as Record<string, any>;
+    // The gate's words stay whole: which check failed on which segment, port or business.
+    if (failed.length) out.skeletonDraft.run.failed = failed;
+    out.gaps = gaps.map((g) => ({ code: g.code, text: clip(g.text, 800) }));
+    return out;
+  };
+  const briefAll = async (at: Date) => {
+    const ids = [...d.store.standalones(), ...d.store.clusters()].map((x) => x.id).sort();
+    const out = [];
+    for (const id of ids) out.push(await briefOne(id, at));
+    return out;
+  };
+
+  // describe (§10.2.3): one service (and one business), or every service's card; brief=1: the check-up's brief.
   api.get("/api/describe", async (c) => {
     const p = await d.authenticate(c, "view");
     if (p instanceof Response) return p;
     const service = c.req.query("service") || undefined, flow = c.req.query("flow") || undefined;
     const at = now();
+    if (c.req.query("brief") === "1") {
+      if (flow) return d.reject(c, 400, "describe/brief-flow", "brief is per service: leave flow out.");
+      if (service && !d.registered(service)) return unknown(c, service);
+      return c.json(service ? await briefOne(service, at) : { services: await briefAll(at) });
+    }
     if (service) {
       if (!d.registered(service)) return unknown(c, service);
       if (flow && !d.store.flowSegments(flow).some((x) => x.service === service)) return d.reject(c, 404, "flow/unknown", `No business ${flow} in ${service}.`);
@@ -314,6 +377,17 @@ export function mountOps(api: Hono, d: OpsRouteDeps) {
     d.store.setTodoDraft(t.id, String(made.body.id));
     return c.json({ draft: String(made.body.id), service: t.service }, 201);
   });
+
+  /** ⑰ for the analyses' first message (analyses.ts useBrief): each service's brief; a service that fails says why. */
+  return {
+    briefs: async (services: string[], at = now()) => {
+      const out: unknown[] = [];
+      for (const id of services) {
+        try { out.push(d.registered(id) ? await briefOne(id, at) : { service: { id }, error: "not registered" }); } catch (e) { out.push({ service: { id }, error: (e as Error).message }); }
+      }
+      return out;
+    },
+  };
 }
 
 export type { AnalysisView, TodoView };

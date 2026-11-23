@@ -2633,9 +2633,12 @@ test("phase 2 step 5: the read-only service tools over /mcp: metrics, alerts, ev
   assert.equal((await data({ service: "flow", kind: "events", query: "process-restarted" })).events.length, 1);
 
   // look kind bulletins: redacted for the AI; the page (deploy-viewer) still reads them as NiFi wrote them (§9.3).
-  const bulletins = (await data({ service: "flow", kind: "bulletins" })).bulletins;
+  const bulletins = (await data({ service: "flow", kind: "bulletins", detail: "full" })).bulletins;
   assert.deepEqual(bulletins.map((b: { message: string }) => b.message), ["401 for Authorization: Bearer [hidden]", "Cannot connect to jdbc:postgresql://etl:[hidden]@db:5432/x with password=[hidden]"]);
-  assert.equal((await data({ service: "flow", kind: "bulletins", levels: ["ERROR"] })).bulletins.length, 1);
+  assert.equal((await data({ service: "flow", kind: "bulletins", levels: ["ERROR"], detail: "full" })).bulletins.length, 1);
+  // ⑰ the default summary groups them, redacted the same.
+  const grouped = await data({ service: "flow", kind: "bulletins" });
+  assert.deepEqual([grouped.count, grouped.top.map((g: { message: string }) => g.message).sort()], [2, bulletins.map((b: { message: string }) => b.message).sort()]);
   const page = await (await t.request("/api/services/flow/bulletins", { as: "viewer" })).json();
   assert.ok(page.bulletins.some((b: { message: string }) => b.message.includes("hunter2")), "the page shows the raw text");
 
@@ -2660,7 +2663,9 @@ test("phase 2 step 5: the read-only service tools over /mcp: metrics, alerts, ev
   const jobs = [await answer((job) => ({ entries: [line(job)], truncated: null })), await answer((job) => ({ entries: [line(job)], truncated: null }))];
   assert.deepEqual(jobs.map((j) => [j.mode, j.query, j.levels]), [["search", "login", ["ERROR"]], ["search", "login", ["ERROR"]]]);
   const found = (await searching).value.data;
-  assert.deepEqual(found.entries.map((e: { member: string; text: string }) => [e.member, e.text]), [
+  // ⑰ a summary by default: grouped by level, logger and pattern, the newest lines (redacted the same).
+  assert.deepEqual([found.count, found.groups, found.top[0].count], [2, 2, 1]);
+  assert.deepEqual(found.newest.map((e: { member: string; text: string }) => [e.member, e.text]), [
     [B, "login failed for https://admin:[hidden]@ldap\n[private key hidden]"],
     [A, "login failed for password=[hidden]\n[private key hidden]"],
   ]);

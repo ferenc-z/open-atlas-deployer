@@ -55,8 +55,12 @@ export interface Visited { service: string; machine: Light; business: Light; ana
 
 const green = (v: Pick<Visited, "machine" | "business">) => v.machine === "healthy" && v.business === "healthy";
 
-/** The first message: why, and each service's analysis id (agents/service-checkup.md "The first message"). */
-export function analysisMessage(trigger: AnalysisTrigger, rows: Pick<AnalysisRecord, "id" | "service">[], reasons: Record<string, string> = {}, feedback?: Feedback): string {
+/** ⑰: each service's check-up brief (ops-routes briefs, checkup-brief.ts), for the first message. */
+export type BriefSource = (services: string[], at: Date) => Promise<unknown[]>;
+
+/** The first message: why, each service's analysis id (agents/service-checkup.md "The first message") and, when
+ *  given, each service's brief (⑰), so the agent does not start with describe and look. */
+export function analysisMessage(trigger: AnalysisTrigger, rows: Pick<AnalysisRecord, "id" | "service">[], reasons: Record<string, string> = {}, feedback?: Feedback, briefs?: unknown[]): string {
   const why: Record<AnalysisTrigger, string> = {
     "schedule": "The scheduled check-up.",
     "machine-red": "The machine light turned red.",
@@ -73,6 +77,10 @@ export function analysisMessage(trigger: AnalysisTrigger, rows: Pick<AnalysisRec
     `Deployer analysis (trigger: ${trigger}). Look at each service below and record it once, with its analysis_id and analysis.trigger "${trigger}".`,
     ...(feedback ? ["The person's feedback is about the business named below: fix the model (look kind model → run_model → publish_model) or explain in the analysis why it stays as it is."] : []),
     "```json", JSON.stringify(body, null, 1), "```",
+    ...(briefs?.length ? [
+      "Each service's brief, built by the Deployer as this check-up started (what describe {brief: true} gives): work from it, and look only for what it does not say.",
+      "```json", JSON.stringify(briefs), "```",
+    ] : []),
   ].join("\n");
 }
 
@@ -83,8 +91,12 @@ export class Analyses {
   /** The newest user-visit start of each service (ms), besides what the table says. */
   private visits = new Map<string, number>();
   private polling = false;
+  private brief: BriefSource | null = null;
 
   constructor(d: AnalysisDeps) { this.d = d; }
+
+  /** ⑰: the briefs for the first message (the app sets it once its routes are mounted). */
+  useBrief(source: BriefSource) { this.brief = source; }
 
   get configured(): boolean { return Boolean(this.d.oma); }
   /** Whether analyses start by themselves (machine-red, user-visit). */
@@ -115,7 +127,10 @@ export class Analyses {
   private async open(rows: AnalysisRecord[], trigger: AnalysisTrigger, reasons?: Record<string, string>, feedback?: Feedback) {
     const title = `Service analysis · ${trigger} · ${rows.map((r) => r.service).join(", ")}`;
     try {
-      const r = await openTurn(this.d.oma!, title, `analysis-${rows[0]!.id}`, analysisMessage(trigger, rows, reasons, feedback));
+      // A brief that cannot be built leaves the message as it was: the agent then starts with describe.
+      let briefs: unknown[] | undefined;
+      if (this.brief) { try { briefs = await this.brief(rows.map((r) => r.service), this.now()); } catch { briefs = undefined; } }
+      const r = await openTurn(this.d.oma!, title, `analysis-${rows[0]!.id}`, analysisMessage(trigger, rows, reasons, feedback, briefs));
       for (const a of rows) {
         const cur = this.d.store.analysis(a.id);
         if (!cur || cur.state !== "running") continue;   // recorded already

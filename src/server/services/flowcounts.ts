@@ -58,6 +58,33 @@ function canonical(v: unknown): string {
 }
 export const topologyHash = (t: unknown) => createHash("sha256").update(canonical(t)).digest("hex");
 
+/** Arrays as sets: each element canonical, sorted, so the order the executor walked the canvas in does not count. */
+function canonicalSet(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(canonicalSet).sort().join(",")}]`;
+  if (v && typeof v === "object") return `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${canonicalSet((v as Any)[k])}`).join(",")}}`;
+  return JSON.stringify(v ?? null);
+}
+
+/** ⑰: the canvas' structure as a stable hash, for "has the canvas changed since the model was published". Only what
+ *  the skeleton and the model are built from (units, their pieces, ports, root links by their ends, S2S, ends, nesting);
+ *  the order of anything, a link's connection id (a link deleted and drawn again the same is the same link) and any
+ *  field the executor may add later (counts, times, run states) are left out. Short (16 hex). */
+export function topologyFingerprint(t: Topology | null | undefined): string | null {
+  if (!t || !Array.isArray(t.groups)) return null;
+  const frag = (f: TopologyFragment) => ({ key: f.key, processors: f.processors, names: f.names ?? [], inputs: f.inputs ?? [], outputs: f.outputs ?? [], remoteIn: f.remoteIn ?? [], s2sOut: f.s2sOut ?? [], starts: f.starts });
+  const end = (e: TopologyEnd) => ({ group: e.group, fragment: e.fragment ?? null, port: e.port ?? null });
+  const shape = {
+    root: t.root?.id ?? null,
+    groups: t.groups.map((g) => ({ id: g.id, name: g.name, root: Boolean(g.root), fragments: (g.fragments ?? []).map(frag) })),
+    links: (t.links ?? []).map((l) => ({ from: end(l.from), to: end(l.to) })),
+    s2sIn: (t.s2sIn ?? []).map((p) => ({ id: p.id, name: p.name, group: p.group, fragment: p.fragment ?? null })),
+    s2sOut: (t.s2sOut ?? []).map((o) => ({ ref: o.ref, name: o.name, targets: o.targets ?? [], group: o.group, fragment: o.fragment ?? null, sources: (o.sources ?? []).map((x) => ({ id: x.id, name: x.name, kind: x.kind, relationships: x.relationships ?? [] })) })),
+    ends: (t.ends ?? []).map((x) => ({ id: x.id, name: x.name, type: x.type, group: x.group, fragment: x.fragment ?? null, relationships: x.relationships ?? [] })),
+    nested: t.nested ?? {}, split: t.split ?? {},
+  };
+  return createHash("sha256").update(canonicalSet(shape)).digest("hex").slice(0, 16);
+}
+
 function isTopology(t: unknown): t is Topology {
   const x = t as Any;
   return Boolean(x) && typeof x.root?.id === "string" && Array.isArray(x.groups) && Array.isArray(x.links) && Array.isArray(x.s2sIn) && Array.isArray(x.s2sOut);

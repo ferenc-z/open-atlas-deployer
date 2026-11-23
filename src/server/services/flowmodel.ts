@@ -8,7 +8,7 @@
 // (importModel), the AI only places them on the canvas.
 
 import { newFlowId, StoreError, type Actor, type FlowPending, type FlowRecord, type Store } from "../store.ts";
-import type { Topology } from "./flowcounts.ts";
+import { topologyFingerprint, type Topology } from "./flowcounts.ts";
 import type { GateVerdict, TodoAction } from "./ops-types.ts";
 import { skeletonOf, type Skeleton, type SkeletonSegment } from "./skeleton.ts";
 import { dangling, links } from "./trace/channels.ts";
@@ -488,7 +488,7 @@ export async function publishModel(d: ModelDeps, input: { service: string; base:
   let revision = 0;
   const pendingOut: PublishResult["pending"] = [];
   store.flowTransaction(() => {
-    revision = store.insertFlowModel(service, input.base, effective, source, input.actor, gate);
+    revision = store.insertFlowModel(service, input.base, effective, source, input.actor, gate, topologyFingerprint(store.latestTopology(service)?.body as Topology | undefined));
     const at = now.toISOString();
     // Businesses of this service before and after.
     const before = new Set(store.flows(service).map((f) => f.id));

@@ -19,7 +19,9 @@ import type { Keys } from "../src/server/keys.ts";
 import { TOOLS } from "../src/server/mcp.ts";
 import { Observer } from "../src/server/observe.ts";
 import { SecretBox } from "../src/server/secretbox.ts";
-import type { Topology, TopologyFragment } from "../src/server/services/flowcounts.ts";
+import { topologyFingerprint, topologyHash, type Topology, type TopologyFragment } from "../src/server/services/flowcounts.ts";
+import { analysisMessage } from "../src/server/services/analyses.ts";
+import { CHECKUP_MESSAGE } from "../src/server/services/checkup-schedule.ts";
 import { opsReads, todoSink } from "../src/server/services/todos.ts";
 import { Store, type FlowCountRow } from "../src/server/store.ts";
 import { Versions } from "../src/server/versions.ts";
@@ -114,7 +116,12 @@ test("describe and look: the lights, gaps pointing at their fix, and look's kind
   const model = (await t.tool("dps_assistant", "look", { service: "n1", kind: "model" })).value;
   assert.deepEqual([model.kind, model.data.base, model.data.current, model.data.draft.segments.map((s: { id: string }) => s.id)], ["model", 0, null, ["A", "B", "C"]]);
   const topo = (await t.tool("dps_assistant", "look", { service: "n1", kind: "topology" })).value.data;
-  assert.deepEqual([topo.topology.groups.length, topo.skeleton.flows.length], [3, 2]);
+  assert.deepEqual([topo.counts.units, topo.units.length, topo.links, topo.skeleton.flows.length], [3, 3, ["Ingest:out → Load:in"], 2], "⑰ a summary by default");
+  const whole = (await t.tool("dps_assistant", "look", { service: "n1", kind: "topology", detail: "full" })).value.data;
+  assert.deepEqual([whole.topology.groups.length, whole.skeleton.flows.length], [3, 2]);
+  const unit = (await t.tool("dps_assistant", "look", { service: "n1", kind: "topology", group: "Load" })).value.data;
+  assert.deepEqual([unit.found, unit.unit.id, unit.links.length], [true, "B", 1]);
+  assert.equal((await t.tool("dps_assistant", "look", { service: "n1", kind: "topology", detail: "all" })).value.finding.code, "mcp/arguments");
   const counts = (await t.tool("dps_assistant", "look", { service: "n1", kind: "flow-counts" })).value.data;
   assert.deepEqual(counts.rows.map((r: { ref: string; in: number; out: number }) => [r.ref, r.in, r.out]), [["A", 0, 10], ["B", 10, 10], ["C", 0, 4]]);
   assert.equal((await t.tool("dps_assistant", "look", { service: "n1", kind: "flow-counts", component: "B" })).value.data.buckets.length, 1);
@@ -228,4 +235,72 @@ test("steps 3b + 4 wired: describe shows the real business light; the service pa
   assert.deepEqual([page.todos.map((x) => x.title), page.business.light], [["Raise the heap"], "attention"]);
   const overview = await (await t.call("GET", "/api/services/overview", { as: "viewer" })).json() as { services: { id: string; todoCount: number }[] };
   assert.equal(overview.services.find((s) => s.id === "n1")?.todoCount, 1);
+});
+
+// ⑰ saving tokens: the brief, and "the canvas has not changed since the model" by its structural fingerprint.
+const CANVAS: Topology = {
+  root: { id: "root", name: "NiFi Flow" }, s2sIn: [], s2sOut: [],
+  groups: [{ id: "A", name: "Ingest", root: false, fragments: [frag("a", { outputs: ["out"] })] }, { id: "B", name: "Load", root: false, fragments: [frag("b", { inputs: ["in"], starts: 0 })] }, { id: "C", name: "Reports", root: false, fragments: [frag("c")] }],
+  links: [{ connection: "A-B", from: { group: "A", fragment: "a", port: "out" }, to: { group: "B", fragment: "b", port: "in" } }],
+};
+const later = (minutes: number) => new Date(Date.now() + minutes * 60_000).toISOString();
+
+test("⑰ brief: the model kept while the canvas keeps its structure; rebuilt after a change or a person's feedback", async () => {
+  const t = setup();
+  const before = (await t.tool("dpc_checkup", "describe", { service: "n1", brief: true })).value;
+  assert.deepEqual([before.model.revision, before.model.rebuild, before.skeletonDraft.segments, before.skeletonDraft.added.length], [0, true, 3, 3], "no model yet: build it");
+  assert.equal(before.skeletonDraft.run.verdict, "needs-confirmation", "the brief has this check-up's replay of the skeleton draft");
+  assert.ok(before.topology.skeleton.flows.length === 2 && before.topology.fingerprint);
+
+  const draft = (await t.tool("dpc_checkup", "look", { service: "n1", kind: "model" })).value.data.draft;
+  await t.tool("dpc_checkup", "publish_model", { service: "n1", base: 0, model: draft, note: "first" });
+  assert.ok(t.store.flowModel("n1")!.topologyFp, "the fingerprint is kept with the revision");
+  // The executor walks the canvas again in another order, the link drawn again: a new snapshot, the same structure.
+  const reordered: Topology = { ...CANVAS, groups: [...CANVAS.groups].reverse(), links: [{ ...CANVAS.links[0]!, connection: "A-B-again" }] };
+  assert.ok(t.store.putTopology("n1", later(1), topologyHash(reordered), reordered));
+  const kept = (await t.tool("dpc_checkup", "describe", { service: "n1", brief: true })).value;
+  assert.deepEqual([kept.model.topology, kept.model.rebuild], ["unchanged", false]);
+  assert.match(kept.model.note, /^拓扑未变，沿用已发布模型 r1/);
+  assert.ok(!kept.gaps.some((g: { code: string }) => g.code === "topology-changed"), "a new snapshot of the same structure is no change");
+  assert.equal(kept.topology.skeleton, undefined, "no rebuild: no skeleton units in the brief");
+  assert.match(kept.next, /^Do not rebuild/);
+  assert.ok(Buffer.byteLength(JSON.stringify(kept)) < 6000, `the brief stays small (${Buffer.byteLength(JSON.stringify(kept))} bytes)`);
+
+  // A person says a business is not right: rebuild, though the canvas is the same.
+  const flow = t.store.flows("n1")[0]!;
+  t.store.addFlowChange({ flow: flow.id, service: "n1", by: "admin", kind: "not-right", text: "人说不对：x", revision: null, verdict: null });
+  const fed = (await t.tool("dpc_checkup", "describe", { service: "n1", brief: true })).value;
+  assert.deepEqual([fed.model.topology, fed.model.rebuild, fed.model.feedback.length], ["unchanged", true, 1]);
+
+  // A structural change (a new link): changed, rebuild, the gap.
+  const changed: Topology = { ...CANVAS, links: [...CANVAS.links, { connection: "B-C", from: { group: "B", fragment: "b", port: null }, to: { group: "C", fragment: "c", port: null } }] };
+  t.store.putTopology("n1", later(2), topologyHash(changed), changed);
+  const now = (await t.tool("dpc_checkup", "describe", { service: "n1", brief: true })).value;
+  assert.deepEqual([now.model.topology, now.model.rebuild], ["changed", true]);
+  assert.ok(now.gaps.some((g: { code: string }) => g.code === "topology-changed"));
+
+  const all = (await t.tool("dpc_checkup", "describe", { brief: true })).value;
+  assert.deepEqual(all.services.map((s: { service: { id: string } }) => s.service.id), ["n1"]);
+  assert.equal((await t.tool("dpc_checkup", "describe", { service: "n1", flow: flow.id, brief: true })).value.finding.code, "describe/brief-flow");
+});
+
+test("⑰ topologyFingerprint: order, connection ids and extra fields do not count; structure does", () => {
+  const fp = topologyFingerprint(CANVAS)!;
+  assert.match(fp, /^[0-9a-f]{16}$/);
+  const shuffled = { ...CANVAS, groups: [CANVAS.groups[2]!, CANVAS.groups[0]!, CANVAS.groups[1]!].map((g) => ({ ...g, fragments: g.fragments.map((f) => ({ ...f, names: [...f.names].reverse() })) })), links: [{ ...CANVAS.links[0]!, connection: "other" }] };
+  assert.equal(topologyFingerprint(shuffled), fp);
+  assert.equal(topologyFingerprint({ ...CANVAS, takenAt: "2026-11-23T00:00:00Z", queued: 5 } as unknown as Topology), fp, "fields beside the structure");
+  assert.notEqual(topologyFingerprint({ ...CANVAS, groups: CANVAS.groups.slice(0, 2) }), fp);
+  assert.notEqual(topologyFingerprint({ ...CANVAS, groups: CANVAS.groups.map((g) => (g.id === "C" ? { ...g, name: "Reports v2" } : g)) }), fp);
+  assert.notEqual(topologyFingerprint({ ...CANVAS, links: [{ ...CANVAS.links[0]!, to: { group: "C", fragment: "c", port: "in" } }] }), fp);
+  assert.equal(topologyFingerprint(null), null);
+});
+
+test("⑰ the first message carries the briefs; the scheduled one asks describe for them", () => {
+  const plain = analysisMessage("check-now", [{ id: 7, service: "n1" }]);
+  assert.ok(!plain.includes("brief"));
+  const withBrief = analysisMessage("check-now", [{ id: 7, service: "n1" }], {}, undefined, [{ service: { id: "n1" }, model: { note: "拓扑未变，沿用已发布模型 r3" } }]);
+  assert.match(withBrief, /Each service's brief/);
+  assert.match(withBrief, /拓扑未变，沿用已发布模型 r3/);
+  assert.match(CHECKUP_MESSAGE, /describe \{brief: true\}/);
 });

@@ -5,6 +5,17 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
 
 ## Unreleased
 
+- Check-up token savings (⑰): the first message of a check-up the Deployer opens carries each service's brief (the
+  lights and the checks that are not healthy, the businesses, to-dos, gaps, the model's state, a topology summary, the
+  skeleton draft against the model and its `run_model`); the scheduled one gets it from `describe {brief: true}` (its
+  fixed message says so; the OMA schedule is updated by itself). `look` topology / model / provenance / bulletins / logs
+  and `describe` answer a summary by default (`detail: "full"`, topology `group`, `offset` for the rest). The Deployer
+  keeps the canvas' structural fingerprint with each published model revision: when it is unchanged and nobody gave
+  feedback since, the brief says "拓扑未变，沿用已发布模型 rN" and the check-up does not rebuild the model; the gap
+  `topology-changed` now needs a structural change. The gate and the skeleton are unchanged.
+- [ ] OMA: publish the Service Check-up again (`agents/service-checkup.md` and the Skill `nifi-ops` changed) and point
+  `DEPLOYER_OMA_CHECKUP_AGENT` at it; republish the Deploy Assistant for the new Skill version (`describe` / `look`
+  answer summaries).
 - `DEPLOYER_CHECKUP_AUTO=off`: turns the automatic check-ups off (pauses the OMA schedule, no machine-red or user-visit starts); Check now and flows feedback still start one. Default on.
 
 - Engine test round 2 (2026-11-22/23): service executor 0.9.5 reports, for each S2S sending port, the components whose

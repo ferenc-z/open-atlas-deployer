@@ -12,9 +12,10 @@ export const CHECKUP_TIMEZONE = "Asia/Shanghai";
 /** OMA's default Environment for a schedule without one. */
 const OMA_DEFAULT_ENVIRONMENT = "env-local-runtime";
 
+// ⑰: the message is fixed, so the brief the Deployer puts in the other first messages comes from describe {brief: true}.
 export const CHECKUP_MESSAGE = [
   "Deployer analysis (trigger: schedule). The scheduled check-up of every managed service.",
-  "There are no analysis ids: call describe without a service for the list, look at every service as your instructions say,",
+  "There are no analysis ids: first call describe {brief: true} without a service, which gives every service's brief, work from it as your instructions say,",
   'and record each one once, without analysis_id, with analysis.trigger "schedule".',
 ].join("\n");
 

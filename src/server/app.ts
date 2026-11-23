@@ -1338,10 +1338,12 @@ export function createApp({ config, store, sessions, observer, deployments, vers
   // §10.2.2 #3, #4, #5 (step 5): Look again now, Check now, following an analysis.
   mountAnalyses(api, { store, ...(deps.analyses ? { analyses: deps.analyses } : {}), authenticate, reject, registered: registeredService });
   // §10.2 step 4: the routes behind the MCP verbs (describe, the model, record, look's extra kinds) and the to-do buttons.
-  mountOps(api, {
+  const ops = mountOps(api, {
     store, executor: (host) => handoff.executor(host, "service"), model: flowModelDeps, flowSearch: (id, q) => provenance.flowSearch(id, q),
     authenticate, reject, registered: registeredService, actorOf, call: (p, spec) => callAs(p, spec), ...(deps.businessHooks ? { hooks: deps.businessHooks } : {}),
   });
+  // ⑰: the analyses' first message carries each service's brief.
+  deps.analyses?.useBrief((services, at) => ops.briefs(services, at));
   // Phase 2 step 4 (§9.3, §15.3): a service's logs, read through its members' service executors (deploy-viewer, §13): the
   // last lines of a member's file and a search of all (or some) members in parallel, merged by time (both the AI reads
   // through the MCP tools; the page for them was removed, pages-rethink §9.2).
