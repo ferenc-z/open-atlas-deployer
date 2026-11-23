@@ -16,7 +16,13 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   turned the S2S hops into external ones to get past the gate). The skeleton draft gives each RPG port of a fan-out its
   own target, and exits to a shared step (dead letters) theirs. reachable joins two groups linked only through a shared
   step. The check-up prompt: a directory hand-over is modelled as an `mq` exit and entry.
-- [ ] Upgrade the service executors to 0.9.5 (the Executors page) so S2S exits are placed by the skeleton.
+- Engine test round 5 (2026-11-23): service executor 0.9.6 reports the flow's ends: processors of a writing type (by
+  NiFi's naming convention, Put…/Publish…/Post…/Send… and the like; `EXECUTOR_EXIT_TYPES` replaces the pattern) whose
+  connections lead nowhere else on the canvas, with the relationships they auto-terminate. The skeleton draft makes
+  them the units' external exits, so data written out is not read as dropped. A port several services send to is
+  balanced against their sum. The check-up prompt's examples no longer name any particular flow's processors or
+  attributes.
+- [ ] Upgrade the service executors to 0.9.6 (the Executors page) so the skeleton places S2S exits and the flow's ends.
 - [ ] OMA: publish the Service Check-up again (`agents/service-checkup.md` changed; Skill unchanged) and point
   `DEPLOYER_OMA_CHECKUP_AGENT` at the new agent.
 - Business skeleton (complex lab flows 2026-11-22): edges to and from a shared step (error handling, audit, dead letters)
