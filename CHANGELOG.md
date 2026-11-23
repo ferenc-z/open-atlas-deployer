@@ -22,6 +22,10 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   them the units' external exits, so data written out is not read as dropped. A port several services send to is
   balanced against their sum. The check-up prompt's examples no longer name any particular flow's processors or
   attributes.
+- Check-up prompt: a model change is checked with `run_model` in the same check-up, and a gate result or refusal
+  reason quotes only what this check-up's `run_model` / `publish_model` returned (check and object); nothing is
+  carried over from an earlier analysis ("本次未检查" when it did not run).
+- [ ] OMA: publish the Service Check-up again for the prompt above and point `DEPLOYER_OMA_CHECKUP_AGENT` at it.
 - [ ] Upgrade the service executors to 0.9.6 (the Executors page) so the skeleton places S2S exits and the flow's ends.
 - [ ] OMA: publish the Service Check-up again (`agents/service-checkup.md` changed; Skill unchanged) and point
   `DEPLOYER_OMA_CHECKUP_AGENT` at the new agent.
