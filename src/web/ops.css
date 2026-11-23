@@ -30,13 +30,11 @@
 .ops .ov-open { color: #1F4FB8; font-weight: 600; white-space: nowrap; }
 
 /* Screen 2 */
-.ops .sv-two { display: flex; flex-wrap: wrap; gap: 16px; }
+.ops .sv-two { display: flex; flex-direction: column; gap: 16px; }
 .ops .sv-card { min-width: 0; background: #fff; border: 2px solid #C9C9C2; border-radius: 12px; padding: 20px 22px; display: flex; flex-direction: column; gap: 14px; }
 .ops .sv-card.edge-failing { border-color: #B3261E; }
 .ops .sv-card.edge-attention { border-color: #C98A1B; }
 .ops .sv-card.edge-healthy { border-color: #9CCBAA; }
-.ops .sv-machine { flex: 3 1 420px; }
-.ops .sv-business { flex: 2 1 340px; }
 .ops .sv-title { display: flex; align-items: center; gap: 10px; }
 .ops .sv-title b { font-size: 14px; color: #5B5B57; }
 .ops .sv-title span { font-size: 12px; color: #5B5B57; }
