@@ -4,7 +4,7 @@
 // package id, the agents published so far and the Skills' ids; each publish makes a new agent id, which the next step
 // points at.
 //
-// The Deploy Assistant's Skills (agents/skills/*.md, e.g. nifi-ops) are OMA Skills of their own (service ops §15.5,
+// The Deploy Assistant's Skills (agents/skills/<name>/SKILL.md, e.g. nifi-ops) are OMA Skills of their own (service ops §15.5,
 // owner 2026-11-07): each is created, or given a new version when its text changed, through OMA's Skills API, and the
 // package references that version. That needs OMA_URL and OMA_API_KEY_FILE (OMA's API and a key that may create Skills,
 // the same pair as DEPLOYER_OMA_URL / DEPLOYER_OMA_API_KEY_FILE): OMA's Builder MCP can create a Skill but not add a

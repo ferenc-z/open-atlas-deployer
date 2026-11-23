@@ -1,4 +1,4 @@
-// The Deploy Assistant's Skills (agents/skills/*.md) kept in OMA as Skills of their own (service ops §15.5, owner
+// The Deploy Assistant's Skills (agents/skills/<name>/SKILL.md) kept in OMA as Skills of their own (service ops §15.5, owner
 // 2026-11-07): bin/publish-assistant.ts creates each one, or adds a version when its text changed, through OMA's Skills
 // API (POST /v1/skills, POST /v1/skills/:id/versions; OMA's Builder MCP can create a Skill but not add a version), then
 // the package references the concrete versions instead of pasting the text into `system`.
@@ -6,8 +6,8 @@
 // A Skill file is one SKILL.md with frontmatter `name` (lowercase, OMA's name rule) and `description`; OMA refuses an
 // upload without them. Unchanged text makes no new version: the latest version's SKILL.md is read back and compared.
 
-import { readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { readdirSync, readFileSync, type Dirent } from "node:fs";
+import { basename, join } from "node:path";
 
 export interface SkillSource { name: string; file: string; content: string }
 export interface PublishedSkill { name: string; skill_id: string; version: string; action: "created" | "updated" | "unchanged" }
@@ -27,14 +27,20 @@ export function skillFrontmatter(content: string): { name?: string; description?
   return { name: out.name, description: out.description };
 }
 
-/** agents/skills/*.md in name order; each must carry a valid name and a description. */
+/** agents/skills/<name>/SKILL.md in name order (the Agent Skills layout OMA reads: a folder named as the Skill, holding
+ *  SKILL.md); each must carry a valid name, the folder's name, and a description. */
 export function readSkillSources(dir: string): SkillSource[] {
-  let files: string[];
-  try { files = readdirSync(dir).filter((f) => f.endsWith(".md")).sort(); } catch { return []; }
-  return files.map((file) => {
-    const content = readFileSync(join(dir, file), "utf8");
+  let entries: Dirent[];
+  try { entries = readdirSync(dir, { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : 1)); } catch { return []; }
+  const loose = entries.find((e) => !e.isDirectory() && e.name.endsWith(".md"));
+  if (loose) throw new Error(`${loose.name}: a Skill is a folder holding SKILL.md (${basename(loose.name, ".md")}/SKILL.md)`);
+  return entries.filter((e) => e.isDirectory()).map((e) => {
+    const file = `${e.name}/SKILL.md`;
+    let content: string;
+    try { content = readFileSync(join(dir, e.name, "SKILL.md"), "utf8"); } catch { throw new Error(`${e.name}: the folder has no SKILL.md`); }
     const { name, description } = skillFrontmatter(content);
     if (!name || !NAME.test(name)) throw new Error(`${file}: the frontmatter needs a name of lowercase letters, digits and hyphens`);
+    if (name !== e.name) throw new Error(`${file}: the frontmatter name ${name} must be the folder's name ${e.name}`);
     if (!description) throw new Error(`${file}: the frontmatter needs a description`);
     return { name, file, content };
   });

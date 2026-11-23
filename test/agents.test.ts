@@ -11,7 +11,7 @@ import { TOOLS, visibleTools, type Tier } from "../src/server/mcp.ts";
 const root = join(import.meta.dirname, "..");
 const read = (...p: string[]) => readFileSync(join(root, ...p), "utf8");
 const allTools = new Set(TOOLS.map((t) => t.name));
-const skills = readdirSync(join(root, "agents", "skills")).map((f) => read("agents", "skills", f));
+const skills = readdirSync(join(root, "agents", "skills")).map((d) => read("agents", "skills", d, "SKILL.md"));
 
 function named(text: string) {
   // `tool` or `tool {args}` in backticks.

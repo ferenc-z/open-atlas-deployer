@@ -2,7 +2,7 @@
 // creates or versions them through OMA's Skills API (stubbed here) and the package references the concrete version.
 
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -114,11 +114,18 @@ test("§15.5: the package references the version; the agent gets read alone to o
 test("§15.5: Skill files need OMA's frontmatter; the repository's Skills have it", () => {
   assert.deepEqual(skillFrontmatter(SKILL), { name: "nifi-ops", description: "Looking into NiFi." });
   const dir = mkdtempSync(join(tmpdir(), "skills-"));
-  writeFileSync(join(dir, "a.md"), "# no frontmatter\n");
-  assert.throws(() => readSkillSources(dir), /a\.md: the frontmatter needs a name/);
-  writeFileSync(join(dir, "a.md"), "---\nname: A_B\ndescription: x\n---\n");
+  writeFileSync(join(dir, "a.md"), "# loose file\n");
+  assert.throws(() => readSkillSources(dir), /a\.md: a Skill is a folder holding SKILL\.md/);
+  rmSync(join(dir, "a.md"));
+  mkdirSync(join(dir, "a"));
+  assert.throws(() => readSkillSources(dir), /a: the folder has no SKILL\.md/);
+  writeFileSync(join(dir, "a", "SKILL.md"), "# no frontmatter\n");
+  assert.throws(() => readSkillSources(dir), /a\/SKILL\.md: the frontmatter needs a name/);
+  writeFileSync(join(dir, "a", "SKILL.md"), "---\nname: A_B\ndescription: x\n---\n");
   assert.throws(() => readSkillSources(dir), /lowercase/);
-  writeFileSync(join(dir, "a.md"), "---\nname: a\n---\n");
+  writeFileSync(join(dir, "a", "SKILL.md"), "---\nname: b\ndescription: x\n---\n");
+  assert.throws(() => readSkillSources(dir), /must be the folder's name a/);
+  writeFileSync(join(dir, "a", "SKILL.md"), "---\nname: a\n---\n");
   assert.throws(() => readSkillSources(dir), /needs a description/);
   assert.deepEqual(readSkillSources(join(dir, "missing")), []);
   const repo = readSkillSources(join(import.meta.dirname, "..", "agents", "skills"));

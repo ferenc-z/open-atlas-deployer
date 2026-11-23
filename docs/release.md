@@ -16,7 +16,7 @@
 # 1. 版本号：package.json 和 package-lock.json 一起改
 npm version 0.2.5 --no-git-tag-version
 # 2. CHANGELOG.md 加上 "## 0.2.5" 一节；执行器代码改了，就同时调 executor/deployer_executor.py 的 VERSION 和 handoff.ts 的 EXECUTOR_VERSION
-#    助手定义改了（agents/*.md、agents/skills/*.md、templates/deploy-assistant.oma.json、templates/onboarding-assessor.oma.json），
+#    助手定义改了（agents/*.md、agents/skills/*/SKILL.md、templates/deploy-assistant.oma.json、templates/onboarding-assessor.oma.json），
 #    这一节要有 "### After upgrading" 和一行 "- [ ] OMA: ..."，写明要在各环境的 OMA 上重新发布哪个 agent、为什么（见下文）
 #    本地先查一遍：sh bin/check-oma-notes.sh 0.2.5
 # 3. 提交，确认本地检查通过（.check/last 是 "<提交> ok"，或手动跑 sh bin/check.sh），再推送分支

@@ -3,6 +3,13 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
+## Unreleased
+
+- Skills follow the Agent Skills layout OMA reads: `agents/skills/<name>/SKILL.md` (a folder named as the Skill, the
+  frontmatter `name` the same), so the folder zips straight into OMA's Skill upload. `bin/publish-assistant.ts` reads
+  the folders (a loose `*.md` there is an error); the Skill's text is unchanged, so no new Skill version and nothing to
+  republish. `bin/check-oma-notes.sh` does not count a file moved without a change of text.
+
 ## 0.3.0-rc.15
 
 - `bin/publish-assistant.ts`: `OMA_CONTEXT_WINDOW_TOKENS` / `OMA_CONTEXT_OUTPUT_TOKENS` put the model's context into the agent's metadata (`context_window_tokens` / `context_output_tokens`), for a model OMA's own table does not know (deepseek: OMA fell back to a 32K window and failed compacting).
