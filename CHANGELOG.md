@@ -5,6 +5,8 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
 
 ## Unreleased
 
+- `DEPLOYER_CHECKUP_AUTO=off`: turns the automatic check-ups off (pauses the OMA schedule, no machine-red or user-visit starts); Check now and flows feedback still start one. Default on.
+
 - Engine test round 2 (2026-11-22/23): service executor 0.9.5 reports, for each S2S sending port, the components whose
   connections lead into it (`s2sOut[].sources`), and the skeleton's draft gives an S2S exit that component and
   relationship (before, every S2S exit was left for the AI to place and the gate refused the drafts). The gate waits for

@@ -3,6 +3,7 @@
 // put back when its agent, version, Environment, Vaults, cron, time zone or message differ, left alone otherwise. OMA
 // opens the session itself with a fixed first message, so there are no analysis ids: the agent records each service
 // with analysis.trigger "schedule" and the Deployer groups them into one round (todos.ts scheduleRun).
+// DEPLOYER_CHECKUP_AUTO=off pauses it (OMA's pause; resumed when the switch is on again).
 
 import { readToken, type TokenSource } from "../versions.ts";
 
@@ -28,12 +29,14 @@ export interface CheckupScheduleConfig {
   timezone: string;
   /** The schedule's name in OMA (one per Deployer environment). */
   name: string;
+  /** DEPLOYER_CHECKUP_AUTO: false pauses the schedule in OMA (and does not make one); Check now still works. Default true. */
+  auto?: boolean;
 }
 
 /** The fields of an OMA schedule this compares and sends. */
 interface OmaSchedule { id: string; name: string; agent_id: string; agent_version: number; environment_id: string; initial_message: string; cron_expression: string; timezone: string; vault_ids?: string[] | null; status: string; next_run_at?: string | null }
 
-export interface EnsureResult { action: "created" | "updated" | "unchanged"; id: string; nextRunAt: string | null }
+export interface EnsureResult { action: "created" | "updated" | "unchanged" | "paused" | "resumed"; id: string | null; nextRunAt: string | null }
 
 export class CheckupSchedule {
   readonly config: CheckupScheduleConfig;
@@ -62,6 +65,7 @@ export class CheckupSchedule {
   /** Makes the schedule match the configuration (the agent's current version), creating it when it is missing. */
   async ensure(): Promise<EnsureResult> {
     const c = this.config;
+    if (c.auto === false) return this.pause();
     const agent = await this.call("GET", `/v1/agents/${encodeURIComponent(c.agent)}`);
     if (!Number.isInteger(agent.version)) throw new Error(`OMA agent ${c.agent} has no version`);
     const body = {
@@ -80,12 +84,30 @@ export class CheckupSchedule {
       && found.environment_id === (c.environment ?? OMA_DEFAULT_ENVIRONMENT) && found.initial_message === body.initial_message
       && found.cron_expression === c.cron && found.timezone === c.timezone
       && [...(found.vault_ids ?? [])].sort().join(",") === [...c.vaults].sort().join(",");
-    if (same) {
-      this.nextRunAt = found.next_run_at ?? null;
-      return { action: "unchanged", id: found.id, nextRunAt: this.nextRunAt };
+    let action: EnsureResult["action"] = "unchanged";
+    this.nextRunAt = found.next_run_at ?? null;
+    if (!same) {
+      const put = await this.call("PUT", `/v1/agent-schedules/${encodeURIComponent(found.id)}`, body) as OmaSchedule;
+      this.nextRunAt = put.next_run_at ?? null;
+      action = "updated";
     }
-    const put = await this.call("PUT", `/v1/agent-schedules/${encodeURIComponent(found.id)}`, body) as OmaSchedule;
-    this.nextRunAt = put.next_run_at ?? null;
-    return { action: "updated", id: found.id, nextRunAt: this.nextRunAt };
+    if (found.status === "paused") {
+      // The switch was off before: on again.
+      const resumed = await this.call("POST", `/v1/agent-schedules/${encodeURIComponent(found.id)}/resume`) as Partial<OmaSchedule>;
+      this.nextRunAt = resumed.next_run_at ?? this.nextRunAt;
+      action = "resumed";
+    }
+    return { action, id: found.id, nextRunAt: this.nextRunAt };
+  }
+
+  /** The switch is off: the schedule (if there is one) is paused, none is made, and there is no next run. */
+  private async pause(): Promise<EnsureResult> {
+    const list = ((await this.call("GET", "/v1/agent-schedules")).data ?? []) as OmaSchedule[];
+    const found = list.find((s) => s.name === this.config.name && s.status !== "archived");
+    this.nextRunAt = null;
+    if (!found) return { action: "unchanged", id: null, nextRunAt: null };
+    if (found.status === "paused") return { action: "unchanged", id: found.id, nextRunAt: null };
+    await this.call("POST", `/v1/agent-schedules/${encodeURIComponent(found.id)}/pause`);
+    return { action: "paused", id: found.id, nextRunAt: null };
   }
 }

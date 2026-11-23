@@ -38,14 +38,14 @@ function fakeOma() {
   return o;
 }
 
-function setup(o: { oma?: boolean } = {}) {
+function setup(o: { oma?: boolean; auto?: boolean } = {}) {
   const now = { t: new Date(T0) };
   const store = new Store(":memory:", () => now.t);
   store.addCluster({ kind: "cluster", id: "c250", service: "nifi", profile: "nifi-2.x", version: "2.5.0", webUrl: null, zookeeper: "zk:2181", zookeeperRoot: "/c250", nodes: [node("/lab/c250-1", 18445), node("/lab/c250-2", 18446)] } as never, "uat", admin);
   store.addStandalone({ kind: "standalone", id: "n112", service: "nifi", profile: "nifi-2.x", version: "2.5.0", webUrl: null, member: node("/lab/n112", 18443) } as never, "uat", admin);
   const lights = new Map<string, Lights>([["c250", { machine: "failing", business: "healthy" }], ["n112", { machine: "healthy", business: "healthy" }]]);
   const oma = fakeOma();
-  const analyses = new Analyses({ store, ...(o.oma === false ? {} : { oma }), lights: (s) => lights.get(s)!, services: () => ["c250", "n112"], now: () => now.t });
+  const analyses = new Analyses({ store, ...(o.oma === false ? {} : { oma }), lights: (s) => lights.get(s)!, services: () => ["c250", "n112"], ...(o.auto === false ? { auto: false } : {}), now: () => now.t });
   return { now, store, lights, oma, analyses };
 }
 
@@ -281,4 +281,37 @@ test("the OMA schedule: created when missing, left alone when it matches, put ba
   assert.equal(schedules.length, 1);
   assert.ok(!calls.some((c) => c.startsWith("DELETE")));
   await assert.rejects(new CheckupSchedule({ ...config, agent: "nope" }, fetcher).ensure(), /HTTP 404: not found/);
+});
+
+test("DEPLOYER_CHECKUP_AUTO off: no machine-red or user-visit start; Check now still starts one", () => {
+  const t = setup({ auto: false });
+  assert.equal(t.analyses.auto, false);
+  assert.equal(t.analyses.machineTurn({ kind: "machine-red", service: "c250", from: "healthy", to: "failing", text: "x" } as never), null);
+  assert.deepEqual(t.analyses.visit([{ service: "c250", machine: "failing", business: "healthy", analysis: null }], "alice"), []);
+  assert.equal(t.analyses.checkNow("c250", "alice").trigger, "check-now");
+});
+
+test("the OMA schedule with the switch off: paused (not made when missing), resumed when on again", async () => {
+  const calls: string[] = [];
+  const schedules: any[] = [];
+  const fetcher = (async (input: URL | string, init?: RequestInit) => {
+    const url = new URL(String(input)); const method = init?.method ?? "GET";
+    calls.push(`${method} ${url.pathname}`);
+    if (url.pathname === "/v1/agents/agent-chk") return Response.json({ id: "agent-chk", version: 3 });
+    if (url.pathname === "/v1/agent-schedules" && method === "GET") return Response.json({ data: schedules });
+    if (url.pathname === "/v1/agent-schedules/sch_1/pause" && method === "POST") { schedules[0].status = "paused"; schedules[0].next_run_at = null; return Response.json(schedules[0]); }
+    if (url.pathname === "/v1/agent-schedules/sch_1/resume" && method === "POST") { schedules[0].status = "active"; schedules[0].next_run_at = "2026-11-19T16:00:00.000Z"; return Response.json(schedules[0]); }
+    return Response.json({ error: "not found" }, { status: 404 });
+  }) as typeof fetch;
+  const config = { url: "http://oma:8787", keyFile: () => "oma-key", agent: "agent-chk", vaults: ["vlt_dpc"], cron: "0 */4 * * *", timezone: "Asia/Shanghai", name: "deployer-checkup-uat" };
+  const off = new CheckupSchedule({ ...config, auto: false }, fetcher);
+  assert.deepEqual(await off.ensure(), { action: "unchanged", id: null, nextRunAt: null }, "missing: not made");
+  assert.ok(!calls.some((c) => c.startsWith("POST")));
+  schedules.push({ id: "sch_1", name: "deployer-checkup-uat", agent_id: "agent-chk", agent_version: 3, environment_id: "env-local-runtime", initial_message: CHECKUP_MESSAGE, cron_expression: "0 */4 * * *", timezone: "Asia/Shanghai", vault_ids: ["vlt_dpc"], status: "active", next_run_at: "2026-11-19T12:00:00.000Z" });
+  assert.deepEqual(await off.ensure(), { action: "paused", id: "sch_1", nextRunAt: null });
+  assert.equal(off.nextRunAt, null);
+  assert.equal((await off.ensure()).action, "unchanged", "paused already");
+  const on = new CheckupSchedule(config, fetcher);
+  assert.deepEqual(await on.ensure(), { action: "resumed", id: "sch_1", nextRunAt: "2026-11-19T16:00:00.000Z" });
+  assert.equal((await on.ensure()).action, "unchanged");
 });

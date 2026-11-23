@@ -112,12 +112,13 @@ const checkupAgent = config.omaUrl && config.omaApiKeyFile && config.omaCheckupA
   ? new OmaSessions({ url: config.omaUrl, keyFile: config.omaApiKeyFile, agent: config.omaCheckupAgent, ...(config.omaCheckupEnvironment ? { environment: config.omaCheckupEnvironment } : {}), vaults: config.omaCheckupVaults ?? [], ...(config.omaApplicationId ? { application: config.omaApplicationId } : {}) })
   : undefined;
 const analyses = new Analyses({
-  store, ...(checkupAgent ? { oma: checkupAgent } : {}), services: serviceIds,
+  store, ...(checkupAgent ? { oma: checkupAgent } : {}), services: serviceIds, auto: config.checkupAuto !== false,
   lights: (service, at) => ({ machine: machineLight(store, serviceExecutor, service, at)?.light ?? "unknown", business: businessHooks.business!(service, at).light }),
 });
 const checkupSchedule = config.omaUrl && config.omaApiKeyFile && config.omaCheckupAgent
-  ? new CheckupSchedule({ url: config.omaUrl, keyFile: config.omaApiKeyFile, agent: config.omaCheckupAgent, ...(config.omaCheckupEnvironment ? { environment: config.omaCheckupEnvironment } : {}), vaults: config.omaCheckupVaults ?? [], cron: config.checkupCron ?? CHECKUP_CRON, timezone: config.checkupTimezone ?? CHECKUP_TIMEZONE, name: `deployer-checkup-${(() => { try { return deployments.environment().env.name; } catch { return "default"; } })()}` })
+  ? new CheckupSchedule({ url: config.omaUrl, keyFile: config.omaApiKeyFile, agent: config.omaCheckupAgent, ...(config.omaCheckupEnvironment ? { environment: config.omaCheckupEnvironment } : {}), vaults: config.omaCheckupVaults ?? [], cron: config.checkupCron ?? CHECKUP_CRON, timezone: config.checkupTimezone ?? CHECKUP_TIMEZONE, name: `deployer-checkup-${(() => { try { return deployments.environment().env.name; } catch { return "default"; } })()}`, auto: config.checkupAuto !== false })
   : undefined;
+if (config.checkupAuto === false) console.log("Automatic check-ups are off (DEPLOYER_CHECKUP_AUTO); Check now still works.");
 const pageSources = opsPageSources(store, checkupSchedule ? () => checkupSchedule.nextRunAt : undefined);
 const briefs = new Briefs(store, () => collectFacts({ store, deployments, status: statusOf, versions, ...(peer.configured ? { peer: () => peer.status() } : {}), drift: () => drift.check(), ops: () => servicesOverview(store, serviceExecutor, pageSources) }), briefWriter, {
   hour: config.briefHour,
@@ -158,7 +159,7 @@ setInterval(() => { drift.check().catch((error) => console.error("drift:", error
 setInterval(() => { analyses.poll().catch((error) => console.error("analyses:", error)); }, 10_000).unref();
 if (checkupSchedule) {
   const ensure = () => checkupSchedule.ensure()
-    .then((r) => { if (r.action !== "unchanged") console.log(`Check-up schedule ${r.id} ${r.action} (${checkupSchedule.config.cron}, ${checkupSchedule.config.timezone}); next ${r.nextRunAt ?? "?"}`); })
+    .then((r) => { if (r.action !== "unchanged") console.log(`Check-up schedule ${r.id} ${r.action} (${checkupSchedule.config.cron}, ${checkupSchedule.config.timezone}); next ${r.nextRunAt ?? "-"}`); })
     .catch((error) => console.error("check-up schedule:", (error as Error).message));
   setTimeout(ensure, 15_000).unref();
   setInterval(ensure, 15 * 60_000).unref();

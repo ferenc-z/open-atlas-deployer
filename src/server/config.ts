@@ -67,6 +67,8 @@ export interface Config {
   omaCheckupEnvironment?: string;
   omaCheckupVaults?: string[];
   checkupCron?: string;
+  /** DEPLOYER_CHECKUP_AUTO (default on): off/false/0/no stops the automatic check-ups (schedule, machine-red, user-visit). */
+  checkupAuto?: boolean;
   checkupTimezone?: string;
   issueRepo?: string;
   issueTokenFile?: TokenSource;
@@ -131,6 +133,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, tokens: Record<
     ...(env.DEPLOYER_OMA_CHECKUP_ENVIRONMENT ? { omaCheckupEnvironment: env.DEPLOYER_OMA_CHECKUP_ENVIRONMENT } : {}),
     omaCheckupVaults: (env.DEPLOYER_OMA_CHECKUP_VAULTS ?? "").split(/[\s,]+/).filter(Boolean),
     checkupCron: env.DEPLOYER_CHECKUP_CRON?.trim() || CHECKUP_CRON,
+    checkupAuto: !/^(off|false|0|no)$/i.test(env.DEPLOYER_CHECKUP_AUTO?.trim() ?? ""),
     checkupTimezone: env.DEPLOYER_CHECKUP_TIMEZONE?.trim() || CHECKUP_TIMEZONE,
     ...(env.DEPLOYER_ISSUE_REPO ? { issueRepo: env.DEPLOYER_ISSUE_REPO } : {}),
     briefHour: Number(env.DEPLOYER_BRIEF_HOUR ?? 8),

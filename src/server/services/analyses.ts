@@ -8,6 +8,7 @@
 // its analyses are created by record, todos.ts), a machine light turning red (checkAll's onTurn), a person opening a
 // page while a service is not green and its analysis is out of date (at most once a service an hour), Check now (one
 // service, or a round over all), and a person's feedback on the flows page (split, not right).
+// DEPLOYER_CHECKUP_AUTO=off turns the automatic ones off (schedule, machine-red, user-visit); a person's still start.
 
 import type { OmaSessions } from "../oma.ts";
 import type { AnalysisRecord, FlowRecord, Store } from "../store.ts";
@@ -31,6 +32,8 @@ export interface AnalysisDeps {
   lights: (service: string, now: Date) => Lights;
   /** Every registered service's id. */
   services: () => string[];
+  /** DEPLOYER_CHECKUP_AUTO: false starts nothing by itself (no machine-red, no user-visit); Check now and flows feedback still do. Default true. */
+  auto?: boolean;
   now?: () => Date;
 }
 
@@ -84,6 +87,8 @@ export class Analyses {
   constructor(d: AnalysisDeps) { this.d = d; }
 
   get configured(): boolean { return Boolean(this.d.oma); }
+  /** Whether analyses start by themselves (machine-red, user-visit). */
+  get auto(): boolean { return this.d.auto !== false; }
   private now() { return this.d.now?.() ?? new Date(); }
 
   /** The service's running analysis, if any. */
@@ -143,7 +148,7 @@ export class Analyses {
 
   /** checkAll's onTurn: a machine light turned red, an analysis now (unless one runs). */
   machineTurn(turn: MachineTurn): AnalysisRecord | null {
-    if (turn.kind !== "machine-red") return null;
+    if (turn.kind !== "machine-red" || !this.auto) return null;
     return this.begin([turn.service], "machine-red", "deployer", { reasons: { [turn.service]: `The machine light turned red (${turn.from} → ${turn.to}): ${turn.text}` } })[0] ?? null;
   }
 
@@ -158,7 +163,7 @@ export class Analyses {
 
   /** A person opened pages showing these services (the overview: all of them, a service page: one): one session for those due. */
   visit(seen: Visited[], by: string): AnalysisRecord[] {
-    if (!this.configured) return [];
+    if (!this.configured || !this.auto) return [];
     const at = this.now().getTime();
     const due = seen.filter((v) => this.due(v, at));
     for (const v of due) this.visits.set(v.service, at);
