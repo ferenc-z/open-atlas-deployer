@@ -689,7 +689,11 @@ export function draftFromSkeleton(store: Store, service: string, now = new Date(
   for (const f of sk.flows) {
     if (!f.segments.some((s) => s.service === service)) continue;
     const existing = f.segments.map((u) => (u.service === service ? known(u)?.flow : undefined)).find(Boolean)
-      ?? store.flows().find((x) => store.flowSegments(x.id).some((s) => s.service !== service && f.segments.some((u) => u.service === s.service && store.flowModel(s.service)?.model.segments.find((m) => m.id === s.segment)?.group.id === u.group.id)))?.id;
+      ?? store.flows().find((x) => store.flowSegments(x.id).some((s) => s.service !== service && f.segments.some((u) => {
+        // The other service's part by group and, in a group of several pieces, by the piece (two businesses can share a group).
+        const m = u.service === s.service ? store.flowModel(s.service)?.model.segments.find((y) => y.id === s.segment) : undefined;
+        return !!m && m.group.id === u.group.id && (m.slice === WHOLE || u.fragment === null || m.slice === u.fragment);
+      })))?.id;
     const key = existing ?? `new:${f.key.replace(/[^A-Za-z0-9_.-]+/g, "-").slice(0, 60)}`;
     for (const u of f.segments) if (u.service === service) add(u, key, "segment");
     if (!existing) notes.push({ flow: key, name: f.segments[0]!.group.name, ...(f.reason ? { reason: f.reason } : {}), ...(f.exceptions.includes("idle") ? { ignore: true } : {}) });
