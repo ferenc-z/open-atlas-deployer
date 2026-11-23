@@ -51,6 +51,16 @@ export function applyFlowAction(store: Store, f: FlowRecord, a: Exclude<FlowActi
     if (a.kind === "rename") { next = { ...f, name: a.name, nameBy: "person" }; change("renamed", `改名为"${a.name}"`); }
     if (a.kind === "split") { change("split-asked", `人说这其实是两条业务${a.note ? `：${a.note}` : ""}`); }
     if (a.kind === "not-right") { change("not-right", `人说不对：${a.note}`); }
+    // Saying a business is wrong (or really two) while a merge of it waits is refusing that merge: it is dropped, and the
+    // business is marked as not to be joined (split-asked, which the skeleton's joins already honour), so the next
+    // check-up does not hold the same merge for a person again.
+    const refused = f.pendings.filter((x) => x.kind === "merge" || x.kind === "cross-service");
+    if ((a.kind === "split" || a.kind === "not-right") && refused.length) {
+      if (a.kind !== "split") change("split-asked", `人拒绝了等待确认的合并（${refused.map((x) => x.text).join("；")}）：这条业务不再被并进别的业务`);
+      const ids = new Set(refused.map((x) => x.id));
+      for (const g of store.flows()) if (g.pendings.some((x) => ids.has(x.id))) store.putFlow({ ...g, pendings: g.pendings.filter((x) => !ids.has(x.id)) });
+      next = { ...(store.flow(f.id) ?? f), pendings: (store.flow(f.id) ?? f).pendings.filter((x) => !ids.has(x.id)) };
+    }
     if (a.kind === "ignore") { next = { ...f, status: "ignored" }; change("ignored", "不用管"); }
     if (a.kind === "watch") { next = { ...f, status: "confirmed", confirmedAt: new Date().toISOString(), confirmedBy: actor.id }; change("watched", "还是要盯着"); }
     if (a.kind === "stuck") {

@@ -497,6 +497,22 @@ test("UAT 2026-11-23: a fan-out's downstream services each hold their join on th
   assert.ok(!store.flow(g), "the receiver's own business is taken in");
 });
 
+test("UAT 2026-11-23: saying a business is wrong while a merge of it waits refuses the merge; the next draft does not hold it again", async () => {
+  const { store, deps, send, recv } = await twoBusinesses("n112");
+  const svc = "c250";
+  const draft = draftFromSkeleton(store, svc, NOW);
+  const held = await publishModel(deps, { service: svc, base: store.flowModel(svc)!.revision, model: draft, note: "join", actor: ai });
+  assert.equal(held.verdict, "needs-confirmation");
+  assert.equal(store.flow(send)!.pendings.length, 1);
+  applyFlowAction(store, store.flow(send)!, { kind: "not-right", note: "这两条不是一件事" }, admin);
+  assert.deepEqual([store.flow(send)!.pendings, store.flow(recv)!.pendings], [[], []]);
+  const again = draftFromSkeleton(store, svc, NOW);
+  assert.equal(again.segments.find((s) => s.group.id === "R")!.flow, recv, "the receiver keeps its own business");
+  const got = await publishModel(deps, { service: svc, base: store.flowModel(svc)!.revision, model: again, note: "again", actor: ai });
+  assert.equal(got.verdict, "published");
+  assert.deepEqual(store.flow(send)!.pendings, []);
+});
+
 test("owner 2026-11-23: a fan-out to a part fed by several stays apart (the skeleton asks)", async () => {
   const { store, deps } = fanOut(true);
   const d = draftFromSkeleton(store, "n112", NOW);

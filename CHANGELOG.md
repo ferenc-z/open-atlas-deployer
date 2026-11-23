@@ -32,6 +32,8 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
 - A business holds one change waiting for a person per service, not one in all: the downstream services of an S2S
   fan-out no longer overwrite each other's join, a service's new publish replaces only its own, and confirming the
   business applies each in turn (stops at the first the gate rejects). Old single rows are read as a list of one.
+- Refusing a merge sticks: "not right" or "these are two flows" on a business while a merge of it waits drops that
+  merge and marks the business as not to be joined (split-asked), so the next check-up does not hold it again.
 
 - Engine test round 2 (2026-11-22/23): service executor 0.9.5 reports, for each S2S sending port, the components whose
   connections lead into it (`s2sOut[].sources`), and the skeleton's draft gives an S2S exit that component and
