@@ -210,7 +210,7 @@ function problems(model: ModelV2 | null, c: Ctx): Problem[] {
     const key = `s2s:${l.from.service}/${sender.id}/${exit.id}>${l.to.service}/${receiver.id}`;
     if (!ts || !tr) continue;
     const refs = ts.s2sOut.filter((o) => o.name === port && (sender.group.id === UNPLACED || o.group === sender.group.id)).map((o) => o.ref);
-    const ids = tr.s2sIn.filter((p) => p.name === port && (receiver.group.id === UNPLACED || p.group === receiver.group.id)).map((p) => p.id);
+    const ids = tr.s2sIn.filter((p) => p.name === port && (receiver.group.id === UNPLACED || p.group === receiver.group.id || p.group === tr.root.id)).map((p) => p.id); // a root-level port feeds the group it links to
     if (!refs.length || !ids.length) {
       out.push({ check: "s2s-balance", flow, key: `${key}:port`, text: `S2S ${l.from.service} → ${l.to.service} 端口 ${port}：${!refs.length ? `${l.from.service} 的 ${label(sender)} 里没有发往这个端口的 RPG` : `${l.to.service} 的 ${label(receiver)} 里没有这个远程输入端口`}` });
       continue;
@@ -220,8 +220,19 @@ function problems(model: ModelV2 | null, c: Ctx): Problem[] {
       for (const r of rows) if (r.kind === kind && set.includes(r.ref)) { const h = Math.floor(Date.parse(r.bucket) / HOUR); m.set(h, (m.get(h) ?? 0) + pick(r)); }
       return m;
     };
-    const a = hourly(c.counts(l.from.service), "s2s-out", refs, (r) => r.out), b = hourly(c.counts(l.to.service), "s2s-in", ids, (r) => Math.max(r.in, r.out));
-    const hours = [...a.keys()].filter((h) => b.has(h)).sort((x, y) => x - y);
+    // Engine test round 4: a port several services send to (dead letters from every service's error handling) receives
+    // their sum; each sender the skeleton links to the receiving unit counts, modelled or not.
+    const recvUnits = new Set(unitsOf(l.to.service, receiver, c.skeleton).map((u) => u.id));
+    const feeders = [...new Set(c.skeleton.edges.filter((e) => e.kind === "s2s" && recvUnits.has(e.to)).map((e) => e.from))]
+      .map((u) => { const [svc, group] = u.split("/") as [string, string]; return { svc, refs: (c.topology(svc)?.s2sOut ?? []).filter((o) => o.name === port && o.group === group).map((o) => o.ref) }; })
+      .filter((f) => f.refs.length);
+    // Only the hours every sender was counted in (a sender whose RPG the topology did not show yet has no rows then).
+    const perFeeder = (feeders.length > 1 ? feeders : [{ svc: l.from.service, refs }]).map((f) => hourly(c.counts(f.svc), "s2s-out", f.refs, (r) => r.out));
+    const a = new Map<number, number>();
+    for (const m of perFeeder) for (const [h, n] of m) a.set(h, (a.get(h) ?? 0) + n);
+    const b = hourly(c.counts(l.to.service), "s2s-in", ids, (r) => Math.max(r.in, r.out));
+    if (feeders.length > 1 && out.some((x) => x.check === "s2s-balance" && x.key === `s2s:fan-in:${l.channel}`)) continue;
+    const hours = [...a.keys()].filter((h) => b.has(h) && perFeeder.every((m) => m.has(h))).sort((x, y) => x - y);
     if (!hours.length) continue;
     const sent = hours.reduce((n, h) => n + a.get(h)!, 0), got = hours.reduce((n, h) => n + b.get(h)!, 0);
     // A hand-over late by a bucket shows as +n then -n: only a difference that stays is a mismatch.
@@ -229,7 +240,8 @@ function problems(model: ModelV2 | null, c: Ctx): Problem[] {
     let cum = 0, off: number | null = null;
     for (const h of hours) { cum += a.get(h)! - b.get(h)!; if (off === null && Math.abs(cum) > bound) off = h; }
     if (off !== null && Math.abs(cum) > bound) {
-      out.push({ check: "s2s-balance", flow, key, text: `S2S ${l.from.service} → ${l.to.service} 端口 ${port}：${hours.length} 个小时里发出 ${sent} 个、收到 ${got} 个，从 ${new Date(off * HOUR).toISOString().slice(0, 13)}:00 起对不上` });
+      const many = feeders.length > 1;
+      out.push({ check: "s2s-balance", flow, key: many ? `s2s:fan-in:${l.channel}` : key, text: `S2S ${many ? feeders.map((f) => f.svc).join("、") : l.from.service} → ${l.to.service} 端口 ${port}：${hours.length} 个小时里发出 ${sent} 个、收到 ${got} 个，从 ${new Date(off * HOUR).toISOString().slice(0, 13)}:00 起对不上` });
     }
   }
   return out;

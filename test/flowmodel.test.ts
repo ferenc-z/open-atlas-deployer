@@ -410,3 +410,20 @@ test("engine test round 3: two groups joined only through a shared step are one 
   const r = runModel(store, "n1", one, NOW);
   assert.equal(r.checks.find((c) => c.check === "reachable")!.ok, true, JSON.stringify(r.checks));
 });
+
+test("engine test round 4: a port two services send to balances against their sum", () => {
+  const { store } = crossing(() => 10);
+  store.addStandalone({ kind: "standalone", id: "n200", service: "nifi", profile: "nifi-2.x", version: "2.0.0", webUrl: null, member: member(18444) } as never, "uat", admin);
+  const ref = "https://localhost:18445/nifi#orders";
+  store.putTopology("n200", "2026-11-19T11:00:00Z", "c", topo("r3", [{ id: "T", name: "Send too", root: false, fragments: [frag("t", { s2sOut: [ref] })] }], { s2sOut: [{ ref, name: "orders", targets: ["https://localhost:18445/nifi"], group: "T", fragment: "t" }] }));
+  const rows: FlowCountRow[] = [];
+  for (let h = 0; h < 6; h++) {
+    const at = (m: number) => new Date(Date.parse("2026-11-19T04:00:00Z") + h * 3_600_000 + m * 60_000).toISOString().replace(".000Z", "Z");
+    rows.push(row("n200", at(0), "s2s-out", ref, 5, 5), row("c250", at(5), "s2s-in", "p-orders", 0, 15));
+  }
+  store.putFlowCounts(rows);
+  for (const id of ["n112", "c250", "n200"]) store.insertFlowModel(id, 0, { version: 2, service: id, sources: [], segments: [] }, "ai", ai, []);
+  store.insertFlowModel("n112", 1, sender(store), "ai", ai, []);
+  const r = runModel(store, "c250", receiver("new:orders"), NOW);
+  assert.equal(r.checks.find((c) => c.check === "s2s-balance")!.ok, true, JSON.stringify(r.checks));
+});
