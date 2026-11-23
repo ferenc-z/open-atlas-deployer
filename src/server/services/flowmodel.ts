@@ -513,7 +513,7 @@ export async function publishModel(d: ModelDeps, input: { service: string; base:
       const isNew = !was;
       const row: FlowRecord = was ?? {
         id: f, name: n?.name ?? flowName(segs), nameBy: "ai", status: "proposed", summary: n?.summary ?? "", reason: n?.reason ?? null, risks: n?.risks ?? [],
-        pending: null, stuck: null, createdAt: at, confirmedAt: null, confirmedBy: null, updatedAt: at,
+        pendings: [], stuck: null, createdAt: at, confirmedAt: null, confirmedBy: null, updatedAt: at,
       };
       if (n) {
         if (n.name && !nameLocked(row)) row.name = n.name;
@@ -536,8 +536,9 @@ export async function publishModel(d: ModelDeps, input: { service: string; base:
       else { store.addFlowChange({ flow: f, service, by, kind: "updated", text: "这条业务已没有段（并进了别的业务或已从画布上去掉），从清单里去掉", revision, verdict: run.verdict }); store.deleteFlow(f); }
     }
     // A publish is the AI's whole picture: what an earlier publish of this service held and this one does not hold
-    // again is dropped (engine test 2026-11-22: a corrected draft left the first draft's "new / gone" waiting).
-    for (const f of store.flows(service)) if (f.pending && f.pending.service === service) store.putFlow({ ...f, pending: null });
+    // again is dropped (engine test 2026-11-22: a corrected draft left the first draft's "new / gone" waiting). Only this
+    // service's: other services' held changes on the same business keep waiting (a fan-out's downstream sides each hold one).
+    for (const f of store.flows()) if (f.pendings.some((p) => p.service === service)) store.putFlow({ ...f, pendings: f.pendings.filter((p) => p.service !== service) });
     for (const x of run.changes) {
       const f = x.flow ? real(x.flow) ?? null : null;
       if (x.kind === "new" && f && !before.has(f)) continue; // said as "found"
@@ -558,17 +559,17 @@ export async function publishModel(d: ModelDeps, input: { service: string; base:
       for (const f of targets) {
         const row = store.flow(f)!;
         const mine = held.filter((x) => (x.flow ? real(x.flow) : undefined) === f);
-        store.putFlow({ ...row, pending: { ...pending, kind: (mine[0]?.kind ?? pending.kind) as FlowPending["kind"], text: (mine.length ? mine : held).map((x) => x.text).join("；") } });
+        const own = { ...pending, kind: (mine[0]?.kind ?? pending.kind) as FlowPending["kind"], text: (mine.length ? mine : held).map((x) => x.text).join("；") };
+        store.putFlow({ ...row, pendings: [...row.pendings.filter((p) => p.service !== service), own] });
         pendingOut.push({ flow: f, kind: mine[0]?.kind ?? pending.kind, text: (mine.length ? mine : held).map((x) => x.text).join("；") });
       }
     }
-    if (input.confirm) for (const f of after.keys()) { const row = store.flow(f); if (row?.pending) store.putFlow({ ...row, pending: null }); }
   });
   const todo = pendingOut.length
     ? d.todos?.open({ service, source: "flows", key: `flows:${service}`, severity: "attention", title: "Confirm the flows the AI found", detail: pendingText(held), action: { kind: "confirm-flows", label: "Review flows" } }) ?? null
     : null;
   // Nothing waits any more (no held change, no proposed business): the flows to-do is done.
-  if (!pendingOut.length && !store.flows(service).some((f) => f.status === "proposed" || f.pending)) d.todos?.close?.(service, `flows:${service}`);
+  if (!pendingOut.length && !store.flows(service).some((f) => f.status === "proposed" || f.pendings.length)) d.todos?.close?.(service, `flows:${service}`);
   return { verdict: held.length ? "needs-confirmation" : "published", revision, reasons, pending: pendingOut, todo };
 }
 
@@ -593,38 +594,49 @@ function orderSegments(store: Store, c: Ctx, flow: string, service: string, segs
   store.setFlowSegments(flow, order);
 }
 
-/** A person confirmed a business (FlowAction confirm): its held change is applied by publishing the current model
- *  with it, through the gate again; a business gone from the canvas is removed. */
+/** A person confirmed a business (FlowAction confirm): each held change on it (one per service) is applied by
+ *  publishing that service's current model with it, through the gate again; a business gone from the canvas is removed. */
 export async function confirmFlow(d: ModelDeps, flow: string, actor: Actor): Promise<{ result: PublishResult | null; removed: boolean }> {
   const { store } = d;
   const row = store.flow(flow);
   if (!row) throw new ModelError(400, "flow/unknown", `No business ${flow}.`);
   const at = (d.now?.() ?? new Date()).toISOString();
-  const confirmed = (r: FlowRecord): FlowRecord => ({ ...r, status: r.status === "gone" ? r.status : "confirmed", pending: null, confirmedAt: at, confirmedBy: actor.id });
-  const p = row.pending;
-  if (!p) {
+  const confirmed = (r: FlowRecord): FlowRecord => ({ ...r, status: r.status === "gone" ? r.status : "confirmed", pendings: [], confirmedAt: at, confirmedBy: actor.id });
+  if (!row.pendings.length) {
     if (row.status === "gone") return { result: null, removed: removeFlow(store, row, actor) };
     store.flowTransaction(() => { store.putFlow(confirmed(row)); store.addFlowChange({ flow, service: store.flowSegments(flow)[0]?.service ?? "-", by: actor.id, kind: "confirmed", text: "确认了这条业务", revision: null, verdict: null }); store.auditFlow(actor, flow, "confirm"); });
     return { result: null, removed: false };
   }
-  const current = store.flowModel(p.service);
-  const model = current?.model ?? { version: 2, service: p.service, sources: [], segments: [] };
-  const removedPlaces = new Set(model.segments.filter((s) => p.remove.includes(s.id) && s.group.id !== UNPLACED).map((s) => `${s.group.id}\0${s.slice}`));
-  const pend = (p.segments as Segment[]).filter((s) => !p.remove.includes(s.id) && !removedPlaces.has(`${s.group.id}\0${s.slice}`));
-  const ids = new Set(pend.map((s) => s.id));
-  const places = new Set(pend.filter((s) => s.group.id !== UNPLACED).map((s) => `${s.group.id}\0${s.slice}`));
-  const segments = [...model.segments.filter((s) => !p.remove.includes(s.id) && !ids.has(s.id) && !places.has(`${s.group.id}\0${s.slice}`)), ...pend];
-  const next: ModelDraft = { ...model, segments, flows: p.notes as FlowNote[] };
-  const result = await publishModel(d, { service: p.service, base: current?.revision ?? 0, model: next, note: `确认：${p.text}`, actor, confirm: true });
-  if (result.verdict === "rejected") return { result, removed: false };
+  let result: PublishResult | null = null;
+  for (const p of row.pendings) {
+    const current = store.flowModel(p.service);
+    const model = current?.model ?? { version: 2, service: p.service, sources: [], segments: [] };
+    const removedPlaces = new Set(model.segments.filter((s) => p.remove.includes(s.id) && s.group.id !== UNPLACED).map((s) => `${s.group.id}\0${s.slice}`));
+    const pend = (p.segments as Segment[]).filter((s) => !p.remove.includes(s.id) && !removedPlaces.has(`${s.group.id}\0${s.slice}`));
+    const ids = new Set(pend.map((s) => s.id));
+    const places = new Set(pend.filter((s) => s.group.id !== UNPLACED).map((s) => `${s.group.id}\0${s.slice}`));
+    const segments = [...model.segments.filter((s) => !p.remove.includes(s.id) && !ids.has(s.id) && !places.has(`${s.group.id}\0${s.slice}`)), ...pend];
+    const next: ModelDraft = { ...model, segments, flows: p.notes as FlowNote[] };
+    const r = await publishModel(d, { service: p.service, base: current?.revision ?? 0, model: next, note: `确认：${p.text}`, actor, confirm: true });
+    result = r;
+    // A change the gate now rejects stays waiting, and so do the ones after it: the person sees why and decides again.
+    if (r.verdict === "rejected") return { result: r, removed: false };
+    store.flowTransaction(() => {
+      for (const f of store.flows()) if (f.pendings.some((x) => x.id === p.id)) store.putFlow({ ...f, pendings: f.pendings.filter((x) => x.id !== p.id) });
+      store.addFlowChange({ flow: store.flow(flow) ? flow : null, service: p.service, by: actor.id, kind: "confirmed", text: `确认了变化：${p.text}`, revision: r.revision, verdict: r.verdict });
+    });
+  }
   store.flowTransaction(() => {
-    for (const f of store.flows()) if (f.pending?.id === p.id) store.putFlow({ ...f, pending: null });
     const after = store.flow(flow);
     if (after) store.putFlow(confirmed({ ...after, status: after.status === "gone" ? "confirmed" : after.status }));
-    store.addFlowChange({ flow, service: p.service, by: actor.id, kind: "confirmed", text: `确认了变化：${p.text}`, revision: result.revision, verdict: result.verdict });
     store.auditFlow(actor, flow, "confirm");
   });
   return { result, removed: !store.flow(flow) };
+}
+
+/** What a business's held changes show a person: the first one's kind, every service's text. */
+export function pendingView(ps: FlowPending[]): { kind: FlowPending["kind"]; text: string } | null {
+  return ps.length ? { kind: ps[0]!.kind, text: ps.map((p) => p.text).join("；") } : null;
 }
 
 /** A business gone from the canvas, confirmed: its segments leave the models' business index and the row goes; its

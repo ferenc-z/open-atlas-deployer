@@ -226,7 +226,7 @@ test("the to-do buttons: done or not needed (admin), Apply only from the page an
 test("steps 3b + 4 wired: describe shows the real business light; the service page shows service_todos", async () => {
   const t = setup();
   const flow = "flw_wired";
-  t.store.putFlow({ id: flow, name: "Invoices", nameBy: "person", status: "confirmed", summary: "in → out", reason: null, risks: [], pending: null, stuck: null, createdAt: "2026-11-19T09:00:00Z", confirmedAt: "2026-11-19T09:30:00Z", confirmedBy: "admin", updatedAt: "2026-11-19T09:30:00Z" } as never);
+  t.store.putFlow({ id: flow, name: "Invoices", nameBy: "person", status: "confirmed", summary: "in → out", reason: null, risks: [], pendings: [], stuck: null, createdAt: "2026-11-19T09:00:00Z", confirmedAt: "2026-11-19T09:30:00Z", confirmedBy: "admin", updatedAt: "2026-11-19T09:30:00Z" } as never);
   t.store.setFlowSegments(flow, [{ service: "n1", segment: "A" }]);
   t.store.noteFlowAnomaly({ flow, service: "n1", ref: "p-db", anomaly: "processor-error", light: "attention", at: new Date().toISOString(), count: 1, detail: { segment: "A", component: "p-db" } });
   const business = (await t.tool("dps_assistant", "describe", { service: "n1" })).value.business;
@@ -301,7 +301,7 @@ test("⑰ brief (b2f33fc): the skeleton's draft moves a segment into another bus
   const actor = { id: "assistant", via: "key" } as const;
   store.insertFlowModel("n1", 0, { version: 2, service: "n1", sources: [], segments: [seg("A", "flw_ab", ext("src"), { type: "local" }), seg("B", "flw_ab", ext("a"), ext("db")), seg("C", "flw_c", ext("src"), { type: "s2s", service: "n2", port: "rep" })] } as never, "ai", actor, [], topologyFingerprint(t1));
   store.insertFlowModel("n2", 0, { version: 2, service: "n2", sources: [], segments: [seg("R", "flw_r", { type: "s2s", port: "rep" }, ext("archive"))] } as never, "ai", actor, [], topologyFingerprint(t2));
-  const flow = (id: string, at: string) => store.putFlow({ id, name: id, nameBy: "ai", status: "confirmed", summary: "", reason: null, risks: [], pending: null, stuck: null, createdAt: at, confirmedAt: at, confirmedBy: "admin", updatedAt: at } as never);
+  const flow = (id: string, at: string) => store.putFlow({ id, name: id, nameBy: "ai", status: "confirmed", summary: "", reason: null, risks: [], pendings: [], stuck: null, createdAt: at, confirmedAt: at, confirmedBy: "admin", updatedAt: at } as never);
   flow("flw_ab", "2026-11-19T08:00:00Z"); flow("flw_c", "2026-11-19T09:00:00Z"); flow("flw_r", "2026-11-19T10:00:00Z");
   store.setFlowSegments("flw_ab", [{ service: "n1", segment: "A" }, { service: "n1", segment: "B" }]);
   store.setFlowSegments("flw_c", [{ service: "n1", segment: "C" }]);
@@ -310,7 +310,7 @@ test("⑰ brief (b2f33fc): the skeleton's draft moves a segment into another bus
   const join = await brief();
   assert.deepEqual([join.topology, join.rebuild], ["unchanged", true], JSON.stringify(join));
   assert.match(join.note, /^拓扑未变，但骨架要把 1 段并进另一条业务.*R → flw_c/);
-  store.putFlow({ ...store.flow("flw_c")!, pending: { id: "pnd_x", kind: "merge", text: "2 条业务合成一条", service: "n2", at: later(0), segments: [], remove: [], notes: [] } } as never);
+  store.putFlow({ ...store.flow("flw_c")!, pendings: [{ id: "pnd_x", kind: "merge", text: "2 条业务合成一条", service: "n2", at: later(0), segments: [], remove: [], notes: [] }] } as never);
   const held = await brief();
   assert.deepEqual([held.topology, held.rebuild], ["unchanged", false], "the join already waits for a person: no rebuild");
 });

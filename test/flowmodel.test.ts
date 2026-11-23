@@ -69,7 +69,7 @@ test("the skeleton as a draft; a first model is published with its businesses pr
   assert.deepEqual([got.verdict, got.revision, got.todo], ["needs-confirmation", 1, "td_1"]);
   assert.deepEqual(todos.map((t) => [t.source, t.key, t.action?.kind]), [["flows", "flows:n1", "confirm-flows"]]);
   const flows = store.flows("n1");
-  assert.deepEqual(flows.map((f) => [f.name, f.status, f.pending?.kind]), [["进货入库", "proposed", "new"], ["Reports", "proposed", "new"]]);
+  assert.deepEqual(flows.map((f) => [f.name, f.status, f.pendings[0]?.kind]), [["进货入库", "proposed", "new"], ["Reports", "proposed", "new"]]);
   assert.deepEqual(flows[0]!.stuck, { attentionS: 900, failingS: 5400, by: "ai", basis: "P95 约 6 分钟" }, "B4: the AI's two stuck times, kept on the business");
   assert.deepEqual(store.flowSegments(flows[0]!.id).map((s) => s.segment), ["A", "B"], "upstream first");
   assert.match(store.flowChanges({ flow: flows[0]!.id })[0]!.text, /Ingest → Load/);
@@ -87,9 +87,9 @@ test("A8: confirmed, then a change inside a business takes effect; the AI never 
   const f = flowOf(store, "n1", "A"), r = flowOf(store, "n1", "C");
   // One publish's held changes are one set: confirming one business applies it; the other is then confirmed as it is.
   assert.equal((await confirmFlow(deps, f, admin)).result?.verdict, "published");
-  assert.equal(store.flow(r)!.pending, null);
+  assert.deepEqual(store.flow(r)!.pendings, []);
   assert.equal((await confirmFlow(deps, r, admin)).result, null);
-  assert.deepEqual(store.flows("n1").map((x) => [x.status, x.pending, x.confirmedBy]), [["confirmed", null, "admin"], ["confirmed", null, "admin"]]);
+  assert.deepEqual(store.flows("n1").map((x) => [x.status, x.pendings, x.confirmedBy]), [["confirmed", [], "admin"], ["confirmed", [], "admin"]]);
   applyFlowAction(store, store.flow(r)!, { kind: "rename", name: "日报" }, admin);
   const m = store.flowModel("n1")!;
   const changed: ModelV2 & { flows?: unknown } = { ...m.model, segments: m.model.segments.map((s) => (s.id === "A" ? { ...s, steps: [...s.steps, { id: "unpack", name: "UnpackContent", position: { kind: "processor", id: "p-unpack" } }] } : s)) };
@@ -120,7 +120,7 @@ test("A8: a new group, a split and a group gone from the canvas wait for a perso
   assert.equal(result!.verdict, "published");
   const load = flowOf(store, "n1", "B");
   assert.notEqual(load, f);
-  assert.deepEqual([store.flowSegments(f).map((s) => s.segment), store.flowSegments(load).map((s) => s.segment), store.flow(f)!.pending], [["A"], ["B"], null]);
+  assert.deepEqual([store.flowSegments(f).map((s) => s.segment), store.flowSegments(load).map((s) => s.segment), store.flow(f)!.pendings], [["A"], ["B"], []]);
   // Merge (only replayed): Load back into Ingest's business.
   m = store.flowModel("n1")!;
   assert.ok(runModel(store, "n1", { ...m.model, segments: m.model.segments.map((s) => (s.id === "A" ? { ...s, flow: load } : s)) }, NOW).changes.some((c) => c.kind === "merge"));
@@ -468,6 +468,33 @@ test("owner 2026-11-23: an S2S fan-out to other services joins the downstream pa
   assert.ok(run.checks.every((x) => x.ok), JSON.stringify(run.checks));
   assert.deepEqual([run.verdict, run.changes.map((x) => [x.flow, x.kind])], ["needs-confirmation", [[f, "merge"]]]);
   assert.equal(draftFromSkeleton(store, "n112", NOW).segments.find((s) => s.group.id === "S")!.flow, f, "the upstream keeps its business");
+});
+
+test("UAT 2026-11-23: a fan-out's downstream services each hold their join on the upstream's business; one confirm applies both", async () => {
+  const { store, deps } = fanOut(false);
+  const d = draftFromSkeleton(store, "n112", NOW);
+  const model = { ...d, segments: d.segments.map((s) => ({ ...s, flow: s.role === "segment" ? `new:${s.group.id}` : s.flow, exits: s.exits.map((e) => ({ ...e, component: "p-send" })) })), flows: [] };
+  await publishModel(deps, { service: "n112", base: 0, model, note: "n112", actor: ai });
+  const f = flowOf(store, "n112", "S");
+  await confirmFlow(deps, f, admin);
+  await publishModel(deps, { service: "c250", base: 0, model: receiver("new:recv"), note: "c250", actor: ai });
+  const g = flowOf(store, "c250", "R");
+  await confirmFlow(deps, g, admin);
+  // Both downstream services publish their skeleton's draft; neither overwrites the other's held change.
+  for (const svc of ["c250", "n200"]) {
+    const draft = draftFromSkeleton(store, svc, NOW);
+    const got = await publishModel(deps, { service: svc, base: store.flowModel(svc)?.revision ?? 0, model: draft, note: svc, actor: ai });
+    assert.equal(got.verdict, "needs-confirmation", `${svc}: ${JSON.stringify(got.reasons)}`);
+  }
+  assert.deepEqual(store.flow(f)!.pendings.map((p) => p.service).sort(), ["c250", "n200"]);
+  // A service publishing again replaces only its own.
+  const again = draftFromSkeleton(store, "c250", NOW);
+  await publishModel(deps, { service: "c250", base: store.flowModel("c250")!.revision, model: again, note: "c250 again", actor: ai });
+  assert.deepEqual(store.flow(f)!.pendings.map((p) => p.service).sort(), ["c250", "n200"]);
+  assert.equal((await confirmFlow(deps, f, admin)).result!.verdict, "published");
+  assert.deepEqual(store.flow(f)!.pendings, []);
+  assert.deepEqual(store.flowSegments(f).map((s) => s.service).sort(), ["c250", "n112", "n200"]);
+  assert.ok(!store.flow(g), "the receiver's own business is taken in");
 });
 
 test("owner 2026-11-23: a fan-out to a part fed by several stays apart (the skeleton asks)", async () => {

@@ -1945,7 +1945,7 @@ export class Store {
         summary = excluded.summary, reason = excluded.reason, risks = excluded.risks, pending = excluded.pending, stuck_attention_s = excluded.stuck_attention_s,
         stuck_failing_s = excluded.stuck_failing_s, stuck_by = excluded.stuck_by, stuck_basis = excluded.stuck_basis, confirmed_at = excluded.confirmed_at,
         confirmed_by = excluded.confirmed_by, updated_at = excluded.updated_at`)
-      .run(f.id, f.name, f.nameBy, f.status, f.summary, f.reason, JSON.stringify(f.risks), f.pending ? JSON.stringify(f.pending) : null,
+      .run(f.id, f.name, f.nameBy, f.status, f.summary, f.reason, JSON.stringify(f.risks), f.pendings.length ? JSON.stringify(f.pendings) : null,
         f.stuck?.attentionS ?? null, f.stuck?.failingS ?? null, f.stuck?.by ?? null, f.stuck?.basis ?? null, f.createdAt, f.confirmedAt, f.confirmedBy, this.stamp());
   }
 
@@ -2156,19 +2156,23 @@ export interface FlowCountRow {
 /** §10.2.4 step 2: a stored v2 model revision. gate: the checks it was published with. */
 export interface StoredFlowModel { service: string; revision: number; model: ModelV2; source: "ai" | "e2e_trace" | "migrated"; publishedAt: string; publishedBy: string; gate: unknown; topologyFp?: string | null }
 const toFlowModel = (r: Row): StoredFlowModel => ({ service: r.service, revision: r.revision, model: JSON.parse(r.body), source: r.source, publishedAt: r.published_at, publishedBy: r.published_by, gate: parse(r.gate), topologyFp: r.topology_fp ?? null });
-/** A change the gate held for a person (A8): the draft's segments of this service it would apply, those it removes. */
+/** A change the gate held for a person (A8): the draft's segments of this service it would apply, those it removes.
+ *  A business holds at most one per service (several services can each wait on the same business, e.g. the downstream
+ *  sides of an S2S fan-out each proposing to join the upstream's business). */
 export interface FlowPending {
   id: string; kind: "new" | "gone" | "merge" | "split" | "cross-service"; text: string; service: string; at: string;
   segments: unknown[]; remove: string[]; notes: unknown[];
 }
 export interface FlowRecord {
   id: string; name: string; nameBy: "ai" | "person"; status: FlowStatus; summary: string; reason: string | null;
-  risks: { text: string; component?: string }[]; pending: FlowPending | null;
+  risks: { text: string; component?: string }[]; pendings: FlowPending[];
   stuck: { attentionS: number; failingS: number; by: "ai" | "person"; basis: string } | null;
   createdAt: string; confirmedAt: string | null; confirmedBy: string | null; updatedAt: string;
 }
+/** The pending column: a list (one per service), or one object as stored before it was a list. */
+const pendingsOf = (v: unknown): FlowPending[] => (Array.isArray(v) ? v : v ? [v as FlowPending] : []);
 const toFlow = (r: Row): FlowRecord => ({
-  id: r.id, name: r.name, nameBy: r.name_by, status: r.status, summary: r.summary, reason: r.reason ?? null, risks: parse(r.risks) ?? [], pending: parse(r.pending),
+  id: r.id, name: r.name, nameBy: r.name_by, status: r.status, summary: r.summary, reason: r.reason ?? null, risks: parse(r.risks) ?? [], pendings: pendingsOf(parse(r.pending)),
   stuck: r.stuck_attention_s && r.stuck_failing_s ? { attentionS: r.stuck_attention_s, failingS: r.stuck_failing_s, by: r.stuck_by ?? "ai", basis: r.stuck_basis ?? "" } : null,
   createdAt: r.created_at, confirmedAt: r.confirmed_at ?? null, confirmedBy: r.confirmed_by ?? null, updatedAt: r.updated_at,
 });

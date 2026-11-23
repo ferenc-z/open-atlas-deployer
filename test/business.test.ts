@@ -46,7 +46,7 @@ function world() {
     store.insertFlowModel("n1", 0, m1, "ai", { id: "ai", via: "key" }, []);
     store.insertFlowModel("c2", 0, m2, "ai", { id: "ai", via: "key" }, []);
   });
-  const f: FlowRecord = { id: FLOW, name: "Invoices", nameBy: "person", status: "confirmed", summary: "mail → db", reason: null, risks: [], pending: null, stuck: null, createdAt: "2026-11-19T09:00:00Z", confirmedAt: "2026-11-19T09:30:00Z", confirmedBy: "admin", updatedAt: "2026-11-19T09:30:00Z" };
+  const f: FlowRecord = { id: FLOW, name: "Invoices", nameBy: "person", status: "confirmed", summary: "mail → db", reason: null, risks: [], pendings: [], stuck: null, createdAt: "2026-11-19T09:00:00Z", confirmedAt: "2026-11-19T09:30:00Z", confirmedBy: "admin", updatedAt: "2026-11-19T09:30:00Z" };
   store.putFlow(f);
   store.setFlowSegments(FLOW, [{ service: "n1", segment: "A" }, { service: "c2", segment: "R" }]);
   const row = (service: string, bucket: string, kind: FlowCountRow["kind"], ref: string, fin: number, fout: number): FlowCountRow => ({ service, bucket, kind, ref, name: ref, flowfilesIn: fin, flowfilesOut: fout, bytesIn: 0, bytesOut: 0, transferred: 0, source: "sample" });

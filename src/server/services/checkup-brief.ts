@@ -84,7 +84,7 @@ export function modelState(store: Store, service: string, sk?: Skeleton): ModelS
     .filter((c) => (c.kind === "split-asked" || c.kind === "not-right") && c.at > m.publishedAt)
     .map((c) => ({ flow: c.flow, kind: c.kind, at: c.at, text: clip(c.text, 200) }));
   // A hand-over a publish of this service already holds for a person (pending) is waiting there, not stale.
-  const waiting = store.flows(service).flatMap((f) => (f.pending?.service === service ? f.pending.segments : []));
+  const waiting = store.flows().flatMap((f) => f.pendings.filter((p) => p.service === service).flatMap((p) => p.segments));
   const mine = { publishedAt: m.publishedAt, model: { segments: [...m.model.segments, ...waiting] } } as ModelLike;
   const handovers = staleHandovers(sk ?? skeletonOf(store, new Date()), service, mine, (s) => store.flowModel(s)?.publishedAt ?? null, (s) => (store.flowModel(s)?.model as ModelLike["model"] | undefined) ?? null);
   const rebuild = topology !== "unchanged" || feedback.length > 0 || handovers.length > 0;

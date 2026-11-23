@@ -396,7 +396,7 @@ export function businessLight(store: Store, service: string): BusinessLightView 
   const lights = rows.map((f) => flowLight(store, f, { collection, open }));
   lights.sort((a, b) => LIGHT_ORDER[a.light] - LIGHT_ORDER[b.light] || (a.flow.name < b.flow.name ? -1 : 1));
   const flows: FlowRow[] = lights.map((l) => ({ id: l.flow.id, name: l.flow.name, status: l.flow.status, light: l.light, sentence: l.sentence, services: l.services, anomalies: [...new Set(l.anomalies.map((a) => a.anomaly))] }));
-  const toConfirm = rows.filter((f) => f.status === "proposed" || f.status === "gone" || f.pending).length;
+  const toConfirm = rows.filter((f) => f.status === "proposed" || f.status === "gone" || f.pendings.length).length;
   const confirmed = rows.map((f) => f.confirmedAt).filter((x): x is string => !!x).sort().at(-1);
   const base = { flows, toConfirm, ...(confirmed ? { confirmedAt: confirmed } : {}) };
   // What waits for a person does not light the lamp; the sentence says so, so the lamp and the list do not seem to disagree.

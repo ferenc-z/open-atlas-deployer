@@ -4,7 +4,7 @@
 // second line is `detail`). Step 3 adds the lights and the drops (FlowDetail #8) through GraphExtras.
 
 import type { FlowRecord, Store } from "../store.ts";
-import { DEFAULT_STUCK } from "./flowmodel.ts";
+import { DEFAULT_STUCK, pendingView } from "./flowmodel.ts";
 import type { Endpoint2, FlowCard, FlowGraph, FlowsReview, FlowStatus, Light, StuckTimes } from "./ops-types.ts";
 import { skeletonOf, type Skeleton } from "./skeleton.ts";
 import { links } from "./trace/channels.ts";
@@ -138,7 +138,7 @@ export function flowCard(store: Store, f: FlowRecord, extras: GraphExtras = {}, 
     exits: ms.flatMap((m) => m.s.exits.filter((e) => outs.has(`ext:${nodeId(m.service, m.s.id)}:out:${e.id}`)).map((e) => endpoint2(m, "exit", e))),
     groups: ms.map((m) => ({ service: m.service, id: m.s.group.id, name: m.s.group.name })),
     reason: f.reason, risks: f.risks.map((r) => ({ text: r.text, component: r.component ?? null })), stuck: stuckOf(f),
-    pending: f.pending ? { kind: f.pending.kind, text: f.pending.text } : null,
+    pending: pendingView(f.pendings),
   };
 }
 

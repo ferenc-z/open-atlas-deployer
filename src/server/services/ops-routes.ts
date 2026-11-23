@@ -12,7 +12,7 @@ import type { ExecutorInfo } from "../handoff.ts";
 import { StoreError, type Actor, type FlowRecord, type Store } from "../store.ts";
 import { topologyFingerprint, type Topology } from "./flowcounts.ts";
 import { modelState, publishedFingerprint } from "./checkup-brief.ts";
-import { draftFromSkeleton, gateRejected, ModelError, publishModel, runModel, parseDraft, type ModelDeps } from "./flowmodel.ts";
+import { draftFromSkeleton, gateRejected, ModelError, pendingView, publishModel, runModel, parseDraft, type ModelDeps } from "./flowmodel.ts";
 import { clip, compactDeep, INLINE_BUDGET, inlineBytes } from "./look-summary.ts";
 import { applyChanges, CHANGE_OPS, draftLines } from "./model-changes.ts";
 import type { ModelDraft } from "./trace/model.ts";
@@ -59,7 +59,7 @@ export function businessStandIn(store: Store, service: string): BusinessLightVie
     id: f.id, name: f.name, status: f.status, light: "unknown", sentence: f.summary,
     services: [...new Set(store.flowSegments(f.id).map((s) => s.service))], anomalies: [],
   }));
-  const toConfirm = flows.filter((f) => f.status === "proposed" || f.pending).length;
+  const toConfirm = flows.filter((f) => f.status === "proposed" || f.pendings.length).length;
   const reason: UnknownReason = !flows.length ? "no-evidence" : flows.some((f) => gateRejected(store, f.id)) ? "gate-rejected" : toConfirm ? "unconfirmed" : "no-evidence";
   return { light: "unknown", reason, sentence: !flows.length ? "No business identified yet." : toConfirm ? `${toConfirm} of ${flows.length} businesses wait for a person to confirm them.` : `${flows.length} businesses.`, flows: rows, toConfirm };
 }
@@ -69,7 +69,7 @@ export function gapsOf(store: Store, service: string, flows: FlowRecord[], now: 
   const gaps: Gap[] = [];
   const m = store.flowModel(service);
   if (!m) gaps.push({ code: "no-model", text: "No business model yet: start from look kind model's draft, replay it, then publish it.", fix: { verb: "run_model", args: { service } } });
-  const proposed = flows.filter((f) => f.status === "proposed" || f.pending);
+  const proposed = flows.filter((f) => f.status === "proposed" || f.pendings.length);
   if (proposed.length) gaps.push({ code: "unconfirmed", text: `${proposed.length} businesses wait for a person (${proposed.slice(0, 5).map((f) => f.name).join(", ")}); a to-do points them to the flows page.`, fix: { verb: "record", args: { service, todos: [{ key: `flows:${service}`, severity: "attention", action: { kind: "confirm-flows", label: "Review flows" } }] } } });
   const rejected = flows.filter((f) => gateRejected(store, f.id));
   if (rejected.length) gaps.push({ code: "gate-rejected", text: `The last model change for ${rejected.map((f) => f.name).join(", ")} failed the replay check: their lights are unknown until a publish passes.`, fix: { verb: "publish_model", args: { service } } });
@@ -185,7 +185,7 @@ export function mountOps(api: Hono, d: OpsRouteDeps) {
     const curById = new Map((current?.segments ?? []).map((s) => [s.id, s]));
     const joins = draft.segments.filter((s) => {
       const c = curById.get(s.id);
-      return Boolean(c && s.flow && c.flow && s.flow !== c.flow && !d.store.flow(s.flow)?.pending && !d.store.flow(c.flow)?.pending);
+      return Boolean(c && s.flow && c.flow && s.flow !== c.flow && !d.store.flow(s.flow)?.pendings.length && !d.store.flow(c.flow)?.pendings.length);
     });
     const model = state && !state.rebuild && joins.length
       ? { ...state, rebuild: true, note: `拓扑未变，但骨架要把 ${joins.length} 段并进另一条业务: the skeleton's draft moves ${joins.map((s) => `${s.group.name} → ${s.flow}`).slice(0, 6).join("; ")} (an S2S hand-over joins the two businesses). Rebuild for these joins only (from: "skeleton", changes → run_model → publish_model); a join of confirmed businesses waits for a person.` }
@@ -276,7 +276,7 @@ export function mountOps(api: Hono, d: OpsRouteDeps) {
       current: m ? { revision: m.revision, publishedAt: m.publishedAt, publishedBy: m.publishedBy, source: m.source, model: m.model } : null,
       base: m?.revision ?? 0,
       draft: draftFromSkeleton(d.store, id, now()),
-      flows: d.store.flows(id).map((f) => ({ id: f.id, name: f.name, nameBy: f.nameBy, status: f.status, summary: f.summary, stuck: f.stuck, pending: f.pending ? { kind: f.pending.kind, text: f.pending.text } : null })),
+      flows: d.store.flows(id).map((f) => ({ id: f.id, name: f.name, nameBy: f.nameBy, status: f.status, summary: f.summary, stuck: f.stuck, pending: pendingView(f.pendings) })),
       e2e: await e2eSchedules(d.store, d.model, id),
     });
   });

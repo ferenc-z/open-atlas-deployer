@@ -212,7 +212,7 @@ test("HTTP #3, #4, #5: 202 running, 409 with the running one, 503 without the ag
 test("flows feedback: split and not-right start a flows-feedback analysis with what the person said", async () => {
   const t = setup();
   const flow = "flw_abc123";
-  t.store.putFlow({ id: flow, name: "发票入库", nameBy: "ai", status: "proposed", summary: "in → out", reason: null, risks: [], pending: null, stuck: null, createdAt: T0, confirmedAt: null, confirmedBy: null, updatedAt: T0 } as never);
+  t.store.putFlow({ id: flow, name: "发票入库", nameBy: "ai", status: "proposed", summary: "in → out", reason: null, risks: [], pendings: [], stuck: null, createdAt: T0, confirmedAt: null, confirmedBy: null, updatedAt: T0 } as never);
   t.store.setFlowSegments(flow, [{ service: "n112", segment: "A" }, { service: "c250", segment: "B" }]);
   const app = new Hono();
   mountFlows(app, {

@@ -29,6 +29,9 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   `DEPLOYER_OMA_CHECKUP_AGENT` at it; republish the Deploy Assistant for the new Skill version (`describe` / `look`
   answer summaries).
 - `DEPLOYER_CHECKUP_AUTO=off`: turns the automatic check-ups off (pauses the OMA schedule, no machine-red or user-visit starts); Check now and flows feedback still start one. Default on.
+- A business holds one change waiting for a person per service, not one in all: the downstream services of an S2S
+  fan-out no longer overwrite each other's join, a service's new publish replaces only its own, and confirming the
+  business applies each in turn (stops at the first the gate rejects). Old single rows are read as a list of one.
 
 - Engine test round 2 (2026-11-22/23): service executor 0.9.5 reports, for each S2S sending port, the components whose
   connections lead into it (`s2sOut[].sources`), and the skeleton's draft gives an S2S exit that component and
