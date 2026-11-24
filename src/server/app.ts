@@ -61,6 +61,8 @@ import { E2E_ID, E2eTraceSource } from "./services/trace/e2e-trace.ts";
 import { e2eImport, mountE2eTrace } from "./services/trace/e2e-routes.ts";
 import { mountFlows } from "./services/flow-routes.ts";
 import { mountAnalyses } from "./services/analysis-routes.ts";
+import { mountRegistrations } from "./services/registration-routes.ts";
+import { Registrations, type GroupReader } from "./services/registration.ts";
 import type { Analyses } from "./services/analyses.ts";
 import type { ModelDeps } from "./services/flowmodel.ts";
 import { McpClient } from "./mcp-client.ts";
@@ -128,6 +130,8 @@ export interface Dependencies {
   pageSources?: PageSources;
   /** Ops step 5 (A1): starting the AI's analyses (user-visit, Check now, flows feedback); none: the POSTs answer 503. */
   analyses?: Analyses;
+  /** S39 §7.4: reads groups now through the service executor (nifi-groups, step 1); none: registering answers register/executor-old. */
+  groupReader?: GroupReader;
 }
 
 const reject = (c: Context, status: 400 | 401 | 403 | 404 | 409 | 429 | 503, code: string, message: string, details: string[] = []) =>
@@ -1337,6 +1341,8 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     ...(deps.analyses ? { feedback: (f, services, kind, note, by) => deps.analyses!.feedback(f, services, kind, note, by) } : {}) });
   // §10.2.2 #3, #4, #5 (step 5): Look again now, Check now, following an analysis.
   mountAnalyses(api, { store, ...(deps.analyses ? { analyses: deps.analyses } : {}), authenticate, reject, registered: registeredService });
+  // S39 §7.5 (step 2): POST /api/registrations/<action>.
+  mountRegistrations(api, { registrations: new Registrations(store, deps.groupReader), authenticate, reject, actorOf });
   // §10.2 step 4: the routes behind the MCP verbs (describe, the model, record, look's extra kinds) and the to-do buttons.
   const ops = mountOps(api, {
     store, executor: (host) => handoff.executor(host, "service"), model: flowModelDeps, flowSearch: (id, q) => provenance.flowSearch(id, q),
