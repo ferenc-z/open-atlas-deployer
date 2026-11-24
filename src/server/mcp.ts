@@ -293,14 +293,14 @@ function lookCheck(a: Record<string, unknown>): string | null {
 
 /** ⑰ run_model / publish_model: the draft as a base and changes (model-changes.ts), or whole as the fallback. */
 const MODEL_INPUT: Record<string, Property> = {
-  from: s("skeleton (the skeleton's draft over the current model) or current (the published model): the base the changes apply to."),
+  from: s("current (the published model): the base the changes apply to. skeleton is gone (S39 step 7)."),
   changes: { type: "array", items: { type: "object" }, description: `The changes, in order, each {op, …}: ${CHANGE_HELP}.` },
   flows: { type: "array", items: { type: "object" }, description: "Optional with from: notes on businesses {flow, name?, summary?, reason?, risks?, stuck?, ignore?} (as the note change)." },
   model: { type: "object", description: "Fallback, instead of from and changes: the whole draft {version: 2, service, sources, segments, flows?} (look kind model with detail full)." },
 };
 function modelInputCheck(a: Record<string, unknown>): string | null {
   if (a.model !== undefined && (a.from !== undefined || a.changes !== undefined)) return "give from with changes, or model, not both";
-  if (a.model === undefined && a.from === undefined) return "give from (skeleton or current) with changes, or the whole model";
+  if (a.model === undefined && a.from === undefined) return "give from (current) with changes, or the whole model";
   if (a.from !== undefined && a.from !== "skeleton" && a.from !== "current") return "from is skeleton or current";
   return null;
 }
@@ -308,7 +308,7 @@ const modelBody = (a: Record<string, unknown>) => (a.model !== undefined ? { mod
 
 const VERBS: Tool[] = [
   { name: "describe", readOnly: true, access: { personal: "all", assistant: true, checkup: true },
-    description: "Start here. Without service: every managed service (NiFi) with its machine light and business light (failing, attention, healthy, unknown), a sentence each, the number of open to-dos and its gaps. With service: the machine light (six checks: process, disk, heap, certificate, coordinator, collection, with member and since), the business light and its businesses, the open to-dos, the newest AI analysis (stale: over an hour old or a light changed since), the business model (revision), whether provenance can be read, and gaps: what keeps the business picture from being right (no-model, unconfirmed, gate-rejected, topology-changed, no-exit, no-stuck-times, s2s-unpaired, no-counts), each with fix: the verb (and arguments) that fixes it. flow adds that business's detail. Short by default (to-do details and long texts clipped); detail \"full\" for all of it. brief: true gives the check-up's brief instead (one service, or every service without service): the two lights and why, the businesses, the open to-dos, the gaps, a topology summary, the model's state (whether the canvas changed since the published revision, people's feedback since, rebuild or not), the skeleton draft against the model and this check-up's run_model of the skeleton draft (verdict, the failing checks with what they name, the changes).",
+    description: "Start here. Without service: every managed service (NiFi) with its machine light and business light (failing, attention, healthy, unknown), a sentence each, the number of open to-dos and its gaps. With service: the machine light (six checks: process, disk, heap, certificate, coordinator, collection, with member and since), the business light and its businesses, the open to-dos, the newest AI analysis (stale: over an hour old or a light changed since), the business model (revision), whether provenance can be read, and gaps: what keeps the business picture from being right (no-model, unconfirmed, gate-rejected, topology-changed, no-exit, no-stuck-times, s2s-unpaired, no-counts, executor-old; with registration on, only registered businesses and shared modules are listed, and so are only their groups' gaps), each with fix: the verb (and arguments) that fixes it. flow adds that business's detail. Short by default (to-do details and long texts clipped); detail \"full\" for all of it. brief: true gives the check-up's brief instead (one service, or every service without service): the two lights and why, the businesses, the open to-dos, the gaps, a topology summary, the model's state (whether the registered groups changed on the canvas since the published revision). The check-up does not build the business model.",
     properties: { service: s("Optional: one service."), flow: s("Optional with service: one business (flw_…) of it."), brief: { type: "boolean", description: "Optional: the check-up brief (see above)." }, detail: s("Optional: full for the whole answer (to-dos' details and actions, long texts).") },
     request: (a) => ({ method: "GET", path: "/api/describe", query: { service: a.service, flow: a.flow, brief: a.brief ? "1" : undefined } }),
     shape: (body, a) => (a.brief ? fitInline(redactStrings(body)) : a.detail === "full" ? redactStrings(body) : fitInline(describeShape(redactStrings(body), a))) },

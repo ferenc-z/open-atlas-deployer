@@ -4,68 +4,27 @@
 // describe {brief: true} for the scheduled one (whose first message OMA keeps fixed). With it the agent records most
 // services without another describe or look, and looks only for what the brief does not say.
 //
-// The model's state (topology unchanged or not) is what lets a check-up skip rebuilding the business model: the
-// Deployer keeps the canvas' fingerprint (flowcounts.topologyFingerprint, structure only) with each published revision;
-// when the canvas still has it and no person gave feedback on a business since, the brief says so and the check-up only
-// looks at the machine and the businesses' health. The gate and the skeleton are not touched by any of this.
+// S39 step 7: the check-up no longer builds the business model (businesses are registered by their owners, not found by
+// the AI), so the brief carries no skeleton draft, no replay of one and no "rebuild or not". What it keeps of the model's
+// state is whether the canvas changed where something is registered since the revision was published: the Deployer has
+// opened a to-do for the owner then (registered.ts canvasChangeTodos); the check-up only says it in the analysis.
 //
-// A hand-over to another managed service is the exception (engine test 2026-11-23): a model published while the other
-// side had no model yet (or could not be seen) keeps such a hand-over as an external source or system, and the canvas
-// never changes to say otherwise. So the model is rebuilt too when the canvas has an S2S link with another service
-// (the skeleton's edges) that the model does not carry as S2S on that group (to that service and port), and that service
-// published a model after this one or its model already carries the hand-over as S2S on its side (an S2S link has two
-// ends, so the other model naming the port is what this one lacks, whichever was published last). Once the model
-// carries the link it is left alone; while neither holds, nothing new is known about the other side.
+// The canvas' fingerprint (flowcounts.topologyFingerprint, structure only) is kept with each published revision; with
+// the registration switch on, only the registered groups' part of the canvas is compared (registered.ts).
 
 import type { Store } from "../store.ts";
 import { topologyFingerprint, type Topology } from "./flowcounts.ts";
-import { clip } from "./look-summary.ts";
-import { skeletonOf, type Skeleton } from "./skeleton.ts";
+import { canvasChanges, registeredFingerprint, registeredGroupIds } from "./registered.ts";
+import { registeredGroupsOn } from "./watch.ts";
 
 export interface ModelState {
   revision: number; publishedAt: string;
-  /** unchanged: the canvas has the fingerprint it had when the revision was published; unknown: no snapshot then or now. */
+  /** unchanged: the canvas (the registered groups' part of it, with the switch on) has the structure it had when the revision was published; unknown: no snapshot then or now. */
   topology: "unchanged" | "changed" | "unknown";
   fingerprint: { published: string | null; now: string | null };
-  /** A person's feedback on a business of this service since the revision ("these are two flows", "not right"). */
-  feedback: { flow: string | null; kind: string; at: string; text: string | null }[];
-  /** S2S links with another managed service the canvas has and the model does not carry, that service's model being newer. */
-  handovers: StaleHandover[];
-  /** Whether this check-up should rebuild the business model (look kind model → run_model → publish_model). */
-  rebuild: boolean;
+  /** Switch on: the registered businesses and modules whose groups changed (a to-do for the owner is open). */
+  changed: { owner: string; name: string; groups: string[] }[];
   note: string;
-}
-
-export interface StaleHandover { peer: string; group: string; side: "in" | "out" }
-
-type ChannelLike = { type: string; service?: string; port?: string };
-interface ModelLike { publishedAt: string; model: { segments: { group: { id: string }; entries: { channel: ChannelLike }[]; exits: { channel: ChannelLike }[] }[] } }
-
-/** The canvas' S2S links between this service and another (sk.edges) that the published model does not carry as S2S on the
- *  group's side (an entry on that port for what comes in, an exit to that service and port for what goes out), counted
- *  when the other service published a model after this one or its model (peerModel) carries the link on its side. */
-export function staleHandovers(sk: Skeleton, service: string, m: ModelLike, peerPublishedAt: (service: string) => string | null, peerModel?: (service: string) => ModelLike["model"] | null): StaleHandover[] {
-  const segs = new Map([...sk.flows.flatMap((f) => f.segments), ...sk.shared].map((s) => [s.id, s]));
-  const out = new Map<string, StaleHandover>();
-  for (const e of sk.edges) {
-    if (e.kind !== "s2s") continue;
-    const a = segs.get(e.from), b = segs.get(e.to);
-    if (!a || !b || a.service === b.service) continue;
-    const pair = a.service === service ? { mine: a, peer: b, side: "out" as const } : b.service === service ? { mine: b, peer: a, side: "in" as const } : null;
-    if (!pair) continue;
-    // An S2S channel for this link: an entry names its port, an exit the receiving service and port.
-    const s2s = (c: ChannelLike | undefined, to: string, entry: boolean) => c?.type === "s2s" && (!e.port || !c.port || c.port === e.port) && (entry || !c.service || c.service === to);
-    const carries = (model: ModelLike["model"] | null | undefined, group: string, entry: boolean, to: string) =>
-      Boolean(model?.segments.some((s) => s.group.id === group && (entry ? s.entries : s.exits).some((x) => s2s(x.channel, to, entry))));
-    // Only a hand-over the model keeps as something else: a group the model leaves out is the AI's call, not stale.
-    if (!m.model.segments.some((s) => s.group.id === pair.mine.group.id)) continue;
-    if (carries(m.model, pair.mine.group.id, pair.side === "in", pair.peer.service)) continue;
-    const peerAt = peerPublishedAt(pair.peer.service);
-    const newer = Boolean(peerAt && peerAt > m.publishedAt);
-    if (!newer && !carries(peerModel?.(pair.peer.service), pair.peer.group.id, pair.side === "out", service)) continue;
-    out.set(`${pair.peer.service}\0${pair.mine.group.id}\0${pair.side}`, { peer: pair.peer.service, group: pair.mine.group.name, side: pair.side });
-  }
-  return [...out.values()];
 }
 
 /** The fingerprint the canvas had when revision m was published: kept with it, or (older rows) the snapshot then. */
@@ -74,28 +33,24 @@ export function publishedFingerprint(store: Store, service: string, m: { topolog
   return topologyFingerprint(store.latestTopology(service, m.publishedAt)?.body as Topology | undefined);
 }
 
-export function modelState(store: Store, service: string, sk?: Skeleton): ModelState | null {
+export function modelState(store: Store, service: string, on = registeredGroupsOn()): ModelState | null {
   const m = store.flowModel(service);
   if (!m) return null;
-  const published = publishedFingerprint(store, service, m);
-  const now = topologyFingerprint(store.latestTopology(service)?.body as Topology | undefined);
-  const topology = !published || !now ? "unknown" : published === now ? "unchanged" : "changed";
-  const feedback = store.flowChanges({ service, limit: 200 })
-    .filter((c) => (c.kind === "split-asked" || c.kind === "not-right") && c.at > m.publishedAt)
-    .map((c) => ({ flow: c.flow, kind: c.kind, at: c.at, text: clip(c.text, 200) }));
-  // A hand-over a publish of this service already holds for a person (pending) is waiting there, not stale.
-  const waiting = store.flows().flatMap((f) => f.pendings.filter((p) => p.service === service).flatMap((p) => p.segments));
-  const mine = { publishedAt: m.publishedAt, model: { segments: [...m.model.segments, ...waiting] } } as ModelLike;
-  const handovers = staleHandovers(sk ?? skeletonOf(store, new Date()), service, mine, (s) => store.flowModel(s)?.publishedAt ?? null, (s) => (store.flowModel(s)?.model as ModelLike["model"] | undefined) ?? null);
-  const rebuild = topology !== "unchanged" || feedback.length > 0 || handovers.length > 0;
-  const note = !rebuild
-    ? `拓扑未变，沿用已发布模型 r${m.revision}: the canvas has not changed since revision ${m.revision} and nobody gave feedback since. Do not rebuild the business model (no look kind model, run_model or publish_model for it); look at the machine and the businesses' health only.`
-    : topology === "unchanged" && !feedback.length
-      ? `拓扑未变，但跨服务交接要更新: the canvas has S2S links with ${[...new Set(handovers.map((h) => h.peer))].join(", ")} that revision ${m.revision} does not carry as S2S (${handovers.map((h) => `${h.group} ${h.side}`).join("; ")}), and that service published a model since or already carries them as S2S. Rebuild the model for these hand-overs only (from: "current", changes → run_model → publish_model).`
-    : feedback.length
-      ? `A person gave feedback on ${feedback.length} business(es) since revision ${m.revision}: rebuild the model for it (look kind model → run_model → publish_model).`
-      : topology === "changed"
-        ? `The canvas changed since revision ${m.revision} (fingerprint ${published} → ${now}): rebuild the model (look kind model → run_model → publish_model).`
-        : `Whether the canvas changed since revision ${m.revision} is not known (no canvas snapshot from then or now): check the model as the gaps say.`;
-  return { revision: m.revision, publishedAt: m.publishedAt, topology, fingerprint: { published, now }, feedback, handovers, rebuild, note };
+  let published: string | null, now: string | null;
+  if (on) {
+    const ids = registeredGroupIds(store, service);
+    published = registeredFingerprint(store.latestTopology(service, m.publishedAt)?.body as Topology | undefined, ids);
+    now = registeredFingerprint(store.latestTopology(service)?.body as Topology | undefined, ids);
+  } else {
+    published = publishedFingerprint(store, service, m);
+    now = topologyFingerprint(store.latestTopology(service)?.body as Topology | undefined);
+  }
+  const changed = on ? canvasChanges(store, service).map((c) => ({ owner: c.owner, name: c.name, groups: c.groups.map((g) => g.text) })) : [];
+  const topology = changed.length ? "changed" : !published || !now ? "unknown" : published === now ? "unchanged" : "changed";
+  const note = topology === "unchanged"
+    ? `拓扑未变，沿用已发布模型 r${m.revision}: the canvas has not changed since revision ${m.revision}. Do not build or publish a business model; look at the machine and the businesses' health only.`
+    : topology === "changed"
+      ? `The canvas changed since revision ${m.revision}${changed.length ? ` where something is registered (${changed.map((c) => c.name).slice(0, 5).join(", ")}); the Deployer opened a to-do for its owner to confirm` : ""}. Do not build or publish a business model: say it in the analysis and leave the to-do to the owner.`
+      : `Whether the canvas changed since revision ${m.revision} is not known (no canvas snapshot from then or now).`;
+  return { revision: m.revision, publishedAt: m.publishedAt, topology, fingerprint: { published, now }, changed, note };
 }

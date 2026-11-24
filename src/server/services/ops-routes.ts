@@ -12,7 +12,9 @@ import type { ExecutorInfo } from "../handoff.ts";
 import { StoreError, type Actor, type FlowRecord, type Store } from "../store.ts";
 import { topologyFingerprint, type Topology } from "./flowcounts.ts";
 import { modelState, publishedFingerprint } from "./checkup-brief.ts";
-import { draftFromSkeleton, gateRejected, ModelError, pendingView, publishModel, runModel, parseDraft, type ModelDeps } from "./flowmodel.ts";
+import { gateRejected, ModelError, pendingView, publishModel, runModel, parseDraft, type ModelDeps } from "./flowmodel.ts";
+import { canvasChanges, groupsExecutorOld, registeredGroupIds, registeredModules, restrictTopology, watchedFlows } from "./registered.ts";
+import { FLOW_GROUPS_KIND, registeredGroupsOn } from "./watch.ts";
 import { clip, compactDeep, INLINE_BUDGET, inlineBytes } from "./look-summary.ts";
 import { applyChanges, CHANGE_OPS, draftLines } from "./model-changes.ts";
 import type { ModelDraft } from "./trace/model.ts";
@@ -49,12 +51,12 @@ export interface OpsRouteDeps {
   now?: () => Date;
 }
 
-export type GapCode = "no-model" | "unconfirmed" | "gate-rejected" | "topology-changed" | "no-exit" | "no-stuck-times" | "s2s-unpaired" | "no-counts" | "e2e-unplaced" | "e2e-gone";
+export type GapCode = "executor-old" | "no-model" | "unconfirmed" | "gate-rejected" | "topology-changed" | "no-exit" | "no-stuck-times" | "s2s-unpaired" | "no-counts" | "e2e-unplaced" | "e2e-gone";
 export interface Gap { code: GapCode; text: string; fix: { verb: "publish_model" | "run_model" | "look" | "record"; args?: Record<string, unknown> } }
 
 /** The stand-in business light (before 3b): what is confirmed and what waits; the light is unknown, never guessed. */
 export function businessStandIn(store: Store, service: string): BusinessLightView {
-  const flows = store.flows(service).filter((f) => f.status !== "ignored");
+  const flows = watchedFlows(store, service).filter((f) => f.status !== "ignored");
   const rows: FlowRow[] = flows.map((f) => ({
     id: f.id, name: f.name, status: f.status, light: "unknown", sentence: f.summary,
     services: [...new Set(store.flowSegments(f.id).map((s) => s.service))], anomalies: [],
@@ -65,9 +67,13 @@ export function businessStandIn(store: Store, service: string): BusinessLightVie
 }
 
 /** describe's gaps: what keeps the business picture from being right, each with the verb that fixes it. */
-export function gapsOf(store: Store, service: string, flows: FlowRecord[], now: Date): Gap[] {
+export function gapsOf(store: Store, service: string, flows: FlowRecord[], now: Date, on = registeredGroupsOn()): Gap[] {
   const gaps: Gap[] = [];
   const m = store.flowModel(service);
+  // S39 step 7: with the registration switch on only what was registered counts; nothing registered on the service,
+  // nothing to be missing (an old executor is the one thing worth saying).
+  const mine = on ? registeredGroupIds(store, service) : null;
+  if (mine && !mine.size) return [];
   if (!m) gaps.push({ code: "no-model", text: "No business model yet: start from look kind model's draft, replay it, then publish it.", fix: { verb: "run_model", args: { service } } });
   const proposed = flows.filter((f) => f.status === "proposed" || f.pendings.length);
   if (proposed.length) gaps.push({ code: "unconfirmed", text: `${proposed.length} businesses wait for a person (${proposed.slice(0, 5).map((f) => f.name).join(", ")}); a to-do points them to the flows page.`, fix: { verb: "record", args: { service, todos: [{ key: `flows:${service}`, severity: "attention", action: { kind: "confirm-flows", label: "Review flows" } }] } } });
@@ -75,15 +81,18 @@ export function gapsOf(store: Store, service: string, flows: FlowRecord[], now: 
   if (rejected.length) gaps.push({ code: "gate-rejected", text: `The last model change for ${rejected.map((f) => f.name).join(", ")} failed the replay check: their lights are unknown until a publish passes.`, fix: { verb: "publish_model", args: { service } } });
   const topo = store.latestTopology(service);
   // ⑰: a newer snapshot whose structure is the one the revision was published on (another walk order, say) is no change.
-  const fpWas = m ? publishedFingerprint(store, service, m) : null, fpNow = topo ? topologyFingerprint(topo.body as Topology) : null;
-  if (m && topo && topo.takenAt > m.publishedAt && !(fpWas && fpNow && fpWas === fpNow)) gaps.push({ code: "topology-changed", text: `The canvas changed at ${topo.takenAt}, after model revision ${m.revision} (${m.publishedAt}).`, fix: { verb: "look", args: { service, kind: "topology" } } });
-  const noExit = (m?.model.segments ?? []).filter((s) => s.role !== "shared" && (!s.exits?.length || s.exits.some((e) => !e.component || e.component === UNPLACED)));
+  // Switch on: the canvas changed only where a registered group is (registered.ts canvasChanges says which; it is a to-do for the owner).
+  const changed = on ? canvasChanges(store, service) : null;
+  const fpWas = m && !on ? publishedFingerprint(store, service, m) : null, fpNow = topo && !on ? topologyFingerprint(topo.body as Topology) : null;
+  if (changed ? changed.length : m && topo && topo.takenAt > m.publishedAt && !(fpWas && fpNow && fpWas === fpNow)) gaps.push({ code: "topology-changed", text: changed ? `Registered groups changed on the canvas since model revision ${m!.revision}: ${changed.map((c) => `${c.name} (${c.groups.map((g) => g.name).join(", ")})`).slice(0, 6).join("; ")}. The owner is asked to confirm (a to-do).` : `The canvas changed at ${topo!.takenAt}, after model revision ${m!.revision} (${m!.publishedAt}).`, fix: { verb: "look", args: { service, kind: "topology" } } });
+  const noExit = (m?.model.segments ?? []).filter((s) => (!mine || (s.flow && flows.some((f) => f.id === s.flow))) && s.role !== "shared" && (!s.exits?.length || s.exits.some((e) => !e.component || e.component === UNPLACED)));
   if (noExit.length) gaps.push({ code: "no-exit", text: `Segments without a placed exit: ${noExit.slice(0, 8).map((s) => s.id).join(", ")} (a drop outside the exits counts as data dropped).`, fix: { verb: "publish_model", args: { service } } });
   const noStuck = flows.filter((f) => f.status !== "ignored" && !f.stuck);
   if (noStuck.length) gaps.push({ code: "no-stuck-times", text: `No stuck times for ${noStuck.slice(0, 8).map((f) => f.name).join(", ")}: the defaults (10 / 60 minutes) are used.`, fix: { verb: "record", args: { service, analysis: { stuckSuggestions: noStuck.slice(0, 8).map((f) => ({ flow: f.id })) } } } });
-  const unpaired = skeletonOf(store, now, [service]).questions.filter((q) => q.service === service && (q.kind === "s2s-unpaired" || q.kind === "s2s-name-only"));
+  const unpaired = skeletonOf(store, now, [service]).questions.filter((q) => q.service === service && (q.kind === "s2s-unpaired" || q.kind === "s2s-name-only") && (!mine || mine.has(q.group)));
   if (unpaired.length) gaps.push({ code: "s2s-unpaired", text: unpaired.slice(0, 5).map((q) => q.text).join(" "), fix: { verb: "look", args: { service, kind: "topology" } } });
   if (!store.hasFlowCounts(service)) gaps.push({ code: "no-counts", text: "No flow counts collected yet: the replay and the idle check have nothing to go on.", fix: { verb: "look", args: { service, kind: "flow-counts" } } });
+  if (groupsExecutorOld(store, service, on)) gaps.unshift({ code: "executor-old", text: `The service executor of ${service} does not read registered groups (its heartbeat does not name ${FLOW_GROUPS_KIND}): it reads the whole canvas and the registered businesses are not watched alone. Upgrade it to 0.9.7 or later first.`, fix: { verb: "look", args: { service, kind: "members" } } });
   return gaps;
 }
 
@@ -143,7 +152,7 @@ export function mountOps(api: Hono, d: OpsRouteDeps) {
     const s = serviceStatus(d.store, d.executor, id, at)!;
     const machine = machineLight(d.store, d.executor, id, at)!;
     const biz = business(id, at);
-    const flows = d.store.flows(id);
+    const flows = watchedFlows(d.store, id);
     const m = d.store.flowModel(id);
     const support = provenanceSupport(s.version);
     const f = flow ? d.store.flow(flow) : null;
@@ -155,69 +164,37 @@ export function mountOps(api: Hono, d: OpsRouteDeps) {
       model: m ? { revision: m.revision, publishedAt: m.publishedAt, sources: m.model.sources } : null,
       provenance: support.supported ? { supported: true } : { supported: false, reason: support.note },
       gaps: gapsOf(d.store, id, flows, at),
+      // S39 step 7: the shared modules registered on this service (their own health is the modules page's).
+      ...(registeredGroupsOn() ? { modules: registeredModules(d.store, id) } : {}),
     };
   };
 
-  /** ⑰ the check-up's brief of one service (checkup-brief.ts): what describe and the first looks would have given, short. */
+  /** ⑰ the check-up's brief of one service (checkup-brief.ts): what describe and the first looks would have given, short.
+   *  S39 step 7: no skeleton draft and no replay of one (the check-up does not build the model), only what is registered. */
   const briefOne = async (id: string, at: Date) => {
+    const on = registeredGroupsOn();
+    // The e2e gaps ask for model placing, which the registration does now; the check-up does not do it.
     const one = describeOne(id, undefined, at);
-    const gaps = [...one.gaps, ...e2eGaps(id, await e2eSchedules(d.store, d.model, id))];
+    const gaps = on ? one.gaps : [...one.gaps, ...e2eGaps(id, await e2eSchedules(d.store, d.model, id))];
     const t = d.store.latestTopology(id);
-    const topo = (t?.body as Topology | undefined) ?? null;
-    const sk = skeletonOf(d.store, at, [id]);
-    const mine = { flows: sk.flows.filter((f) => f.segments.some((s) => s.service === id)), shared: sk.shared.filter((s) => s.service === id), empty: sk.empty.filter((e) => e.service === id), questions: sk.questions.filter((q) => q.service === id) };
-    const pieces = mine.flows.filter((f) => f.exceptions.length || f.reason).map((f) => ({ key: f.key, exceptions: f.exceptions, ...(f.reason ? { reason: f.reason } : {}) }));
-    const state = modelState(d.store, id);
-    const current = d.store.flowModel(id)?.model ?? null;
-    // The skeleton draft against the current model, and this check-up's replay of it (the gate's own words).
-    const draft = draftFromSkeleton(d.store, id, at);
-    const curIds = new Set((current?.segments ?? []).map((s) => s.id));
-    const added = draft.segments.filter((s) => !curIds.has(s.id)).map((s) => ({ id: s.id, flow: s.flow ?? null, group: s.group.name, slice: s.slice, role: s.role, exits: s.exits.length }));
-    let run: Record<string, unknown>;
-    let failed: { check: string; text: string }[] = [];
-    try {
-      const r = runModel(d.store, id, parseDraft(d.store, id, draft).model, at);
-      failed = r.checks.filter((x) => !x.ok).map((x) => ({ check: x.check, text: x.text }));
-      run = { verdict: r.verdict, failed, regressions: r.regressions, changes: compactDeep(r.changes, 200, 15), window: r.window };
-    } catch (e) { run = { error: (e as Error).message, ...(e instanceof ModelError ? { details: e.details.slice(0, 8) } : {}) }; }
-    // A segment the skeleton's draft moves into another business (the two sides of an S2S hand-over join one, whichever
-    // went first), where neither business waits for a person already: the canvas did not change, but the model should.
-    const curById = new Map((current?.segments ?? []).map((s) => [s.id, s]));
-    const joins = draft.segments.filter((s) => {
-      const c = curById.get(s.id);
-      return Boolean(c && s.flow && c.flow && s.flow !== c.flow && !d.store.flow(s.flow)?.pendings.length && !d.store.flow(c.flow)?.pendings.length);
-    });
-    const model = state && !state.rebuild && joins.length
-      ? { ...state, rebuild: true, note: `拓扑未变，但骨架要把 ${joins.length} 段并进另一条业务: the skeleton's draft moves ${joins.map((s) => `${s.group.name} → ${s.flow}`).slice(0, 6).join("; ")} (an S2S hand-over joins the two businesses). Rebuild for these joins only (from: "skeleton", changes → run_model → publish_model); a join of confirmed businesses waits for a person.` }
-      : state;
-    const rebuild = !model || model.rebuild;
-    const e2e = gaps.filter((g) => g.code === "e2e-unplaced" || g.code === "e2e-gone");
+    const raw = (t?.body as Topology | undefined) ?? null;
+    const topo = raw && on ? restrictTopology(raw, registeredGroupIds(d.store, id)) : raw;
+    const model = modelState(d.store, id, on);
     const out = compactDeep({
       service: one.service,
       machine: { light: one.machine.light, sentence: one.machine.sentence, asOf: one.machine.asOf, notHealthy: one.machine.checks.filter((x) => x.light !== "healthy"), members: one.machine.members },
       business: { light: one.business.light, ...(one.business.reason ? { reason: one.business.reason } : {}), sentence: one.business.sentence, toConfirm: one.business.toConfirm, flows: one.business.flows.map((f) => ({ id: f.id, name: f.name, status: f.status, light: f.light, sentence: f.sentence, ...(f.anomalies.length ? { anomalies: f.anomalies } : {}) })) },
+      ...(on ? { modules: (one as { modules?: unknown }).modules ?? [] } : {}),
       todos: one.todos.map((x) => ({ id: x.id, flow: x.flow, severity: x.severity, title: x.title, detail: clip(x.detail, 160), ...(x.action ? { action: x.action.kind } : {}) })),
       analysis: one.analysis ? { id: one.analysis.id, trigger: one.analysis.trigger, state: one.analysis.state, startedAt: one.analysis.startedAt, stale: one.analysis.stale, summary: clip(one.analysis.summary, 300), error: one.analysis.error } : null,
       provenance: one.provenance,
-      model: model ?? { revision: 0, rebuild: true, note: "No business model yet: build it (look kind model → run_model → publish_model)." },
+      model: model ?? { revision: 0, note: on ? "没有登记业务，没有业务模型。Nothing is registered on this service: there is no business to look at." : "No business model yet." },
       topology: topo ? {
         takenAt: t!.takenAt, fingerprint: topologyFingerprint(topo),
         counts: { units: topo.groups.length, links: topo.links.length, s2sIn: topo.s2sIn.length, s2sOut: topo.s2sOut.length, ends: (topo.ends ?? []).length },
-        // The skeleton's questions and its pieces' reasons only matter when the model is rebuilt (the S2S ones are gaps
-        // anyway); which unit is in which proposed business is the draft's lines below.
-        ...(rebuild ? { questions: mine.questions, ...(pieces.length ? { pieces } : {}), ...(mine.empty.length ? { empty: mine.empty.map((e) => e.group.name) } : {}) } : {}),
       } : null,
-      skeletonDraft: rebuild
-        ? { segments: draft.segments.length, sameAsModel: draft.segments.length - added.length, lines: draftLines(draft).lines.map((l) => (curIds.has(l.id) ? l : { ...l, new: true })), newBusinesses: draft.flows ?? [], run }
-        : { segments: draft.segments.length, sameAsModel: draft.segments.length - added.length, added, run },
-      next: rebuild
-        ? "Rebuild: skeletonDraft has the skeleton's draft in a line per segment and this check-up's run_model of it. Write only the changes it needs: run_model {from: \"skeleton\", changes}, then publish_model with the same from and changes. look kind model only for what the lines do not show."
-        : `Do not rebuild the model.${e2e.length ? ` Only the e2e gaps (${e2e.map((g) => g.code).join(", ")}) are model work this time.` : ""} Record from this brief; look only for what it does not say (a check that is not healthy, a business with anomalies).`,
+      next: "Record from this brief; look only for what it does not say (a check that is not healthy, a business with anomalies). Do not build or publish a business model: businesses are registered by their owners; a registered group that changed on the canvas is a to-do the Deployer opened for its owner (say it in the analysis).",
     }, 300, 25) as Record<string, any>;
-    // The gate's words stay whole: which check failed on which segment, port or business.
-    if (failed.length) out.skeletonDraft.run.failed = failed;
-    // Every segment's line (changes name them), not the first 25.
-    if (rebuild) out.skeletonDraft.lines = draftLines(draft).lines.map((l) => (curIds.has(l.id) ? l : { ...l, new: true }));
     out.gaps = gaps.map((g) => ({ code: g.code, text: clip(g.text, 800) }));
     return out;
   };
@@ -228,7 +205,7 @@ export function mountOps(api: Hono, d: OpsRouteDeps) {
     for (const id of ids) out.push(await briefOne(id, at));
     if (inlineBytes({ services: out }) <= INLINE_BUDGET) return { services: out };
     return {
-      services: out.map((b) => ({ service: b.service, machine: { light: b.machine?.light, sentence: b.machine?.sentence }, business: { light: b.business?.light, sentence: b.business?.sentence }, rebuild: b.model?.rebuild, todos: b.todos?.length ?? 0, gaps: (b.gaps ?? []).map((g: { code: string }) => g.code) })),
+      services: out.map((b) => ({ service: b.service, machine: { light: b.machine?.light, sentence: b.machine?.sentence }, business: { light: b.business?.light, sentence: b.business?.sentence }, canvas: b.model?.topology, todos: b.todos?.length ?? 0, gaps: (b.gaps ?? []).map((g: { code: string }) => g.code) })),
       next: "The briefs together are too big for one answer: call describe {service, brief: true} for each service, one at a time.",
     };
   };
@@ -246,9 +223,9 @@ export function mountOps(api: Hono, d: OpsRouteDeps) {
     }
     if (service) {
       if (!d.registered(service)) return unknown(c, service);
-      if (flow && !d.store.flowSegments(flow).some((x) => x.service === service)) return d.reject(c, 404, "flow/unknown", `No business ${flow} in ${service}.`);
+      if (flow && (!d.store.flowSegments(flow).some((x) => x.service === service) || !watchedFlows(d.store, service).some((x) => x.id === flow))) return d.reject(c, 404, "flow/unknown", `No business ${flow} in ${service}.`);
       const one = describeOne(service, flow, at);
-      const more = e2eGaps(service, await e2eSchedules(d.store, d.model, service));
+      const more = registeredGroupsOn() ? [] : e2eGaps(service, await e2eSchedules(d.store, d.model, service));
       return c.json(more.length ? { ...one, gaps: [...one.gaps, ...more] } : one);
     }
     if (flow) return d.reject(c, 400, "describe/flow-needs-service", "Give service with flow.");
@@ -275,8 +252,7 @@ export function mountOps(api: Hono, d: OpsRouteDeps) {
     return c.json({
       current: m ? { revision: m.revision, publishedAt: m.publishedAt, publishedBy: m.publishedBy, source: m.source, model: m.model } : null,
       base: m?.revision ?? 0,
-      draft: draftFromSkeleton(d.store, id, now()),
-      flows: d.store.flows(id).map((f) => ({ id: f.id, name: f.name, nameBy: f.nameBy, status: f.status, summary: f.summary, stuck: f.stuck, pending: pendingView(f.pendings) })),
+      flows: watchedFlows(d.store, id).map((f) => ({ id: f.id, name: f.name, nameBy: f.nameBy, status: f.status, summary: f.summary, stuck: f.stuck, pending: pendingView(f.pendings) })),
       e2e: await e2eSchedules(d.store, d.model, id),
     });
   });
@@ -289,9 +265,12 @@ export function mountOps(api: Hono, d: OpsRouteDeps) {
     if (!d.registered(id)) return unknown(c, id);
     const t = d.store.latestTopology(id);
     const sk = skeletonOf(d.store, now(), [id]);
+    // Switch on: only the registered groups are the service's canvas as far as monitoring goes (S39 step 7).
+    const only = registeredGroupsOn() ? registeredGroupIds(d.store, id) : null;
+    const mine = (g: string) => !only || only.has(g);
     return c.json({
-      takenAt: t?.takenAt ?? null, topology: (t?.body as Topology | undefined) ?? null,
-      skeleton: { flows: sk.flows.filter((f) => f.segments.some((s) => s.service === id)), shared: sk.shared.filter((s) => s.service === id), empty: sk.empty.filter((e) => e.service === id), questions: sk.questions.filter((q) => q.service === id) },
+      takenAt: t?.takenAt ?? null, topology: t && only ? restrictTopology(t.body as Topology, only) : (t?.body as Topology | undefined) ?? null,
+      skeleton: { flows: sk.flows.filter((f) => f.segments.some((s) => s.service === id && mine(s.group.id))), shared: sk.shared.filter((s) => s.service === id && mine(s.group.id)), empty: sk.empty.filter((e) => e.service === id && mine(e.group.id)), questions: sk.questions.filter((q) => q.service === id && mine(q.group)) },
     });
   });
 
@@ -339,14 +318,11 @@ export function mountOps(api: Hono, d: OpsRouteDeps) {
   const draftOf = (id: string, b: Record<string, unknown>, at: Date): { model: unknown; built: boolean } => {
     if (b.from === undefined && b.changes === undefined) return { model: b.model, built: false };
     if (b.model !== undefined) throw new ModelError(400, "flow-model/both", "Give model (the whole draft) or from with changes, not both.");
-    if (b.from !== "skeleton" && b.from !== "current") throw new ModelError(400, "flow-model/from", "from is skeleton (the skeleton's draft over the current model) or current (the published model).");
-    let base: ModelDraft;
-    if (b.from === "skeleton") base = draftFromSkeleton(d.store, id, at);
-    else {
-      const m = d.store.flowModel(id);
-      if (!m) throw new ModelError(400, "flow-model/no-current", `${id} has no published model yet: start from skeleton.`);
-      base = { ...m.model, flows: [] };
-    }
+    if (b.from === "skeleton") throw new ModelError(400, "flow-model/from", "from skeleton is gone (S39 step 7): businesses are registered by their owners (register), not found from the whole canvas. from is current (the published model).");
+    if (b.from !== "current") throw new ModelError(400, "flow-model/from", "from is current (the published model).");
+    const m = d.store.flowModel(id);
+    if (!m) throw new ModelError(400, "flow-model/no-current", `${id} has no published model yet: register a business first.`);
+    const base: ModelDraft = { ...m.model, flows: [] };
     const flows = b.flows === undefined ? [] : Array.isArray(b.flows) ? b.flows.map((f) => ({ ...(f as object), op: "note" })) : null;
     if (!flows) throw new ModelError(400, "flow-model/flows", "flows is a list of business notes {flow, name?, …}.");
     const got = applyChanges(base, [...(Array.isArray(b.changes) ? b.changes : b.changes === undefined ? [] : [b.changes]), ...flows]);

@@ -11,6 +11,7 @@ import { redactStrings } from "./redact.ts";
 import type { ConfigFileRecord, ConfigMember, ServiceConfigBody } from "./config.ts";
 import { parseProperties } from "./configview.ts";
 import { installKey } from "./draft.ts";
+import { watchedFlows } from "./registered.ts";
 
 export const ANALYSIS_TRIGGERS: readonly AnalysisTrigger[] = ["schedule", "machine-red", "user-visit", "check-now", "flows-feedback"];
 export const ANOMALIES: readonly Anomaly[] = ["processing-failed", "invalid-data", "stuck", "handover-lost", "processor-error", "data-dropped", "e2e-failed"];
