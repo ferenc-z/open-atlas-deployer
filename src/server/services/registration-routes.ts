@@ -4,7 +4,9 @@
 // changes the name only. With `draft` (§7.9) add, remove, rename, declare-handoff, place-worker and preview change the
 // draft only (preview keeps its result there), and commit makes the draft a business. Drafts: POST /api/registrations/drafts makes one, GET /api/registrations/drafts/<id> reads it;
 // GET /api/registrations/modules lists the shared modules. Anyone who can sign in to the Deployer may call it (a
-// person's key, the session, the Assistant's key); the check-up's key cannot write, it only reads.
+// person's key, the session, the Assistant's key); the check-up's key cannot write, it only reads. Step 6: a draft
+// may copy a registered business (drafts with flow), and its commit applies the changes; the Assistant's key changes
+// drafts only and never commits or unregisters (register/person-only, 403): a person does that on the page.
 
 import type { Context, Hono } from "hono";
 import type { Permission, Principal } from "../auth.ts";
@@ -31,7 +33,16 @@ const ACTIONS = new Set([...WRITES, "preview", "shared"]);
 /** What a draft takes (commit makes it a business). */
 const DRAFTABLE = new Set(["add", "remove", "rename", "declare-handoff", "preview", "place-worker", "commit"]);
 
-const draftBody = (d: RegistrationDraft) => ({ draft: d.id, createdBy: d.createdBy, name: d.name, groups: d.groups, handoffs: d.handoffs, places: d.places, preview: d.preview, createdAt: d.createdAt, updatedAt: d.updatedAt });
+/** §7.9 (step 6): the Assistant's key changes drafts only; a person commits them on the page (a draft of a business's
+ *  changes too), and unregisters. shared with commit stays open to it: the owner agrees in the conversation first. */
+const isAssistant = (p: Principal) => p.via === "service" && p.keyKind !== "checkup";
+function personOnly(action: string, drafted: boolean): RegError | null {
+  if (action === "commit" || action === "unregister") return new RegError("register/person-only", `register ${action} is done by a person on the page${action === "commit" ? " (Register / confirm the changes)" : " (Unregister on the business's page)"}: tell the owner it is ready, do not do it.`);
+  if (WRITES.has(action) && !drafted) return new RegError("register/person-only", `Change a registered business through a draft: make one with action draft and flow, change the draft (${action} with draft), and the owner confirms it on the page.`);
+  return null;
+}
+
+const draftBody = (d: RegistrationDraft) => ({ draft: d.id, flow: d.flow, createdBy: d.createdBy, name: d.name, groups: d.groups, handoffs: d.handoffs, places: d.places, preview: d.preview, createdAt: d.createdAt, updatedAt: d.updatedAt });
 
 export function mountRegistrations(api: Hono, d: RegistrationRouteDeps) {
   // Before /:action, which would take "drafts" for an action.
@@ -41,7 +52,7 @@ export function mountRegistrations(api: Hono, d: RegistrationRouteDeps) {
     if (p.keyKind === "checkup") return d.reject(c, 403, "auth/forbidden", "The check-up's key only reads: it cannot register businesses.");
     const raw = await c.req.json().catch(() => ({}));
     const b = (raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {}) as Record<string, unknown>;
-    try { return c.json(draftBody(d.registrations.createDraft(d.actorOf(p), b.name))); } catch (error) {
+    try { return c.json(draftBody(d.registrations.createDraft(d.actorOf(p), b.name, b.flow))); } catch (error) {
       if (error instanceof RegError) return fail(c, error);
       throw error;
     }
@@ -84,6 +95,8 @@ export function mountRegistrations(api: Hono, d: RegistrationRouteDeps) {
     const drafted = b.draft !== undefined;
     if (drafted && b.flow !== undefined) return fail(c, new RegError("register/bad-request", "Give draft or flow, not both: a draft is changed apart from a registered business."));
     if (drafted && !DRAFTABLE.has(action)) return fail(c, new RegError("register/bad-request", `register ${action} takes no draft.`));
+    const refused = isAssistant(p) ? personOnly(action, drafted) : null;
+    if (refused) return fail(c, refused);
     const needsId = WRITES.has(action) || (action === "shared" && b.commit === true);
     if (needsId && (typeof b.request_id !== "string" || !b.request_id.trim() || b.request_id.length > 200)) return fail(c, new RegError("register/bad-request", "request_id is required: any string unique to this command."));
     const actor = d.actorOf(p);

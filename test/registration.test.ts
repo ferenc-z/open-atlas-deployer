@@ -315,13 +315,16 @@ test("route: who may call, request_id on writes, the actions of this step and th
   assert.equal(add.status, 200, JSON.stringify(add.body));
   assert.deepEqual([add.body.added.map((a: { service: string }) => a.service), add.body.published, add.body.revisions], [["n1"], true, [{ service: "n1", revision: 1 }]]);
   // Step 5: a group nothing joins to the rest opens a gap; told how the data goes over, it is added.
-  const gap = await t.post("add", { flow: "flw_aaaaaa", links: [l2(G3)], request_id: "r2b" }, "dps_assistant");
+  // Step 6: the Assistant changes a registered business only through a draft; a person does it directly.
+  const bot = await t.post("add", { flow: "flw_aaaaaa", links: [l2(G3)], request_id: "r2a" }, "dps_assistant");
+  assert.deepEqual([bot.status, bot.body.error], [403, "register/person-only"]);
+  const gap = await t.post("add", { flow: "flw_aaaaaa", links: [l2(G3)], request_id: "r2b" }, "dpk_viewer");
   assert.deepEqual([gap.status, gap.body.error, gap.body.gaps.map((g: { kind: string }) => g.kind)], [409, "register/gaps-open", ["disconnected"]]);
-  const told = await t.post("add", { flow: "flw_aaaaaa", links: [l2(G3)], handoffs: [{ from: { service: "n1", group: G1, component: "p" }, to: { service: "c2", group: G3 }, quote: "收单写到 /in，对账从那里取" }], request_id: "r3" }, "dps_assistant");
+  const told = await t.post("add", { flow: "flw_aaaaaa", links: [l2(G3)], handoffs: [{ from: { service: "n1", group: G1, component: "p" }, to: { service: "c2", group: G3 }, quote: "收单写到 /in，对账从那里取" }], request_id: "r3" }, "dpk_viewer");
   assert.equal(told.status, 200, JSON.stringify(told.body));
   assert.deepEqual(told.body.revisions.map((r: { service: string }) => r.service).sort(), ["c2", "n1"], "both services publish at once");
   t.store.putFlow(flow("flw_bbbbbb", "对账"));
-  const dup = await t.post("add", { flow: "flw_bbbbbb", links: [l1(G1)], request_id: "r4" }, "dps_assistant");
+  const dup = await t.post("add", { flow: "flw_bbbbbb", links: [l1(G1)], request_id: "r4" }, "dpk_viewer");
   assert.deepEqual([dup.status, dup.body.error, dup.body.taken[0].by.name, dup.body.options.length], [409, "register/group-taken", "订单入库", 2]);
   const root = await t.post("add", { flow: "flw_bbbbbb", links: ["https://h-a1:8443/nifi/#/process-groups/root"], request_id: "r5" }, "dpk_viewer");
   assert.deepEqual([root.status, root.body.error], [400, "register/root-group"]);

@@ -26,9 +26,9 @@ export type RegisterCode =
   | "register/bad-request" | "register/bad-link" | "register/root-group" | "register/unknown-address" | "register/ambiguous-address"
   | "register/group-missing" | "register/executor-old" | "register/executor-offline" | "register/group-taken" | "register/not-found"
   | "register/empty" | "register/not-implemented" | "register/bad-handoff" | "register/port-missing" | "register/module-in-use"
-  | "register/gaps-open" | "register/gate-rejected";
-const STATUS: Record<RegisterCode, 400 | 404 | 409 | 501 | 503> = {
-  "register/bad-request": 400, "register/bad-handoff": 400, "register/bad-link": 400, "register/root-group": 400, "register/unknown-address": 400, "register/ambiguous-address": 400,
+  | "register/gaps-open" | "register/gate-rejected" | "register/person-only";
+const STATUS: Record<RegisterCode, 400 | 403 | 404 | 409 | 501 | 503> = {
+  "register/person-only": 403, "register/bad-request": 400, "register/bad-handoff": 400, "register/bad-link": 400, "register/root-group": 400, "register/unknown-address": 400, "register/ambiguous-address": 400,
   "register/group-missing": 404, "register/not-found": 404, "register/port-missing": 404, "register/group-taken": 409, "register/empty": 409, "register/module-in-use": 409,
   "register/gaps-open": 409, "register/gate-rejected": 409,
   "register/executor-old": 503, "register/executor-offline": 503, "register/not-implemented": 501,
@@ -36,7 +36,7 @@ const STATUS: Record<RegisterCode, 400 | 404 | 409 | 501 | 503> = {
 
 export class RegError extends Error {
   readonly code: RegisterCode;
-  readonly status: 400 | 404 | 409 | 501 | 503;
+  readonly status: 400 | 403 | 404 | 409 | 501 | 503;
   /** More of the answer than the message (the services to choose from, who has the group...). */
   readonly extra: Record<string, unknown>;
   constructor(code: RegisterCode, message: string, extra: Record<string, unknown> = {}) {
@@ -339,9 +339,16 @@ export class Registrations {
 
   // --- drafts (§7.9): the same actions on a draft; nothing is registered, nothing is published ---------------------
 
-  createDraft(actor: Actor, name?: unknown): RegistrationDraft {
+  /** A new draft, empty or (flow, step 6) a copy of a registered business: its groups, told hand-overs, worker places and
+   *  name. Changes to a business go through such a draft, so a person confirms them on the page (commit, §7.9). */
+  createDraft(actor: Actor, name?: unknown, flowId?: unknown): RegistrationDraft {
     if (name !== undefined && name !== null) this.checkName(name);
-    return this.store.createRegistrationDraft(actor.id, name === undefined || name === null ? null : String(name).trim());
+    const given = name === undefined || name === null ? null : String(name).trim();
+    if (flowId === undefined || flowId === null) return this.store.createRegistrationDraft(actor.id, given);
+    const flow = this.flowOf(flowId);
+    const groups: RegistrationDraftGroup[] = this.store.flowRegistrations({ owner: flow.id }).filter((r) => r.role === "segment")
+      .map((r) => ({ service: r.service, group: { id: r.groupId, name: r.groupName, path: r.groupPath ?? "" }, link: r.link, addedBy: r.registeredBy, addedAt: r.registeredAt }));
+    return this.store.createRegistrationDraft(actor.id, given ?? flow.name, { flow: flow.id, groups, handoffs: this.store.flowHandoffs(flow.id), places: this.store.workerPlaces(flow.id) });
   }
 
   draft(id: unknown): RegistrationDraft {
@@ -353,7 +360,8 @@ export class Registrations {
 
   async draftAdd(id: unknown, links: unknown, actor: Actor): Promise<{ draft: string; added: RegisteredGroup[]; unchanged: RegisteredGroup[] }> {
     const d = this.draft(id);
-    const { added, unchanged } = await this.stage(links, d.id, d.groups);
+    // A draft of a business's changes owns what the business has registered too.
+    const { added, unchanged } = await this.stage(links, d.flow ?? d.id, d.groups);
     const at = new Date().toISOString();
     const fresh = this.draft(d.id);
     this.store.putRegistrationDraft({ ...fresh, groups: [...fresh.groups, ...added.map((a): RegistrationDraftGroup => ({ service: a.service, group: a.group, link: a.link, addedBy: actor.id, addedAt: at }))] });
@@ -500,6 +508,40 @@ export class Registrations {
     this.log(flow, "place-worker", actor, () => place ? `schedule ${schedule} 的 worker ${worker} ${place.group ? `在组"${plan.groupName}"` : "不在 NiFi 上"}（负责人说："${place.quote}"）` : `去掉了 schedule ${schedule} 的 worker ${worker} 的位置`,
       [place?.service ?? had?.service ?? "-"].filter((s) => s !== "-" || !revisions?.size), revisions);
     this.store.auditFlow(actor, flow, "register-place-worker");
+  }
+
+  /** Writes what a draft of a business's changes (step 6) changes: the groups added (staged) and gone, the told hand-overs
+   *  and worker places kept, replaced or gone, the name. With the publish's revisions; call inside flowTransaction. */
+  applyDraft(d: RegistrationDraft, added: RegisteredGroup[], actor: Actor, revisions: Map<string, number>, oldName: string, name: string) {
+    const flow = d.flow!;
+    if (added.length) this.addStaged(flow, added, actor, "add-group", revisions);
+    const keep = new Set(d.groups.map((g) => `${g.service}\0${g.group.id}`));
+    const gone = this.store.flowRegistrations({ owner: flow }).filter((r) => r.role === "segment" && !keep.has(`${r.service}\0${r.groupId}`)).map((r) => ({ service: r.service, group: r.groupId }));
+    const removed = gone.length ? this.remove(flow, gone, actor, revisions).removed : [];
+    const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+    const told: string[] = [], untold: string[] = [];
+    const nowTold = this.store.flowHandoffs(flow);
+    for (const h of nowTold) if (!d.handoffs.some((x) => x.id === h.id)) { this.writeHandoff(flow, { removed: h.id }, actor, revisions); untold.push(h.id); }
+    for (const h of d.handoffs) {
+      const was = nowTold.find((x) => x.id === h.id);
+      if (!was || !same([was.from, was.to, was.quote], [h.from, h.to, h.quote])) { this.writeHandoff(flow, { handoff: h }, actor, revisions); told.push(h.id); }
+    }
+    const key = (p: WorkerPlace) => `${p.schedule}\0${p.worker.toLowerCase()}`;
+    const nowPlaced = this.store.workerPlaces(flow);
+    let placed = 0;
+    for (const p of nowPlaced) if (!d.places.some((x) => key(x) === key(p))) { this.writeWorkerPlace({ flow, schedule: p.schedule, worker: p.worker, place: null, had: p, groupName: "" }, actor, revisions); placed++; }
+    for (const p of d.places) {
+      const had = nowPlaced.find((x) => key(x) === key(p)) ?? null;
+      if (had && same([had.service, had.group, had.quote], [p.service, p.group, p.quote])) continue;
+      const groupName = d.groups.find((g) => g.service === p.service && g.group.id === p.group)?.group.name ?? "";
+      this.writeWorkerPlace({ flow, schedule: p.schedule, worker: p.worker, place: p, had, groupName }, actor, revisions);
+      placed++;
+    }
+    if (name !== oldName) {
+      this.log(flow, "rename", actor, () => `改名为"${name}"（原名"${oldName}"）`, [...new Set(d.groups.map((g) => g.service))]);
+      this.store.auditFlow(actor, flow, "register-rename");
+    }
+    return { added, removed, handoffs: { told, removed: untold }, places: placed, renamed: name !== oldName };
   }
 
   private checkName(name: unknown): string {

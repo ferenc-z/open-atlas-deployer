@@ -204,7 +204,7 @@ export class RegisterChain {
       if (b.links !== undefined) throw new RegError("register/bad-request", "A draft is previewed with its own groups: add links with register add and the draft.");
       if (!d.groups.length) throw new RegError("register/empty", "The draft has no group yet: add a link first.");
       const p = await this.chainOf(d.groups.map((g) => ({ service: g.service, group: g.group.id, link: g.link })),
-        { name: (b.name as string | undefined) ?? d.name ?? "", handoffs: [...d.handoffs.map(toChain), ...told], placements: d.places });
+        { name: (b.name as string | undefined) ?? d.name ?? "", ...(d.flow ? { flow: d.flow } : {}), handoffs: [...d.handoffs.map(toChain), ...told], placements: d.places });
       store.putRegistrationDraft({ ...this.d.registrations.draft(d.id), preview: p });
       return p;
     }

@@ -64,10 +64,27 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   paths (skeleton draft, `publish_model`'s gate, describe's gaps, the business graph drawing `port:` / `link:` as
   outside, the runtime hand-over check on a partial first hour) are not adapted yet (steps 7–9); turning it on is step 9.
 
+- S39 step 6: the eighth MCP verb `register` (people and the Deploy Assistant; not the check-up's key) passes every
+  registration action through: `draft` (new, or `flow` for a copy of a registered business), `show`, `preview`, `add`,
+  `remove`, `rename`, `declare-handoff`, `place-worker`, `shared`, `modules`, `commit`, `unregister`. A refusal keeps the
+  route's details for the AI (`gaps`, `preview`, `problems`, `taken`, `candidates`…). The Assistant's key changes drafts
+  only: `commit`, `unregister` and a registered business's changes without a draft answer `register/person-only` (403);
+  a person presses Register / confirms on the page. `POST /api/registrations/drafts` takes `flow`: the draft starts as
+  that business (groups, told hand-overs, worker places, name; `registration_drafts.flow`, new column), and its `commit`
+  applies the difference as one change (chained, refused only for gaps it opens, gated, published; one history line per
+  kind). `publish_model` is no longer the Assistant's (internal; whether it leaves MCP is step 7). The Assistant's
+  prompt and the Skill `nifi-ops` describe the registration conversation instead of the business model.
+
 - Skills follow the Agent Skills layout OMA reads: `agents/skills/<name>/SKILL.md` (a folder named as the Skill, the
   frontmatter `name` the same), so the folder zips straight into OMA's Skill upload. `bin/publish-assistant.ts` reads
   the folders (a loose `*.md` there is an error); the Skill's text is unchanged, so no new Skill version and nothing to
   republish. `bin/check-oma-notes.sh` does not count a file moved without a change of text.
+
+### After upgrading
+
+- [ ] OMA: republish the Deploy Assistant (`agents/deploy-assistant.md`, allowed_tools: `register` in, `publish_model`
+  out) and the Skill `nifi-ops` (the registration conversation; the business-model section is gone), then point
+  `DEPLOYER_OMA_AGENT` and the Workbench Business Agent "Deploy Assistant" at the new agent.
 
 ## 0.3.0-rc.15
 

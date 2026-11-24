@@ -9,7 +9,7 @@
 // channel (port:<id> / link:<id>) on both sides, so the trace follows the data across (trace/channels.ts).
 
 import { randomBytes } from "node:crypto";
-import { newFlowId, type Actor, type FlowRecord, type RegistrationDraftHandoff, type Store, type WorkerPlace } from "../store.ts";
+import { newFlowId, type Actor, type FlowRecord, type RegistrationDraft, type RegistrationDraftHandoff, type Store, type WorkerPlace } from "../store.ts";
 import type { ChainHandoff, ChainModule, ChainModuleEndpoint, Preview, PreviewGap, PreviewSegment } from "./chain.ts";
 import { topologyFingerprint, type Topology } from "./flowcounts.ts";
 import { segIdOf } from "./flowmodel.ts";
@@ -266,6 +266,7 @@ export class RegisterPublisher {
     if (b.draft !== undefined) {
       if (b.links !== undefined) throw new RegError("register/bad-request", "A draft is committed with its own groups: add links to the draft first.");
       const d = reg.draft(b.draft);
+      if (d.flow) return this.commitChanges(d, b, actor);
       draft = d.id;
       name = nameOf(b.name ?? d.name);
       if (!d.groups.length) throw new RegError("register/empty", "The draft has no group yet: add a link first.");
@@ -293,6 +294,35 @@ export class RegisterPublisher {
       if (draft) this.store.deleteRegistrationDraft(draft);
     });
     return { flow, name, revisions, verdict: "published" as const, preview, gate: gate.checks, ...(draft ? { draft } : {}) };
+  }
+
+  /** commit of a draft of a business's changes (step 6, §7.9): the business becomes what the draft says (groups, told
+   *  hand-overs, worker places, name), chained, gated and published as one change; only gaps it opens refuse it. */
+  private async commitChanges(d: RegistrationDraft, b: Record<string, unknown>, actor: Actor) {
+    const reg = this.d.registrations;
+    const flow = reg.flowOf(d.flow);
+    const name = nameOf(b.name ?? d.name ?? flow.name);
+    if (!d.groups.length) throw new RegError("register/empty", "The draft has no group left: unregister the business instead.");
+    const before = this.stateOf(flow.id);
+    const k = (service: string, group: string) => `${service}\0${group}`;
+    const had = new Map(before.groups.map((g) => [k(g.service, g.group), g]));
+    const asks = d.groups.filter((g) => !had.has(k(g.service, g.group.id)) && g.link).map((g) => ({ link: g.link!, service: g.service }));
+    // Somebody may have registered one of the new groups since it went into the draft.
+    const added = asks.length ? (await reg.stage(asks, flow.id, [])).added : [];
+    const state: FlowState = { groups: d.groups.map((g) => ({ service: g.service, group: g.group.id, slice: had.get(k(g.service, g.group.id))?.slice, link: g.link })), handoffs: d.handoffs, places: d.places };
+    const sameAs = JSON.stringify([state.groups.map((g) => k(g.service, g.group)).sort(), d.handoffs, d.places]) === JSON.stringify([[...had.keys()].sort(), before.handoffs, before.places]);
+    if (sameAs && name === flow.name) {
+      this.store.deleteRegistrationDraft(d.id);
+      return { flow: flow.id, name, revisions: [], published: false, gate: [] as GateResult["checks"], draft: d.id, unchanged: true };
+    }
+    const preview = await this.chain(flow.id, name, state);
+    await this.newGaps(flow.id, name, preview, () => this.chain(flow.id, flow.name, before));
+    let out!: ReturnType<Registrations["applyDraft"]>;
+    const { revisions, gate } = this.publish({ op: opId(), actor, builds: [{ flow: flow.id, name, preview, handoffs: d.handoffs.map(toChain) }], regs: new Map([[flow.id, this.regRows(flow.id, preview)]]), own: [flow.id] }, (rev) => {
+      out = reg.applyDraft(d, added, actor, rev, flow.name, name);
+      this.store.deleteRegistrationDraft(d.id);
+    });
+    return { flow: flow.id, name, ...out, revisions, verdict: "published" as const, published: true, preview, gate: gate.checks, draft: d.id };
   }
 
   /** add (§7.5): groups join a registered business; told hand-overs may come with them (handoffs, as in preview). */

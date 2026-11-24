@@ -90,7 +90,7 @@ test("three kinds of key: what each sees; the 22 old service tools are gone", as
   const viewer = await t.names("dpk_viewer"), admin = await t.names("dpk_admin"), assistant = await t.names("dps_assistant"), checkup = await t.names("dpc_checkup");
   assert.deepEqual(VERBS.filter((v) => viewer.includes(v)), ["describe", "look", "trace", "run_model", "draft_change"], "a viewer's key: no publish_model, no record");
   assert.deepEqual(VERBS.filter((v) => admin.includes(v)), VERBS);
-  assert.deepEqual(VERBS.filter((v) => assistant.includes(v)), VERBS, "P4, P5: the Assistant publishes the model and saves to-dos");
+  assert.deepEqual(VERBS.filter((v) => assistant.includes(v)), VERBS.filter((v) => v !== "publish_model"), "P5: the Assistant saves to-dos; publish_model is internal (S39 step 6)");
   assert.ok(assistant.includes("plan_deploy") && !assistant.includes("deploy"));
   assert.deepEqual(checkup.sort(), VERBS.filter((v) => v !== "draft_change").sort(), "the check-up: the verbs without draft_change, nothing else");
   for (const list of [viewer, admin, assistant, checkup]) for (const old of OLD) assert.ok(!list.includes(old), old);
@@ -141,7 +141,7 @@ test("run_model and publish_model: the gate's verdicts, the to-do it opens, a st
   assert.equal((await t.tool("dpc_checkup", "run_model", { service: "n1", model: { version: 1 } })).value.finding.code, "flow-model/invalid");
   assert.equal(t.store.flowModel("n1"), null, "run_model saves nothing");
 
-  const got = (await t.tool("dps_assistant", "publish_model", { service: "n1", base: 0, model: draft, note: "first" })).value;
+  const got = (await t.tool("dpk_admin", "publish_model", { service: "n1", base: 0, model: draft, note: "first" })).value;
   assert.deepEqual([got.verdict, got.revision], ["needs-confirmation", 1]);
   assert.match(got.todo, /^td_/);
   const todo = t.store.todo(got.todo)!;

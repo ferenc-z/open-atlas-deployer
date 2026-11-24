@@ -39,7 +39,8 @@ for (const [agent, template, tier, extra] of [
 
 test("the Assistant and the check-up have the seven verbs (the check-up without draft_change); the old service tools are gone", () => {
   const verbs = ["describe", "look", "trace", "run_model", "publish_model", "record", "draft_change"];
-  assert.deepEqual(verbs.filter((v) => allowed("deploy-assistant.oma.json").has(v)), verbs);
+  const assistant = [...verbs.filter((v) => v !== "publish_model"), "register"];
+  assert.deepEqual(assistant.filter((v) => allowed("deploy-assistant.oma.json").has(v)), assistant, "S39 step 6: register, publish_model internal");
   assert.deepEqual([...allowed("service-checkup.oma.json")].sort(), verbs.filter((v) => v !== "draft_change").sort());
   for (const old of ["list_service_clusters", "get_cluster_status", "get_service_health", "trace_business_data", "draft_service_config"]) assert.ok(!allTools.has(old), old);
 });

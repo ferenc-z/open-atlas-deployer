@@ -1773,7 +1773,7 @@ test("/mcp: tools are the page's calls; a service key sees only the read-only on
   const init = await mcp(t, service, "initialize", { protocolVersion: "2025-03-26" });
   assert.equal(init.body.result.serverInfo.name, "open-atlas-deployer");
   const serviceTools = (await mcp(t, service, "tools/list")).body.result.tools as { name: string; annotations: { readOnlyHint: boolean } }[];
-  assert.ok(serviceTools.every((x) => x.annotations.readOnlyHint || /draft_/.test(x.name) || ["publish_model", "record"].includes(x.name)), "read-only tools, draft tools, and the business model and to-dos (P4, P5)");
+  assert.ok(serviceTools.every((x) => x.annotations.readOnlyHint || /draft_/.test(x.name) || ["register", "record"].includes(x.name)), "read-only tools, draft tools, registration drafts and to-dos (P4, P5, S39 step 6)");
   assert.ok(serviceTools.some((x) => x.name === "plan_deploy") && !serviceTools.some((x) => x.name === "deploy"));
   const personalTools = (await mcp(t, personal, "tools/list")).body.result.tools as { name: string }[];
   assert.ok(personalTools.some((x) => x.name === "deploy"));

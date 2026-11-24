@@ -434,7 +434,10 @@ export class Store {
     {
       const have = (this.db.prepare("PRAGMA table_info(shared_modules)").all() as Row[]).map((c) => c.name);
       for (const column of ["entries", "exits"]) if (!have.includes(column)) this.db.exec(`ALTER TABLE shared_modules ADD COLUMN ${column} TEXT`);
-      if (!(this.db.prepare("PRAGMA table_info(registration_drafts)").all() as Row[]).some((c) => c.name === "places")) this.db.exec("ALTER TABLE registration_drafts ADD COLUMN places TEXT");
+      const draftCols = (this.db.prepare("PRAGMA table_info(registration_drafts)").all() as Row[]).map((c) => c.name);
+      if (!draftCols.includes("places")) this.db.exec("ALTER TABLE registration_drafts ADD COLUMN places TEXT");
+      // S39 step 6 (§7.9): a draft of changes to a registered business (its id); NULL for a new business.
+      if (!draftCols.includes("flow")) this.db.exec("ALTER TABLE registration_drafts ADD COLUMN flow TEXT");
       // S39 step 5 (§7.7 8): the rows one registration action writes over several services share an op.
       if (!(this.db.prepare("PRAGMA table_info(flow_changes)").all() as Row[]).some((c) => c.name === "op")) this.db.exec("ALTER TABLE flow_changes ADD COLUMN op TEXT");
     }
@@ -2060,17 +2063,20 @@ export class Store {
   // S39 (§7.9): registration drafts. A draft not touched for REGISTRATION_DRAFT_TTL_MS does not exist (read as gone at once,
   // deleted by pruneRegistrationDrafts).
 
-  createRegistrationDraft(by: string, name: string | null = null): RegistrationDraft {
+  /** A new draft; from (S39 step 6) starts it as a copy of a registered business, whose changes its commit applies. */
+  createRegistrationDraft(by: string, name: string | null = null, from?: { flow: string; groups: RegistrationDraftGroup[]; handoffs: RegistrationDraftHandoff[]; places: WorkerPlace[] }): RegistrationDraft {
     const id = `rgd_${randomBytes(6).toString("hex")}`;
     const at = this.stamp();
-    this.db.prepare("INSERT INTO registration_drafts (id, created_by, name, groups, handoffs, preview, created_at, updated_at) VALUES (?, ?, ?, '[]', '[]', NULL, ?, ?)").run(id, by, name, at, at);
-    return { id, createdBy: by, name, groups: [], handoffs: [], preview: null, places: [], createdAt: at, updatedAt: at };
+    const groups = from?.groups ?? [], handoffs = from?.handoffs ?? [], places = from?.places ?? [];
+    this.db.prepare("INSERT INTO registration_drafts (id, created_by, name, groups, handoffs, preview, places, flow, created_at, updated_at) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)")
+      .run(id, by, name, JSON.stringify(groups), JSON.stringify(handoffs), JSON.stringify(places), from?.flow ?? null, at, at);
+    return { id, createdBy: by, name, groups, handoffs, preview: null, places, flow: from?.flow ?? null, createdAt: at, updatedAt: at };
   }
 
   registrationDraft(id: string): RegistrationDraft | null {
     const r = this.db.prepare("SELECT * FROM registration_drafts WHERE id = ? AND updated_at >= ?").get(id, new Date(this.now().getTime() - REGISTRATION_DRAFT_TTL_MS).toISOString()) as Row | undefined;
     return r ? { id: r.id, createdBy: r.created_by, name: r.name ?? null, groups: JSON.parse(r.groups), handoffs: JSON.parse(r.handoffs), preview: r.preview === null ? null : JSON.parse(r.preview),
-      places: r.places ? JSON.parse(r.places) : [], createdAt: r.created_at, updatedAt: r.updated_at } : null;
+      places: r.places ? JSON.parse(r.places) : [], flow: r.flow ?? null, createdAt: r.created_at, updatedAt: r.updated_at } : null;
   }
 
   /** Saves a draft's name, groups and hand-overs, its worker places and the last preview when given (preview null clears
@@ -2375,6 +2381,8 @@ export interface RegistrationDraft {
   preview: unknown | null; createdAt: string; updatedAt: string;
   /** S39 step 4: the draft's worker places (worker_places' shape). */
   places: WorkerPlace[];
+  /** S39 step 6: the registered business this draft changes (its commit applies the difference); null for a new one. */
+  flow: string | null;
 }
 /** S39 step 4 (§7.8 6): one worker placed by the owner; service/group null = not in NiFi. */
 export interface WorkerPlace { schedule: string; worker: string; service: string | null; group: string | null; quote: string; placedBy: string; placedAt: string }
