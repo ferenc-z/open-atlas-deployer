@@ -102,9 +102,9 @@ function plainPage(card: ServiceCard): ServicePage {
   };
 }
 
-/** Worst first (the worse of the two lights), then by id: what the server does for GET /api/services/overview. */
+/** Worst machine light first (S39: the card is the machine's), then by id: what the server does for GET /api/services/overview. */
 export function sortCards(list: ServiceCard[]): ServiceCard[] {
-  const worst = (c: ServiceCard) => Math.min(LIGHT_ORDER[c.machine.light], LIGHT_ORDER[c.business.light]);
+  const worst = (c: ServiceCard) => LIGHT_ORDER[c.machine.light];
   return [...list].sort((a, b) => worst(a) - worst(b) || a.id.localeCompare(b.id));
 }
 

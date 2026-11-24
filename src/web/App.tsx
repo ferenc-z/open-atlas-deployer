@@ -17,11 +17,12 @@ import { NeedsYou, Platform, usePlatform } from "./Platform.tsx";
 import { SettingsPage } from "./Settings.tsx";
 import { SetupPage } from "./Setup.tsx";
 import { ask } from "./Confirm.tsx";
-import { FlowsPage } from "./FlowsPage.tsx";
+import { BusinessesPage } from "./BusinessesPage.tsx";
+import { RegisterPage } from "./RegisterPage.tsx";
 import { FlowDetailPage } from "./FlowDetailPage.tsx";
-import { flowHref, parseFlowRoute, type FlowRoute } from "./flow-routes.ts";
+import { parseFlowRoute, type FlowRoute } from "./flow-routes.ts";
 
-type Tab = "setup" | "status" | "history" | "hosts" | "settings" | "env" | "registry" | "onboarding" | "ingress" | "keys" | "audit" | "services" | "takeover" | "flows" | "flow";
+type Tab = "setup" | "status" | "history" | "hosts" | "settings" | "env" | "registry" | "onboarding" | "ingress" | "keys" | "audit" | "services" | "takeover" | "businesses" | "register" | "flow";
 type Panel = { kind: "deploy"; app: string; initial?: { version: string; pinFrom?: string } } | { kind: "job"; id: string } | undefined;
 
 const VERDICT: Record<string, { label: string; tone: string }> = {
@@ -67,8 +68,8 @@ export function App() {
     openPlan: (app: string, version: string, pinFrom?: string) => { setPanel({ kind: "deploy", app, initial: { version, ...(pinFrom ? { pinFrom } : {}) } }); setTab("status"); },
     openServiceChange: (id: string, draft: string) => { setService(id); setServiceDraft({ draft, at: Date.now() }); setTab("services"); },
   }), []);
-  // Step 6b: the flow pages are hash routes (#/flows/<service>, #/flow/<flow>?service=): the service page links to them, and
-  // they can ask for the Ask AI panel to open (oa:open-assistant).
+  // The business pages are hash routes (#/businesses?service=, #/register, #/flow/<flow>?service=): cards and rows link to them,
+  // and they can ask for the Ask AI panel to open (oa:open-assistant).
   const [flowRoute, setFlowRoute] = useState<FlowRoute | null>(() => parseFlowRoute(location.hash));
   useEffect(() => {
     const on = () => { const r = parseFlowRoute(location.hash); setFlowRoute(r); if (r) setTab(r.kind); };
@@ -118,8 +119,9 @@ export function App() {
           {shown === "history" && <HistoryPage onBack={(j) => { setPanel({ kind: "deploy", app: j.app, initial: { version: j.version, pinFrom: j.id } }); setTab("status"); }} />}
           {shown === "hosts" && <HostsPage isAdmin={p.permissions.includes("admin")} />}
           {shown === "services" && <ServicesPage key={`${service ?? ""}:${serviceDraft?.at ?? ""}`} onTakeover={() => go("takeover")} isAdmin={p.permissions.includes("admin")} {...(service ? { initialOpen: service } : {})} {...(serviceDraft ? { initialDraft: serviceDraft.draft } : {})} />}
-          {shown === "flows" && flowRoute?.kind === "flows" && <FlowsPage service={flowRoute.service} isAdmin={p.permissions.includes("admin")} onBack={() => { go("services"); openService(flowRoute.service); }} />}
-          {shown === "flow" && flowRoute?.kind === "flow" && <FlowDetailPage key={`${flowRoute.flow}:${flowRoute.service ?? ""}`} flow={flowRoute.flow} {...(flowRoute.service ? { service: flowRoute.service } : {})} isAdmin={p.permissions.includes("admin")} onBack={(s) => { go("services"); openService(s); }} onOpenFlow={(f, s) => { location.hash = flowHref(f, s); }} />}
+          {shown === "businesses" && <BusinessesPage key={flowRoute?.kind === "businesses" ? flowRoute.service ?? "" : ""} {...(flowRoute?.kind === "businesses" && flowRoute.service ? { service: flowRoute.service } : {})} me={{ id: p.id, displayName: p.displayName }} />}
+          {shown === "register" && <RegisterPage />}
+          {shown === "flow" && flowRoute?.kind === "flow" && <FlowDetailPage key={`${flowRoute.flow}:${flowRoute.service ?? ""}`} flow={flowRoute.flow} {...(flowRoute.service ? { service: flowRoute.service } : {})} isAdmin={p.permissions.includes("admin")} onBack={() => go("businesses")} onOpenService={(s) => { go("services"); openService(s); }} />}
           {shown === "takeover" && <TakeoverPage isAdmin={p.permissions.includes("admin")} onRegistered={() => go("services")} />}
           {shown === "settings" && <SettingsPage />}
           {shown === "env" && <EnvPage />}
@@ -150,7 +152,7 @@ function Sidebar({ principal, environment, tab, setTab, setupOnly, onSignedOut }
     ["Deploy", [["status", "Overview"], ["history", "Deploy history"], ["hosts", "Hosts"], ["settings", "Environment settings"]]],
     ["Apps", [["registry", "Apps & manifests"], ["onboarding", "Onboarding & assessments"], ["env", "Environment variables"], ["ingress", "Ingress"]]],
     // S3: managed services (NiFi) have their own pages, apart from the apps.
-    ["Services", [["services", "Managed services"], ["takeover", "Takeover"]]],
+    ["Services", [["services", "Managed services"], ["businesses", "Businesses"], ["takeover", "Takeover"]]],
     ["Admin", [["keys", "API keys"], ...(principal.permissions.includes("admin") ? [["audit", "Audit"] as [Tab, string]] : [])]],
   ];
   const prod = environment?.toLowerCase() === "prod";

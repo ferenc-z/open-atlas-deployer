@@ -1,12 +1,13 @@
-// Screen 1 (prototype Main.dc.html): the managed services as one card each. Machine light and business light (with the flow
-// count) on a line each, one sentence from the AI under each; the bar on the card's top has the worse light's colour; the
-// worst service comes first (the server sorts). Above: how many are failing / need attention / wait for the person, when the
+// Screen 1 (prototype Main.dc.html): the managed services as one card each. The machine light and the AI's sentence; the bar on
+// the card's top has that light's colour; the line at the bottom counts the businesses that run here (it opens the Businesses
+// page for that service) and the open to-dos. Business health is not shown here (S39). The worst service comes first (the server sorts). Above: how many are failing / need attention / wait for the person, when the
 // AI last checked, and Check now. Fixed text is English, the AI's sentences Chinese (C2).
 
 import { useCallback, useEffect, useState } from "react";
 import { LightBadge } from "./OpsParts.tsx";
 import { ops } from "./ops-data.ts";
-import { businessLabel, cardLight, checkupLine, nextLine, summaryParts } from "./ops-view.ts";
+import { businessesLine, cardLight, checkupLine, nextLine, summaryParts } from "./ops-view.ts";
+import { businessesHref } from "./flow-routes.ts";
 import type { Light, ServiceCard, ServicesOverview } from "../server/services/ops-types.ts";
 
 export function OverviewPage({ onOpen, onTakeover }: { onOpen: (id: string) => void; onTakeover: () => void }) {
@@ -49,7 +50,7 @@ export function OverviewPage({ onOpen, onTakeover }: { onOpen: (id: string) => v
         ? <section className="fl-card"><p className="fl-muted" style={{ margin: 0 }}>Nothing is registered yet. Discover on the hosts and confirm a takeover draft first.</p><div><button type="button" className="fl-btn primary" onClick={onTakeover}>Open Takeover</button></div></section>
         : <section className="ov-grid">{data.services.map((s) => <Card key={s.id} s={s} onOpen={() => onOpen(s.id)} />)}</section>}
       <p className="fl-muted" style={{ margin: 0 }}>
-        Failing first, then needs attention, then healthy. Lights come from rules (every minute); the sentences come from the latest AI analysis.{" "}
+        This page is about the NiFi services themselves: failing first, then needs attention, then healthy. Lights come from rules (every minute); the sentences come from the latest AI analysis. Business health lives on the Businesses page; the line at the bottom of each card opens it filtered to that service.{" "}
         <a href="#" onClick={(e) => { e.preventDefault(); onTakeover(); }}>Take over more…</a>
       </p>
     </div>
@@ -58,18 +59,21 @@ export function OverviewPage({ onOpen, onTakeover }: { onOpen: (id: string) => v
 
 function Card({ s, onOpen }: { s: ServiceCard; onOpen: () => void }) {
   const next = nextLine(s);
+  const open = (e: { preventDefault: () => void }) => { e.preventDefault(); onOpen(); };
   return (
-    <a href="#" className={`ov-card edge-${cardLight(s)}`} onClick={(e) => { e.preventDefault(); onOpen(); }} title={`Open ${s.id}`}>
+    <div className={`ov-card edge-${cardLight(s)}`}>
       <div className="ov-card-head">
-        <span className="ov-name">{s.id}</span>
+        <a href="#" className="ov-name" onClick={open} title={`Open ${s.id}`}>{s.id}</a>
         <span className="fl-muted">{s.environment.toUpperCase()} · {s.label}</span>
       </div>
       <div className="ov-lines">
-        <div className="ov-line"><span className="ov-kind">Machine</span><LightBadge light={s.machine.light} /><span className="ov-text">{s.machine.sentence}</span></div>
-        <div className="ov-line"><span className="ov-kind">{businessLabel(s)}</span><LightBadge light={s.business.light} /><span className="ov-text">{s.business.sentence}</span></div>
+        <div className="ov-line"><LightBadge light={s.machine.light} /><span className="ov-text">{s.machine.sentence}</span></div>
       </div>
-      {next && <div className="ov-next"><span>{next}</span><span className="ov-open">Open →</span></div>}
-    </a>
+      <div className="ov-next">
+        <a href={businessesHref(s.id)} className="ov-biz">{businessesLine(s)}</a>
+        <a href="#" className="ov-open" onClick={open}>{next ?? "Open"} →</a>
+      </div>
+    </div>
   );
 }
 

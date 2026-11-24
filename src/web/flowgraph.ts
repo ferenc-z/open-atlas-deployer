@@ -14,6 +14,8 @@ export const EDGE_STYLE: Record<EdgeKind, { color: string; dash: string | null; 
   failure: { color: "#8A5300", dash: null, label: "failure" },
   retry: { color: "#8A5300", dash: null, label: "retry" },
   drop: { color: "#B3261E", dash: "6 6", label: "failure" },
+  // S39: a handoff the owner described (NiFi cannot see it): purple dashed.
+  declared: { color: "#6B4FBF", dash: "6 4", label: null },
 };
 
 export const SERVICE_ID = (id: string) => `svc:${id}`;
@@ -81,7 +83,7 @@ export function toElk(graph: FlowGraph): ElkNode {
   return { id: "root", layoutOptions: { ...LAYOUT_OPTIONS }, children, edges };
 }
 
-export interface LaidNode { id: string; kind: "group" | "external"; label: string; detail?: string; light?: Light; x: number; y: number; width: number; height: number; dropTarget: boolean }
+export interface LaidNode { id: string; kind: "group" | "external"; label: string; detail?: string; light?: Light; module?: boolean; x: number; y: number; width: number; height: number; dropTarget: boolean }
 export interface LaidService { id: string; label: string; x: number; y: number; width: number; height: number }
 export interface LaidEdge { id: string; kind: EdgeKind; from: string; to: string; path: string; label: { text: string; x: number; y: number; width: number; height: number } | null }
 export interface Laid { width: number; height: number; services: LaidService[]; nodes: LaidNode[]; edges: LaidEdge[] }
@@ -102,7 +104,7 @@ export function fromElk(graph: FlowGraph, laid: ElkNode): Laid {
       const s = serviceMeta.get(c.id);
       if (s) services.push({ id: s.id, label: s.label, x, y, width: c.width ?? 0, height: c.height ?? 0 });
       const m = meta.get(c.id);
-      if (m) nodes.push({ id: m.id, kind: m.kind, label: m.label, ...(m.detail ? { detail: m.detail } : {}), ...(m.light ? { light: m.light } : {}), x, y, width: c.width ?? 0, height: c.height ?? 0, dropTarget: dropTargets.has(c.id) });
+      if (m) nodes.push({ id: m.id, kind: m.kind, label: m.label, ...(m.detail ? { detail: m.detail } : {}), ...(m.light ? { light: m.light } : {}), ...(m.module ? { module: true } : {}), x, y, width: c.width ?? 0, height: c.height ?? 0, dropTarget: dropTargets.has(c.id) });
       walk(c, x, y);
     }
   };

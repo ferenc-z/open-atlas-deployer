@@ -1,5 +1,5 @@
-// Screen 2 (prototype Service.dc.html), the service page's Health tab: the machine card (big, six checks) and the business card
-// (the flows, each a link to the flow page of 6b), the AI analysis (the reason, what it looked at, when and why), For you
+// Screen 2 (prototype Service.dc.html), the service page's Health tab: the machine card (big, six checks) and "Businesses affected
+// by this" (S39: only while the machine has a problem; each a link to the business page; a line to the Businesses page), the AI analysis (the reason, what it looked at, when and why), For you
 // (the to-dos, at most one main button each) and the configuration summary. The AI only drafts: Apply the AI's change opens
 // the draft and the three steps, and only a click goes on into the Deployer's own draft -> diff -> rolling restart flow.
 // Ask AI is the one button at the page's bottom right (App); "Ask about this" gives it the to-do as context.
@@ -11,7 +11,7 @@ import type { ChangeKind } from "./api.ts";
 import { ask } from "./Confirm.tsx";
 import { ANOMALY_LABEL, LIGHT_LABEL } from "./FlowParts.tsx";
 import { BigLight, LightBadge } from "./OpsParts.tsx";
-import { flowHref, flowsHref, openAskAi } from "./flow-routes.ts";
+import { businessesHref, flowHref, openAskAi } from "./flow-routes.ts";
 import { usePageFocus } from "./focus.ts";
 import { ops } from "./ops-data.ts";
 import type { AnalysisView, FlowRow, MachineCheck, ServicePage, TodoView } from "../server/services/ops-types.ts";
@@ -68,7 +68,7 @@ export function ServiceHealth(p: HealthProps) {
       {error && <p className="fl-error">{error}</p>}
       <section className="sv-two">
         <MachineCard page={page} cluster={cluster} />
-        <BusinessCard page={page} />
+        <AffectedCard page={page} />
       </section>
       <AnalysisSection service={page.service.id} analysis={page.analysis} onChanged={load} onError={setError} />
       <TodoSection page={page} {...p} onChanged={load} onError={setError} onAsk={(id) => { setAsked(id); openAskAi(); }} />
@@ -115,29 +115,32 @@ function MachineCard({ page, cluster }: { page: ServicePage; cluster: boolean })
 /** What the flow's pill says: the first anomaly's name, else the light. */
 const flowPill = (f: FlowRow) => (f.light !== "healthy" && f.anomalies[0] ? ANOMALY_LABEL[f.anomalies[0]] : LIGHT_LABEL[f.light]);
 
-function BusinessCard({ page }: { page: ServicePage }) {
-  const b = page.business;
+/** S39: the businesses the machine's problem touches, listed only while the machine has one. The server says which (`affected`);
+ *  without that field the businesses that are not healthy are listed. */
+function AffectedCard({ page }: { page: ServicePage }) {
   const id = page.service.id;
+  const machineOk = page.machine.light === "healthy";
+  const affected = machineOk ? [] : page.affected ?? page.business.flows.filter((f) => f.light === "failing" || f.light === "attention");
+  const count = page.businessCount ?? page.business.flows.length;
   return (
-    <div className={`sv-card sv-business edge-${b.light}`}>
-      <div className="sv-title"><b>Business{b.flows.length > 0 ? ` · ${b.flows.length} ${b.flows.length === 1 ? "flow" : "flows"}` : ""}</b><span>is the data right?</span></div>
-      <BigLight light={b.light} size={28} />
-      <p className="sv-sentence" style={{ fontSize: 15 }}>{b.sentence}</p>
+    <div className="sv-card sv-business">
+      <div className="sv-title"><b>Businesses affected by this ({affected.length})</b><span>only shown while the machine has a problem</span></div>
       <div className="sv-flows">
-        {b.flows.map((f) => (
+        {affected.map((f) => (
           <a key={f.id} className="sv-flow" href={flowHref(f.id, id)}>
             <span className={`dot d-${f.light}`} />
             <span className="body">
-              <span className="name"><b>{f.name}</b><span className={`fl-pill tone-${f.light}`}>{flowPill(f)}</span>{f.services.length > 1 && <span className="fl-muted" style={{ fontSize: 12 }}>Spans {f.services.length} services</span>}</span>
+              <span className="name"><b>{f.name}</b><span className={`fl-pill tone-${f.light}`}>{flowPill(f)}</span></span>
               <span className="text">{f.sentence}</span>
             </span>
             <span style={{ fontSize: 13, color: "#1F4FB8", paddingTop: 2 }}>›</span>
           </a>
         ))}
-        {b.flows.length === 0 && <p className="fl-muted" style={{ margin: 0 }}>No confirmed flows yet.</p>}
-        {b.toConfirm > 0 && <a className="sv-flow" href={flowsHref(id)}><span className="dot d-unknown" /><span className="body"><span className="name"><b>{b.toConfirm} {b.toConfirm === 1 ? "flow" : "flows"} to confirm</b></span><span className="text">The AI found {b.toConfirm === 1 ? "it" : "them"} on the canvas; the business light waits for you.</span></span><span style={{ fontSize: 13, color: "#1F4FB8", paddingTop: 2 }}>›</span></a>}
+        {affected.length === 0 && <p className="fl-muted" style={{ margin: 0 }}>{machineOk ? "The machine is fine, so nothing here is affected by it." : "No registered business is affected."}</p>}
       </div>
-      <div className="sv-foot">The AI found these flows on the canvas{b.confirmedAt ? `; you confirmed them on ${shortDay(b.confirmedAt)}` : ""}. If one is wrong, open it and tell the AI.</div>
+      <div className="sv-foot">
+        <a href={businessesHref(id)}>{count === 0 ? `No businesses registered on ${id} · register one on Businesses →` : `${count} ${count === 1 ? "business runs" : "businesses run"} on ${id} · see ${count === 1 ? "it" : "them"} on Businesses →`}</a>
+      </div>
     </div>
   );
 }
@@ -208,7 +211,7 @@ function TodoCard(p: TodoProps & { t: TodoView; n: number; onApply: () => void }
       case "set-threshold":
         return <button type="button" className="fl-btn" disabled={!p.isAdmin || busy} onClick={() => void setThreshold()}>{actionLabel(a)}</button>;
       case "confirm-flows":
-        return <a className="fl-btn" href={flowsHref(t.service)}>{actionLabel(a)}</a>;
+        return <a className="fl-btn" href={businessesHref(t.service)}>{actionLabel(a)}</a>;
       case "open-nifi":
         return <a className="fl-btn" href={a.url} target="_blank" rel="noreferrer">{actionLabel(a)} ↗</a>;
     }

@@ -54,6 +54,7 @@
 .fl .fl-node.failing { border: 2px solid #B3261E; }
 .fl .fl-node.attention { border: 2px solid #C98A1B; }
 .fl .fl-node.healthy { border: 2px solid #7DBB90; }
+.fl .fl-node.shared { background: #F3FAF5; border: 1px dashed #7DBB90; }
 .fl .fl-node b { font-weight: 700; }
 .fl .fl-edgelabel { position: absolute; text-align: center; font-size: 13px; line-height: 16px; background: #FCFCFA; }
 

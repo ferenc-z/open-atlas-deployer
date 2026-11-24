@@ -71,6 +71,8 @@ export interface ServiceCard {
   label: string;
   machine: { light: Light; sentence: string };
   business: { light: Light; reason?: UnknownReason; sentence: string; flowCount: number; toConfirm: number; confirmedAt?: string };
+  /** S39 step 8: the card's bottom line ("N businesses run here · 1 failing"): the registered businesses that run on this service. Absent: the page falls back to business.flowCount. */
+  businesses?: { count: number; failing: number; attention: number };
   todoCount: number;
   nextCheckAt?: string; aiHasPlan?: boolean;
 }
@@ -81,6 +83,8 @@ export interface ServicePage {
   machine: MachineLightView;
   business: BusinessLightView;
   analysis: AnalysisView | null;
+  /** S39 step 8: the registered businesses this machine's problem touches (only while the machine is not healthy) and how many run here. Absent: the page lists the businesses that are not healthy. */
+  affected?: FlowRow[]; businessCount?: number;
   todos: TodoView[];
   config: { revision: number | null; lastChange: { at: string; by: string; text: string } | null; activeChange: string | null; drift: boolean };
 }
@@ -123,8 +127,10 @@ export interface StuckTimes { attentionMinutes: number; failingMinutes: number; 
 export interface FlowGraph {
   services: { id: string; label: string }[];
   /** detail: the node's second line (§10.3), e.g. "Dropped · 7 个". */
-  nodes: { id: string; kind: "group" | "external"; service: string | null; label: string; detail?: string; light?: Light }[];
-  edges: { from: string; to: string; kind: "data" | "s2s" | "failure" | "retry" | "drop"; label?: string }[];
+  /** module: a registered shared module (S39), drawn as a green dashed box. */
+  nodes: { id: string; kind: "group" | "external"; service: string | null; label: string; detail?: string; light?: Light; module?: boolean }[];
+  /** declared: a handoff the owner described (S39), drawn purple dashed; its label carries the owner's words. */
+  edges: { from: string; to: string; kind: "data" | "s2s" | "failure" | "retry" | "drop" | "declared"; label?: string }[];
 }
 export interface FlowCard {
   id: string; name: string; nameBy: "ai" | "person"; status: FlowStatus; summary: string;
