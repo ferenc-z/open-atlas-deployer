@@ -9,6 +9,7 @@
 
 import { newFlowId, StoreError, type Actor, type FlowPending, type FlowRecord, type Store } from "../store.ts";
 import { topologyFingerprint, type Topology } from "./flowcounts.ts";
+import { registeredGroupsOn } from "./watch.ts";
 import type { GateVerdict, TodoAction } from "./ops-types.ts";
 import { rootPortTargets, skeletonOf, type Skeleton, type SkeletonSegment } from "./skeleton.ts";
 import { dangling, links } from "./trace/channels.ts";
@@ -423,6 +424,27 @@ const flowName = (segs: Segment[]) => segs[0]?.group.name || segs[0]?.id || "业
 /** A8: a name a person gave or confirmed is never changed by the AI. */
 export const nameLocked = (f: FlowRecord) => f.nameBy === "person" || f.confirmedAt !== null;
 
+const canon = (v: unknown): string => Array.isArray(v) ? `[${v.map(canon).join(",")}]` : v && typeof v === "object" ? `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${canon((v as Record<string, unknown>)[k])}`).join(",")}}` : JSON.stringify(v ?? null);
+
+/** S39 step 7: what a registration wrote (the segments of registered businesses and modules) is the registration's: a
+ *  publish_model that changes, drops or takes over one is refused (it would write over what the owner registered).
+ *  Only with the registration switch on and something registered on the service; the old, unregistered segments stay open to it. */
+function protectRegistered(store: Store, service: string, base: ModelV2 | null, draft: ModelV2) {
+  if (!registeredGroupsOn()) return;
+  const regs = store.flowRegistrations({ service });
+  if (!regs.length) return;
+  const owners = new Set(regs.map((r) => r.owner)), groups = new Set(regs.map((r) => r.groupId));
+  const mine = (s: Segment) => Boolean((s.flow && owners.has(s.flow)) || (s.module && owners.has(s.module)));
+  const had = new Map((base?.segments ?? []).filter(mine).map((s) => [s.id, canon(s)]));
+  const bad: string[] = [];
+  for (const s of draft.segments) {
+    if (mine(s)) { if (had.get(s.id) !== canon(s)) bad.push(s.id); had.delete(s.id); }
+    else if (groups.has(s.group.id) && s.group.id !== UNPLACED) bad.push(s.id);
+  }
+  bad.push(...had.keys());
+  if (bad.length) throw new ModelError(409, "flow-model/registered", `Segments a registration wrote (${[...new Set(bad)].slice(0, 6).join(", ")}) are changed by register, not by publish_model: change the registration (add or remove a group, declare a hand-over).`);
+}
+
 /** publish_model: the gate, then A8's line. `confirm`: a person confirmed the held change (FlowAction confirm), so
  *  nothing is held again. */
 export async function publishModel(d: ModelDeps, input: { service: string; base: number; model: unknown; note: string; source?: "ai" | "e2e_trace"; actor: Actor; confirm?: boolean }): Promise<PublishResult> {
@@ -435,6 +457,7 @@ export async function publishModel(d: ModelDeps, input: { service: string; base:
   const parsed = parseDraft(store, service, input.model);
   const placed = await withE2e(d, service, parsed.model, current?.model ?? null, source);
   const draft = placed.model;
+  protectRegistered(store, service, current?.model ?? null, draft);
   const c = context(store, service, now);
   const run = replay(c, current?.model ?? null, draft);
   const by = input.actor.via === "key" || input.actor.via === "service" ? "ai" : input.actor.id;
@@ -664,7 +687,10 @@ export function gateRejected(store: Store, flow: string): boolean {
 
 export const segIdOf = (group: string, slice: string) => (slice === WHOLE ? group : `${group.slice(0, 27)}.${slice.slice(0, 36)}`).slice(0, 64);
 
-/** The skeleton of a service as a draft over its current model: segments the model has (by group and slice) are kept,
+/** S39 step 7: no production caller any more (the brief, look kind model and run_model / publish_model `from: "skeleton"`
+ *  were the ones; the check-up does not build the model and a registration writes the segments). Kept as the fixture
+ *  builder of the model tests.
+ *  The skeleton of a service as a draft over its current model: segments the model has (by group and slice) are kept,
  *  units it lacks become segments with one step on their group, an entry and the S2S exits the topology shows; a
  *  business the model does not know yet gets new:<skeleton key>. For the AI to name, judge and complete (exits'
  *  components) before run_model.

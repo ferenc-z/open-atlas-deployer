@@ -16,7 +16,9 @@ import type { FlowAnomaly, FlowRecord, ServiceBulletin, Store } from "../store.t
 import { DEFAULT_STUCK, dropRelationship, exitOf, gateRejected } from "./flowmodel.ts";
 import type { Topology } from "./flowcounts.ts";
 import { LIGHT_ORDER, type Anomaly, type FlowNote, type BusinessLightView, type FlowRow, type FlowStatus, type Light, type UnknownReason } from "./ops-types.ts";
+import { canvasChangeTodos, watchedFlows } from "./registered.ts";
 import { lightOfAlert } from "./rules.ts";
+import { registeredGroupsOn } from "./watch.ts";
 import { WHOLE, type ModelV2, type Segment } from "./trace/model.ts";
 
 const MIN = 60_000, HOUR = 60 * MIN, DAY = 24 * HOUR;
@@ -52,7 +54,7 @@ export interface Place { flow: string; service: string; segment: string; group: 
 export function locator(store: Store, service: string): (o: { component?: string | null; group?: string | null; groupName?: string | null }) => Place | null {
   const model = store.flowModel(service)?.model ?? null;
   const topo = (store.latestTopology(service)?.body as Topology | undefined) ?? null;
-  const watched = new Map(store.flows(service).filter((f) => f.status !== "ignored").map((f) => [f.id, f]));
+  const watched = new Map(watchedFlows(store, service).filter((f) => f.status !== "ignored").map((f) => [f.id, f]));
   const segs = (model?.segments ?? []).filter((s) => s.role === "segment" && s.flow && watched.has(s.flow));
   const place = (s: Segment): Place => ({ flow: s.flow!, service, segment: s.id, group: s.group.id, groupName: s.group.name });
   const units = new Set([...(topo?.groups ?? []).map((g) => g.id), ...(topo ? [topo.root.id] : [])]);
@@ -175,12 +177,13 @@ export function handoverConditions(store: Store, service: string, locate: Return
   const to = new Date(Math.floor(now.getTime() / (5 * MIN)) * 5 * MIN - 5 * MIN).toISOString();
   const from = new Date(Date.parse(to) - HANDOVER_HOURS * HOUR).toISOString();
   const mine = store.flowCounts(service, from, to);
+  const watched = new Set(watchedFlows(store, service).map((x) => x.id));
   const out: Observation[] = [];
   for (const s of model.segments) for (const e of s.exits) {
     if (e.channel.type !== "s2s" || !e.channel.service || !e.channel.port) continue;
     const target = e.channel.service;
-    const f = s.role === "segment" && s.flow ? store.flow(s.flow) : null;
-    const place: Place | null = f && f.status !== "ignored" ? { flow: f.id, service, segment: s.id, group: s.group.id, groupName: s.group.name } : null;
+    const f = s.role === "segment" && s.flow && watched.has(s.flow) ? store.flow(s.flow) : null;
+    const place: Place | null = f && f.status !== "ignored" ?{ flow: f.id, service, segment: s.id, group: s.group.id, groupName: s.group.name } : null;
     const ttopo = store.latestTopology(target)?.body as Topology | undefined;
     if (!place || !ttopo) continue;
     const refs = new Set(topo.s2sOut.filter((o) => o.name === e.channel.port && o.group === s.group.id).map((o) => o.ref));
@@ -189,7 +192,18 @@ export function handoverConditions(store: Store, service: string, locate: Return
     const theirs = store.flowCounts(target, from, to).filter((r) => r.kind === "s2s-in" && ids.has(r.ref));
     const ours = mine.filter((r) => r.kind === "s2s-out" && refs.has(r.ref));
     if (!theirs.length || !ours.length) continue;
-    const sent = ours.reduce((n, r) => n + r.flowfilesOut, 0), got = theirs.reduce((n, r) => n + Math.max(r.flowfilesIn, r.flowfilesOut), 0); // a remote input port's status counts what it received as out
+    // The registration gate's rule (register-gate.ts s2s-balance): only the 5-minute buckets both sides counted, and not
+    // the first bucket of either side (its history may start in the middle of one: a node restarted, a port added).
+    const bucketsOf = (rows: typeof ours, pick: (r: (typeof ours)[number]) => number) => {
+      const m = new Map<number, number>();
+      for (const r of rows) { const t = Date.parse(r.bucket); m.set(t, (m.get(t) ?? 0) + pick(r)); }
+      return m;
+    };
+    const sentBy = bucketsOf(ours, (r) => r.flowfilesOut), gotBy = bucketsOf(theirs, (r) => Math.max(r.flowfilesIn, r.flowfilesOut)); // a remote input port's status counts what it received as out
+    const first = Math.max(Math.min(...sentBy.keys()), Math.min(...gotBy.keys()));
+    const common = [...gotBy.keys()].filter((t) => t > first && sentBy.has(t));
+    if (!common.length) continue;
+    const sent = common.reduce((n, t) => n + sentBy.get(t)!, 0), got = common.reduce((n, t) => n + gotBy.get(t)!, 0);
     const bound = Math.max(5, Math.ceil(0.02 * Math.max(sent, got)));
     if (sent - got > bound) out.push({ place, ref: `s2s:${target}:${e.channel.port}`, anomaly: "handover-lost", light: "failing", at: to, count: sent - got, detail: { segment: s.id, component: e.component, target, port: e.channel.port, sent, received: got, from, to } });
   }
@@ -235,7 +249,7 @@ export function record(store: Store, service: string, observations: Observation[
   const quiet = new Date(now.getTime() - QUIET_MINUTES * MIN).toISOString();
   for (const a of store.flowAnomalies({ service, state: "open" })) if (EVENT_KINDS.includes(a.anomaly) && a.lastAt < quiet) store.closeFlowAnomaly(a.id, at);
   // A business that is gone, ignored or no longer has a segment here keeps nothing open here.
-  const here = new Set(store.flows(service).filter((f) => f.status !== "ignored").map((f) => f.id));
+  const here = new Set(watchedFlows(store, service).filter((f) => f.status !== "ignored").map((f) => f.id));
   for (const a of store.flowAnomalies({ service, state: "open" })) if (!here.has(a.flow)) store.closeFlowAnomaly(a.id, at);
 }
 
@@ -245,6 +259,8 @@ const BULLETINS_AT = "businessBulletinsAt";
  *  error groups. The provenance scan (BusinessScanner) runs on its own, every SCAN_MINUTES. */
 export function businessCheck(store: Store, service: string, now: Date = new Date()) {
   if (!store.flowModel(service)) return;
+  // S39 step 7: a registered group that changed on the canvas is a to-do for its owner (only with the registration switch on).
+  if (registeredGroupsOn()) canvasChangeTodos(store, service);
   const locate = locator(store, service);
   const facts = store.serviceFacts(service);
   const from = facts.get(`*\0${BULLETINS_AT}`) ?? new Date(now.getTime() - SCAN_MINUTES * MIN).toISOString();
@@ -288,7 +304,7 @@ export class BusinessScanner {
   /** One service: the window since its last scan (at most SCAN_BACK_MINUTES back). */
   async scan(service: string, now: Date = new Date()): Promise<{ observations: number; notes: string[] }> {
     const model = this.store.flowModel(service)?.model ?? null;
-    if (!model || !this.store.flows(service).some((f) => f.status !== "ignored")) return { observations: 0, notes: ["no businesses"] };
+    if (!model || !watchedFlows(this.store, service).some((f) => f.status !== "ignored")) return { observations: 0, notes: ["no businesses"] };
     const last = this.store.serviceFacts(service).get(`*\0${SCAN_AT}`);
     const from = new Date(Math.max(now.getTime() - SCAN_BACK_MINUTES * MIN, last ? Date.parse(last) : now.getTime() - SCAN_MINUTES * MIN)).toISOString();
     const to = now.toISOString();
@@ -389,8 +405,8 @@ const REASON_ORDER: UnknownReason[] = ["collection", "gate-rejected", "no-eviden
 /** The business light of a service: the worst failing / attention of its businesses; else unknown when one it watches
  *  cannot be told (collection, gate, no data; by that order) or none is confirmed; else healthy. */
 export function businessLight(store: Store, service: string): BusinessLightView {
-  const rows = store.flows(service).filter((f) => f.status !== "ignored");
-  const open = store.flowAnomalies({ state: "open", limit: 5000 });
+  const rows = watchedFlows(store, service).filter((f) => f.status !== "ignored");
+  const open =store.flowAnomalies({ state: "open", limit: 5000 });
   const down = new Map<string, boolean>();
   const collection = (s: string) => { if (!down.has(s)) down.set(s, collectionDown(store, s)); return down.get(s)!; };
   const lights = rows.map((f) => flowLight(store, f, { collection, open }));

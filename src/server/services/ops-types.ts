@@ -123,7 +123,8 @@ export interface StuckTimes { attentionMinutes: number; failingMinutes: number; 
 export interface FlowGraph {
   services: { id: string; label: string }[];
   /** detail: the node's second line (§10.3), e.g. "Dropped · 7 个". */
-  nodes: { id: string; kind: "group" | "external"; service: string | null; label: string; detail?: string; light?: Light }[];
+  /** module: the shared module (shm_…) a group node is (S39 step 7), drawn as the module. */
+  nodes: { id: string; kind: "group" | "external"; service: string | null; label: string; detail?: string; light?: Light; module?: string }[];
   edges: { from: string; to: string; kind: "data" | "s2s" | "failure" | "retry" | "drop"; label?: string }[];
 }
 export interface FlowCard {

@@ -41,7 +41,7 @@ test("the Assistant and the check-up have the seven verbs (the check-up without 
   const verbs = ["describe", "look", "trace", "run_model", "publish_model", "record", "draft_change"];
   const assistant = [...verbs.filter((v) => v !== "publish_model"), "register"];
   assert.deepEqual(assistant.filter((v) => allowed("deploy-assistant.oma.json").has(v)), assistant, "S39 step 6: register, publish_model internal");
-  assert.deepEqual([...allowed("service-checkup.oma.json")].sort(), verbs.filter((v) => v !== "draft_change").sort());
+  assert.deepEqual([...allowed("service-checkup.oma.json")].sort(), verbs.filter((v) => !["draft_change", "run_model", "publish_model"].includes(v)).sort(), "S39 step 7: the check-up does not build the model");
   for (const old of ["list_service_clusters", "get_cluster_status", "get_service_health", "trace_business_data", "draft_service_config"]) assert.ok(!allTools.has(old), old);
 });
 

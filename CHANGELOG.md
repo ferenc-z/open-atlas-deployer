@@ -5,6 +5,18 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
 
 ## Unreleased
 
+- S39 step 7 (monitoring looks at what is registered): with `DEPLOYER_REGISTERED_GROUPS=1`, describe, the brief, the
+  business light and the flows page list only registered businesses and shared modules, and the gaps (`no-exit`,
+  `s2s-unpaired`, `topology-changed`, `unconfirmed`, `no-stuck-times`) only count their groups; a service with nothing
+  registered has no gaps. New gap `executor-old` (the service executor does not name `flow-groups@1`). A registered group
+  renamed, gone, with a vanished slice or changed on the canvas opens a to-do `canvas:<owner>` "需要负责人确认" (closes by
+  itself). The runtime handover-lost check uses the gate's bucket rule (only buckets both sides have, not the first of
+  either). The business graph draws `port:`/`link:` as inside and a module node by its `module`. The check-up no longer
+  builds the model: the brief has no skeleton draft or rebuild flag, `look kind model` no `draft`, `run_model` /
+  `publish_model` refuse `from: "skeleton"`, `publish_model` refuses to change segments a registration wrote, and
+  `service-checkup` loses the model part and the two verbs from its `allowed_tools`.
+- [ ] OMA: 重新发布 service-checkup
+
 - Service executor 0.9.7 (S39 step 1, reading only the registered businesses): a watch entry with `groups` (ids of
   process groups at any depth) has only those groups read: each group's recursive status
   (`flow/process-groups/<id>/status`) for the counts, and for the topology each group with its subgroups plus one hop

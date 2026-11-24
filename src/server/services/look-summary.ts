@@ -167,7 +167,7 @@ export function modelShape(body: Any, a: Record<string, unknown>) {
     current: cur ? { revision: cur.revision, publishedAt: cur.publishedAt, publishedBy: cur.publishedBy, source: cur.source, sources: cur.model?.sources ?? [], segments: ((cur.model?.segments ?? []) as Any[]).map(segLine) } : null,
     draft: draft ? { ...draft, lines: draft.lines.map((l) => (curIds.has(l.id) ? l : { ...l, new: true })) } : null,
     flows: body?.flows ?? [], e2e: body?.e2e ?? null,
-    more: `run_model / publish_model take {from: "skeleton"|"current", changes}: name segments, entries and exits by these ids. ${FULL_HINT} (the whole draft and current model).`,
+    more: `run_model / publish_model take {from: "current", changes}: name segments, entries and exits by these ids. ${FULL_HINT} (the whole draft and current model).`,
   };
 }
 

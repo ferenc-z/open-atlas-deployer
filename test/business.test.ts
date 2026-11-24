@@ -151,11 +151,11 @@ test("stuck (B4): a queue never empty for the attention time is attention, for t
 
 test("hand-over lost: n1 sent 20 by S2S, c2 received 5 (failing); balanced, it closes; data into the shared error group is processing failed", () => {
   const { store, clock, row } = world();
-  store.putFlowCounts([row("n1", "2026-11-19T10:30:00Z", "s2s-out", "https://c2:9443/nifi#orders", 20, 20), row("c2", "2026-11-19T10:30:00Z", "s2s-in", "p-in", 5, 5)]);
+  store.putFlowCounts([row("n1", "2026-11-19T10:25:00Z", "s2s-out", "https://c2:9443/nifi#orders", 20, 20), row("n1", "2026-11-19T10:30:00Z", "s2s-out", "https://c2:9443/nifi#orders", 20, 20), row("c2", "2026-11-19T10:25:00Z", "s2s-in", "p-in", 5, 5), row("c2", "2026-11-19T10:30:00Z", "s2s-in", "p-in", 5, 5)]);
   businessCheck(store, "n1", clock.t);
   assert.deepEqual(open(store), ["n1 handover-lost failing s2s:c2:orders 15"]);
   assert.match(flowLight(store, store.flow(FLOW)!).sentence, /S2S to c2 port orders: 20 sent, 5 received/);
-  store.putFlowCounts([row("c2", "2026-11-19T10:30:00Z", "s2s-in", "p-in", 20, 20), row("n1", "2026-11-19T11:50:00Z", "group", "E", 4, 0)]);
+  store.putFlowCounts([row("c2", "2026-11-19T10:25:00Z", "s2s-in", "p-in", 20, 20), row("c2", "2026-11-19T10:30:00Z", "s2s-in", "p-in", 20, 20), row("n1", "2026-11-19T11:50:00Z", "group", "E", 4, 0)]);
   businessCheck(store, "n1", clock.t);
   assert.deepEqual(open(store), ["n1 processing-failed attention E 4"]);
 });
