@@ -399,7 +399,7 @@ test("reader: an executor that does not name nifi-groups@1 is executor-old, none
   await refused(readerLab().groupReader.read("nope", [G1]), "register/unknown-address");
 });
 
-test("watch: registeredGroups is off by default, undefined (never []) without a registration, and counts a module's groups once", () => {
+test("watch: registeredGroups with the switch off or on, undefined (never []) without a registration, and counts a module's groups once", () => {
   const store = new Store(":memory:");
   seed(store);
   store.putFlow(flow("flw_aaaaaa", "订单入库"));
@@ -412,7 +412,7 @@ test("watch: registeredGroups is off by default, undefined (never []) without a 
   assert.equal(registeredGroups(store, "c2", true), undefined, "no registration left: undefined, not []");
   assert.deepEqual(registeredGroups(store, "n1", true), [G2]);
   // The environment switch.
-  assert.equal(registeredGroupsOn({}), false);
+  assert.equal(registeredGroupsOn({}), true, "on by default");
   assert.equal(registeredGroupsOn({ DEPLOYER_REGISTERED_GROUPS: "0" }), false);
   assert.equal(registeredGroupsOn({ DEPLOYER_REGISTERED_GROUPS: "1" }), true);
   // Off, the watch carries no groups key at all; on, the registered service has one and the others none.

@@ -5,6 +5,12 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
 
 ## Unreleased
 
+- S39 step 9 (registration is the default): `DEPLOYER_REGISTERED_GROUPS` is now **on by default**; set it to `0` to turn
+  it off, an emergency way back to reading the whole canvas. With it on, a service shows only what was registered: a
+  service with no registration has no businesses and no gaps. The businesses and models of the old whole-canvas way are
+  not carried over: on upgrade clear `flows`, `flow_segments`, `flow_changes`, `flow_anomalies` and `flow_models`
+  (nothing is migrated) and register again through the Deploy Assistant. The service executor must be 0.9.7
+  (`flow-groups@1`, `nifi-groups@1`), else the gap `executor-old` shows.
 - S39 step 7 (monitoring looks at what is registered): with `DEPLOYER_REGISTERED_GROUPS=1`, describe, the brief, the
   business light and the flows page list only registered businesses and shared modules, and the gaps (`no-exit`,
   `s2s-unpaired`, `topology-changed`, `unconfirmed`, `no-stuck-times`) only count their groups; a service with nothing

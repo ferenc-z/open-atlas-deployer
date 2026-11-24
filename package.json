@@ -13,7 +13,7 @@
     "build:web": "vite build",
     "typecheck": "tsc --noEmit",
     "test:e2e": "PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-x64 playwright test -c e2e",
-    "test": "node --test \"test/**/*.test.ts\"",
+    "test": "DEPLOYER_REGISTERED_GROUPS=0 node --test \"test/**/*.test.ts\"",
     "gen-compose": "node bin/gen-compose.ts",
     "import-manifests": "node bin/import-manifests.ts"
   },
