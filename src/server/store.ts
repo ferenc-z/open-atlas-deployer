@@ -435,6 +435,8 @@ export class Store {
       const have = (this.db.prepare("PRAGMA table_info(shared_modules)").all() as Row[]).map((c) => c.name);
       for (const column of ["entries", "exits"]) if (!have.includes(column)) this.db.exec(`ALTER TABLE shared_modules ADD COLUMN ${column} TEXT`);
       if (!(this.db.prepare("PRAGMA table_info(registration_drafts)").all() as Row[]).some((c) => c.name === "places")) this.db.exec("ALTER TABLE registration_drafts ADD COLUMN places TEXT");
+      // S39 step 5 (§7.7 8): the rows one registration action writes over several services share an op.
+      if (!(this.db.prepare("PRAGMA table_info(flow_changes)").all() as Row[]).some((c) => c.name === "op")) this.db.exec("ALTER TABLE flow_changes ADD COLUMN op TEXT");
     }
     // S37 step 4: a bulletin's component and process group (the investigation page's links into NiFi).
     {
@@ -1952,7 +1954,7 @@ export class Store {
   }
 
   /** Adds the next revision over `base` (0: none yet); another publish in between is refused. Call inside flowTransaction. */
-  insertFlowModel(service: string, base: number, model: ModelV2, source: "ai" | "e2e_trace" | "migrated", actor: Actor, gate: unknown, topologyFp: string | null = null): number {
+  insertFlowModel(service: string, base: number, model: ModelV2, source: "ai" | "e2e_trace" | "migrated" | "register", actor: Actor, gate: unknown, topologyFp: string | null = null): number {
     const was = (this.db.prepare("SELECT MAX(revision) AS r FROM flow_models WHERE service = ?").get(service) as Row | undefined)?.r ?? 0;
     if (was !== base) throw new StoreError("flow-model/stale", `${service}'s model is at revision ${was}, not ${base}: read it again (describe) and redo the draft on it.`);
     const revision = base + 1;
@@ -2000,16 +2002,25 @@ export class Store {
     ordered.forEach((s, seq) => this.db.prepare("INSERT INTO flow_segments (flow, seq, service, segment) VALUES (?, ?, ?, ?)").run(flow, seq, s.service, s.segment));
   }
 
-  addFlowChange(c: Omit<FlowChange, "id" | "at">) {
-    this.db.prepare("INSERT INTO flow_changes (flow, service, at, by, kind, text, revision, verdict) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-      .run(c.flow, c.service, this.stamp(), c.by, c.kind, c.text, c.revision, c.verdict);
+  addFlowChange(c: Omit<FlowChange, "id" | "at" | "op"> & { op?: string | null }) {
+    this.db.prepare("INSERT INTO flow_changes (flow, service, at, by, kind, text, revision, verdict, op) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(c.flow, c.service, this.stamp(), c.by, c.kind, c.text, c.revision, c.verdict, c.op ?? this.flowOpId);
+  }
+
+  private flowOpId: string | null = null;
+  /** S39 step 5 (§7.7 8): every flow_changes row written in `work` carries `op` (one registration action over several
+   *  services reads as one). */
+  flowOp<T>(op: string, work: () => T): T {
+    const was = this.flowOpId;
+    this.flowOpId = op;
+    try { return work(); } finally { this.flowOpId = was; }
   }
 
   /** Newest first: a business's history, or a service's. */
   flowChanges(o: { flow?: string; service?: string; limit?: number }): FlowChange[] {
     const where = o.flow ? "flow = ?" : "service = ?";
     return (this.db.prepare(`SELECT * FROM flow_changes WHERE ${where} ORDER BY id DESC LIMIT ?`).all(o.flow ?? o.service ?? "", Math.min(500, o.limit ?? 50)) as Row[])
-      .map((r) => ({ id: r.id, flow: r.flow ?? null, service: r.service, at: r.at, by: r.by, kind: r.kind, text: r.text, revision: r.revision ?? null, verdict: r.verdict ?? null }));
+      .map((r) => ({ id: r.id, flow: r.flow ?? null, service: r.service, at: r.at, by: r.by, kind: r.kind, text: r.text, revision: r.revision ?? null, verdict: r.verdict ?? null, op: r.op ?? null }));
   }
 
   // S39 (business-registration §7.1): the registered groups. services/registration.ts decides; these only read and write.
@@ -2108,6 +2119,20 @@ export class Store {
   }
 
   deleteSharedModule(id: string) { this.db.prepare("DELETE FROM shared_modules WHERE id = ?").run(id); }
+
+  /** Puts (or replaces, by id) a told hand-over of a business. Call inside flowTransaction. */
+  putFlowHandoff(flow: string, h: RegistrationDraftHandoff) {
+    const to = "system" in h.to ? { service: null, group: null, system: h.to.system } : { service: h.to.service, group: h.to.group, system: null };
+    this.db.prepare(`INSERT INTO flow_handoffs (id, flow, from_service, from_group, from_component, from_relationship, to_service, to_group, to_system, quote, declared_by, declared_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET from_service = excluded.from_service, from_group = excluded.from_group,
+        from_component = excluded.from_component, from_relationship = excluded.from_relationship, to_service = excluded.to_service, to_group = excluded.to_group,
+        to_system = excluded.to_system, quote = excluded.quote, declared_by = excluded.declared_by, declared_at = excluded.declared_at`)
+      .run(h.id, flow, h.from.service, h.from.group, h.from.component, h.from.relationship ?? null, to.service, to.group, to.system, h.quote, h.declaredBy, h.declaredAt);
+  }
+
+  deleteFlowHandoff(id: string): boolean { return Number(this.db.prepare("DELETE FROM flow_handoffs WHERE id = ?").run(id).changes) > 0; }
+
+  deleteRegistrationDraft(id: string) { this.db.prepare("DELETE FROM registration_drafts WHERE id = ?").run(id); }
 
   /** A business's told hand-overs (§7.3), in the draft's shape. */
   flowHandoffs(flow: string): RegistrationDraftHandoff[] {
@@ -2299,7 +2324,7 @@ export interface FlowCountRow {
   source: "sample" | "nifi-history";
 }
 /** §10.2.4 step 2: a stored v2 model revision. gate: the checks it was published with. */
-export interface StoredFlowModel { service: string; revision: number; model: ModelV2; source: "ai" | "e2e_trace" | "migrated"; publishedAt: string; publishedBy: string; gate: unknown; topologyFp?: string | null }
+export interface StoredFlowModel { service: string; revision: number; model: ModelV2; source: "ai" | "e2e_trace" | "migrated" | "register"; publishedAt: string; publishedBy: string; gate: unknown; topologyFp?: string | null }
 const toFlowModel = (r: Row): StoredFlowModel => ({ service: r.service, revision: r.revision, model: JSON.parse(r.body), source: r.source, publishedAt: r.published_at, publishedBy: r.published_by, gate: parse(r.gate), topologyFp: r.topology_fp ?? null });
 /** A change the gate held for a person (A8): the draft's segments of this service it would apply, those it removes.
  *  A business holds at most one per service (several services can each wait on the same business, e.g. the downstream
@@ -2357,5 +2382,6 @@ export interface WorkerPlace { schedule: string; worker: string; service: string
 export interface SharedModule { id: string; name: string; createdBy: string; createdAt: string; updatedAt: string; entries: unknown[]; exits: unknown[] }
 const sharedModuleOf = (r: Row): SharedModule => ({ id: r.id, name: r.name, createdBy: r.created_by, createdAt: r.created_at, updatedAt: r.updated_at,
   entries: r.entries ? JSON.parse(r.entries) : [], exits: r.exits ? JSON.parse(r.exits) : [] });
-export interface FlowChange { id: number; flow: string | null; service: string; at: string; by: string; kind: FlowChangeKind; text: string; revision: number | null; verdict: GateVerdict | null }
+/** op (S39 step 5): the registration action the row is part of (one per service it touched); null before step 5. */
+export interface FlowChange { id: number; flow: string | null; service: string; at: string; by: string; kind: FlowChangeKind; text: string; revision: number | null; verdict: GateVerdict | null; op?: string | null }
 export interface ServiceCert { member: string; store: string; path: string | null; type: string | null; alias: string | null; chain: number | null; subject: string | null; issuer: string | null; notBefore: string | null; notAfter: string | null; readAt: string; error: string | null }

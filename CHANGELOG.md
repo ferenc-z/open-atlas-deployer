@@ -41,6 +41,29 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   the last hour), `GET …/modules/<id>` adds who uses it now; unregistering a module still used answers
   `register/module-in-use`. Nothing is published yet (step 5).
 
+- S39 step 5: a registration takes effect at once, no approval. `register commit` (a draft, which then goes, or `name` +
+  `links` + `handoffs?`), and `add` (now with `handoffs?`), `remove`, `declare-handoff`, `place-worker` of a registered
+  business, `shared` with `commit: true` and `unregister` chain the registration again on what NiFi has now, refuse
+  while a gap is open (`register/gaps-open`, 409, with the gaps; a change to a registered business is refused only for
+  gaps it opens), write the chain into the model of every service it touches and publish them all in one transaction
+  (model source `register`; a service whose model comes out the same gets no revision). A business's segment is its
+  registered group (exits: the hand-overs to its other segments, the modules, told hand-overs with `declared`, the ends;
+  entries: its starts, with a file-name cue, and the hand-overs in); a module's segment is `role: "shared"` with
+  `module: "shm_…"` and its registered entries and exits. Two registered groups joined on the canvas name the same
+  channel on both sides (external `port:<module port id>` or `link:<connection / funnel / schedule step>`): the trace
+  follows the data across them under the same key, so it now passes through a module's canvas ports (`declared:` stays
+  unfollowed). The model parser keeps `module` and `declared`. The registration gate (`services/register-gate.ts`) judges
+  the new models together, on registered businesses only: coverage (every registered group is a segment), reachable,
+  no-dangling (told hand-overs are not dangling), s2s-balance (per 5-minute bucket both sides were counted in) and
+  no-regression; a refusal (`register/gate-rejected`, 409) names the business, the group and its link or both sides of
+  the hand-over. `flows` / `flow_segments` follow the registration (person's name, confirmed, upstream first);
+  `GET /api/registrations/modules` gives each module's model `segments`; `flow_changes` rows of one action carry the same
+  `op` (new column), one per service with that service's revision. `rename` still changes only the name (the models do
+  not carry it). **`DEPLOYER_REGISTERED_GROUPS` stays off by default**: with it on (checked on the lab dev instance) the
+  watch reads exactly the registered groups and the registration publishes and gates on that, but the old whole-canvas
+  paths (skeleton draft, `publish_model`'s gate, describe's gaps, the business graph drawing `port:` / `link:` as
+  outside, the runtime hand-over check on a partial first hour) are not adapted yet (steps 7–9); turning it on is step 9.
+
 - Skills follow the Agent Skills layout OMA reads: `agents/skills/<name>/SKILL.md` (a folder named as the Skill, the
   frontmatter `name` the same), so the folder zips straight into OMA's Skill upload. `bin/publish-assistant.ts` reads
   the folders (a loose `*.md` there is an error); the Skill's text is unchanged, so no new Skill version and nothing to

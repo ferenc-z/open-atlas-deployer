@@ -311,11 +311,15 @@ test("route: who may call, request_id on writes, the actions of this step and th
   const no = await t.post("add", { flow: "flw_aaaaaa", links: [l1(G1)] }, "dpk_viewer");
   assert.deepEqual([no.status, no.body.error], [400, "register/bad-request"]);
   // A viewer with no admin right may register; so may the Assistant.
-  const add = await t.post("add", { flow: "flw_aaaaaa", links: [l1(G1), l2(G3)], request_id: "r2" }, "dpk_viewer");
+  const add = await t.post("add", { flow: "flw_aaaaaa", links: [l1(G1)], request_id: "r2" }, "dpk_viewer");
   assert.equal(add.status, 200, JSON.stringify(add.body));
-  assert.deepEqual(add.body.added.map((a: { service: string }) => a.service), ["n1", "c2"]);
-  const taken = await t.post("add", { flow: "flw_aaaaaa", links: [l1(G2)], request_id: "r3" }, "dps_assistant");
-  assert.equal(taken.status, 200);
+  assert.deepEqual([add.body.added.map((a: { service: string }) => a.service), add.body.published, add.body.revisions], [["n1"], true, [{ service: "n1", revision: 1 }]]);
+  // Step 5: a group nothing joins to the rest opens a gap; told how the data goes over, it is added.
+  const gap = await t.post("add", { flow: "flw_aaaaaa", links: [l2(G3)], request_id: "r2b" }, "dps_assistant");
+  assert.deepEqual([gap.status, gap.body.error, gap.body.gaps.map((g: { kind: string }) => g.kind)], [409, "register/gaps-open", ["disconnected"]]);
+  const told = await t.post("add", { flow: "flw_aaaaaa", links: [l2(G3)], handoffs: [{ from: { service: "n1", group: G1, component: "p" }, to: { service: "c2", group: G3 }, quote: "收单写到 /in，对账从那里取" }], request_id: "r3" }, "dps_assistant");
+  assert.equal(told.status, 200, JSON.stringify(told.body));
+  assert.deepEqual(told.body.revisions.map((r: { service: string }) => r.service).sort(), ["c2", "n1"], "both services publish at once");
   t.store.putFlow(flow("flw_bbbbbb", "对账"));
   const dup = await t.post("add", { flow: "flw_bbbbbb", links: [l1(G1)], request_id: "r4" }, "dps_assistant");
   assert.deepEqual([dup.status, dup.body.error, dup.body.taken[0].by.name, dup.body.options.length], [409, "register/group-taken", "订单入库", 2]);
@@ -328,10 +332,11 @@ test("route: who may call, request_id on writes, the actions of this step and th
   assert.equal((await t.post("remove", { flow: "flw_aaaaaa", groups: [{ service: "c2", group: G3 }], request_id: "r8" }, "dpk_viewer")).status, 200);
   assert.equal((await t.post("unregister", { flow: "flw_bbbbbb", request_id: "r9" }, "dpk_viewer")).status, 200);
   assert.equal((await t.post("unregister", { flow: "flw_bbbbbb", request_id: "r10" }, "dpk_viewer")).status, 404);
-  for (const action of ["commit", "declare-handoff"]) {
-    const later = await t.post(action, { links: [l1(G1)] }, "dpk_viewer");
-    assert.deepEqual([later.status, later.body.error], [501, "register/not-implemented"], action);
-  }
+  const nameless = await t.post("commit", { links: [l1(G2)], request_id: "r11" }, "dpk_viewer");
+  assert.deepEqual([nameless.status, nameless.body.error], [400, "register/bad-request"]);
+  const commit = await t.post("commit", { name: "入库", links: [l1(G2)], request_id: "r12" }, "dpk_viewer");
+  assert.deepEqual([commit.status, commit.body.verdict], [200, "published"], JSON.stringify(commit.body));
+  assert.deepEqual(t.store.flowRegistrations({ owner: commit.body.flow }).map((r) => r.groupId), [G2]);
   // Step 4: preview needs no request_id; shared does only with commit: true.
   const pv = await t.post("preview", { links: [l2(G3)] }, "dpk_viewer");
   assert.equal(pv.status, 200, JSON.stringify(pv.body));
@@ -518,8 +523,10 @@ test("route: drafts are made and read; the actions take `draft` and change only 
   const ho = await t.post("declare-handoff", { draft: id, from: { service: "n1", group: G1, component: "PutSFTP" }, to: { system: "客户" }, quote: "给客户", request_id: "d5" }, "dps_assistant");
   assert.equal(ho.status, 200, JSON.stringify(ho.body));
   assert.equal((await t.post("add", { draft: "rgd_000000000000", links: [l1(G2)], request_id: "d6" }, "dpk_viewer")).status, 404);
+  // Step 5: the two groups do not reach each other: commit refused with the gap.
   const commit = await t.post("commit", { draft: id, request_id: "d7" }, "dpk_viewer");
-  assert.deepEqual([commit.status, commit.body.error], [501, "register/not-implemented"]);
+  assert.deepEqual([commit.status, commit.body.error, commit.body.gaps.map((g: { kind: string }) => g.kind)], [409, "register/gaps-open", ["disconnected"]]);
+  assert.equal(t.store.flowRegistrations().length, 0, "nothing registered");
   assert.equal((await t.post("shared", { draft: id, links: [l1(G1)], request_id: "d7" }, "dpk_viewer")).body.error, "register/bad-request", "a module takes no draft");
   assert.equal((await t.post("preview", { draft: id, links: [l1(G1)] }, "dpk_viewer")).body.error, "register/bad-request", "a draft is previewed with its own groups");
   const got = await t.draftGet(id, "dpk_viewer");
@@ -531,4 +538,12 @@ test("route: drafts are made and read; the actions take `draft` and change only 
   const rm = await t.post("remove", { draft: id, groups: [{ service: "c2", group: G3 }], request_id: "d8" }, "dpk_viewer");
   assert.equal(rm.status, 200);
   assert.equal((await t.draftGet(id, "dpk_viewer")).body.groups.length, 1);
+  // Step 5: what is left closes (one group, its hand-over to the customer told): the draft becomes a business.
+  const done = await t.post("commit", { draft: id, request_id: "d9" }, "dpk_viewer");
+  assert.equal(done.status, 200, JSON.stringify(done.body));
+  assert.deepEqual([done.body.name, done.body.verdict, done.body.revisions], ["订单入库", "published", [{ service: "n1", revision: 1 }]]);
+  assert.equal((await t.draftGet(id, "dpk_viewer")).status, 404, "the draft is gone");
+  assert.deepEqual(t.store.flowHandoffs(done.body.flow).map((h) => h.quote), ["给客户"]);
+  const exits = t.store.flowModel("n1")!.model.segments[0]!.exits;
+  assert.deepEqual(exits.map((e) => [e.channel.system, e.declared?.quote]), [[`declared:${ho.body.handoff.id}`, "给客户"]]);
 });

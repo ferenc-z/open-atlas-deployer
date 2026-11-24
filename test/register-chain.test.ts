@@ -6,6 +6,7 @@ import { test } from "node:test";
 import { chain } from "../src/server/services/chain.ts";
 import type { Topology, TopologyFragment, TopologyNeighbor } from "../src/server/services/flowcounts.ts";
 import { moduleViews, RegisterChain, type ScheduleRows } from "../src/server/services/register-chain.ts";
+import { RegisterPublisher } from "../src/server/services/register-publish.ts";
 import { RegError, Registrations, type GroupInfo, type GroupReader } from "../src/server/services/registration.ts";
 import { Store, type Actor, type FlowRecord } from "../src/server/store.ts";
 
@@ -52,7 +53,8 @@ function setup(schedules?: (s: string) => Promise<ScheduleRows | null>) {
   const store = new Store(":memory:");
   store.addStandalone({ kind: "standalone", id: "n1", service: "nifi", profile: "nifi-1.x", version: "1.12.1", webUrl: "https://h-a1:8443/nifi", member: { host: "h-a1", installDir: "/opt/a", serviceUser: "nifi", startEnvironment: null, ports: { https: 8443 }, discovery: null } } as never, "uat", admin);
   const regs = new Registrations(store, reader);
-  return { store, regs, chains: new RegisterChain({ store, registrations: regs, reader, ...(schedules ? { schedules } : {}) }) };
+  const chains = new RegisterChain({ store, registrations: regs, reader, ...(schedules ? { schedules } : {}) });
+  return { store, regs, chains, publisher: new RegisterPublisher({ store, registrations: regs, chains }) };
 }
 const refused = async (p: Promise<unknown>, code: string) => {
   try { await p; } catch (e) { assert.ok(e instanceof RegError, String(e)); assert.equal(e.code, code, e.message); return e; }
@@ -62,7 +64,7 @@ const edges = (p: { edges: { from: string; to: string; kind: string }[]; segment
   p.edges.map((e) => `${p.segments.find((s) => s.id === e.from)!.group.name}>${p.segments.find((s) => s.id === e.to)!.group.name}:${e.kind}`).sort();
 
 test("shared: a group two businesses use becomes a module out of the one that had it; both join it by its ports; history on both", async () => {
-  const { store, regs, chains } = setup();
+  const { store, regs, chains, publisher } = setup();
   store.putFlow(flow("flw_orders", "订单"));
   store.putFlow(flow("flw_invoice", "发票"));
   await regs.add("flw_orders", [link(A), link(V), link(O)], admin);
@@ -80,7 +82,7 @@ test("shared: a group two businesses use becomes a module out of the one that ha
   assert.deepEqual([look.segments.map((s) => s.role), look.users.map((u) => u.flow).sort(), look.takeover.flow], [["shared"], ["flw_invoice", "flw_orders"], "flw_orders"]);
   assert.equal(store.sharedModules().length, 0, "a preview writes nothing");
 
-  const done = await chains.shared({ ...body, takeover: true, commit: true }, admin) as { module: string; users: { flow: string; joined: boolean; gaps: number }[] };
+  const done = await publisher.shared({ ...body, takeover: true, commit: true }, admin) as { module: string; users: { flow: string; joined: boolean; gaps: number }[] };
   assert.match(done.module, /^shm_/);
   assert.deepEqual(store.flowRegistrations({ owner: "flw_orders" }).map((r) => r.groupId), [A, O], "V left the business");
   assert.deepEqual(store.flowRegistrations({ owner: done.module }).map((r) => [r.groupId, r.role]), [[V, "shared"]]);
@@ -107,15 +109,15 @@ test("shared: a group two businesses use becomes a module out of the one that ha
 });
 
 test("shared: the business's only group is not taken over; without takeover the group stays", async () => {
-  const { store, regs, chains } = setup();
+  const { store, regs, chains, publisher } = setup();
   store.putFlow(flow("flw_one", "只有校验"));
   await regs.add("flw_one", [link(V)], admin);
   await refused(chains.shared({ name: "校验", links: [link(V)], entries: [{ port: "in" }], takeover: true, commit: true }, admin), "register/empty");
   await refused(chains.shared({ name: "校验", links: [link(V), link(A)], entries: [{ port: "in" }] }, admin), "register/bad-request");
   // A free group: registered, nobody uses it yet, so it can go.
-  const { module } = await chains.shared({ name: "订单", links: [link(B)], entries: [], commit: true }, admin).catch((e) => e) as { module?: string };
+  const { module } = await publisher.shared({ name: "订单", links: [link(B)], entries: [], commit: true }, admin).catch((e) => e) as { module?: string };
   assert.equal(module, undefined, "a module needs an entry");
-  const ok = await chains.shared({ name: "收尾", links: [link(L)], entries: [{ port: "in" }], commit: true }, admin) as { module: string };
+  const ok = await publisher.shared({ name: "收尾", links: [link(L)], entries: [{ port: "in" }], commit: true }, admin) as { module: string };
   await chains.assertModuleFree(ok.module);
   assert.equal(regs.unregister({ module: ok.module }, admin).removed.groups, 1);
 });

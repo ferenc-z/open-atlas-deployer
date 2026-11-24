@@ -662,7 +662,7 @@ export function gateRejected(store: Store, flow: string): boolean {
 
 // ---- the skeleton as a draft -------------------------------------------------------------------------------------
 
-const segIdOf = (group: string, slice: string) => (slice === WHOLE ? group : `${group.slice(0, 27)}.${slice.slice(0, 36)}`).slice(0, 64);
+export const segIdOf = (group: string, slice: string) => (slice === WHOLE ? group : `${group.slice(0, 27)}.${slice.slice(0, 36)}`).slice(0, 64);
 
 /** The skeleton of a service as a draft over its current model: segments the model has (by group and slice) are kept,
  *  units it lacks become segments with one step on their group, an entry and the S2S exits the topology shows; a

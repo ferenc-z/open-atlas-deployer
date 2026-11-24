@@ -99,7 +99,9 @@ export interface PreviewSegment {
 }
 export type EdgeKind = "link" | "s2s" | "mq" | "schedule" | "shared-entry" | "shared-exit" | "declared";
 export type EdgeBasis = "topology" | "rpg-address" | "rpg-name" | "mq-props" | "e2e" | "owner";
-export interface PreviewEdge { from: string; to: string; kind: EdgeKind; via: string; basis: EdgeBasis; inferred: boolean; quote?: string; handoff?: string }
+/** channel (step 5): what both sides of the hand-over name in the models (s2s:<service>/<port>, mq:<exchange>/<key>, a
+ *  module's port:<id>, link:<connection, funnel or schedule step>); component: the sending group's component. */
+export interface PreviewEdge { from: string; to: string; kind: EdgeKind; via: string; basis: EdgeBasis; inferred: boolean; quote?: string; handoff?: string; channel?: string; component?: string }
 export interface PreviewEnd { segment: string; label: string; channel?: string; component?: string }
 export type GapKind = "disconnected" | "exit-unregistered" | "entry-unregistered" | "s2s-unpaired" | "mq-unpaired" | "worker-unplaced" | "group-missing";
 export interface PreviewGap {
@@ -224,11 +226,13 @@ export function chain(input: ChainInput): Preview {
   };
 
   /** component: on a shared-entry, the registered group's component the data leaves by. */
-  const edges = new Map<string, PreviewEdge & { component?: string }>();
-  const edge = (e: PreviewEdge & { component?: string }) => {
+  const edges = new Map<string, PreviewEdge>();
+  const edge = (e: PreviewEdge) => {
     if (e.from === e.to) return;
     const k = `${e.from}\0${e.to}\0${e.kind}\0${e.via}`;
-    if (!edges.has(k)) edges.set(k, e);
+    const had = edges.get(k);
+    if (!had) edges.set(k, e);
+    else { had.channel ??= e.channel; had.component ??= e.component; }
   };
   const gap = (g: Omit<PreviewGap, "id">) => out.gaps.push({ id: "", ...g });
   const nb = (service: string, group: { id: string; name: string } | undefined, port?: string) =>
@@ -241,7 +245,7 @@ export function chain(input: ChainInput): Preview {
     if (!t) continue;
     for (const l of t.links) {
       const from = resolve(s.id, l.from.group, l.from.fragment), to = resolve(s.id, l.to.group, l.to.fragment);
-      if (from && to) edge({ from: from.id, to: to.id, kind: "link", via: `${l.from.port ?? "?"} → ${l.to.port ?? "?"}`, basis: "topology", inferred: false });
+      if (from && to) edge({ from: from.id, to: to.id, kind: "link", via: `${l.from.port ?? "?"} → ${l.to.port ?? "?"}`, basis: "topology", inferred: false, channel: `link:${l.connection}` });
     }
     const funnels = new Map<string, { name: string; group: string; ins: { seg: Seg; n: TopologyNeighbor }[]; outs: { seg: Seg; n: TopologyNeighbor }[] }>();
     for (const n of t.neighbors ?? []) {
@@ -253,13 +257,14 @@ export function chain(input: ChainInput): Preview {
         if (mine) {
           const other = byPort(s.id, o.id, o.port?.name ?? "", n.side === "out" ? "in" : "out")!;
           const [a, b, pa, pb] = n.side === "out" ? [seg, other, n.port.name, o.port?.name] : [other, seg, o.port?.name, n.port.name];
-          edge({ from: a.id, to: b.id, kind: "link", via: `${pa ?? "?"} → ${pb ?? "?"}`, basis: "topology", inferred: false });
+          const sender = n.side === "out" ? n.port.id : o.port?.id;
+          edge({ from: a.id, to: b.id, kind: "link", via: `${pa ?? "?"} → ${pb ?? "?"}`, basis: "topology", inferred: false, channel: `link:${n.connection}`, ...(sender ? { component: sender } : {}) });
           continue;
         }
         const m = o.port ? (n.side === "out" ? modEntryPort : modExitPort).get(`${s.id}\0${o.port.id}`) : undefined;
         if (m) {
-          if (n.side === "out") edge({ from: seg.id, to: modSeg(m), kind: "shared-entry", via: `${n.port.name} → ${m.name}.${o.port!.name}`, basis: "topology", inferred: false, component: n.port.id });
-          else edge({ from: modSeg(m), to: seg.id, kind: "shared-exit", via: `${m.name}.${o.port!.name} → ${n.port.name}`, basis: "topology", inferred: false });
+          if (n.side === "out") edge({ from: seg.id, to: modSeg(m), kind: "shared-entry", via: `${n.port.name} → ${m.name}.${o.port!.name}`, basis: "topology", inferred: false, channel: `port:${o.port!.id}`, component: n.port.id });
+          else edge({ from: modSeg(m), to: seg.id, kind: "shared-exit", via: `${m.name}.${o.port!.name} → ${n.port.name}`, basis: "topology", inferred: false, channel: `port:${o.port!.id}`, component: o.port!.id });
           continue;
         }
         if (n.side === "out") gap({ kind: "exit-unregistered", segment: seg.id, component: n.port.id, neighbor: nb(s.id, { id: o.id, name: o.name }, o.port?.name),
@@ -288,8 +293,8 @@ export function chain(input: ChainInput): Preview {
       else gap({ kind: "entry-unregistered", segment: seg.id, neighbor: nb(s.id, parent), text: `${seg.group.name} 的输入端口 ${n.port.name} 从${what}收数据，那里没有登记。` });
     }
     // A funnel in the parent only passes data on: the groups feeding it hand over to the groups it feeds.
-    for (const f of funnels.values()) {
-      for (const a of f.ins) for (const b of f.outs) edge({ from: a.seg.id, to: b.seg.id, kind: "link", via: `${a.n.port.name} → 漏斗 → ${b.n.port.name}`, basis: "topology", inferred: false });
+    for (const [fid, f] of funnels) {
+      for (const a of f.ins) for (const b of f.outs) edge({ from: a.seg.id, to: b.seg.id, kind: "link", via: `${a.n.port.name} → 漏斗 → ${b.n.port.name}`, basis: "topology", inferred: false, channel: `link:${fid}`, component: a.n.port.id });
       const parent = { id: f.group, name: (f.ins[0] ?? f.outs[0]) ? parentName(s.id, (f.ins[0] ?? f.outs[0]).n.group) : "上一层" };
       if (!f.outs.length) for (const a of f.ins) gap({ kind: "exit-unregistered", segment: a.seg.id, component: a.n.port.id, neighbor: nb(s.id, parent),
         candidates: [{ component: a.n.port.id, name: a.n.port.name }], text: `${a.seg.group.name} 的输出端口 ${a.n.port.name} 接到 ${parent.name} 里的漏斗，往后没有登记的组。` });
@@ -326,10 +331,10 @@ export function chain(input: ChainInput): Preview {
       }
     }
     for (const p of to) {
-      edge({ from: o.seg, to: p.seg, kind: "s2s", via: `S2S ${p.service}/${o.name}`, basis, inferred: basis === "rpg-name" });
+      edge({ from: o.seg, to: p.seg, kind: "s2s", via: `S2S ${p.service}/${o.name}`, basis, inferred: basis === "rpg-name", channel: `s2s:${p.service}/${o.name}`, component: o.component });
       fed.add(p);
     }
-    for (const m of mods) edge({ from: o.seg, to: modSeg(m), kind: "shared-entry", via: `S2S ${m.service}/${o.name}`, basis, inferred: basis === "rpg-name", component: o.component });
+    for (const m of mods) edge({ from: o.seg, to: modSeg(m), kind: "shared-entry", via: `S2S ${m.service}/${o.name}`, basis, inferred: basis === "rpg-name", channel: `s2s:${m.service}/${o.name}`, component: o.component });
     if (to.length || mods.length) {
       if (basis === "rpg-name") out.notes.push(`${segs.get(o.seg)!.group.name} 发往 ${o.targets.join(", ")} 的 S2S 地址对不上受管服务，按端口名 ${o.name} 接上，要确认一次。`);
       continue;
@@ -342,7 +347,7 @@ export function chain(input: ChainInput): Preview {
   for (const p of s2sIn) {
     if (fed.has(p)) continue;
     const mods = modExitKey.get(`s2s:${p.service}/${p.name}`) ?? [];
-    for (const m of mods) edge({ from: modSeg(m), to: p.seg, kind: "shared-exit", via: `S2S ${p.service}/${p.name}`, basis: "rpg-address", inferred: false });
+    for (const m of mods) edge({ from: modSeg(m), to: p.seg, kind: "shared-exit", via: `S2S ${p.service}/${p.name}`, basis: "rpg-address", inferred: false, channel: `s2s:${p.service}/${p.name}` });
     if (mods.length) continue;
     const mine = new Set((services.get(p.service)?.addresses ?? []).map((a) => a.toLowerCase()));
     const from = (input.senders ?? []).filter((x) => x.port === p.name && !byGroup.has(`${x.service}\0${x.group.id}`) && !(input.modules ?? []).some((m) => m.service === x.service && m.group.id === x.group.id)
@@ -420,7 +425,7 @@ export function chain(input: ChainInput): Preview {
       seg.origin = "e2e_trace";
       if (!seg.steps.includes(worker)) seg.steps.push(worker);
       const from = prev?.seg ?? manager;
-      if (from) edge({ from: from.id, to: seg.id, kind: "schedule", basis: "e2e", inferred: false,
+      if (from) edge({ from: from.id, to: seg.id, kind: "schedule", basis: "e2e", inferred: false, channel: `link:schedule-${h.schedule_id}-${d.schedule_seq}`,
         via: `schedule ${name} ${prev ? `${prev.seq}→${d.schedule_seq}` : `调度 → ${d.schedule_seq}`}${skipped.length ? `（跳过没对上的${skipped.join("、")}）` : ""}` });
       skipped.length = 0;
       prev = { seg, seq: Number(d.schedule_seq) };
@@ -452,17 +457,17 @@ export function chain(input: ChainInput): Preview {
       gotMq.add(i);
       const t = triggers.find((x) => x === i);
       const fin = finals.get(o.seg)?.[0];
-      if (t) edge({ from: o.seg, to: i.seg, kind: "schedule", basis: "mq-props", inferred: false, via: `${fin ? `schedule ${fin.schedule} 收尾` : o.label} → schedule ${t.schedule} trigger ${o.key.slice(3)}` });
-      else edge({ from: o.seg, to: i.seg, kind: "mq", basis: "mq-props", inferred: true, via: o.label });
+      if (t) edge({ from: o.seg, to: i.seg, kind: "schedule", basis: "mq-props", inferred: false, via: `${fin ? `schedule ${fin.schedule} 收尾` : o.label} → schedule ${t.schedule} trigger ${o.key.slice(3)}`, channel: o.key, component: o.component });
+      else edge({ from: o.seg, to: i.seg, kind: "mq", basis: "mq-props", inferred: true, via: o.label, channel: o.key, component: o.component });
     }
-    for (const m of mods) edge({ from: o.seg, to: modSeg(m), kind: "shared-entry", basis: "mq-props", inferred: true, via: o.label, component: o.component });
+    for (const m of mods) edge({ from: o.seg, to: modSeg(m), kind: "shared-entry", basis: "mq-props", inferred: true, via: o.label, channel: o.key, component: o.component });
     if (!to.length && !mods.length) gap({ kind: "mq-unpaired", segment: o.seg, component: o.component, candidates: [{ component: o.component, name: o.label }],
       text: `${segs.get(o.seg)!.group.name} 发到 ${o.label}，这条业务里没有组收它，要问负责人交到哪里。` });
   }
   for (const i of mqIn) {
     if (gotMq.has(i)) continue;
     const mods = modExitKey.get(i.key) ?? [];
-    for (const m of mods) edge({ from: modSeg(m), to: i.seg, kind: "shared-exit", basis: "mq-props", inferred: true, via: i.label });
+    for (const m of mods) edge({ from: modSeg(m), to: i.seg, kind: "shared-exit", basis: "mq-props", inferred: true, via: i.label, channel: i.key });
     if (!mods.length) out.entries.push({ segment: i.seg, label: i.label, channel: i.key, ...(i.component ? { component: i.component } : {}) });
   }
 
@@ -514,7 +519,7 @@ export function chain(input: ChainInput): Preview {
   }
 
   // ⑦ One business: registered segments not joined to the rest (through a module only from its entry to its exit).
-  out.edges = [...edges.values()].map(({ component: _c, ...e }) => e).sort((a, b) => order(a.from, b.from) || order(a.to, b.to) || (a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : 0));
+  out.edges = [...edges.values()].map((e) => ({ ...e })).sort((a, b) => order(a.from, b.from) || order(a.to, b.to) || (a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : 0));
   const up = new Map<string, string>();
   const find = (x: string): string => { while (up.has(x) && up.get(x) !== x) x = up.get(x)!; return x; };
   const join = (a: string, b: string) => { const ra = find(a), rb = find(b); if (ra !== rb) up.set(rb, ra); };

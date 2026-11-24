@@ -1,8 +1,9 @@
 // S39 business-registration §7.1, §7.5, §7.6 (step 2): a business registers the process groups it runs through. This
 // module holds the link parsing (NiFi 1.x and 2.x UI addresses -> group id and managed service), the checks that
 // precede a registration (the group exists, nobody else has it) and the registration's own actions: add, remove,
-// rename, unregister. preview and shared (step 4) are in register-chain.ts; commit and declare-handoff of a business
-// wait for step 5. The routes (registration-routes.ts) only translate a RegError into HTTP.
+// rename, unregister. preview and shared (step 4) are in register-chain.ts; commit and the publishing of every change
+// (step 5) in register-publish.ts, which checks with these first and writes with them inside its transaction. The
+// routes (registration-routes.ts) only translate a RegError into HTTP.
 
 import { randomBytes } from "node:crypto";
 import { StoreError, type Actor, type FlowRegistration, type RegistrationDraft, type RegistrationDraftGroup, type RegistrationDraftHandoff, type Store, type WorkerPlace } from "../store.ts";
@@ -24,10 +25,12 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export type RegisterCode =
   | "register/bad-request" | "register/bad-link" | "register/root-group" | "register/unknown-address" | "register/ambiguous-address"
   | "register/group-missing" | "register/executor-old" | "register/executor-offline" | "register/group-taken" | "register/not-found"
-  | "register/empty" | "register/not-implemented" | "register/bad-handoff" | "register/port-missing" | "register/module-in-use";
+  | "register/empty" | "register/not-implemented" | "register/bad-handoff" | "register/port-missing" | "register/module-in-use"
+  | "register/gaps-open" | "register/gate-rejected";
 const STATUS: Record<RegisterCode, 400 | 404 | 409 | 501 | 503> = {
   "register/bad-request": 400, "register/bad-handoff": 400, "register/bad-link": 400, "register/root-group": 400, "register/unknown-address": 400, "register/ambiguous-address": 400,
   "register/group-missing": 404, "register/not-found": 404, "register/port-missing": 404, "register/group-taken": 409, "register/empty": 409, "register/module-in-use": 409,
+  "register/gaps-open": 409, "register/gate-rejected": 409,
   "register/executor-old": 503, "register/executor-offline": 503, "register/not-implemented": 501,
 };
 
@@ -163,6 +166,12 @@ export interface Taken {
 }
 
 export interface RegisterResult { flow: string; added: RegisteredGroup[]; unchanged: RegisteredGroup[]; revisions: { service: string; revision: number }[]; published: boolean }
+/** A business's place-worker, checked, before it is written (the publish chains with it first, step 5). */
+export interface WorkerPlan { flow: string; schedule: string; worker: string; place: WorkerPlace | null; had: WorkerPlace | null; groupName: string }
+
+/** Whether a told hand-over starts or ends on a group. */
+export const handoffNames = (h: RegistrationDraftHandoff, service: string, group: string) =>
+  (h.from.service === service && h.from.group === group) || ("group" in h.to && h.to.service === service && h.to.group === group);
 
 export class Registrations {
   private store: Store;
@@ -189,35 +198,41 @@ export class Registrations {
     return { kind: owner.startsWith("shm_") ? "module" : "flow", id: owner, name: m?.name ?? owner };
   }
 
-  private flowOf(id: unknown) {
+  flowOf(id: unknown) {
     if (typeof id !== "string" || !id) throw new RegError("register/bad-request", "flow is a business id (flw_…).");
     const f = this.store.flow(id);
     if (!f) throw new RegError("register/not-found", `No business ${id}.`);
     return f;
   }
 
-  /** One flow_changes row per service the action touched (§7.1). */
-  private log(flow: string, kind: "register" | "add-group" | "remove-group" | "rename" | "unregister" | "place-worker", actor: Actor, text: (service: string) => string, services: string[]) {
-    for (const service of services.length ? services : ["-"]) this.store.addFlowChange({ flow, service, by: actor.id, kind, text: text(service), revision: null, verdict: null });
+  /** One flow_changes row per service the action touched (§7.1); with the publish's revisions (step 5) every service it
+   *  published a model of gets one too, with that revision. */
+  private log(flow: string, kind: "register" | "add-group" | "remove-group" | "rename" | "unregister" | "place-worker" | "declare-handoff", actor: Actor, text: (service: string) => string, services: string[], revisions?: Map<string, number>) {
+    const all = [...new Set([...services, ...(revisions?.keys() ?? [])])];
+    for (const service of all.length ? all : ["-"]) this.store.addFlowChange({ flow, service, by: actor.id, kind, text: text(service), revision: revisions?.get(service) ?? null, verdict: revisions?.has(service) ? "published" : null });
   }
 
   /** add: the groups of these links join the business. Refused when a link's group is missing or somebody else has it. */
   async add(flowId: unknown, links: unknown, actor: Actor): Promise<RegisterResult> {
     const flow = this.flowOf(flowId);
     const { added, unchanged } = await this.stage(links, flow.id, []);
-    const rows: Omit<FlowRegistration, "registeredAt">[] = added.map((a) => ({ owner: flow.id, role: "segment", service: a.service, groupId: a.group.id, groupName: a.group.name, groupPath: a.group.path, slice: "*", link: a.link, registeredBy: actor.id }));
-    try {
-      this.store.flowTransaction(() => {
-        this.store.addFlowRegistrations(rows);
-        const services = [...new Set(added.map((a) => a.service))];
-        this.log(flow.id, "add-group", actor, (s) => `登记了组${added.filter((a) => a.service === s).map((a) => `"${a.group.name}"（${a.group.path}）`).join("、")}`, services);
-        this.store.auditFlow(actor, flow.id, "register-add");
-      });
-    } catch (error) {
+    this.store.flowTransaction(() => this.addStaged(flow.id, added, actor, "add-group"));
+    return { flow: flow.id, added, unchanged, revisions: [], published: false };
+  }
+
+  /** Writes staged groups as the business's (register: the first ones of a commit). Call inside flowTransaction. */
+  addStaged(flow: string, added: RegisteredGroup[], actor: Actor, kind: "register" | "add-group", revisions?: Map<string, number>, name?: string) {
+    const rows: Omit<FlowRegistration, "registeredAt">[] = added.map((a) => ({ owner: flow, role: "segment", service: a.service, groupId: a.group.id, groupName: a.group.name, groupPath: a.group.path, slice: "*", link: a.link, registeredBy: actor.id }));
+    try { this.store.addFlowRegistrations(rows); } catch (error) {
       if (error instanceof StoreError && error.code === "flow-registrations/taken") throw new RegError("register/group-taken", error.message, { options: TAKEN_OPTIONS });
       throw error;
     }
-    return { flow: flow.id, added, unchanged, revisions: [], published: false };
+    const services = [...new Set(added.map((a) => a.service))];
+    const groups = (s: string) => added.filter((a) => a.service === s).map((a) => `"${a.group.name}"（${a.group.path}）`).join("、");
+    this.log(flow, kind, actor, (s) => kind === "register"
+      ? `登记了业务"${name ?? flow}"${groups(s) ? `，本服务上的组${groups(s)}` : "，本服务上的公共模块"}`
+      : groups(s) ? `登记了组${groups(s)}` : "加组后重新串联，本服务的模型随之更新", services, revisions);
+    this.store.auditFlow(actor, flow, kind === "register" ? "register-commit" : "register-add");
   }
 
   /** The groups of these links, read from NiFi and checked: they exist, and nobody but the owner (ownKey: a business, or a
@@ -269,8 +284,8 @@ export class Registrations {
     return rs.filter((r) => { const k = `${r.service}\0${r.groupId}`; if (seen.has(k)) return false; seen.add(k); return true; });
   }
 
-  /** remove: these groups leave the business. The last one cannot (unregister does that). */
-  remove(flowId: unknown, groups: unknown, actor: Actor): { flow: string; removed: { service: string; group: string }[]; revisions: { service: string; revision: number }[]; published: boolean } {
+  /** The groups remove would take out (checked: they are the business's, and not all of them). */
+  removing(flowId: unknown, groups: unknown): { flow: string; wanted: { service: string; group: string }[] } {
     const flow = this.flowOf(flowId);
     if (!Array.isArray(groups) || groups.length < 1 || groups.length > LINKS_MAX
       || !groups.every((g) => g && typeof g === "object" && typeof g.service === "string" && typeof g.group === "string")) {
@@ -283,18 +298,29 @@ export class Registrations {
     if (lost.length) throw new RegError("register/not-found", `The business has no registered group ${lost.map((l) => `${l.group} (${l.service})`).join(", ")}.`);
     const gone = new Set(wanted.map((w) => `${w.service}\0${w.group}`));
     if (mine.every((m) => gone.has(`${m.service}\0${m.groupId}`))) throw new RegError("register/empty", "That would take every group out of the business: unregister it instead.");
+    return { flow: flow.id, wanted };
+  }
+
+  /** remove: these groups leave the business (and the told hand-overs and worker places on them). The last one cannot
+   *  (unregister does that). With the publish's revisions inside its transaction (step 5). */
+  remove(flowId: unknown, groups: unknown, actor: Actor, revisions?: Map<string, number>): { flow: string; removed: { service: string; group: string }[]; droppedHandoffs: string[]; revisions: { service: string; revision: number }[]; published: boolean } {
+    const { flow, wanted } = this.removing(flowId, groups);
+    const mine = this.store.flowRegistrations({ owner: flow });
     const removed: { service: string; group: string; name: string }[] = [];
+    const dropped: string[] = [];
     this.store.flowTransaction(() => {
       for (const w of wanted) {
         const name = mine.find((m) => m.service === w.service && m.groupId === w.group)!.groupName;
-        if (this.store.removeFlowRegistration(flow.id, w.service, w.group)) removed.push({ ...w, name });
-        // A worker placed in a group that leaves is asked about again.
-        for (const p of this.store.workerPlaces(flow.id)) if (p.service === w.service && p.group === w.group) this.store.setWorkerPlace(flow.id, p.schedule, p.worker, null);
+        if (this.store.removeFlowRegistration(flow, w.service, w.group)) removed.push({ ...w, name });
+        // A worker placed in a group that leaves is asked about again; a told hand-over naming it goes with it.
+        for (const p of this.store.workerPlaces(flow)) if (p.service === w.service && p.group === w.group) this.store.setWorkerPlace(flow, p.schedule, p.worker, null);
+        for (const h of this.store.flowHandoffs(flow)) if (handoffNames(h, w.service, w.group) && this.store.deleteFlowHandoff(h.id)) dropped.push(h.id);
       }
-      this.log(flow.id, "remove-group", actor, (s) => `去掉了组${removed.filter((r) => r.service === s).map((r) => `"${r.name}"`).join("、")}`, [...new Set(removed.map((r) => r.service))]);
-      this.store.auditFlow(actor, flow.id, "register-remove");
+      this.log(flow, "remove-group", actor, (s) => removed.some((r) => r.service === s) ? `去掉了组${removed.filter((r) => r.service === s).map((r) => `"${r.name}"`).join("、")}` : "删组后重新串联，本服务的模型随之更新",
+        [...new Set(removed.map((r) => r.service))], revisions);
+      this.store.auditFlow(actor, flow, "register-remove");
     });
-    return { flow: flow.id, removed: removed.map(({ service, group }) => ({ service, group })), revisions: [], published: false };
+    return { flow, removed: removed.map(({ service, group }) => ({ service, group })), droppedHandoffs: dropped, revisions: [...(revisions ?? [])].map(([service, revision]) => ({ service, revision })), published: Boolean(revisions) };
   }
 
   /** rename: only the business's name (kept as a person's, the AI does not change it). */
@@ -366,19 +392,28 @@ export class Registrations {
    *  outside ({system}). Whether the component is in the group is not known before the chaining (step 3). */
   draftDeclareHandoff(id: unknown, b: Record<string, unknown>, actor: Actor): { draft: string; handoff?: RegistrationDraftHandoff; removed?: string } {
     const d = this.draft(id);
-    const find = (v: unknown, what: string): number => {
+    const got = this.handoffFor(d.groups.map((g) => ({ service: g.service, group: g.group.id })), d.handoffs, b, actor, "draft");
+    if (got.removed) {
+      this.store.putRegistrationDraft({ ...d, handoffs: d.handoffs.filter((h) => h.id !== got.removed) });
+      return { draft: d.id, removed: got.removed };
+    }
+    this.store.putRegistrationDraft({ ...d, handoffs: [...d.handoffs.filter((h) => h.id !== got.handoff!.id), got.handoff!] });
+    return { draft: d.id, handoff: got.handoff! };
+  }
+
+  /** declare-handoff's checks over a registration's groups and its told hand-overs (a draft's or a business's): the hand-over
+   *  to keep (a new id, or the one replaced), or the id to remove. Writes nothing. */
+  handoffFor(groups: { service: string; group: string }[], handoffs: RegistrationDraftHandoff[], b: Record<string, unknown>, actor: Actor, what: "draft" | "business"): { handoff?: RegistrationDraftHandoff; removed?: string } {
+    const d = { groups: groups.map((g) => ({ service: g.service, group: { id: g.group } })), handoffs };
+    const find = (v: unknown, why: string): number => {
       const i = typeof v === "string" ? d.handoffs.findIndex((h) => h.id === v) : -1;
-      if (i < 0) throw new RegError("register/not-found", `The draft has no hand-over ${String(v)} (${what}).`);
+      if (i < 0) throw new RegError("register/not-found", `The ${what} has no hand-over ${String(v)} (${why}).`);
       return i;
     };
-    if (b.remove !== undefined) {
-      const i = find(b.remove, "remove");
-      this.store.putRegistrationDraft({ ...d, handoffs: d.handoffs.filter((_, j) => j !== i) });
-      return { draft: d.id, removed: d.handoffs[i]!.id };
-    }
+    if (b.remove !== undefined) return { removed: d.handoffs[find(b.remove, "remove")]!.id };
     const own = (service: unknown, group: unknown, role: string) => {
       if (typeof service !== "string" || typeof group !== "string" || !d.groups.some((g) => g.service === service && g.group.id === group.toLowerCase()))
-        throw new RegError("register/bad-handoff", `The ${role} is not a group of this draft: add its link first.`);
+        throw new RegError("register/bad-handoff", `The ${role} is not a group of this ${what}: add its link first.`);
       return { service, group: group.toLowerCase() };
     };
     const from = b.from as Record<string, unknown> | undefined, to = b.to as Record<string, unknown> | undefined;
@@ -396,14 +431,24 @@ export class Registrations {
       from: { ...fromG, component: from.component.trim(), ...(from.relationship !== undefined ? { relationship: from.relationship as string } : {}) },
       to: target, quote: b.quote.trim(), declaredBy: actor.id, declaredAt: at,
     };
-    this.store.putRegistrationDraft({ ...d, handoffs: [...d.handoffs.filter((h) => h.id !== handoff.id), handoff] });
-    return { draft: d.id, handoff };
+    return { handoff };
+  }
+
+  /** A business's told hand-over kept, replaced or removed, with the publish's revisions. Call inside flowTransaction. */
+  writeHandoff(flow: string, got: { handoff?: RegistrationDraftHandoff; removed?: string }, actor: Actor, revisions?: Map<string, number>) {
+    if (got.removed) this.store.deleteFlowHandoff(got.removed);
+    if (got.handoff) this.store.putFlowHandoff(flow, got.handoff);
+    const h = got.handoff;
+    const to = h ? ("system" in h.to ? `NiFi 外的 ${h.to.system}` : `${h.to.service} 的组 ${h.to.group}`) : "";
+    this.log(flow, "declare-handoff", actor, () => h ? `记了口头交接 ${h.id}：${h.from.service} 的组 ${h.from.group} 交给${to}（负责人说："${h.quote}"）` : `去掉了口头交接 ${got.removed}`,
+      h ? [h.from.service] : [], revisions);
+    this.store.auditFlow(actor, flow, "register-declare-handoff");
   }
 
   /** place-worker (§7.8 6): where a schedule's worker runs, in the owner's words, when its worker_name matches no
    *  registered group: a group of the business (or draft), or outside: true (not in NiFi); remove: true forgets it.
    *  The chaining uses it from then on (chain() placements) and stops asking. */
-  placeWorker(target: { flow?: unknown; draft?: unknown }, b: Record<string, unknown>, actor: Actor): { flow?: string; draft?: string; schedule: string; worker: string; place: WorkerPlace | null } {
+  placeWorker(target: { flow?: unknown; draft?: unknown }, b: Record<string, unknown>, actor: Actor, o: { plan?: boolean } = {}): { flow?: string; draft?: string; schedule: string; worker: string; place: WorkerPlace | null; plan?: WorkerPlan } {
     const schedule = typeof b.schedule === "number" ? String(b.schedule) : typeof b.schedule === "string" ? b.schedule.trim() : "";
     const worker = typeof b.worker === "string" ? b.worker.trim() : "";
     if (!schedule || schedule.length > NAME_MAX || !worker || worker.length > NAME_MAX) throw new RegError("register/bad-request", "schedule is the schedule_id (or its name), worker its worker_name (the gap's worker says both).");
@@ -435,15 +480,26 @@ export class Registrations {
     }
     const had = this.store.workerPlaces(flow!.id).find(same);
     if (!place && !had) throw new RegError("register/not-found", `The business has no place for ${worker} of schedule ${schedule}.`);
-    this.store.flowTransaction(() => {
-      if (had) this.store.setWorkerPlace(flow!.id, had.schedule, had.worker, null);
-      if (place) this.store.setWorkerPlace(flow!.id, schedule, worker, { service: place.service, group: place.group, quote: place.quote, placedBy: place.placedBy, placedAt: place.placedAt });
-      const name = place?.group ? groups.find((x) => x.service === place!.service && x.id === place!.group)!.name : "";
-      this.log(flow!.id, "place-worker", actor, () => place ? `schedule ${schedule} 的 worker ${worker} ${place.group ? `在组"${name}"` : "不在 NiFi 上"}（负责人说："${place.quote}"）` : `去掉了 schedule ${schedule} 的 worker ${worker} 的位置`,
-        [place?.service ?? had?.service ?? "-"]);
-      this.store.auditFlow(actor, flow!.id, "register-place-worker");
-    });
+    const plan: WorkerPlan = { flow: flow!.id, schedule, worker, place, had: had ?? null, groupName: place?.group ? groups.find((x) => x.service === place!.service && x.id === place!.group)!.name : "" };
+    if (o.plan) return { ...plan, plan };
+    this.store.flowTransaction(() => this.writeWorkerPlace(plan, actor));
     return { flow: flow!.id, schedule, worker, place };
+  }
+
+  /** The business's worker places after a place-worker plan. */
+  placesAfter(plan: WorkerPlan): WorkerPlace[] {
+    const rest = this.store.workerPlaces(plan.flow).filter((p) => !(p.schedule === plan.had?.schedule && p.worker === plan.had.worker));
+    return plan.place ? [...rest, plan.place] : rest;
+  }
+
+  /** Writes a place-worker plan of a business (with the publish's revisions). Call inside flowTransaction. */
+  writeWorkerPlace(plan: WorkerPlan, actor: Actor, revisions?: Map<string, number>) {
+    const { flow, schedule, worker, place, had } = plan;
+    if (had) this.store.setWorkerPlace(flow, had.schedule, had.worker, null);
+    if (place) this.store.setWorkerPlace(flow, schedule, worker, { service: place.service, group: place.group, quote: place.quote, placedBy: place.placedBy, placedAt: place.placedAt });
+    this.log(flow, "place-worker", actor, () => place ? `schedule ${schedule} 的 worker ${worker} ${place.group ? `在组"${plan.groupName}"` : "不在 NiFi 上"}（负责人说："${place.quote}"）` : `去掉了 schedule ${schedule} 的 worker ${worker} 的位置`,
+      [place?.service ?? had?.service ?? "-"].filter((s) => s !== "-" || !revisions?.size), revisions);
+    this.store.auditFlow(actor, flow, "register-place-worker");
   }
 
   private checkName(name: unknown): string {
@@ -452,7 +508,8 @@ export class Registrations {
   }
 
   /** unregister: a business (or a shared module) and all its registered groups go; flow_segments and handoffs with it. */
-  unregister(target: { flow?: unknown; module?: unknown }, actor: Actor): { removed: { flow?: string; module?: string; groups: number }; revisions: { service: string; revision: number }[]; published: boolean } {
+  unregister(target: { flow?: unknown; module?: unknown }, actor: Actor, revisions?: Map<string, number>): { removed: { flow?: string; module?: string; groups: number }; revisions: { service: string; revision: number }[]; published: boolean } {
+    const published = { revisions: [...(revisions ?? [])].map(([service, revision]) => ({ service, revision })), published: Boolean(revisions) };
     if ((target.flow === undefined) === (target.module === undefined)) throw new RegError("register/bad-request", "Give flow or module, one of them.");
     if (target.flow !== undefined) {
       const flow = this.flowOf(target.flow);
@@ -460,12 +517,12 @@ export class Registrations {
       const services = [...new Set([...mine.map((r) => r.service), ...(mine.length ? [] : this.store.flowSegments(flow.id).map((s) => s.service))])];
       let groups = 0;
       this.store.flowTransaction(() => {
-        this.log(flow.id, "unregister", actor, (s) => `注销了业务"${flow.name}"，去掉本服务上的${mine.filter((r) => r.service === s).length} 个组`, services);
+        this.log(flow.id, "unregister", actor, (s) => `注销了业务"${flow.name}"，去掉本服务上的${mine.filter((r) => r.service === s).length} 个组`, services, revisions);
         groups = this.store.removeFlowRegistrations(flow.id);
         this.store.deleteFlow(flow.id);
         this.store.auditFlow(actor, flow.id, "register-unregister");
       });
-      return { removed: { flow: flow.id, groups }, revisions: [], published: false };
+      return { removed: { flow: flow.id, groups }, ...published };
     }
     const id = typeof target.module === "string" ? target.module : "";
     const mod = id ? this.store.sharedModule(id) : null;
@@ -473,11 +530,11 @@ export class Registrations {
     const mine = this.store.flowRegistrations({ owner: mod.id });
     let groups = 0;
     this.store.flowTransaction(() => {
-      this.log(mod.id, "unregister", actor, (s) => `注销了公共模块"${mod.name}"，去掉本服务上的${mine.filter((r) => r.service === s).length} 个组`, [...new Set(mine.map((r) => r.service))]);
+      this.log(mod.id, "unregister", actor, (s) => `注销了公共模块"${mod.name}"，去掉本服务上的${mine.filter((r) => r.service === s).length} 个组`, [...new Set(mine.map((r) => r.service))], revisions);
       groups = this.store.removeFlowRegistrations(mod.id);
       this.store.deleteSharedModule(mod.id);
     });
-    return { removed: { module: mod.id, groups }, revisions: [], published: false };
+    return { removed: { module: mod.id, groups }, ...published };
   }
 }
 

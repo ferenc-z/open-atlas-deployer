@@ -8,11 +8,18 @@ export interface EndpointRef { service: string; business: string; endpoint: stri
 export interface Link { channel: string; from: EndpointRef; to: EndpointRef }
 export interface Dangling extends EndpointRef { side: "entry" | "exit"; channel: string; message: string }
 
-/** The channel's identity, the same string on both sides; null for an external channel (it is not joined). */
+/** S39 step 5: an external channel that is a hand-over on the canvas, written by a registration on both sides: a port
+ *  of a shared module (port:<port id>) or a connection, funnel or schedule step between two registered groups
+ *  (link:<id>). The data keeps its key across it (same NiFi, or the same correlation id). */
+export const CANVAS_CHANNEL = /^(port|link):\S+$/;
+
+/** The channel's identity, the same string on both sides; null for an external channel (it is not joined), except a
+ *  canvas hand-over (CANVAS_CHANNEL). A told hand-over (declared:<id>, §7.3) stays unjoined. */
 export function channelKey(service: string, e: Endpoint, side: "entry" | "exit"): string | null {
   const c = e.channel;
   if (c.type === "s2s") return `s2s:${side === "entry" ? service : c.service}/${c.port}`;
   if (c.type === "mq") return `mq:${c.exchange}/${c.routingKey}`;
+  if (c.type === "external" && c.system && CANVAS_CHANNEL.test(c.system)) return c.system;
   return null;
 }
 

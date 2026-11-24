@@ -3,9 +3,10 @@
 //     (nifi-groups: exactly those groups, one hop out), chained by chain() with the e2e_trace schedules, the shared
 //     modules registered and the told hand-overs. A draft keeps the last preview.
 //   - shared: a group made a shared module: its entries (input ports: canvas, S2S), its exits (output ports, S2S, an
-//     end, with a split condition `when`), kept on shared_modules until the publishing (step 5) writes them into the
-//     models. A group another business has moves out of it with takeover: true (§7.8 1); every business joined to the
-//     module by its ports gets a line in its history and is chained again.
+//     end, with a split condition `when`), kept on shared_modules and written into the models by the publish (step 5,
+//     register-publish.ts: sharedPlan here reads and checks, sharedWrite writes inside the publish's transaction). A
+//     group another business has moves out of it with takeover: true (§7.8 1); every business joined to the module by
+//     its ports gets a line in its history and is chained and published again.
 //   - a module still joined to a business cannot be unregistered (register/module-in-use).
 // Who uses a module is told by the canvas: a registered group on the other side of one of its declared ports (the
 // module's one hop out), or an S2S sender / receiver in the services' latest topologies. MQ users are not seen here.
@@ -29,6 +30,12 @@ export interface RegisterChainDeps {
 }
 /** A business joined to a module, and by what (port names, S2S). */
 export interface ModuleUser { flow: string; name: string; via: string[] }
+/** register shared, checked and read (sharedPlan), before anything is written. module: the module as chain() takes it. */
+export interface SharedPlan {
+  id: string; mod: SharedModule | null; name: string; service: string; group: { id: string; name: string }; path: string; link: string | null;
+  entries: ChainModuleEndpoint[]; exits: ChainModuleEndpoint[]; users: ModuleUser[]; takeover: { flow: string; name: string } | null;
+  preview: Preview; module: ChainModule;
+}
 interface GroupRef { service: string; group: string; slice?: string; link?: string | null }
 interface Port { id: string; name: string; remote?: boolean }
 
@@ -62,10 +69,10 @@ function linkTemplate(webUrl: string | null | undefined, version: string | null 
   return /^1\./.test(String(version ?? "")) ? `${base}/?processGroupId={id}&componentIds=` : `${base}/#/process-groups/{id}`;
 }
 
-const toChain = (h: RegistrationDraftHandoff): ChainHandoff => ({ id: h.id, from: h.from, to: h.to, quote: h.quote, by: h.declaredBy, at: h.declaredAt });
+export const toChain = (h: RegistrationDraftHandoff): ChainHandoff => ({ id: h.id, from: h.from, to: h.to, quote: h.quote, by: h.declaredBy, at: h.declaredAt });
 
 /** preview's handoffs: told hand-overs not committed yet, in declare-handoff's shape. */
-function handoffsOf(v: unknown): ChainHandoff[] {
+export function handoffsOf(v: unknown): ChainHandoff[] {
   if (v === undefined) return [];
   if (!Array.isArray(v) || v.length > 50) throw new RegError("register/bad-request", "handoffs is a list of at most 50 {from, to, quote}.");
   return v.map((h, i): ChainHandoff => {
@@ -155,7 +162,7 @@ export class RegisterChain {
   }
 
   /** chain() on what NiFi has now for these groups. */
-  async chainOf(groups: GroupRef[], o: { name?: string; flow?: string; handoffs?: ChainHandoff[]; placements?: WorkerPlace[] } = {}): Promise<Preview> {
+  async chainOf(groups: GroupRef[], o: { name?: string; flow?: string; handoffs?: ChainHandoff[]; placements?: WorkerPlace[]; modules?: ChainModule[] } = {}): Promise<Preview> {
     const services = this.services();
     const byService = new Map<string, string[]>();
     for (const g of groups) byService.set(g.service, [...(byService.get(g.service) ?? []), g.group]);
@@ -179,7 +186,7 @@ export class RegisterChain {
     const p = chain({
       name: o.name ?? "", ...(o.flow ? { flow: o.flow } : {}),
       groups: groups.map((g) => ({ service: g.service, group: g.group, slice: g.slice ?? "*", link: g.link ?? null })),
-      services, modules: this.modules(), handoffs: o.handoffs ?? [], senders, ...(schedules ? { schedules } : {}),
+      services, modules: o.modules ?? this.modules(), handoffs: o.handoffs ?? [], senders, ...(schedules ? { schedules } : {}),
       placements: (o.placements ?? []).map((x) => ({ schedule: x.schedule, worker: x.worker, service: x.service, group: x.group, quote: x.quote })),
     });
     if (!schedules && !notes.length) notes.push(this.d.schedules ? "这些服务没有配置 e2e_trace 或没读到 schedule 定义，这次只按画布串，没有 schedule 这部分。" : "这个 Deployer 没接 e2e_trace，这次只按画布串，没有 schedule 这部分。");
@@ -357,8 +364,15 @@ export class RegisterChain {
     };
   }
 
-  /** register shared (§7.5, §7.8 1): preview (commit false) or register a shared module. */
-  async shared(b: Record<string, unknown>, actor: Actor) {
+  /** register shared (§7.5, §7.8 1) without commit: the module's preview and who would use it. */
+  async shared(b: Record<string, unknown>, _actor: Actor) {
+    const p = await this.sharedPlan(b);
+    return { ...p.preview, users: p.users, ...(p.takeover ? { takeover: p.takeover } : {}) };
+  }
+
+  /** A shared module checked and read, nothing written: its id (new or the one changed), endpoints, the businesses
+   *  joined to it by its ports and the business it is taken from (takeover). */
+  async sharedPlan(b: Record<string, unknown>): Promise<SharedPlan> {
     const store = this.d.store;
     let mod: SharedModule | null = null;
     if (b.module !== undefined) {
@@ -393,36 +407,35 @@ export class RegisterChain {
     const draft: ChainModule = { id: mod?.id ?? "new", name, service: r.service, group: { id: r.groupId, name: info.name ?? r.groupId }, link: r.link, entries, exits };
     const users = this.usersOf(draft, topology);
     const preview = this.modulePreview(draft, info, topology, path);
-    if (b.commit !== true) return { ...preview, users, ...(takeover ? { takeover } : {}) };
-
     const id = mod?.id ?? `shm_${randomBytes(6).toString("hex")}`;
-    const ports = `入口 ${entries.map(endpointText).join("、")}${exits.length ? `；出口 ${exits.map(endpointText).join("、")}` : "；没有出口"}`;
+    return { id, mod, name, service: r.service, group: draft.group, path, link: r.link, entries, exits, users, takeover, preview,
+      module: { ...draft, id } };
+  }
+
+  /** Writes a shared module (inside the publish's transaction, step 5): its registration and endpoints, the line in its
+   *  history and in each joined business's (with the revisions the publish made). */
+  sharedWrite(p: SharedPlan, actor: Actor, revisions?: Map<string, number>) {
+    const store = this.d.store;
+    const rev = (s: string) => revisions?.get(s) ?? null;
+    const verdict = (s: string) => (revisions?.has(s) ? "published" as const : null);
+    const ports = `入口 ${p.entries.map(endpointText).join("、")}${p.exits.length ? `；出口 ${p.exits.map(endpointText).join("、")}` : "；没有出口"}`;
     store.flowTransaction(() => {
-      if (takeover) store.removeFlowRegistration(takeover.flow, r.service, r.groupId);
-      const same = mod ? store.flowRegistrations({ owner: mod.id }).some((o) => o.service === r.service && o.groupId === r.groupId) : false;
-      if (mod && !same) store.removeFlowRegistrations(mod.id);
-      store.putSharedModule({ id, name, createdBy: actor.id, entries, exits });
-      if (!same) store.addFlowRegistrations([{ owner: id, role: "shared", service: r.service, groupId: r.groupId, groupName: draft.group.name, groupPath: path, slice: "*", link: r.link, registeredBy: actor.id }]);
-      store.addFlowChange({ flow: id, service: r.service, by: actor.id, kind: "shared", revision: null, verdict: null,
-        text: `${mod ? "改了" : "登记了"}公共模块"${name}"：组"${draft.group.name}"（${path}）${takeover ? `，原属业务"${takeover.name}"` : ""}；${ports}` });
-      if (takeover) {
-        store.addFlowChange({ flow: takeover.flow, service: r.service, by: actor.id, kind: "shared", revision: null, verdict: null, text: `组"${draft.group.name}"移出本业务，转成公共模块"${name}"，本业务按端口接上它` });
-        store.auditFlow(actor, takeover.flow, "register-shared");
+      if (p.takeover) store.removeFlowRegistration(p.takeover.flow, p.service, p.group.id);
+      const same = p.mod ? store.flowRegistrations({ owner: p.mod.id }).some((o) => o.service === p.service && o.groupId === p.group.id) : false;
+      if (p.mod && !same) store.removeFlowRegistrations(p.mod.id);
+      store.putSharedModule({ id: p.id, name: p.name, createdBy: actor.id, entries: p.entries, exits: p.exits });
+      if (!same) store.addFlowRegistrations([{ owner: p.id, role: "shared", service: p.service, groupId: p.group.id, groupName: p.group.name, groupPath: p.path, slice: "*", link: p.link, registeredBy: actor.id }]);
+      store.addFlowChange({ flow: p.id, service: p.service, by: actor.id, kind: "shared", revision: rev(p.service), verdict: verdict(p.service),
+        text: `${p.mod ? "改了" : "登记了"}公共模块"${p.name}"：组"${p.group.name}"（${p.path}）${p.takeover ? `，原属业务"${p.takeover.name}"` : ""}；${ports}` });
+      if (p.takeover) {
+        store.addFlowChange({ flow: p.takeover.flow, service: p.service, by: actor.id, kind: "shared", revision: rev(p.service), verdict: verdict(p.service), text: `组"${p.group.name}"移出本业务，转成公共模块"${p.name}"，本业务按端口接上它` });
+        store.auditFlow(actor, p.takeover.flow, "register-shared");
       }
-      for (const u of users) {
-        if (u.flow === takeover?.flow) continue;
-        store.addFlowChange({ flow: u.flow, service: r.service, by: actor.id, kind: "shared", revision: null, verdict: null, text: `按端口接上公共模块"${name}"（${u.via.join("、")}）` });
+      for (const u of p.users) {
+        if (u.flow === p.takeover?.flow) continue;
+        store.addFlowChange({ flow: u.flow, service: p.service, by: actor.id, kind: "shared", revision: rev(p.service), verdict: verdict(p.service), text: `按端口接上公共模块"${p.name}"（${u.via.join("、")}）` });
       }
     });
-    // Each business joined to it, chained again with the module in place.
-    const chained: { flow: string; name: string; joined?: boolean; gaps?: number; preview?: Preview; error?: string }[] = [];
-    for (const u of users.slice(0, 10)) {
-      try {
-        const p = await this.preview({ flow: u.flow });
-        chained.push({ flow: u.flow, name: u.name, joined: p.segments.some((s) => s.module === id), gaps: p.gaps.length, preview: p });
-      } catch (error) { chained.push({ flow: u.flow, name: u.name, error: (error as Error).message }); }
-    }
-    return { module: id, name, revisions: [] as { service: string; revision: number }[], published: false, preview: { ...preview, segments: preview.segments.map((s) => ({ ...s, module: id })) }, users: chained, ...(takeover ? { takeover } : {}) };
   }
 
   /** The businesses joined to a module now (its group read from NiFi). */
@@ -477,9 +490,12 @@ export function moduleHealth(store: Store, m: SharedModule, now = new Date()): M
 
 /** The shared modules as describe and the pages read them: one object each, its health is the module's own (§7.2). */
 export function moduleViews(store: Store, service?: string, now = new Date()) {
+  const models = store.flowModels();
   return store.sharedModules().map((m) => ({
     id: m.id, name: m.name,
     groups: store.flowRegistrations({ owner: m.id }).map((r) => ({ service: r.service, group: { id: r.groupId, name: r.groupName, path: r.groupPath }, link: r.link })),
+    // Step 5: where the published models have it (role shared, its module id): the segment the trace passes through.
+    segments: models.flatMap((x) => x.model.segments.filter((s) => s.module === m.id).map((s) => ({ service: x.service, segment: s.id, revision: x.revision }))),
     entries: (m.entries as ChainModuleEndpoint[]).map((e) => ({ id: e.id, text: endpointText(e) })),
     exits: (m.exits as ChainModuleEndpoint[]).map((e) => ({ id: e.id, text: endpointText(e), ...(e.when ? { when: e.when } : {}) })),
     health: moduleHealth(store, m, now),

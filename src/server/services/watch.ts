@@ -36,9 +36,10 @@ export interface WatchEntry {
 export const FLOW_GROUPS_KIND = "flow-groups@1";
 const BEAT_FRESH_MS = 30_000;
 
-/** S39 (step 2): the switch that lets the watch carry the registered groups. Off unless DEPLOYER_REGISTERED_GROUPS=1:
- *  the skeleton, the model and the gates still assume the whole canvas (step 3 changes that), so the real services are
- *  read whole until then. */
+/** S39 (step 2): the switch that lets the watch carry the registered groups. Off unless DEPLOYER_REGISTERED_GROUPS=1.
+ *  Step 5: the registration's publish and gate work on the groups read (checked on the lab with it on), but the old
+ *  whole-canvas paths (skeleton draft, publish_model's gate, describe, the pages) are not adapted until steps 7–8; the
+ *  default stays off until step 9. */
 export const registeredGroupsOn = (env: NodeJS.ProcessEnv = process.env): boolean => env.DEPLOYER_REGISTERED_GROUPS === "1";
 
 /** S39: the groups registered for a service (ids, a business's and a shared module's, once each); undefined while the
