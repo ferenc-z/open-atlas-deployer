@@ -12,7 +12,10 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   groups, a fragment names up to 200 processors (was 5), so such workers can be offered as candidates. The Register
   page no longer says "This draft is gone" right after registering. The `nifi-ops` skill: a hand-over NiFi does not
   show is recorded only after the owner described or confirmed it (the quote is their words about it), and `look
-  topology` shows only registered groups.
+  topology` shows only registered groups. The business graph draws a shared module once (not also as the old
+  "公共环节"). The "登记的组在画布上变了" to-do no longer opens when nothing inside the groups changed (a neighbour
+  registered, a group just registered or just added, the executor upgrade); the old "Confirm the flows the AI found"
+  to-do is closed once registration is on.
 - [ ] OMA: 重新发布 Deploy Assistant（`nifi-ops` skill 改了口头交接的问法）
 - S39 step 9 (registration is the default): `DEPLOYER_REGISTERED_GROUPS` is now **on by default**; set it to `0` to turn
   it off, an emergency way back to reading the whole canvas. With it on, a service shows only what was registered: a
