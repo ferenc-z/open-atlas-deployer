@@ -97,6 +97,9 @@
 .assistant-try b { font-weight: 600; color: var(--muted); }
 .assistant-try button { text-align: left; min-height: 36px; padding: 6px 10px; border-radius: 10px; border: 1px solid #E3E3DE; background: #F9F9F7; color: #1B1B1B; font: inherit; font-size: 13px; cursor: pointer; }
 .assistant-try .copied { color: #1E6B34; font-size: 12px; }
+.assistant-try button.picked { border-color: #9DB8A4; background: #F1F6F2; }
+.assistant-try .copy-failed { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; border-radius: 10px; background: #FBF3E6; color: #7A4B0B; font-size: 12px; }
+.assistant-try .copy-failed input { font: inherit; font-size: 13px; padding: 6px 8px; border: 1px solid #E3C99A; border-radius: 8px; background: #fff; color: #1B1B1B; }
 dialog.ops-dialog { border: 0; border-radius: 14px; padding: 0; width: min(620px, calc(100% - 32px)); color: #1B1B1B; font-family: Inter, "Noto Sans SC", system-ui, sans-serif; }
 dialog.ops-dialog::backdrop { background: rgba(20, 20, 19, .45); }
 dialog.ops-dialog .body { padding: 24px; display: flex; flex-direction: column; gap: 16px; }

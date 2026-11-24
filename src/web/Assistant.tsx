@@ -7,6 +7,7 @@ import { useEffect, useRef, useState, type CSSProperties, type FormEvent, type P
 import * as api from "./api.ts";
 import { AiMissing } from "./Setup.tsx";
 import { ask } from "./Confirm.tsx";
+import { copyText } from "./clipboard.ts";
 
 export const HOST_OPERATIONS = ["plan_deploy", "plan_rollback", "build_artifact", "set_env_value", "open_service_change"] as const;
 
@@ -71,14 +72,24 @@ export async function runHostOperation(operation: string, payload: Payload, acti
 }
 
 /** "Try asking": examples for this page. The chat cannot be pre-filled (the embed protocol has only a context), so a click copies the question. */
+// When the browser refuses both ways of copying, the question is shown selected in a field so Ctrl+C copies it: a click
+// never ends without something on the page saying what happened.
 function TryAsking({ items }: { items: string[] }) {
-  const [copied, setCopied] = useState<string | undefined>();
-  const copy = (q: string) => { navigator.clipboard?.writeText(q).then(() => setCopied(q), () => undefined); };
+  const [result, setResult] = useState<{ q: string; ok: boolean } | undefined>();
+  const manual = useRef<HTMLInputElement>(null);
+  const copy = async (q: string) => { setResult({ q, ok: await copyText(q) }); };
+  useEffect(() => { if (result && !result.ok) manual.current?.select(); }, [result]);
   return (
     <div className="assistant-try">
       <b>Try asking</b>
-      {items.map((q) => <button key={q} type="button" onClick={() => copy(q)} title="Copies the question: paste it into the box below">{q}</button>)}
-      {copied && <span className="copied">Copied. Paste it into the box below.</span>}
+      {items.map((q) => <button key={q} type="button" className={result?.q === q ? "picked" : undefined} onClick={() => void copy(q)} title="Copies the question: paste it into the box below">{q}</button>)}
+      {result?.ok && <span className="copied" role="status">Copied. Paste it into the box below (Ctrl+V).</span>}
+      {result && !result.ok && (
+        <div className="copy-failed" role="alert">
+          <span>This browser did not allow copying. The question is selected below: press Ctrl+C (⌘C on a Mac), then paste it into the box below.</span>
+          <input ref={manual} readOnly value={result.q} onFocus={(e) => e.currentTarget.select()} aria-label="Question to copy" />
+        </div>
+      )}
     </div>
   );
 }
