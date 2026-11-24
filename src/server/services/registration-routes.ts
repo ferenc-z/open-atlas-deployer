@@ -58,6 +58,28 @@ export function mountRegistrations(api: Hono, d: RegistrationRouteDeps) {
     }
   });
 
+  // S39 step 8: the open drafts that change one registered business (the assistant makes them; the business page shows them).
+  api.get("/api/registrations/drafts", async (c) => {
+    const p = await d.authenticate(c, "view");
+    if (p instanceof Response) return p;
+    const flow = c.req.query("flow");
+    if (!flow) return fail(c, new RegError("register/bad-request", "Give ?flow=<business id>."));
+    return c.json({ drafts: d.store.registrationDraftsOf(flow).map(draftBody) });
+  });
+
+  /** A person throws a draft away (the assistant's key does not: it only changes drafts). */
+  api.delete("/api/registrations/drafts/:id", async (c) => {
+    const p = await d.authenticate(c, "view");
+    if (p instanceof Response) return p;
+    if (isAssistant(p) || p.keyKind === "checkup") return d.reject(c, 403, "register/person-only", "A person discards a draft on the page.");
+    try { d.registrations.draft(c.req.param("id")); } catch (error) {
+      if (error instanceof RegError) return fail(c, error);
+      throw error;
+    }
+    d.store.deleteRegistrationDraft(c.req.param("id"));
+    return c.json({ discarded: c.req.param("id") });
+  });
+
   api.get("/api/registrations/drafts/:id", async (c) => {
     const p = await d.authenticate(c, "view");
     if (p instanceof Response) return p;

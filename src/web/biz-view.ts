@@ -2,7 +2,7 @@
 
 import { LIGHT_ORDER } from "../server/services/ops-types.ts";
 import type { Light } from "../server/services/ops-types.ts";
-import type { BusinessRow, EdgeKindP, GapKind, HandoffInput, LinkInput, Preview, PreviewEdge, PreviewGap, PreviewSegment } from "./biz-types.ts";
+import type { BusinessRow, EdgeKindP, GapKind, HandoffInput, LinkInput, ModuleDetail, ModuleView, Preview, PreviewEdge, PreviewGap, PreviewSegment, RegDraft, RegistrationInfo, SharedModuleRow } from "./biz-types.ts";
 
 // ---- The Businesses page ----
 
@@ -94,24 +94,19 @@ export function summaryOf(p: Preview): string {
   return `${noun} · ${Math.max(0, groups - stuck)} connected · ${open} to ask`;
 }
 
-/** Groups the server could not use: not found, held by another business, or inside one that is. */
+/** Groups the server could not use: NiFi no longer has them (a group somebody else holds is refused when it is added). */
 export function groupProblems(p: Preview): string[] {
-  return p.groups.flatMap((g) => {
-    const where = `${g.service} · ${g.group.name}`;
-    if (g.state === "missing") return [`${where}: not found on that service`];
-    if (g.state === "taken") return [`${where}: already registered${g.takenBy ? ` by ${g.takenBy.name}` : ""}`];
-    if (g.state === "nested") return [`${where}: overlaps a group that is already registered`];
-    return [];
-  });
+  return p.groups.filter((g) => g.state === "missing").map((g) => `${g.service} · ${g.group.name}: not found on that service`);
 }
 
 /** Registering waits for every question to be answered, every group to be usable, and a name. */
 export const canRegister = (p: Preview | undefined, name: string): boolean => p !== undefined && p.segments.length > 0 && p.gaps.length === 0 && groupProblems(p).length === 0 && name.trim() !== "";
 
-/** A gap where the group has no known source: the person says where its data comes from (the others are about where it goes). */
-export const isIncoming = (kind: GapKind): boolean => kind !== "exit-unregistered";
+/** A gap where the group has no known source (its data comes in from somewhere the person must say); the others are about where data goes out: an exit nobody receives, an S2S or MQ nobody takes. */
+export const isIncoming = (kind: GapKind): boolean => kind === "entry-unregistered" || kind === "disconnected";
 
-export interface GapAnswer { from: string; component: string; quote: string; system: string }
+/** `dir` is for a part not joined to the rest (disconnected): the data goes out of this part into `from`, or comes in from it (the default). */
+export interface GapAnswer { from: string; component: string; quote: string; system: string; dir?: "in" | "out" }
 /** The answered gap as the `handoffs` entry of the next preview: data from `from` (a segment) into the gap's segment, or out of NiFi (`system`). Null while something is missing. */
 export function handoffOf(p: Preview, gap: PreviewGap, a: GapAnswer): HandoffInput | null {
   const mine = p.segments.find((s) => s.id === gap.segment);
@@ -124,5 +119,73 @@ export function handoffOf(p: Preview, gap: PreviewGap, a: GapAnswer): HandoffInp
   }
   const source = p.segments.find((s) => s.id === a.from);
   const component = a.component.trim();
+  if (gap.kind === "disconnected" && a.dir === "out") return source && component ? { from: { service: mine.service, group: mine.group.id, component }, to: { service: source.service, group: source.group.id }, quote } : null;
   return source && component ? { from: { service: source.service, group: source.group.id, component }, to: { service: mine.service, group: mine.group.id }, quote } : null;
+}
+
+// ---- The Register page on a draft (7.9) ----
+
+/** True while the groups the preview was made from are not the draft's groups any more (the AI changed them since). */
+export function previewStale(d: RegDraft): boolean {
+  if (!d.preview) return d.groups.length > 0;
+  const was = new Set(d.preview.groups.map((g) => `${g.service}\0${g.group.id}`));
+  return was.size !== new Set(d.groups.map((g) => `${g.service}\0${g.group.id}`)).size || d.groups.some((g) => !was.has(`${g.service}\0${g.group.id}`));
+}
+
+/** The one sentence a refused Register becomes, for the person to paste to the assistant (its input cannot be pre-filled). */
+export function tellAiText(why: { code?: string; message: string; gaps?: PreviewGap[]; problems?: { text: string }[] }, button = "Register"): string {
+  if (why.code === "register/gate-rejected" && why.problems?.length) return `点 ${button} 被闸门拒绝了，问题是：${why.problems.map((p) => p.text).join("；")}。请帮我看看怎么处理，处理好了我再点。`;
+  if (why.code === "register/gaps-open" && why.gaps?.length) return `点 ${button} 被拒绝了，还有 ${why.gaps.length} 个地方接不上：${why.gaps.map((g) => g.text).join("；")}。请帮我逐个处理。`;
+  return `点 ${button} 被拒绝了：${why.message} 请帮我看看怎么处理。`;
+}
+
+/** A refused commit as the page keeps it: the server's sentence, the lines under it, and the sentence for the assistant. */
+export function refusalOf(x: { code?: string; message: string; body?: Record<string, unknown> }, button = "Register"): { code?: string; message: string; lines: string[]; tell: string } {
+  const body = x.body ?? {};
+  return {
+    ...(x.code ? { code: x.code } : {}), message: x.message, lines: refusalLines(body),
+    tell: tellAiText({ ...(x.code ? { code: x.code } : {}), message: x.message, ...(Array.isArray(body.gaps) ? { gaps: body.gaps as PreviewGap[] } : {}), ...(Array.isArray(body.problems) ? { problems: body.problems as { text: string }[] } : {}) }, button),
+  };
+}
+
+/** What a refused commit lists on the page, from the server's answer (gaps, or the gate's problems). */
+export function refusalLines(body: Record<string, unknown>): string[] {
+  const problems = Array.isArray(body.problems) ? (body.problems as { text?: string }[]).map((p) => p.text ?? "") : [];
+  const gaps = Array.isArray(body.gaps) ? (body.gaps as PreviewGap[]).map((g) => g.text) : [];
+  return [...problems, ...gaps].filter(Boolean);
+}
+
+// ---- Shared modules (the Businesses page) ----
+
+const MODULE_LIGHT: Record<ModuleView["health"]["light"], Light> = { ok: "healthy", idle: "unknown", attention: "attention", unknown: "unknown" };
+
+/** One row of the shared-module list; `detail` (who is joined now) comes later, so the row says nothing about users until then. */
+export function moduleRow(m: ModuleView, detail?: ModuleDetail): SharedModuleRow {
+  const ports = [m.entries.length ? `In: ${m.entries.map((e) => e.text).join("、")}` : "", m.exits.length ? `Out: ${m.exits.map((e) => e.text).join("、")}` : ""].filter(Boolean).join(" · ");
+  return {
+    id: m.id, name: m.name, service: [...new Set(m.groups.map((g) => g.service))].join(", "), ports: ports || "No ports described",
+    ...(detail ? { usedBy: detail.users.map((u) => ({ id: u.flow, name: u.name })) } : {}),
+    light: MODULE_LIGHT[m.health.light], health: m.health.text,
+  };
+}
+
+// ---- A draft of changes to a registered business (the business page) ----
+
+/** What a modification draft changes against the business as registered: groups added and removed, the name, the hand-overs told. */
+export function draftChanges(d: RegDraft, now: { name: string; reg: RegistrationInfo }): string[] {
+  const key = (s: string, g: string) => `${s}\0${g}`;
+  const had = new Map(now.reg.groups.map((g) => [key(g.service, g.id), g]));
+  const has = new Map(d.groups.map((g) => [key(g.service, g.group.id), g]));
+  const out: string[] = [];
+  for (const [k, g] of has) if (!had.has(k)) out.push(`Add group ${g.group.name} (${g.service})`);
+  for (const [k, g] of had) if (!has.has(k)) out.push(`Remove group ${g.name} (${g.service})`);
+  if (d.name && d.name !== now.name) out.push(`Rename to “${d.name}”`);
+  const was = new Map(now.reg.handoffs.map((h) => [h.id, h]));
+  for (const h of d.handoffs) {
+    const old = was.get(h.id);
+    if (!old) out.push(`Add a handoff you described: “${h.quote}”`);
+    else if (old.quote !== h.quote || JSON.stringify(old.to) !== JSON.stringify(h.to) || old.from.component !== h.from.component) out.push(`Change a handoff you described: “${h.quote}”`);
+  }
+  for (const h of now.reg.handoffs) if (!d.handoffs.some((x) => x.id === h.id)) out.push(`Remove a handoff you described: “${h.quote}”`);
+  return out;
 }

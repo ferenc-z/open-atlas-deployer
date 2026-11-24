@@ -10,7 +10,7 @@ import { watchedFlows } from "./registered.ts";
 import { skeletonOf, type Skeleton } from "./skeleton.ts";
 import { registeredGroupsOn } from "./watch.ts";
 import { links } from "./trace/channels.ts";
-import { toTraceModel, WHOLE, type Endpoint, type ModelV2, type Segment } from "./trace/model.ts";
+import { toTraceModel, WHOLE, type DeclaredHandoff, type Endpoint, type ModelV2, type Segment } from "./trace/model.ts";
 
 /** What step 3 adds to the graph: node lights, and drops outside an exit (B3 data-dropped). */
 export interface GraphExtras {
@@ -33,10 +33,13 @@ function members(store: Store, flow: string, models: Map<string, ModelV2 | null>
 
 const nodeId = (service: string, segment: string) => `${service}/${segment}`;
 
-function endpointText(side: "entry" | "exit", e: Endpoint): string {
+function endpointText(side: "entry" | "exit", e: Endpoint & { declared?: DeclaredHandoff }): string {
   const c = e.channel;
   if (c.type === "s2s") return side === "entry" ? `经 S2S 端口 ${c.port} 收到` : `经 S2S 送到 ${c.service} 的端口 ${c.port}`;
   if (c.type === "mq") return side === "entry" ? `从 MQ ${c.exchange} / ${c.routingKey} 收到` : `发到 MQ ${c.exchange} / ${c.routingKey}`;
+  // S39 §7.3: a hand-over the owner described (its channel is "declared:<id>"): say where, in the owner's words.
+  if (e.declared) return `送到 ${"system" in e.declared.to ? e.declared.to.system : e.declared.to.group}（负责人说明：${e.declared.quote}）`;
+  if (c.system?.startsWith("declared:")) return "从负责人说明的交接进来";
   return side === "entry" ? `从 ${c.system} 进来` : `送到 ${c.system}`;
 }
 
@@ -104,12 +107,24 @@ export function flowGraph(store: Store, flow: string, extras: GraphExtras = {}, 
   for (const m of ms) {
     const id = nodeId(m.service, m.s.id);
     for (const e of m.s.entries) {
+      // A hand-over the owner described: its exit side draws the dashed line (S39 §7.3), the entry has nothing of its own.
+      if (e.channel.type === "external" && /^declared:/.test(e.channel.system ?? "")) continue;
       if (joinedIn(m, e) || inside(e) || (e.channel.type !== "external" && fedBySegment(m)) || (e.channel.type === "external" && fedBySegment(m) && /待 AI/.test(e.channel.system ?? ""))) continue;
       const ext = `ext:${id}:in:${e.id}`;
       g.nodes.push({ id: ext, kind: "external", service: null, label: e.channel.type === "external" ? e.channel.system! : e.channel.type === "mq" ? `MQ ${e.channel.exchange}` : `S2S ${e.channel.port}`, detail: e.channel.type === "mq" ? e.channel.routingKey! : e.channel.type });
       edge({ from: ext, to: id, kind: e.channel.type === "s2s" ? "s2s" : "data" });
     }
     for (const e of m.s.exits) {
+      const told = e.declared;
+      if (told) {
+        const to = "group" in told.to ? ms.find((x) => x.service === (told.to as { service: string }).service && x.s.group.id === (told.to as { group: string }).group) : undefined;
+        if (to) { edge({ from: id, to: nodeId(to.service, to.s.id), kind: "declared", label: told.quote }); continue; }
+        const outside = "system" in told.to ? told.to.system : String((told.to as { group: string }).group);
+        const ext = `ext:${id}:out:${e.id}`;
+        g.nodes.push({ id: ext, kind: "external", service: null, label: outside, detail: "outside NiFi" });
+        edge({ from: id, to: ext, kind: "declared", label: told.quote });
+        continue;
+      }
       if (joinedOut(m, e) || inside(e)) continue;
       const ext = `ext:${id}:out:${e.id}`;
       g.nodes.push({ id: ext, kind: "external", service: null, label: e.channel.type === "external" ? e.channel.system! : e.channel.type === "mq" ? `MQ ${e.channel.exchange}` : `${e.channel.service} · ${e.channel.port}`, detail: e.channel.type === "mq" ? e.channel.routingKey! : e.channel.type });

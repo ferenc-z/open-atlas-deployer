@@ -179,3 +179,11 @@ dialog.ops-dialog .err { padding: 10px 12px; border-radius: 8px; background: #FD
 .ops .rg-commit { display: flex; flex-direction: column; gap: 10px; padding-top: 12px; border-top: 1px solid #EFEFEA; }
 .ops .rg-done { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 12px 14px; border-radius: 10px; background: #E6F4EA; font-size: 14px; }
 .ops .rg-done b { color: #1E6B34; }
+
+/* S39 step 8 second round: the assistant in the Register page's left column, the fallback cards under it, a draft of changes on the business page */
+.ops .rg-frame { display: flex; flex-direction: column; }
+.ops .rg-frame iframe { width: 100%; height: 560px; border: 0; border-top: 1px solid #EFEFEA; }
+.ops .rg-chat .assistant-hint { padding: 10px 18px; background: #F6F6F3; font-size: 13px; }
+.ops .rg-chat .assistant-try { padding: 10px 18px; }
+.ops .rg-fallback { border-top: 1px solid #EFEFEA; }
+.fl .bz-draft { display: flex; flex-direction: column; gap: 10px; border: 2px solid #C98A1B; background: #FFFBF2; font-size: 15px; line-height: 1.6; }

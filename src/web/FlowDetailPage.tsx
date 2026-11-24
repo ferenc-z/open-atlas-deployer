@@ -7,7 +7,10 @@ import { useCallback, useEffect, useState } from "react";
 import { FlowGraphView } from "./FlowGraphView.tsx";
 import { ANOMALY_LABEL, groupsText, LightPill, RenameField, shortDay, shortTime, StuckEditor, UNKNOWN_REASON } from "./FlowParts.tsx";
 import type { FlowDetail, Light } from "../server/services/ops-types.ts";
-import type { BusinessDetail } from "./biz-types.ts";
+import type { BusinessDetail, RegDraft } from "./biz-types.ts";
+import type { ApiError } from "./api.ts";
+import { draftChanges, refusalOf } from "./biz-view.ts";
+import { Refusal } from "./RegisterPage.tsx";
 import { ask } from "./Confirm.tsx";
 import { biz } from "./biz-data.ts";
 import { businessesHref, openAskAi } from "./flow-routes.ts";
@@ -41,10 +44,32 @@ export function FlowDetailPage({ flow, service, isAdmin, onBack, onOpenService }
   const [renaming, setRenaming] = useState(false);
   const load = useCallback(() => flows.detail(flow, service).then((v) => { setD(v); setError(""); }, (e: Error) => setError(e.message)), [flow, service]);
   useEffect(() => { setD(undefined); void load(); }, [load]);
+  // The drafts the assistant made to change this business (7.9): read every few seconds, so a draft made in the Ask AI drawer shows up here.
+  const [drafts, setDrafts] = useState<RegDraft[]>([]);
+  const [refusal, setRefusal] = useState<{ draft: string; r: ReturnType<typeof refusalOf>; empty: boolean } | undefined>();
+  const [confirmed, setConfirmed] = useState("");
+  const [working, setWorking] = useState(false);
+  const loadDrafts = useCallback(() => biz.draftsOf(flow).then((r) => setDrafts(r.drafts), () => undefined), [flow]);
+  useEffect(() => { void loadDrafts(); const t = setInterval(() => void loadDrafts(), 3000); return () => clearInterval(t); }, [loadDrafts]);
   if (!d) return <div className="fl wide">{error ? <p className="fl-error">{error}</p> : <p className="fl-muted">Loading…</p>}</div>;
   const f = d.flow;
   const reg = d.registration;
   const lead = d.problems[0];
+  const confirmChanges = async (draft: RegDraft) => {
+    setWorking(true); setRefusal(undefined); setError(""); setConfirmed("");
+    try {
+      const r = await biz.commit(draft.draft);
+      setConfirmed(`Changes confirmed: ${r.name} now has ${r.preview.groups.length} ${r.preview.groups.length === 1 ? "group" : "groups"}.`);
+      await Promise.all([load(), loadDrafts()]);
+    } catch (e) {
+      const x = e as ApiError;
+      setRefusal({ draft: draft.draft, r: refusalOf({ ...(x.code ? { code: x.code } : {}), message: x.message, body: x.body }, "Confirm changes"), empty: x.code === "register/empty" });
+    } finally { setWorking(false); }
+  };
+  const discard = async (draft: RegDraft) => {
+    if (!(await ask("Discard these changes? The business stays as it is registered now.", { confirm: "Discard", danger: true }))) return;
+    try { await biz.discardDraft(draft.draft); setRefusal(undefined); await loadDrafts(); } catch (e) { setError((e as Error).message); }
+  };
   const unregister = async () => {
     if (!(await ask(`Unregister “${f.name}”? Deployer stops watching it and its problems close. NiFi is not touched. Its registration history is deleted with it.`, { confirm: "Unregister", danger: true }))) return;
     try { await biz.unregister(f.id); onBack(); } catch (e) { setError((e as Error).message); }
@@ -62,6 +87,25 @@ export function FlowDetailPage({ flow, service, isAdmin, onBack, onOpenService }
         {f.services.map((s) => <a key={s} href="#" onClick={(e) => { e.preventDefault(); onOpenService(s); }}>{s}</a>)}
       </div>
       {error && <p className="fl-error">{error}</p>}
+      {confirmed && <p role="status" style={{ margin: 0, color: "#1E6B34", fontWeight: 600 }}>{confirmed}</p>}
+      {reg && drafts.map((dr) => {
+        const changes = draftChanges(dr, { name: f.name, reg });
+        const mine = refusal?.draft === dr.draft ? refusal : undefined;
+        return (
+          <section key={dr.draft} className="fl-card bz-draft" aria-label="Changes waiting for you">
+            <h3 style={{ margin: 0 }}>Changes waiting for you</h3>
+            <span className="fl-muted" style={{ fontSize: 14 }}>The assistant prepared these from your conversation. Nothing changes until you confirm.</span>
+            {changes.length === 0 ? <span>The draft is the same as the registered business.</span> : <ul style={{ margin: 0, paddingLeft: 18 }}>{changes.map((c, i) => <li key={i}>{c}</li>)}</ul>}
+            <div className="fl-row" style={{ gap: 10 }}>
+              <button type="button" className="fl-btn primary" disabled={working || changes.length === 0} onClick={() => void confirmChanges(dr)}>{working ? "Confirming…" : "Confirm changes"}</button>
+              <button type="button" className="fl-btn" disabled={working} onClick={() => void discard(dr)}>Discard</button>
+            </div>
+            {mine && (mine.empty
+              ? <div className="rg-problem" role="alert"><b>Not confirmed</b><span>These changes take away every group. To stop watching this business, unregister it instead.</span><div className="fl-row"><button type="button" className="fl-btn small" style={{ borderColor: "#E8B4AE", color: "#B3261E" }} onClick={() => void unregister()}>Unregister…</button></div></div>
+              : <Refusal r={mine.r} />)}
+          </section>
+        );
+      })}
 
       <section className={`fl-top ${border}`}>
         <div className="left">

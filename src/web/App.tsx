@@ -120,7 +120,7 @@ export function App() {
           {shown === "hosts" && <HostsPage isAdmin={p.permissions.includes("admin")} />}
           {shown === "services" && <ServicesPage key={`${service ?? ""}:${serviceDraft?.at ?? ""}`} onTakeover={() => go("takeover")} isAdmin={p.permissions.includes("admin")} {...(service ? { initialOpen: service } : {})} {...(serviceDraft ? { initialDraft: serviceDraft.draft } : {})} />}
           {shown === "businesses" && <BusinessesPage key={flowRoute?.kind === "businesses" ? flowRoute.service ?? "" : ""} {...(flowRoute?.kind === "businesses" && flowRoute.service ? { service: flowRoute.service } : {})} me={{ id: p.id, displayName: p.displayName }} />}
-          {shown === "register" && <RegisterPage />}
+          {shown === "register" && <RegisterPage workbenchUrl={me.workbenchUrl} {...(me.environment ? { environment: me.environment } : {})} actions={actions} canAsk={p.via === "workbench"} />}
           {shown === "flow" && flowRoute?.kind === "flow" && <FlowDetailPage key={`${flowRoute.flow}:${flowRoute.service ?? ""}`} flow={flowRoute.flow} {...(flowRoute.service ? { service: flowRoute.service } : {})} isAdmin={p.permissions.includes("admin")} onBack={() => go("businesses")} onOpenService={(s) => { go("services"); openService(s); }} />}
           {shown === "takeover" && <TakeoverPage isAdmin={p.permissions.includes("admin")} onRegistered={() => go("services")} />}
           {shown === "settings" && <SettingsPage />}
@@ -133,13 +133,13 @@ export function App() {
         </main>
       </div>
       {/* Ask AI: the one entrance, a button at the bottom right and the Assistant beside the page (prototype README "AI 入口只有一个"). */}
-      {!assistant && p.via === "workbench" && !setupOnly && (
+      {!assistant && p.via === "workbench" && !setupOnly && shown !== "register" && (
         <button type="button" className="ask-fab" onClick={() => setAssistant(true)} title="Ask the AI about this page">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z" /></svg>
           Ask AI
         </button>
       )}
-      {assistant && <AssistantPanel workbenchUrl={me.workbenchUrl} {...(me.environment ? { environment: me.environment } : {})} page={contextPage(shown)} suggestions={SUGGESTIONS[shown] ?? []} {...(panel?.kind === "deploy" ? { app: panel.app } : {})} focus={focus} actions={actions} onClose={() => { setAssistant(false); window.dispatchEvent(new Event("oa:assistant-closed")); }} onSetup={() => go("setup")} />}
+      {assistant && shown !== "register" && <AssistantPanel workbenchUrl={me.workbenchUrl} {...(me.environment ? { environment: me.environment } : {})} page={contextPage(shown)} suggestions={SUGGESTIONS[shown] ?? []} {...(panel?.kind === "deploy" ? { app: panel.app } : {})} focus={focus} actions={actions} onClose={() => { setAssistant(false); window.dispatchEvent(new Event("oa:assistant-closed")); }} onSetup={() => go("setup")} />}
     </div>
     </PageFocus.Provider>
   );

@@ -3,23 +3,38 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { makeBizClient } from "../src/web/biz-client.ts";
 import type { BusinessRow, Preview } from "../src/web/biz-types.ts";
-import { businessFilter, canRegister, chainOf, countByLight, edgeText, groupProblems, groupsLine, handoffOf, parseLinks, sortBusinesses, summaryOf } from "../src/web/biz-view.ts";
+import type { RegDraft } from "../src/web/biz-types.ts";
+import { draftChanges, isIncoming, moduleRow, previewStale, refusalOf, businessFilter, canRegister, chainOf, countByLight, edgeText, groupProblems, groupsLine, handoffOf, parseLinks, sortBusinesses, summaryOf } from "../src/web/biz-view.ts";
 
-test("client: the register verb goes to registrations/<action>, a write carries a request id", async () => {
+test("client: the pages' calls go to the registration routes, a write carries a request id", async () => {
   const seen: { method: string; path: string; body: unknown }[] = [];
   let n = 0;
   const biz = makeBizClient((async (method: string, path: string, body?: unknown) => { seen.push({ method, path, body }); return {}; }) as never, () => `req-${++n}`);
-  await biz.list();
-  await biz.preview({ links: ["a", { link: "b", service: "c250" }], name: "x" });
-  await biz.commit({ name: "x", links: ["a"] });
+  await biz.businesses();
+  await biz.modules();
+  await biz.module("shm_1");
+  await biz.createDraft();
+  await biz.draft("rgd_1");
+  await biz.draftsOf("flw_1");
+  await biz.addLinks("rgd_1", ["a", { link: "b", service: "c250" }]);
+  await biz.preview("rgd_1");
+  await biz.commit("rgd_1", "x");
+  await biz.discardDraft("rgd_1");
   await biz.rename("flw_1", "y");
   await biz.unregister("flw_1");
   assert.deepEqual(seen, [
     { method: "GET", path: "businesses", body: undefined },
-    { method: "POST", path: "registrations/preview", body: { links: ["a", { link: "b", service: "c250" }], name: "x" } },
-    { method: "POST", path: "registrations/commit", body: { name: "x", links: ["a"], request_id: "req-1" } },
-    { method: "POST", path: "registrations/rename", body: { flow: "flw_1", name: "y", request_id: "req-2" } },
-    { method: "POST", path: "registrations/unregister", body: { flow: "flw_1", request_id: "req-3" } },
+    { method: "GET", path: "registrations/modules", body: undefined },
+    { method: "GET", path: "registrations/modules/shm_1", body: undefined },
+    { method: "POST", path: "registrations/drafts", body: {} },
+    { method: "GET", path: "registrations/drafts/rgd_1", body: undefined },
+    { method: "GET", path: "registrations/drafts?flow=flw_1", body: undefined },
+    { method: "POST", path: "registrations/add", body: { draft: "rgd_1", links: ["a", { link: "b", service: "c250" }], request_id: "req-1" } },
+    { method: "POST", path: "registrations/preview", body: { draft: "rgd_1" } },
+    { method: "POST", path: "registrations/commit", body: { draft: "rgd_1", name: "x", request_id: "req-2" } },
+    { method: "DELETE", path: "registrations/drafts/rgd_1", body: undefined },
+    { method: "POST", path: "registrations/rename", body: { flow: "flw_1", name: "y", request_id: "req-3" } },
+    { method: "POST", path: "registrations/unregister", body: { flow: "flw_1", request_id: "req-4" } },
   ]);
 });
 
@@ -80,7 +95,45 @@ test("register: the chain follows the layers, the summary counts what is open, a
 });
 
 test("register: a group that cannot be used is named, and blocks Register", () => {
-  const bad: Preview = { ...preview, gaps: [], groups: [{ ref: "g1", service: "c250", group: { id: "1", name: "Manager" }, state: "taken", takenBy: { flow: "flw_x", name: "订单同步" } }, { ref: "g2", service: "n192", group: { id: "2", name: "Gone" }, state: "missing" }] };
-  assert.deepEqual(groupProblems(bad), ["c250 · Manager: already registered by 订单同步", "n192 · Gone: not found on that service"]);
+  const bad: Preview = { ...preview, gaps: [], groups: [{ ref: "g1", service: "c250", group: { id: "1", name: "Manager" }, state: "ok" }, { ref: "g2", service: "n192", group: { id: "2", name: "Gone" }, state: "missing" }] };
+  assert.deepEqual(groupProblems(bad), ["n192 · Gone: not found on that service"]);
   assert.equal(canRegister(bad, "x"), false);
+});
+
+test("register: S2S and MQ nobody receives are about where data goes out; a part not joined to the rest is about where it comes from", () => {
+  for (const k of ["exit-unregistered", "s2s-unpaired", "mq-unpaired", "worker-unplaced", "group-missing"] as const) assert.equal(isIncoming(k), false, k);
+  for (const k of ["entry-unregistered", "disconnected"] as const) assert.equal(isIncoming(k), true, k);
+});
+
+const draft = (over: Partial<RegDraft>): RegDraft => ({ draft: "rgd_1", flow: null, createdBy: "u", name: null, groups: [], handoffs: [], places: [], preview: null, createdAt: "", updatedAt: "", ...over });
+const dg = (service: string, id: string, name: string) => ({ service, group: { id, name, path: "" }, link: null, addedBy: "u", addedAt: "" });
+
+test("register: the picture is stale while the draft's groups are not the preview's", () => {
+  assert.equal(previewStale(draft({})), false);
+  assert.equal(previewStale(draft({ groups: [dg("c250", "1", "A")] })), true, "no preview yet");
+  const p = { ...preview, groups: [{ ref: "g1", service: "c250", group: { id: "1", name: "A" }, state: "ok" as const }] };
+  assert.equal(previewStale(draft({ groups: [dg("c250", "1", "A")], preview: p })), false);
+  assert.equal(previewStale(draft({ groups: [dg("c250", "1", "A"), dg("c250", "2", "B")], preview: p })), true);
+});
+
+test("register: a refused Register becomes the lines to show and one sentence for the assistant", () => {
+  const gate = refusalOf({ code: "register/gate-rejected", message: "refused", body: { problems: [{ text: "s2s-balance: 发出 10 收到 8" }] } });
+  assert.deepEqual(gate.lines, ["s2s-balance: 发出 10 收到 8"]);
+  assert.match(gate.tell, /^点 Register 被闸门拒绝了.*s2s-balance/u);
+  const gaps = refusalOf({ code: "register/gaps-open", message: "open", body: { gaps: [{ id: "g1", text: "Archive 接不上" }] } }, "Confirm changes");
+  assert.match(gaps.tell, /^点 Confirm changes 被拒绝了，还有 1 个地方接不上：Archive 接不上/u);
+});
+
+test("business: a draft of changes is listed against what is registered", () => {
+  const reg = { by: "u", at: "", shared: [], changes: [], groups: [{ service: "c250", id: "1", name: "A", how: "" }, { service: "c250", id: "2", name: "B", how: "" }], handoffs: [{ id: "hof_1", from: { service: "c250", group: "1", component: "p" }, to: { system: "x" }, quote: "old" }] };
+  const same = draft({ flow: "flw_1", name: "N", groups: [dg("c250", "1", "A"), dg("c250", "2", "B")], handoffs: [{ id: "hof_1", from: reg.handoffs[0]!.from, to: reg.handoffs[0]!.to, quote: "old", declaredBy: "", declaredAt: "" }] });
+  assert.deepEqual(draftChanges(same, { name: "N", reg }), []);
+  const changed = draft({ flow: "flw_1", name: "Z", groups: [dg("c250", "1", "A"), dg("n112", "3", "C")], handoffs: [] });
+  assert.deepEqual(draftChanges(changed, { name: "N", reg }), ["Add group C (n112)", "Remove group B (c250)", "Rename to “Z”", "Remove a handoff you described: “old”"]);
+});
+
+test("modules: a row says what goes in and out, its own health, and who uses it once that is known", () => {
+  const m = { id: "shm_1", name: "校验", groups: [{ service: "n112", group: { id: "g", name: "validate" } }], segments: [], entries: [{ id: "e", text: "S2S 端口 in" }], exits: [{ id: "x", text: "MQ ok" }], health: { light: "ok" as const, minutes: 60, flowfilesIn: 3, flowfilesOut: 3, text: "进 3 出 3" }, createdBy: "u", updatedAt: "" };
+  assert.deepEqual(moduleRow(m), { id: "shm_1", name: "校验", service: "n112", ports: "In: S2S 端口 in · Out: MQ ok", light: "healthy", health: "进 3 出 3" });
+  assert.deepEqual(moduleRow(m, { ...m, users: [{ flow: "flw_1", name: "订单", via: [] }] }).usedBy, [{ id: "flw_1", name: "订单" }]);
 });

@@ -5,25 +5,30 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { Light } from "../server/services/ops-types.ts";
-import type { BusinessRow, SharedModuleRow } from "./biz-types.ts";
+import type { BusinessRow, ModuleDetail, ModuleView, SharedModuleRow } from "./biz-types.ts";
 import { biz } from "./biz-data.ts";
 import { flowHref, openAskAi, registerHref } from "./flow-routes.ts";
 import { LIGHT_LABEL } from "./FlowParts.tsx";
 import { usePageFocus } from "./focus.ts";
-import { businessFilter, countByLight, groupsLine, sortBusinesses, type StatusFilter } from "./biz-view.ts";
+import { businessFilter, countByLight, groupsLine, moduleRow, sortBusinesses, type StatusFilter } from "./biz-view.ts";
 import "./ops.css";
 
 export type Me = { id: string; displayName: string };
 
 export function BusinessesPage({ service, me }: { service?: string; me: Me }) {
   usePageFocus("page", "businesses");
-  const [data, setData] = useState<{ businesses: BusinessRow[]; shared: SharedModuleRow[] } | undefined>();
+  const [data, setData] = useState<{ businesses: BusinessRow[]; modules: ModuleView[] } | undefined>();
+  // Who uses a module is read from NiFi by the server: asked once per module after the list is on screen.
+  const [users, setUsers] = useState<Record<string, ModuleDetail>>({});
   const [error, setError] = useState("");
   const [status, setStatus] = useState<StatusFilter>("all");
   const [svc, setSvc] = useState(service ?? "");
   const [mine, setMine] = useState(false);
   useEffect(() => setSvc(service ?? ""), [service]);
-  const load = useCallback(() => biz.list().then((d) => { setData(d); setError(""); }, (e: Error) => setError(e.message)), []);
+  const load = useCallback(() => Promise.all([biz.businesses(), biz.modules()]).then(([b, m]) => { setData({ businesses: b.businesses, modules: m.modules }); setError(""); }, (e: Error) => setError(e.message)), []);
+  useEffect(() => {
+    for (const m of data?.modules ?? []) if (!users[m.id]) void biz.module(m.id).then((d) => setUsers((u) => ({ ...u, [m.id]: d })), () => undefined);
+  }, [data?.modules.map((m) => m.id).join(",")]);
   useEffect(() => { void load(); const t = setInterval(() => void load(), 15_000); return () => clearInterval(t); }, [load]);
 
   const all = useMemo(() => (data ? sortBusinesses(data.businesses) : []), [data]);
@@ -33,6 +38,7 @@ export function BusinessesPage({ service, me }: { service?: string; me: Me }) {
   const rows = useMemo(() => scoped.filter(businessFilter({ status, service: "", mine: false, me })), [scoped, status, me]);
   const counts = countByLight(scoped);
 
+  const shared: SharedModuleRow[] = (data?.modules ?? []).map((m) => moduleRow(m, users[m.id]));
   if (!data) return <div className="fl ops ops-wide">{error ? <p className="fl-error">{error}</p> : <p className="fl-muted">Loading…</p>}</div>;
   const chips: [StatusFilter, string][] = [["all", `All ${scoped.length}`], ["failing", `Failing ${counts.failing}`], ["attention", `Attention ${counts.attention}`], ["healthy", `Healthy ${counts.healthy}`], ...(counts.unknown > 0 ? [["unknown", `Unknown ${counts.unknown}`] as [StatusFilter, string]] : [])];
   return (
@@ -92,17 +98,17 @@ export function BusinessesPage({ service, me }: { service?: string; me: Me }) {
 
       <section className="fl-card">
         <div className="fl-head">
-          <h2 style={{ fontSize: 18 }}>Shared modules ({data.shared.length})</h2>
+          <h2 style={{ fontSize: 18 }}>Shared modules ({shared.length})</h2>
           <button type="button" className="fl-linkbtn" style={{ fontSize: 14 }} title="Opens Ask AI" onClick={openAskAi}>Register a shared module</button>
         </div>
         <p className="fl-muted" style={{ fontSize: 14, margin: 0 }}>A shared module is registered once with its entrances and exits; a business whose groups connect to them is linked automatically. Its health is shown as a whole, not split per business.</p>
-        {data.shared.length === 0 && <p className="fl-muted" style={{ margin: 0 }}>No shared modules yet.</p>}
-        {data.shared.map((m) => (
+        {shared.length === 0 && <p className="fl-muted" style={{ margin: 0 }}>No shared modules yet.</p>}
+        {shared.map((m) => (
           <div key={m.id} className="bz-module">
             <span className="n">{m.name}</span>
             <span className="w">{m.service}</span>
             <span className="p">{m.ports}</span>
-            <span className="u">Used by {m.usedBy.length ? m.usedBy.map((u) => u.name).join("、") : "no business yet"}</span>
+            <span className="u">{m.usedBy === undefined ? "Checking which businesses use it…" : `Used by ${m.usedBy.length ? m.usedBy.map((u) => u.name).join("、") : "no business yet"}`}<br /><span className="fl-muted">{m.health}</span></span>
             <LightPill light={m.light} />
           </div>
         ))}

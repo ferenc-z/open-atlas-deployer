@@ -73,7 +73,8 @@ function setup() {
     const body = await rpc(key, "tools/call", { name: "register", arguments: { ...args, request_id: `r${++rid}` } });
     return { isError: Boolean(body.result.isError), value: JSON.parse(body.result.content[0].text) };
   };
-  return { store, names, register };
+  const http = async (key: string, method: string, path: string) => { const res = await app.request(`/deploy/api/${path}`, { method, headers: { authorization: `Bearer ${key}` } }); return { status: res.status, body: (await res.json()) as any }; };
+  return { store, names, register, http };
 }
 
 test("register: the Assistant and people see it, the check-up does not; publish_model is no longer the Assistant's", async () => {
@@ -158,4 +159,37 @@ test("register: a registered business changes through a draft of it, which a per
   const same = (await t.register("dps_assistant", { action: "draft", flow })).value;
   const none = (await t.register("dpk_owner", { action: "commit", draft: same.draft })).value;
   assert.deepEqual([none.published, none.revisions], [false, []]);
+});
+
+test("pages: the business list, its registration block, the drafts that change it, the cards' business counts", async () => {
+  const t = setup();
+  const d = (await t.register("dpk_owner", { action: "draft", name: "对账" })).value;
+  await t.register("dpk_owner", { action: "add", draft: d.draft, links: [link(C)] });
+  await t.register("dpk_owner", { action: "declare-handoff", draft: d.draft, from: { service: "n1", group: C, component: "c-out" }, to: { system: "对账系统" }, quote: "先交给对账系统" });
+  const flow = (await t.register("dpk_owner", { action: "commit", draft: d.draft })).value.flow as string;
+
+  const list = (await t.http("dpk_owner", "GET", "businesses")).body.businesses;
+  assert.deepEqual(list.map((b: { id: string; name: string; groupCount: number; handoffCount: number; registeredBy: string; services: string[] }) => [b.id, b.name, b.groupCount, b.handoffCount, b.registeredBy, b.services]), [[flow, "对账", 1, 1, "owner@x", ["n1"]]]);
+
+  const detail = (await t.http("dpk_owner", "GET", `flows/${flow}`)).body;
+  assert.equal(detail.registration.by, "owner@x");
+  assert.deepEqual(detail.registration.groups.map((g: { id: string; name: string }) => [g.id, g.name]), [[C, "对账收"]]);
+  assert.equal(detail.registration.handoffs[0].quote, "先交给对账系统");
+  assert.ok(detail.registration.changes.length >= 1);
+  assert.ok(detail.flow.graph.edges.some((e: { kind: string; label?: string }) => e.kind === "declared" && e.label === "先交给对账系统"), JSON.stringify(detail.flow.graph));
+
+  // The assistant's modification draft is found by the business; a person discards it, the assistant cannot.
+  const e = (await t.register("dps_assistant", { action: "draft", flow })).value;
+  const found = (await t.http("dpk_owner", "GET", `registrations/drafts?flow=${flow}`)).body.drafts;
+  assert.deepEqual(found.map((x: { draft: string }) => x.draft), [e.draft]);
+  assert.equal((await t.http("dps_assistant", "DELETE", `registrations/drafts/${e.draft}`)).status, 403);
+  assert.equal((await t.http("dpk_owner", "DELETE", `registrations/drafts/${e.draft}`)).status, 200);
+  assert.deepEqual((await t.http("dpk_owner", "GET", `registrations/drafts?flow=${flow}`)).body.drafts, []);
+  assert.equal((await t.http("dpk_owner", "GET", `registrations/drafts?flow=`)).status, 400);
+
+  const card = (await t.http("dpk_owner", "GET", "services/overview")).body.services.find((c: { id: string }) => c.id === "n1");
+  assert.equal(card.businesses.count, 1);
+  const page = (await t.http("dpk_owner", "GET", "services/n1/page")).body;
+  assert.equal(page.businessCount, 1);
+  assert.ok(Array.isArray(page.affected));
 });
