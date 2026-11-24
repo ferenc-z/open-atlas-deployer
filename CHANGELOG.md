@@ -5,6 +5,11 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
 
 ## Unreleased
 
+- S39 UAT fixes (2026-11-25): a shared module whose exits only write out of NiFi (an error log, an audit trail, a dead
+  letter store) no longer makes every business sending into it report `exit-unregistered`. A schedule whose worker
+  names match processors (or groups named like them) in the registered groups now joins the chain as questions
+  (`worker-unplaced` with candidates) instead of being left out. Service executor 0.9.8: reading only the registered
+  groups, a fragment names up to 200 processors (was 5), so such workers can be offered as candidates.
 - S39 step 9 (registration is the default): `DEPLOYER_REGISTERED_GROUPS` is now **on by default**; set it to `0` to turn
   it off, an emergency way back to reading the whole canvas. With it on, a service shows only what was registered: a
   service with no registration has no businesses and no gaps. The businesses and models of the old whole-canvas way are

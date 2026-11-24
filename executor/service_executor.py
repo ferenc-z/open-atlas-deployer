@@ -86,7 +86,7 @@ from executor_core import (  # noqa: F401
     FINAL, ID_RE, PROTOCOLS, Failed, ProtocolExecutor, Refused, Restarting, load_env_file, now_iso, write_json)
 # <<< executor_core
 
-VERSION = "0.9.7"
+VERSION = "0.9.8"
 # The executor's release (§8.6): one directory in the archive, holding only these files.
 PACKAGE = "open-atlas-service-executor"
 PACKAGE_FILES = ("service_executor.py", "launch.sh", "switch", "install.sh", "open-atlas-service-executor.service", "service-executor.env.example")
@@ -709,6 +709,9 @@ NEIGHBORS_MAX = 200
 GROUP_ID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 HISTORY_CALLS_MAX = 200
 FLOW_NAMES_MAX = 5
+# 0.9.8 (S39 UAT): reading only the registered groups, a fragment names up to FLOW_NAMES_SCOPED_MAX processors, so a
+# schedule's worker that runs as a processor (worker_name = the processor's name) can be offered as a candidate.
+FLOW_NAMES_SCOPED_MAX = 200
 # 0.9.6: a processor that hands data out of NiFi, told by NiFi's naming convention for its type (PutFile, PutSFTP,
 # PublishKafka, PostHTTP, SendTrapSNMP …); EXECUTOR_EXIT_TYPES (a regular expression on the type's simple name)
 # replaces it where a flow uses other processors to write out.
@@ -1158,7 +1161,7 @@ def build_topology(root_id, root_name, groups, units=None):
         procs = sorted(nodes[i]["name"] for i in members if nodes[i]["kind"] == "processor")
         remote_in = sorted(({"id": i, "name": nodes[i]["name"]} for i in members if nodes[i]["kind"] == "input-port" and nodes[i]["remote"]), key=lambda p: p["id"])
         s2s_out = sorted({f"{(nodes[i]['targets'] or [''])[0]}#{nodes[i]['name']}" for i in members if nodes[i]["kind"] == "rpg-port" and i in incoming})
-        frag = {"key": key, "processors": len(procs), "names": procs[:FLOW_NAMES_MAX],
+        frag = {"key": key, "processors": len(procs), "names": procs[:FLOW_NAMES_MAX if units is None else FLOW_NAMES_SCOPED_MAX],
                 "inputs": sorted(nodes[i]["name"] for i in members if nodes[i]["kind"] == "input-port" and nodes[i]["group"] == u and u != root_id),
                 "outputs": sorted(nodes[i]["name"] for i in members if nodes[i]["kind"] == "output-port" and nodes[i]["group"] == u and u != root_id),
                 "remoteIn": [p["name"] for p in remote_in], "s2sOut": s2s_out,
