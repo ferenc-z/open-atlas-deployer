@@ -87,6 +87,8 @@ test("a change in a group nobody registered is none; a registered group renamed,
   const five = { ...was, groups: was.groups.map((g) => ({ ...g, fragments: g.fragments.map((f) => ({ ...f, names: ["f", "g", "h", "i", "j"] })) })) };
   assert.equal(registeredFingerprint(was, new Set(["M"])), registeredFingerprint(linked, new Set(["M"])));
   assert.equal(registeredFingerprint(five, new Set(["A"])), registeredFingerprint(named, new Set(["A"])));
+  // The whole-canvas way's "confirm the flows" to-do is closed too.
+  store.upsertTodo({ service: "n1", flow: null, source: "flows", key: "flows:n1", severity: "attention", title: "Confirm the flows the AI found", detail: "", action: null, analysis: null }, "deployer");
   canvasChangeTodos(store, "n1");
   assert.equal(store.todos("n1").length, 0);
   // A is renamed on the canvas.

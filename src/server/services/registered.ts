@@ -145,4 +145,7 @@ export function canvasChangeTodos(store: Store, service: string, changes = canva
     }, "deployer");
   }
   for (const t of store.todos(service)) if (t.key.startsWith("canvas:") && !live.has(t.key)) store.closeTodo(t.id, "done", { id: "deployer", via: "service" });
+  // The whole-canvas way's "Confirm the flows the AI found" (flows:<service>) has nothing left to confirm once businesses
+  // are registered: registering publishes without it, so nothing else closes it (S39 UAT 2026-11-25).
+  for (const t of store.todos(service)) if (t.key === `flows:${service}`) store.closeTodo(t.id, "done", { id: "deployer", via: "service" });
 }
