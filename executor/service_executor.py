@@ -86,7 +86,7 @@ from executor_core import (  # noqa: F401
     FINAL, ID_RE, PROTOCOLS, Failed, ProtocolExecutor, Refused, Restarting, load_env_file, now_iso, write_json)
 # <<< executor_core
 
-VERSION = "0.9.6"
+VERSION = "0.9.7"
 # The executor's release (§8.6): one directory in the archive, holding only these files.
 PACKAGE = "open-atlas-service-executor"
 PACKAGE_FILES = ("service_executor.py", "launch.sh", "switch", "install.sh", "open-atlas-service-executor.service", "service-executor.env.example")
@@ -697,7 +697,16 @@ BACKPRESSURE_STOPPED_MAX = 50
 FLOW_DEFAULT, FLOW_MAX = 300, 3600
 FLOW_BUDGET = 20.0
 TOPOLOGY_SECONDS = 3600
-TOPOLOGY_GROUPS_MAX = 500
+# 0.9.7 (S39 step 1): a watch entry's registered groups (groups: [ids]) are all the flow counts and the topology read:
+# each group with its subgroups, and one hop out (its parent's connections to it). No cap on the canvas' groups any
+# more; the time is given by the registered groups: FLOW_BUDGET_BASE + FLOW_BUDGET_PER_GROUP each, at most
+# FLOW_BUDGET_MAX. At most GROUPS_MAX groups per member (more are cut and said); nifi-groups reads NIFI_GROUPS_MAX.
+FLOW_BUDGET_BASE, FLOW_BUDGET_PER_GROUP, FLOW_BUDGET_MAX = 10.0, 2.0, 120.0
+GROUPS_MAX = 500
+NIFI_GROUPS_MAX = 20
+NIFI_GROUPS_SECONDS = 30
+NEIGHBORS_MAX = 200
+GROUP_ID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 HISTORY_CALLS_MAX = 200
 FLOW_NAMES_MAX = 5
 # 0.9.6: a processor that hands data out of NiFi, told by NiFi's naming convention for its type (PutFile, PutSFTP,
@@ -748,8 +757,24 @@ def watch_entries(value):
             "files": watch_files(w.get("files")),
             # The Deployer has no flow counts of this service yet: read NiFi's own status history (about 24 hours) once.
             "flowHistory": w.get("flowHistory") is True,
+            **watch_groups(w),
         })
     return out
+
+
+def watch_groups(w):
+    """S39 step 1: the groups registered on this member. No key (an older Deployer): None, the whole canvas is read as
+    before. A list: those groups only (ids, or {id} objects; others dropped), [] none at all (no flow counts, no
+    topology; the machine's own numbers are sampled as ever). In a cluster the Deployer gives the list to one node and
+    [] to the others (§7.7 question 6). groupsCut: how many beyond GROUPS_MAX were left out."""
+    if "groups" not in w:
+        return {"groups": None, "groupsCut": 0}
+    ids = []
+    for g in w["groups"] if isinstance(w["groups"], list) else []:
+        gid = g.get("id") if isinstance(g, dict) else g
+        if isinstance(gid, str) and GROUP_ID.match(gid) and gid not in ids:
+            ids.append(gid)
+    return {"groups": ids[:GROUPS_MAX], "groupsCut": max(0, len(ids) - GROUPS_MAX)}
 
 
 def watch_files(value):
@@ -1046,16 +1071,24 @@ def target_uris(rpg):
     return [u.strip().rstrip("/").lower() for u in str(raw).split(",") if u.strip()]
 
 
-def build_topology(root_id, root_name, groups):
+def build_topology(root_id, root_name, groups, units=None):
     """The skeleton's raw material from the walked groups [{id, name, parent, flow}] (flow: processGroupFlow.flow):
     each group directly under root is a unit, and so are the components on the root canvas itself (unit = root id,
     root: true). Inside a unit, the connected pieces are its fragments (A7 ②); root-level connections between units are
     links (A7 ①, ③); S2S: the remote input ports (s2sIn) and the RPG ports connections go to (s2sOut, ref
     '<target uri>#<port name>'). Returns (body, helper): the body is what the Deployer stores, the helper what the
-    counts need (connection ids by S2S ref, root sources)."""
+    counts need (connection ids by S2S ref, root sources). 0.9.7: units (a set of group ids, S39 registered groups at any
+    depth) makes those groups the units instead, each with the subgroups under it (a registered group inside another
+    is a unit of its own); the groups entries then carry parent and path (see scoped_topology)."""
     parent = {g["id"]: g.get("parent") for g in groups}
 
     def unit_of(gid):
+        if units is not None:
+            u, seen = gid, set()
+            while u is not None and u not in units and u not in seen:
+                seen.add(u)
+                u = parent.get(u)
+            return u if u in units else None
         if gid == root_id:
             return root_id
         u, seen = gid, set()
@@ -1070,6 +1103,8 @@ def build_topology(root_id, root_name, groups):
     for g in groups:
         gid, f = g["id"], g.get("flow") or {}
         u = unit_of(gid)
+        if u is None:
+            continue
         name_of = lambda e: ((e.get("component") or {}).get("name")) or e.get("id")
         for e in f.get("processors") or []:
             comp = e.get("component") or {}
@@ -1116,7 +1151,7 @@ def build_topology(root_id, root_name, groups):
     for i, n in nodes.items():
         if n["kind"] == "processor" or i in linked:
             classes.setdefault(find(i), []).append(i)
-    frag_of, units = {}, {}
+    frag_of, pieces = {}, {}
     for members in classes.values():
         key = min(members)
         u = nodes[members[0]]["unit"]
@@ -1130,14 +1165,17 @@ def build_topology(root_id, root_name, groups):
                 "starts": sum(1 for i in members if nodes[i]["kind"] == "processor" and i not in incoming) + len(remote_in)}
         for i in members:
             frag_of[i] = key
-        units.setdefault(u, []).append(frag)
+        pieces.setdefault(u, []).append(frag)
     body_groups = []
     for g in groups:
-        if parent.get(g["id"]) == root_id:
-            body_groups.append({"id": g["id"], "name": names[g["id"]], "root": False, "fragments": sorted(units.get(g["id"], []), key=lambda f: f["key"])})
+        if units is not None and g["id"] in units:
+            body_groups.append({"id": g["id"], "name": names[g["id"]], "root": False, "parent": g.get("parent"), "path": g.get("path") or [],
+                                "fragments": sorted(pieces.get(g["id"], []), key=lambda f: f["key"])})
+        elif units is None and parent.get(g["id"]) == root_id:
+            body_groups.append({"id": g["id"], "name": names[g["id"]], "root": False, "fragments": sorted(pieces.get(g["id"], []), key=lambda f: f["key"])})
     body_groups.sort(key=lambda g: (g["name"], g["id"]))
-    if units.get(root_id):
-        body_groups.insert(0, {"id": root_id, "name": root_name or root_id, "root": True, "fragments": sorted(units[root_id], key=lambda f: f["key"])})
+    if units is None and pieces.get(root_id):
+        body_groups.insert(0, {"id": root_id, "name": root_name or root_id, "root": True, "fragments": sorted(pieces[root_id], key=lambda f: f["key"])})
     port_name = lambda i: nodes[i]["name"] if nodes[i]["kind"] in ("input-port", "output-port") else None
     body_links = sorted(({"connection": cid, "from": {"group": nodes[s]["unit"], "fragment": frag_of.get(s), "port": port_name(s)},
                          "to": {"group": nodes[d]["unit"], "fragment": frag_of.get(d), "port": port_name(d)}} for cid, s, d in links), key=lambda l: l["connection"] or "")
@@ -1170,9 +1208,14 @@ def build_topology(root_id, root_name, groups):
                           key=lambda x: (x["group"], x["id"]))
     # Ops step 3b (B3): where a bulletin's, a provenance event's or a queue's component is. nested: a group deeper than
     # root's children -> its unit; split: in a unit of several fragments, each processor -> its fragment.
-    body["nested"] = {gid: unit_of(gid) for gid in sorted(parent) if gid != root_id and parent.get(gid) not in (None, root_id)}
-    multi = {u for u, fs in units.items() if len(fs) > 1}
+    if units is None:
+        body["nested"] = {gid: unit_of(gid) for gid in sorted(parent) if gid != root_id and parent.get(gid) not in (None, root_id)}
+    else:
+        body["nested"] = {gid: unit_of(gid) for gid in sorted(parent) if gid not in units and unit_of(gid) is not None}
+    multi = {u for u, fs in pieces.items() if len(fs) > 1}
     body["split"] = {i: frag_of[i] for i in sorted(frag_of) if nodes[i]["unit"] in multi and nodes[i]["kind"] == "processor"}
+    if units is not None:  # scoped_topology's one hop out needs them (and drops them)
+        helper["fragOf"], helper["nodes"] = frag_of, nodes
     return body, helper
 
 
@@ -1192,10 +1235,7 @@ def flow_counts(index, topology, helper):
     for x in root.get("processGroupStatusSnapshots") or []:
         g = (x or {}).get("processGroupStatusSnapshot") or {}
         if isinstance(g.get("id"), str):
-            out.append({"kind": "group", "ref": g["id"], "name": g.get("name") or g["id"],
-                        "flowFilesIn": _n(g, "flowFilesIn", "flowFilesReceived"), "flowFilesOut": _n(g, "flowFilesOut", "flowFilesSent"),
-                        "bytesIn": _n(g, "bytesIn", "bytesReceived"), "bytesOut": _n(g, "bytesOut", "bytesSent"),
-                        "transferred": _n(g, "flowFilesTransferred")})
+            out.append(group_row(g["id"], g))
     if topology is None:
         return out
     snap = lambda i: comps.get(i, (None, {}))[1]
@@ -1206,15 +1246,209 @@ def flow_counts(index, topology, helper):
                     "flowFilesIn": sum(_n(s, "flowFilesOut") for s in ins), "flowFilesOut": sum(_n(s, "flowFilesOut") for s in outs),
                     "bytesIn": sum(_n(s, "bytesOut") for s in ins), "bytesOut": sum(_n(s, "bytesOut") for s in outs),
                     "transferred": sum(_n((x or {}).get("processorStatusSnapshot") or {}, "flowFilesOut") for x in root.get("processorStatusSnapshots") or [])})
+    return out + s2s_rows(snap, topology, helper)
+
+
+def s2s_rows(snap, topology, helper):
+    """The S2S counts: each S2S ref's connections into the RPG ports, each remote input port (snap: id -> snapshot)."""
+    out = []
     for ref, o in sorted(helper["s2sOut"].items()):
         ss = [snap(c) for c in o["connections"]]
         out.append({"kind": "s2s-out", "ref": ref, "name": o["name"], "flowFilesIn": sum(_n(s, "flowFilesIn") for s in ss), "flowFilesOut": sum(_n(s, "flowFilesOut") for s in ss),
                     "bytesIn": sum(_n(s, "bytesIn") for s in ss), "bytesOut": sum(_n(s, "bytesOut") for s in ss)})
-    for p in topology["s2sIn"]:
-        s = snap(p["id"])
-        out.append({"kind": "s2s-in", "ref": p["id"], "name": p["name"], "flowFilesIn": _n(s, "flowFilesIn"), "flowFilesOut": _n(s, "flowFilesOut"),
+    # 0.9.7: with registered groups, also the remote input ports beside them that feed them (one hop out).
+    for pid, name in [*((p["id"], p["name"]) for p in topology["s2sIn"]), *sorted((helper.get("outsideIn") or {}).items())]:
+        s = snap(pid)
+        out.append({"kind": "s2s-in", "ref": pid, "name": name, "flowFilesIn": _n(s, "flowFilesIn"), "flowFilesOut": _n(s, "flowFilesOut"),
                     "bytesIn": _n(s, "bytesIn"), "bytesOut": _n(s, "bytesOut")})
     return out
+
+
+# --- S39 step 1 (0.9.7): only the registered groups ------------------------------------------------------------------
+
+def breadcrumb_path(b):
+    """processGroupFlow.breadcrumb as [{id, name}] from root down to the group itself."""
+    chain, seen = [], set()
+    while isinstance(b, dict) and b.get("id") not in seen:
+        seen.add(b.get("id"))
+        inner = b.get("breadcrumb") or {}
+        gid = b.get("id") or inner.get("id")
+        chain.append({"id": gid, "name": inner.get("name") or gid})
+        b = b.get("parentBreadcrumb")
+    return chain[::-1]
+
+
+def walk_groups(get, ids):
+    """The registered groups and every group under them, each read once (flow/process-groups/<id>): (walked
+    [{id, name, parent, path, flow}], missing: the registered ids NiFi does not have). path: [{id, name}] from root to
+    the parent, from NiFi's breadcrumb, so a group at any depth is placed. Nothing outside the registered groups."""
+    walked, missing, seen = [], [], set()
+    for gid in ids:
+        todo = [gid]
+        while todo:
+            x = todo.pop(0)
+            if x in seen:
+                continue
+            try:
+                f = (get(f"flow/process-groups/{urllib.parse.quote(x)}") or {}).get("processGroupFlow") or {}
+            except NifiAnswer as e:
+                if x == gid and e.status == 404:
+                    missing.append(gid)
+                    break
+                raise
+            seen.add(x)
+            crumbs = breadcrumb_path(f.get("breadcrumb")) or [{"id": x, "name": x}]
+            flow = f.get("flow") or {}
+            walked.append({"id": x, "name": crumbs[-1]["name"], "parent": f.get("parentGroupId") or (crumbs[-2]["id"] if len(crumbs) > 1 else None),
+                           "path": crumbs[:-1], "flow": flow})
+            todo.extend(g["id"] for g in flow.get("processGroups") or [] if isinstance(g, dict) and isinstance(g.get("id"), str))
+    return walked, missing
+
+
+CONNECTABLE_KINDS = {"PROCESSOR": "processor", "FUNNEL": "funnel", "INPUT_PORT": "port", "OUTPUT_PORT": "port",
+                     "REMOTE_INPUT_PORT": "rpg", "REMOTE_OUTPUT_PORT": "rpg"}
+
+
+def scoped_topology(get, ids):
+    """S39 step 1 (§7.4): the topology of the registered groups only, wherever they are on the canvas. Each registered
+    group is a unit with the groups under it (build_topology with units), and one hop out: the connections in its
+    parent (process-groups/<parent>/connections) that end at one of its ports, as neighbors (the other end: a processor,
+    funnel or port of the parent, a port of a group beside it, an RPG); between two registered groups such a connection
+    is also a link. Returns (body, helper): body.scope "groups", body.missing the registered ids NiFi does not have;
+    helper.units per unit its ports and sizes (nifi-groups), helper.outsideConns / outsideIn the S2S connections and
+    remote input ports beside the groups whose status each round reads."""
+    walked, missing = walk_groups(get, ids)
+    by_id = {g["id"]: g for g in walked}
+    units = [gid for gid in ids if gid in by_id]
+    first = by_id[units[0]] if units else None
+    root = (first["path"][0] if first and first["path"] else None) or {"id": "root", "name": "root"}
+    body, helper = build_topology(root["id"], root["name"], walked, units=set(units))
+    frag_of, nodes = helper.pop("fragOf"), helper.pop("nodes")
+    links = {l["connection"]: l for l in body["links"]}
+    neighbors, outside_in, outside_conns, cache = [], {}, [], {}
+    q = urllib.parse.quote
+
+    def component(path):
+        if path not in cache:
+            try:
+                cache[path] = (get(path) or {}).get("component") or {}
+            except NifiAnswer:  # not allowed to read it: the connection's own names are enough
+                cache[path] = {}
+        return cache[path]
+
+    def other(t, gid, cid, name, p):
+        kind = CONNECTABLE_KINDS.get(t, str(t or "unknown").lower())
+        if kind == "port" and gid != p:
+            g = by_id.get(gid)
+            return {"kind": "group", "id": gid, "name": (g or {}).get("name") or component(f"process-groups/{q(gid)}").get("name") or gid,
+                    "group": p, "port": {"id": cid, "name": name}, "registered": gid in units}
+        if kind == "port":
+            remote = component(f"{'input' if t == 'INPUT_PORT' else 'output'}-ports/{q(cid)}").get("allowRemoteAccess")
+            # NiFi 1.x has no allowRemoteAccess: its root-level ports are the remote ones.
+            return {"kind": "port", "id": cid, "name": name, "group": p, "remote": bool(remote) if remote is not None else p == root["id"]}
+        if kind == "rpg":
+            c = component(f"remote-process-groups/{q(gid)}")
+            return {"kind": "rpg", "id": gid, "name": c.get("name") or gid, "group": p, "port": {"id": cid, "name": name}, "targets": target_uris({"component": c})}
+        return {"kind": kind, "id": cid, "name": name, "group": p}
+
+    parents = sorted({by_id[gid]["parent"] for gid in units if by_id[gid]["parent"] and by_id[gid]["parent"] not in by_id})
+    for p in parents:
+        for e in (get(f"process-groups/{q(p)}/connections") or {}).get("connections") or []:
+            c = e.get("component") or {}
+            s, d = c.get("source") or {}, c.get("destination") or {}
+            sid, sg, st = e.get("sourceId") or s.get("id"), e.get("sourceGroupId") or s.get("groupId"), e.get("sourceType") or s.get("type")
+            did, dg, dt = e.get("destinationId") or d.get("id"), e.get("destinationGroupId") or d.get("groupId"), e.get("destinationType") or d.get("type")
+            sname, dname = s.get("name") or sid, d.get("name") or did
+            mine = [*([("out", sg, sid, sname)] if sg in units and st == "OUTPUT_PORT" else []), *([("in", dg, did, dname)] if dg in units and dt == "INPUT_PORT" else [])]
+            if not mine:
+                continue
+            cid = e.get("id")
+            rels = sorted(x for x in c.get("selectedRelationships") or [] if isinstance(x, str))
+            for direction, g, port_id, port_name in mine:
+                o = other(dt, dg, did, dname, p) if direction == "out" else other(st, sg, sid, sname, p)
+                neighbors.append({"group": g, "connection": cid, "side": direction, "port": {"id": port_id, "name": port_name}, "relationships": rels, "other": o})
+                if direction == "out" and o["kind"] == "rpg" and dt == "REMOTE_INPUT_PORT":
+                    ref = f"{(o['targets'] or [''])[0]}#{o['port']['name']}"
+                    helper["s2sOut"].setdefault(ref, {"name": o["port"]["name"], "connections": []})["connections"].append(cid)
+                    outside_conns.append(cid)
+                elif direction == "in" and o["kind"] == "port" and o["remote"] and st == "INPUT_PORT":
+                    outside_in[o["id"]] = o["name"]
+                    helper["s2sIn"].setdefault(o["id"], []).append(cid)
+            if len(mine) == 2 and cid not in links:
+                links[cid] = {"connection": cid, "from": {"group": sg, "fragment": frag_of.get(sid), "port": sname}, "to": {"group": dg, "fragment": frag_of.get(did), "port": dname}}
+    neighbors.sort(key=lambda n: (n["group"], n["side"], n["connection"] or ""))
+    body.update(scope="groups", links=sorted(links.values(), key=lambda l: l["connection"] or ""), neighbors=neighbors[:NEIGHBORS_MAX], missing=missing)
+    if len(neighbors) > NEIGHBORS_MAX:
+        body["neighborsCut"] = len(neighbors) - NEIGHBORS_MAX
+    port = lambda e, remote: {"id": e["id"], "name": ((e.get("component") or {}).get("name")) or e["id"],
+                              **({"remote": bool((e.get("component") or {}).get("allowRemoteAccess", e.get("allowRemoteAccess")))} if remote else {})}
+    helper["units"] = {gid: {"inputPorts": [port(e, True) for e in by_id[gid]["flow"].get("inputPorts") or [] if isinstance(e, dict) and isinstance(e.get("id"), str)],
+                             "outputPorts": [port(e, False) for e in by_id[gid]["flow"].get("outputPorts") or [] if isinstance(e, dict) and isinstance(e.get("id"), str)],
+                             "groups": sum(1 for u in body["nested"].values() if u == gid),
+                             "processors": sum(1 for n in nodes.values() if n["unit"] == gid and n["kind"] == "processor")} for gid in units}
+    helper["outsideIn"], helper["outsideConns"] = outside_in, sorted(set(outside_conns))
+    return body, helper
+
+
+def scoped_status(get, ids):
+    """Each registered group's recursive status (flow/process-groups/<id>/status, NiFi's 5-minute window; a cluster's
+    totals): ({id: status_index}, missing ids, a signature of all their components: other ones walk the topology again)."""
+    per, missing = {}, []
+    for gid in ids:
+        try:
+            per[gid] = status_index(get(f"flow/process-groups/{urllib.parse.quote(gid)}/status?recursive=true"))
+        except NifiAnswer as e:
+            if e.status != 404:
+                raise
+            missing.append(gid)
+    signature = hashlib.sha256("\n".join([*(f"{g}:{per[g]['signature']}" for g in per), *(f"missing:{g}" for g in missing)]).encode()).hexdigest()
+    return per, missing, signature
+
+
+def outside_status(get, helper):
+    """The snapshots of the S2S connections and remote input ports beside the registered groups (one hop out)."""
+    out = {}
+    for cid in helper.get("outsideConns") or []:
+        s = ((get(f"flow/connections/{urllib.parse.quote(cid)}/status") or {}).get("connectionStatus") or {}).get("aggregateSnapshot") or {}
+        out[cid] = s
+    for pid in helper.get("outsideIn") or {}:
+        s = ((get(f"flow/input-ports/{urllib.parse.quote(pid)}/status") or {}).get("portStatus") or {}).get("aggregateSnapshot") or {}
+        out[pid] = s
+    return out
+
+
+def group_row(ref, g):
+    """A unit's count row from its group snapshot (in = through its input ports and received, out = through its output
+    ports and sent; transferred: moved inside it)."""
+    return {"kind": "group", "ref": ref, "name": g.get("name") or ref,
+            "flowFilesIn": _n(g, "flowFilesIn", "flowFilesReceived"), "flowFilesOut": _n(g, "flowFilesOut", "flowFilesSent"),
+            "bytesIn": _n(g, "bytesIn", "bytesReceived"), "bytesOut": _n(g, "bytesOut", "bytesSent"),
+            "transferred": _n(g, "flowFilesTransferred")}
+
+
+def scoped_counts(per, topology, helper, outside):
+    """The counts of one round with registered groups: each group's own (its recursive status), the S2S refs its RPG
+    ports (inside it, or beside it one hop out) are sent to, its remote input ports and those beside it that feed it."""
+    out = [group_row(gid, ix["root"]) for gid, ix in per.items()]
+    if topology is None:
+        return out
+    comps = {}
+    for ix in per.values():
+        comps.update(ix["comps"])
+    return out + s2s_rows(lambda i: outside[i] if i in outside else comps.get(i, (None, {}))[1], topology, helper)
+
+
+def group_report(body, helper, gid):
+    """nifi-groups: what one registered group is (§7.4): its name and place, ports, ends, S2S, size, pieces, neighbors."""
+    g = next((x for x in body["groups"] if x["id"] == gid), None)
+    if g is None:
+        return {"id": gid, "exists": False}
+    u = helper["units"][gid]
+    near = [{k: v for k, v in n.items() if k != "group"} for n in body["neighbors"] if n["group"] == gid]
+    return {"id": gid, "exists": True, "name": g["name"], "parent": g["parent"], "path": g["path"], "inputPorts": u["inputPorts"], "outputPorts": u["outputPorts"],
+            "ends": [e for e in body["ends"] if e["group"] == gid], "s2sOut": [o for o in body["s2sOut"] if o["group"] == gid],
+            "s2sIn": [p for p in body["s2sIn"] if p["group"] == gid], "groups": u["groups"], "processors": u["processors"],
+            "fragments": [f["key"] for f in g["fragments"]], "neighbors": near}
 
 
 def history_points(histories):
@@ -1431,38 +1665,88 @@ class Collector:
         Within FLOW_BUDGET; what did not fit is said in errors."""
         every = int(self.cfg.get("flow_seconds", FLOW_DEFAULT) or 0)
         member = w["member"]
-        if every <= 0 or ctx is None or time.monotonic() < self.flow_next.get(member, 0):
+        registered = w.get("groups")
+        # S39 step 1: [] = nothing registered on this member (or another node of the cluster reads them).
+        if every <= 0 or ctx is None or registered == [] or time.monotonic() < self.flow_next.get(member, 0):
             return None
         target = nifi_target(w, props)
         if not target:
             return None
         self.flow_next[member] = time.monotonic() + every - min(every, int(self.cfg.get("collect_seconds", COLLECT_DEFAULT))) / 2
         connect, sni, port = target
-        deadline = time.monotonic() + FLOW_BUDGET
+        budget = FLOW_BUDGET if registered is None else min(FLOW_BUDGET_MAX, FLOW_BUDGET_BASE + FLOW_BUDGET_PER_GROUP * len(registered))
+        deadline = time.monotonic() + budget
         out, errors = {"at": now_iso(), "everySeconds": every}, {}
 
         def get(path):
             left = deadline - time.monotonic()
             if left < 0.5:
-                raise TimeoutError(f"{FLOW_BUDGET:g} seconds were used up")
+                raise TimeoutError(f"{budget:g} seconds were used up")
             status, body = self.fetch(ctx, connect, port, sni, path, min(REQUEST_TIMEOUT, left))
             if status != 200:
                 raise NifiAnswer(status, body[:200].decode("utf-8", "replace").strip())
             return json.loads(body)
 
+        if registered is not None:
+            cached = self.flow_groups(member, registered, get, out, errors)
+            if cached is False:
+                return out
+            if w.get("groupsCut"):
+                errors["groups"] = f"{w['groupsCut']} registered group(s) beyond {GROUPS_MAX} were not read"
+        else:
+            try:
+                index = status_index(get("flow/process-groups/root/status?recursive=true"))
+            except (OSError, ssl.SSLError, http.client.HTTPException, NifiAnswer, ValueError, TimeoutError) as e:
+                out["errors"] = {"status": (str(e) or type(e).__name__)[:300]}
+                return out
+            cached = self.canvas_topology(member, index, get, out, errors)
+            out["counts"] = flow_counts(index, cached and cached["body"], cached and cached["helper"])
+        self.flow_history(w, member, cached, get, out, errors)
+        if errors:
+            out["errors"] = errors
+        return out
+
+    def flow_groups(self, member, registered, get, out, errors):
+        """S39 step 1: one round of the registered groups (each group's recursive status; the topology when other
+        components show or an hour since, or the groups changed; the S2S status one hop out). Returns the cached topology
+        (or None), False when the status could not be read at all (out.errors says)."""
         try:
-            index = status_index(get("flow/process-groups/root/status?recursive=true"))
-        except (OSError, ssl.SSLError, http.client.HTTPException, NifiAnswer, ValueError) as e:
+            per, missing, signature = scoped_status(get, registered)
+        except (OSError, ssl.SSLError, http.client.HTTPException, NifiAnswer, ValueError, TimeoutError) as e:
             out["errors"] = {"status": (str(e) or type(e).__name__)[:300]}
-            return out
+            return False
+        if missing:
+            out["missing"] = missing
+        signature = hashlib.sha256(f"{','.join(registered)}\n{signature}".encode()).hexdigest()
+        cached = self.topologies.get(member)
+        if cached is None or cached["signature"] != signature or time.monotonic() - cached["at"] >= TOPOLOGY_SECONDS:
+            try:
+                body, helper = scoped_topology(get, registered)
+                cached = {"at": time.monotonic(), "signature": signature, "body": body, "helper": helper}
+                self.topologies[member] = cached
+                out["topology"] = body
+            except (OSError, ssl.SSLError, http.client.HTTPException, NifiAnswer, ValueError, TimeoutError) as e:
+                errors["topology"] = (str(e) or type(e).__name__)[:300]
+                if cached is not None and cached["body"].get("scope") != "groups":
+                    cached = None  # the whole canvas' topology does not fit the groups' counts
+        outside = {}
+        if cached is not None:
+            try:
+                outside = outside_status(get, cached["helper"])
+            except (OSError, ssl.SSLError, http.client.HTTPException, NifiAnswer, ValueError, TimeoutError) as e:
+                errors["outside"] = (str(e) or type(e).__name__)[:300]
+        out["counts"] = scoped_counts(per, cached and cached["body"], cached and cached["helper"], outside)
+        return cached
+
+    def canvas_topology(self, member, index, get, out, errors):
+        """The whole canvas (a Deployer that sends no groups): walked group by group from root when other components
+        show in the status or an hour since. 0.9.7: no cap on the groups, only the round's time budget."""
         cached = self.topologies.get(member)
         if cached is None or cached["signature"] != index["signature"] or time.monotonic() - cached["at"] >= TOPOLOGY_SECONDS:
             try:
                 root_id, root_name = index["root"].get("id"), index["root"].get("name")
                 groups, todo = [], [(root_id, None)]
                 while todo:
-                    if len(groups) >= TOPOLOGY_GROUPS_MAX:
-                        raise ValueError(f"more than {TOPOLOGY_GROUPS_MAX} process groups: the topology is not walked")
                     gid, parent = todo.pop(0)
                     f = (get(f"flow/process-groups/{urllib.parse.quote(gid)}") or {}).get("processGroupFlow") or {}
                     flow = f.get("flow") or {}
@@ -1476,13 +1760,19 @@ class Collector:
             except (OSError, ssl.SSLError, http.client.HTTPException, NifiAnswer, ValueError, TimeoutError) as e:
                 errors["topology"] = (str(e) or type(e).__name__)[:300]
                 # The counts keep the topology last walked (its S2S refs may be a little behind).
-        out["counts"] = flow_counts(index, cached and cached["body"], cached and cached["helper"])
+                if cached is not None and cached["body"].get("scope") == "groups":
+                    cached = None  # the registered groups' topology does not fit the whole canvas' counts
+        return cached
+
+    def flow_history(self, w, member, cached, get, out, errors):
+        """NiFi's status history (about 24 hours), once per run when the Deployer asks (flowHistory)."""
         if w.get("flowHistory") and member not in self.history_done and cached is not None:
             self.history_done.add(member)
             history, calls = [], 0
             wanted = [("group", g["id"], g["name"], [f"flow/process-groups/{g['id']}/status/history"]) for g in cached["body"]["groups"] if not g["root"]]
             wanted += [("s2s-out", ref, o["name"], [f"flow/connections/{c}/status/history" for c in o["connections"]]) for ref, o in sorted(cached["helper"]["s2sOut"].items())]
-            wanted += [("s2s-in", p["id"], p["name"], [f"flow/connections/{c}/status/history" for c in cached["helper"]["s2sIn"].get(p["id"], [])]) for p in cached["body"]["s2sIn"]]
+            ins = [*((p["id"], p["name"]) for p in cached["body"]["s2sIn"]), *sorted((cached["helper"].get("outsideIn") or {}).items())]
+            wanted += [("s2s-in", pid, name, [f"flow/connections/{c}/status/history" for c in cached["helper"]["s2sIn"].get(pid, [])]) for pid, name in ins]
             try:
                 for kind, ref, name, paths in wanted:
                     if not paths:
@@ -1496,9 +1786,6 @@ class Collector:
             except (OSError, ssl.SSLError, http.client.HTTPException, NifiAnswer, ValueError, TimeoutError) as e:
                 errors["history"] = (str(e) or type(e).__name__)[:300]
             out["history"] = history
-        if errors:
-            out["errors"] = errors
-        return out
 
     # --- certificates (S27) ---
 
@@ -3371,7 +3658,7 @@ class ServiceExecutor(ProtocolExecutor):
     EXECUTOR = "service"
     # Read jobs: kind -> method(job) returning the job's result (a dict).
     READ_JOBS = {"svc-discover": "discover", "svc-read": "read_files", "svc-state": "state", "log-read": "log_read", "log-tail": "log_tail",
-                 "nifi-provenance": "nifi_provenance"}
+                 "nifi-provenance": "nifi_provenance", "nifi-groups": "nifi_groups"}
     # Change jobs that run beside the reads: kind -> method(request, status), one at a time.
     CHANGE_JOBS = {"svc-write": "svc_write", "svc-control": "svc_control"}
     # What the read jobs can do beyond their first form, named "<kind>@<n>" in the heartbeat's kinds (§15.2): the
@@ -3379,7 +3666,9 @@ class ServiceExecutor(ProtocolExecutor):
     # svc-read@2: confDir (and bootstrapFile), an installation's conf directory kept apart from it (S25).
     # nifi-provenance@1: provenance, lineage, event and search-options as ProvenanceQuery reads them (S28).
     # svc-state@1, svc-write@1, svc-control@1: the jobs' first forms (§16.3), so the plain kind alone never counts.
-    CAPABILITIES = ["svc-discover@2", "svc-read@2", "nifi-provenance@1", "svc-state@1", "svc-write@1", "svc-control@1"]
+    # 0.9.7 (S39 step 1): nifi-groups@1, the registered groups read now (nifi_groups); flow-groups@1, the collector reads
+    # only a watch entry's groups when it has the key (Collector.flow), so the Deployer knows registering takes effect.
+    CAPABILITIES = ["svc-discover@2", "svc-read@2", "nifi-provenance@1", "svc-state@1", "svc-write@1", "svc-control@1", "nifi-groups@1", "flow-groups@1"]
     # Where discovery looks (tests point these elsewhere; the directories scanned are the configuration's scan_dirs).
     PROC = "/proc"
     AUTOSTART_DIRS = AUTOSTART_DIRS
@@ -3898,6 +4187,53 @@ class ServiceExecutor(ProtocolExecutor):
         counts = {k: len(out[k]) for k in ("events", "nodes", "links", "fields") if isinstance(out.get(k), list)}
         job.log(f"{r.get('op')}: " + (", ".join(f"{v} {k}" for k, v in counts.items()) or "1 event") + (f" ({'; '.join(out['notes'])})" if out.get("notes") else ""))
         return {"op": r.get("op"), **counts, **({"notes": out["notes"]} if out.get("notes") else {})}
+
+    def nifi_groups(self, job):
+        """nifi-groups (S39 step 1, §7.4): request.member (a watched installation) and request.groups (1 to
+        NIFI_GROUPS_MAX group ids), read now with the monitor certificate, as the collector reads registered groups:
+        each group with its subgroups and one hop out. The answer: per group (in the order asked) exists, name, parent,
+        path, ports, ends, S2S, sizes, pieces and neighbors (group_report), and the whole scoped topology (topology), the
+        same body the collector sends, for a preview before the groups are registered. Within request.timeoutSeconds
+        (default and at most NIFI_GROUPS_SECONDS)."""
+        r = job.request
+        w = self.watched(r.get("member"))
+        ids = r.get("groups")
+        if not isinstance(ids, list) or not ids or len(ids) > NIFI_GROUPS_MAX or not all(isinstance(g, str) and GROUP_ID.match(g) for g in ids):
+            raise Refused(f"groups must be 1 to {NIFI_GROUPS_MAX} process group ids")
+        ids = list(dict.fromkeys(ids))
+        seconds = r.get("timeoutSeconds")
+        seconds = seconds if isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and 0 < seconds <= NIFI_GROUPS_SECONDS else NIFI_GROUPS_SECONDS
+        where = Discovery.layout(w["installDir"], conf=w["confDir"])
+        try:
+            props = read_properties(where["propertiesFile"])
+        except OSError as e:
+            raise Failed(f"cannot read {where['propertiesFile']}: {e.strerror or e}")
+        ctx, why_not = nifi_context(self.cfg)
+        if ctx is None:
+            raise Failed(f"reading groups needs the monitor certificate: {why_not}")
+        target = nifi_target(w, props)
+        if not target:
+            raise Failed("nifi.web.https.port is not set: groups are only read over HTTPS")
+        call = nifi_caller(ctx, *target)
+        deadline = time.monotonic() + min(seconds, max(1.0, job.left() - 3))
+
+        def get(path):
+            left = deadline - time.monotonic()
+            if left < 0.5:
+                raise TimeoutError(f"{seconds:g} seconds were used up")
+            status, body = call("GET", path, None, min(REQUEST_TIMEOUT, left))
+            if status != 200:
+                raise NifiAnswer(status, body[:200].decode("utf-8", "replace").strip())
+            return json.loads(body)
+
+        try:
+            body, helper = scoped_topology(get, ids)
+        except (OSError, ssl.SSLError, http.client.HTTPException, NifiAnswer, ValueError, TimeoutError) as e:
+            raise Failed(f"reading the groups failed: {e}"[:500])
+        out = {"groups": [group_report(body, helper, gid) for gid in ids], "topology": body}
+        found = sum(1 for g in out["groups"] if g["exists"])
+        job.log(f"{found} of {len(ids)} group(s) found, {len(body['neighbors'])} neighbor(s)")
+        return out
 
     def beat_body(self, busy):
         body = super().beat_body(busy)

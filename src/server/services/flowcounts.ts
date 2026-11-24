@@ -21,8 +21,15 @@ export interface TopologyFragment {
   /** Processors without an incoming connection, plus remote input ports: where data starts (A7 ③ "its own start"). */
   starts: number;
 }
-/** A group directly under root; root: true is the root canvas' own components. */
-export interface TopologyGroup { id: string; name: string; root: boolean; fragments: TopologyFragment[] }
+/** A group directly under root; root: true is the root canvas' own components. With scope "groups" (S39): a registered
+ *  group at any depth, with its parent and path (root first, down to the parent). */
+export interface TopologyGroup { id: string; name: string; root: boolean; fragments: TopologyFragment[]; parent?: string | null; path?: { id: string; name: string }[] }
+/** S39 step 1: one hop out of a registered group, a connection in its parent that ends at one of its ports. */
+export interface TopologyNeighbor {
+  group: string; connection: string; side: "in" | "out"; port: { id: string; name: string }; relationships: string[];
+  other: { kind: "processor" | "funnel" | "port" | "group" | "rpg" | string; id: string; name: string; group: string;
+    port?: { id: string; name: string }; remote?: boolean; registered?: boolean; targets?: string[] };
+}
 export interface TopologyEnd { group: string; fragment: string | null; port: string | null }
 /** The topology body (service_topology.body), as the executor's build_topology makes it. */
 export interface Topology {
@@ -39,6 +46,12 @@ export interface Topology {
   nested?: Record<string, string>;
   /** Step 3b: in a unit of several fragments, a processor's id -> its fragment key. */
   split?: Record<string, string>;
+  /** S39 step 1 (service executor 0.9.7): "groups" when only the registered groups were read (units = those groups,
+   *  links = connections between two of them, nested = their subgroups); left out: the whole canvas. */
+  scope?: "groups";
+  neighbors?: TopologyNeighbor[];
+  /** Registered groups NiFi does not have. */
+  missing?: string[];
 }
 
 type Any = Record<string, any>;
@@ -81,6 +94,12 @@ export function topologyFingerprint(t: Topology | null | undefined): string | nu
     s2sOut: (t.s2sOut ?? []).map((o) => ({ ref: o.ref, name: o.name, targets: o.targets ?? [], group: o.group, fragment: o.fragment ?? null, sources: (o.sources ?? []).map((x) => ({ id: x.id, name: x.name, kind: x.kind, relationships: x.relationships ?? [] })) })),
     ends: (t.ends ?? []).map((x) => ({ id: x.id, name: x.name, type: x.type, group: x.group, fragment: x.fragment ?? null, relationships: x.relationships ?? [] })),
     nested: t.nested ?? {}, split: t.split ?? {},
+    // S39: only with registered groups, so the whole canvas' fingerprints stay what they were.
+    ...(t.scope === "groups" ? {
+      scope: t.scope, missing: t.missing ?? [],
+      groupPlaces: t.groups.map((g) => ({ id: g.id, parent: g.parent ?? null, path: (g.path ?? []).map((p) => p.id) })),
+      neighbors: (t.neighbors ?? []).map((n) => ({ group: n.group, side: n.side, port: n.port?.name ?? null, relationships: n.relationships ?? [], other: { kind: n.other?.kind ?? null, id: n.other?.id ?? null, port: n.other?.port?.name ?? null } })),
+    } : {}),
   };
   return createHash("sha256").update(canonicalSet(shape)).digest("hex").slice(0, 16);
 }

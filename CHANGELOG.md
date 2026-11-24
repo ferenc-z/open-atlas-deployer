@@ -5,6 +5,19 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
 
 ## Unreleased
 
+- Service executor 0.9.7 (S39 step 1, reading only the registered businesses): a watch entry with `groups` (ids of
+  process groups at any depth) has only those groups read: each group's recursive status
+  (`flow/process-groups/<id>/status`) for the counts, and for the topology each group with its subgroups plus one hop
+  out (the connections in its parent that end at its ports: `neighbors`, and `links` between two registered groups;
+  an RPG beside it counts as its S2S exit). The topology body says `scope: "groups"`; its groups carry `parent` and
+  `path`, and `missing` lists the registered groups NiFi does not have. `groups: []` reads no counts and no topology
+  (the machine's numbers as ever); no `groups` key reads the whole canvas as before. The 500-group cap on the whole
+  canvas is gone: the round's time budget (20 seconds; with groups 10 + 2 per group, at most 120) is the only limit.
+  New read job `nifi-groups` (`nifi-groups@1`): up to 20 groups read now, each with its name, path, ports, ends, S2S,
+  sizes, pieces and neighbors, plus the scoped topology. The heartbeat names `flow-groups@1` and `nifi-groups@1`. The
+  Deployer gives a cluster's groups to one node (the first whose executor is fresh, names `flow-groups@1` and whose
+  NiFi answered) and `[]` to the others. Nothing is registered yet (step 2), so every service is still read whole.
+
 - Skills follow the Agent Skills layout OMA reads: `agents/skills/<name>/SKILL.md` (a folder named as the Skill, the
   frontmatter `name` the same), so the folder zips straight into OMA's Skill upload. `bin/publish-assistant.ts` reads
   the folders (a loose `*.md` there is an error); the Skill's text is unchanged, so no new Skill version and nothing to

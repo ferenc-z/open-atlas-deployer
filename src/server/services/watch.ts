@@ -26,6 +26,38 @@ export interface WatchEntry {
   files: { name: string; path: string }[];
   /** pages-rethink A9: no flow counts of this service yet, so the executor reads NiFi's status history (about 24 hours) once. */
   flowHistory: boolean;
+  /** S39 step 1 (§7.4): the registered groups this member reads, each with its subgroups and one hop out (service
+   *  executor 0.9.7, flow-groups@1). Left out: nothing registered for the service yet, the whole canvas is read as
+   *  before. []: another node of the cluster reads them (§7.7 question 6), or none is registered. */
+  groups?: { id: string }[];
+}
+
+/** S39 step 1: the capability a service executor names when it reads only the watch entry's groups. */
+export const FLOW_GROUPS_KIND = "flow-groups@1";
+const BEAT_FRESH_MS = 30_000;
+
+/** S39: the groups registered for a service (ids); undefined while the service has no registration. Step 2 reads
+ *  flow_registrations here; until then nothing is registered and every service is read whole, as before. */
+export function registeredGroups(_store: Store, _service: string): string[] | undefined {
+  return undefined;
+}
+
+/** §7.7 question 6: which node of a cluster reads its registered groups. A group's status is the cluster's total on
+ *  every node, so one reads for all: the first node (in the cluster's order) whose service executor beat in the last
+ *  30 seconds, names flow-groups@1 and whose last sample (10 minutes at most) saw NiFi answer; else the first such
+ *  node; else the first with a fresh beat; else the first. Chosen again with every heartbeat reply, so another node
+ *  takes over within a round or two. */
+export function groupsReader(store: Store, service: string, nodes: ServiceMember[], now = Date.now()): string | undefined {
+  const fresh = (m: ServiceMember) => {
+    const beat = store.executorBeat(m.host, "service");
+    return beat && now - Date.parse(beat.beatAt) <= BEAT_FRESH_MS ? (beat.heartbeat as { kinds?: unknown }) ?? {} : undefined;
+  };
+  const answered = new Set(store.latestServiceSamples(service)
+    .filter((s) => ["ok", "partial"].includes(String((s.body?.nifi as { state?: unknown } | undefined)?.state)) && now - Date.parse(s.at) <= 10 * 60_000)
+    .map((s) => s.member));
+  const live = nodes.filter((m) => { const k = fresh(m)?.kinds; return Array.isArray(k) && k.includes(FLOW_GROUPS_KIND); });
+  const pick = live.find((m) => answered.has(installKey(m))) ?? live[0] ?? nodes.find((m) => fresh(m)) ?? nodes[0];
+  return pick ? installKey(pick) : undefined;
 }
 
 /** A sample as the executor sends it (§15.3); the Deployer keeps the body as it is (step 2 takes it apart). */
@@ -47,23 +79,30 @@ function discovered(store: Store, cache: Map<string, Instance[]>, m: ServiceMemb
 
 const jobs = new Map<string, Instance[]>();
 
-/** The watch list of one host's service executor. */
-export function watchList(store: Store, host: string): WatchEntry[] {
-  const entry = (service: string, kind: WatchEntry["kind"], profile: string, m: ServiceMember): WatchEntry => {
+/** The watch list of one host's service executor. groupsOf: the registered groups of a service (registeredGroups;
+ *  tests give their own). */
+export function watchList(store: Store, host: string, groupsOf: (service: string) => string[] | undefined = (s) => registeredGroups(store, s), now = Date.now()): WatchEntry[] {
+  const entry = (service: string, kind: WatchEntry["kind"], profile: string, m: ServiceMember, reader?: string): WatchEntry => {
     const d = discovered(store, jobs, m);
     const httpsHost = d?.properties?.["nifi.web.https.host"];
     const logs = d?.storage?.logs?.path;
+    const groups = groupsOf(service);
     return {
       service, kind, member: installKey(m), profile, installDir: m.installDir, confDir: confDirOf(m),
       https: { host: typeof httpsHost === "string" ? httpsHost : null, port: m.ports?.https ?? null },
       nodeAddress: m.nodeAddress ?? null, logDir: typeof logs === "string" ? logs : null,
       files: store.serviceMemberFiles(service).filter((f) => f.member === installKey(m)).map((f) => ({ name: f.file, path: f.path })),
       flowHistory: !store.hasFlowCounts(service),
+      ...(groups ? { groups: reader === undefined || reader === installKey(m) ? groups.map((id) => ({ id })) : [] } : {}),
     };
   };
   return [
     ...store.standalones().filter((s) => s.member.host === host).map((s) => entry(s.id, "standalone", s.profile, s.member)),
-    ...store.clusters().flatMap((c) => c.nodes.filter((n) => n.host === host).map((n) => entry(c.id, "node", c.profile, n))),
+    ...store.clusters().flatMap((c) => {
+      const mine = c.nodes.filter((n) => n.host === host);
+      const reader = mine.length && groupsOf(c.id) ? groupsReader(store, c.id, c.nodes, now) : undefined;
+      return mine.map((n) => entry(c.id, "node", c.profile, n, reader));
+    }),
   ];
 }
 

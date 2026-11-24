@@ -101,7 +101,7 @@ class RegistrationTest(Base):
         beat = self.api.beats[-1]
         self.assertEqual(beat["executor"], "service")
         self.assertEqual(beat["protocols"], [2])
-        self.assertEqual(beat["kinds"], ["svc-discover", "svc-read", "svc-state", "log-read", "log-tail", "nifi-provenance", "svc-write", "svc-control", "executor-upgrade", "svc-discover@2", "svc-read@2", "nifi-provenance@1", "svc-state@1", "svc-write@1", "svc-control@1"],
+        self.assertEqual(beat["kinds"], ["svc-discover", "svc-read", "svc-state", "log-read", "log-tail", "nifi-provenance", "nifi-groups", "svc-write", "svc-control", "executor-upgrade", "svc-discover@2", "svc-read@2", "nifi-provenance@1", "svc-state@1", "svc-write@1", "svc-control@1", "nifi-groups@1", "flow-groups@1"],
                          "the service jobs and what they can do (§15.2); never the deploy ones")
         name, root = sx.ServiceExecutor.user()
         self.assertEqual((beat["user"], beat["isRoot"]), (name, root))
@@ -3562,6 +3562,167 @@ class FlowCountsTest(unittest.TestCase):
         self.assertEqual(sum(1 for p in calls if p.startswith("flow/process-groups/") and "status" not in p), 4, "four groups walked once")
         self.assertIsNone(sx.Collector({"flow_seconds": 0}).flow(w, {}, object()), "0 turns it off")
         self.assertEqual(sx.watch_entries([{"service": "s", "member": "m", "installDir": "/opt/nifi", "flowHistory": True}])[0]["flowHistory"], True)
+
+
+# S39 step 1: registered groups at any depth. root has P (not registered) and K (registered); P holds G (registered, its
+# child H walked with it), a sibling S, a processor feed and an RPG. In P: feed -> G.in, G.out -> S.in, G.out -> the
+# RPG's port "orders"; on root: K.out -> P.in. GONE is registered but not on the canvas.
+ROOT, P, G, H, K, S, GONE = (f"00000000-0000-0000-0000-00000000000{i}" for i in range(7))
+
+
+def _crumb(*chain):
+    b = None
+    for gid, name in chain:
+        b = {"id": gid, "breadcrumb": {"id": gid, "name": name}, **({"parentBreadcrumb": b} if b else {})}
+    return b
+
+
+def _end(i, gid, t, name):
+    return {"id": i, "groupId": gid, "type": t, "name": name}
+
+
+SCOPED = {
+    f"flow/process-groups/{G}": {"processGroupFlow": {"breadcrumb": _crumb((ROOT, "NiFi Flow"), (P, "Partner"), (G, "Orders")), "flow": {
+        "processors": [_e("g1", "parse"), _e("g2", "write", type="org.apache.nifi.processors.standard.PutSFTP")],
+        "inputPorts": [_e("G-in", "in", allowRemoteAccess=False)], "outputPorts": [_e("G-out", "out")], "processGroups": [{"id": H}],
+        "connections": [_conn("cg1", "G-in", "g1"), _conn("cg2", "g1", "G-out"), _conn("cg3", "g1", "H-in")]}}},
+    f"flow/process-groups/{H}": {"processGroupFlow": {"breadcrumb": _crumb((ROOT, "NiFi Flow"), (P, "Partner"), (G, "Orders"), (H, "Inner")), "flow": {
+        "processors": [_e("h1", "h")], "inputPorts": [_e("H-in", "hin")], "connections": [_conn("ch", "H-in", "h1")]}}},
+    f"flow/process-groups/{K}": {"processGroupFlow": {"breadcrumb": _crumb((ROOT, "NiFi Flow"), (K, "Billing")), "flow": {
+        "processors": [_e("k1", "bill")], "outputPorts": [_e("K-out", "kout")], "connections": [_conn("ck", "k1", "K-out")]}}},
+    f"process-groups/{P}/connections": {"connections": [
+        {"id": "n1", "component": {"source": _end("feed", P, "PROCESSOR", "feed"), "destination": _end("G-in", G, "INPUT_PORT", "in"), "selectedRelationships": ["success"]}},
+        {"id": "n2", "component": {"source": _end("G-out", G, "OUTPUT_PORT", "out"), "destination": _end("S-in", S, "INPUT_PORT", "sin")}},
+        {"id": "n3", "component": {"source": _end("G-out", G, "OUTPUT_PORT", "out"), "destination": _end("rp", "rpg", "REMOTE_INPUT_PORT", "orders")}},
+        {"id": "n4", "component": {"source": _end("x1", P, "PROCESSOR", "x"), "destination": _end("x2", P, "PROCESSOR", "y")}}]},
+    f"process-groups/{ROOT}/connections": {"connections": [
+        {"id": "r1", "component": {"source": _end("K-out", K, "OUTPUT_PORT", "kout"), "destination": _end("P-in", P, "INPUT_PORT", "pin")}}]},
+    f"process-groups/{S}": {"component": {"name": "Sibling"}},
+    f"process-groups/{P}": {"component": {"name": "Partner"}},
+    "remote-process-groups/rpg": {"component": {"name": "to-c250", "targetUris": "https://C250:18445/nifi"}},
+    f"flow/process-groups/{G}/status?recursive=true": {"processGroupStatus": {"aggregateSnapshot": {"id": G, "name": "Orders", "flowFilesReceived": 0, "flowFilesIn": 7, "flowFilesOut": 5,
+                                                                                                    "flowFilesTransferred": 9, "processorStatusSnapshots": [{"processorStatusSnapshot": {"id": "g1"}}]}}},
+    f"flow/process-groups/{K}/status?recursive=true": {"processGroupStatus": {"aggregateSnapshot": {"id": K, "name": "Billing", "flowFilesOut": 2}}},
+    "flow/connections/n3/status": {"connectionStatus": {"aggregateSnapshot": {"id": "n3", "flowFilesIn": 4, "flowFilesOut": 4}}},
+}
+
+
+def _scoped_get(calls=None):
+    def get(path):
+        if calls is not None:
+            calls.append(path)
+        if path in SCOPED:
+            return SCOPED[path]
+        raise sx.NifiAnswer(404, f"Unable to locate {path}")
+    return get
+
+
+class ScopedGroupsTest(unittest.TestCase):
+    def test_watch_groups_key_absent_empty_or_listed(self):
+        base = {"service": "s", "member": "m", "installDir": "/opt/nifi"}
+        self.assertEqual(sx.watch_entries([base])[0]["groups"], None, "no key: an older Deployer, the whole canvas")
+        self.assertEqual(sx.watch_entries([{**base, "groups": []}])[0]["groups"], [])
+        self.assertEqual(sx.watch_entries([{**base, "groups": [{"id": G, "slice": "*"}, G, K, "root", 5]}])[0]["groups"], [G, K], "ids or {id}, once; not root or junk")
+        many = [f"00000000-0000-0000-0001-{i:012d}" for i in range(sx.GROUPS_MAX + 3)]
+        w = sx.watch_entries([{**base, "groups": many}])[0]
+        self.assertEqual((len(w["groups"]), w["groupsCut"]), (sx.GROUPS_MAX, 3))
+
+    def test_scoped_topology_any_depth_and_one_hop_out(self):
+        body, helper = sx.scoped_topology(_scoped_get(), [G, K, GONE])
+        self.assertEqual((body["scope"], body["root"], body["missing"]), ("groups", {"id": ROOT, "name": "NiFi Flow"}, [GONE]))
+        groups = {g["id"]: g for g in body["groups"]}
+        self.assertEqual(sorted(groups), sorted([K, G]))
+        self.assertEqual((groups[G]["parent"], groups[G]["path"]), (P, [{"id": ROOT, "name": "NiFi Flow"}, {"id": P, "name": "Partner"}]), "placed at any depth")
+        self.assertEqual(groups[K]["path"], [{"id": ROOT, "name": "NiFi Flow"}])
+        self.assertEqual([(f["names"], f["inputs"], f["outputs"]) for f in groups[G]["fragments"]], [(["h", "parse"], ["in"], ["out"]), (["write"], [], [])], "the child group counts to G")
+        self.assertEqual(body["nested"], {H: G})
+        self.assertEqual([e["id"] for e in body["ends"]], ["g2"])
+        near = {(n["group"], n["connection"]): n for n in body["neighbors"]}
+        self.assertEqual(sorted(near), sorted([(G, "n1"), (G, "n2"), (G, "n3"), (K, "r1")]), "n4 does not touch a registered group")
+        self.assertEqual((near[(G, "n1")]["side"], near[(G, "n1")]["other"], near[(G, "n1")]["relationships"]),
+                         ("in", {"kind": "processor", "id": "feed", "name": "feed", "group": P}, ["success"]))
+        self.assertEqual(near[(G, "n2")]["other"], {"kind": "group", "id": S, "name": "Sibling", "group": P, "port": {"id": "S-in", "name": "sin"}, "registered": False})
+        self.assertEqual(near[(G, "n3")]["other"]["targets"], ["https://c250:18445/nifi"])
+        self.assertEqual(near[(K, "r1")]["other"]["name"], "Partner")
+        self.assertEqual(body["links"], [], "G and K are not beside each other")
+        self.assertEqual(helper["s2sOut"]["https://c250:18445/nifi#orders"]["connections"], ["n3"], "an RPG beside G: an S2S exit one hop out")
+        self.assertEqual(helper["outsideConns"], ["n3"])
+        self.assertEqual(helper["units"][G], {"inputPorts": [{"id": "G-in", "name": "in", "remote": False}], "outputPorts": [{"id": "G-out", "name": "out"}], "groups": 1, "processors": 3})
+        report = sx.group_report(body, helper, G)
+        self.assertEqual((report["exists"], report["name"], report["fragments"], len(report["neighbors"])), (True, "Orders", ["G-in", "g2"], 3))
+        self.assertEqual(sx.group_report(body, helper, GONE), {"id": GONE, "exists": False})
+
+    def test_two_registered_groups_side_by_side_are_linked(self):
+        conns = {"connections": [{"id": "l1", "component": {"source": _end("K-out", K, "OUTPUT_PORT", "kout"), "destination": _end("G-in", G, "INPUT_PORT", "in")}}]}
+        flows = {**SCOPED, f"process-groups/{ROOT}/connections": conns,
+                 f"flow/process-groups/{G}": {"processGroupFlow": {**SCOPED[f"flow/process-groups/{G}"]["processGroupFlow"], "breadcrumb": _crumb((ROOT, "NiFi Flow"), (G, "Orders"))}}}
+        get = lambda path: flows[path] if path in flows else (_ for _ in ()).throw(sx.NifiAnswer(404, path))
+        body, _ = sx.scoped_topology(get, [G, K])
+        self.assertEqual(body["links"], [{"connection": "l1", "from": {"group": K, "fragment": "K-out", "port": "kout"}, "to": {"group": G, "fragment": "G-in", "port": "in"}}])
+        self.assertEqual(sorted((n["group"], n["side"], n["other"]["registered"]) for n in body["neighbors"]), sorted([(K, "out", True), (G, "in", True)]))
+
+    def test_collector_reads_only_the_registered_groups(self):
+        c = sx.Collector({"flow_seconds": 300, "collect_seconds": 60})
+        calls = []
+
+        def fetch(ctx, connect, port, sni, path, timeout):
+            calls.append(path)
+            return (200, json.dumps(SCOPED[path]).encode()) if path in SCOPED else (404, b"Unable to locate")
+
+        c.fetch = fetch
+        w = {"member": "m", "https": {"host": "localhost", "port": 18443}, "nodeAddress": None, "flowHistory": False, "groups": [G, K, GONE], "groupsCut": 0}
+        out = c.flow(w, {}, object())
+        self.assertFalse(any("root" in p for p in calls), "never the root's status or flow")
+        self.assertEqual(out["topology"]["scope"], "groups")
+        self.assertEqual(out["missing"], [GONE])
+        rows = {(r["kind"], r["ref"]): r for r in out["counts"]}
+        self.assertEqual(sorted(rows), sorted([("group", G), ("group", K), ("s2s-out", "https://c250:18445/nifi#orders")]))
+        self.assertEqual((rows[("group", G)]["flowFilesIn"], rows[("group", G)]["transferred"], rows[("s2s-out", "https://c250:18445/nifi#orders")]["flowFilesOut"]), (7, 9, 4))
+        self.assertIsNone(c.flow({**w, "groups": []}, {}, object()), "nothing registered here: no counts, no topology")
+        c.flow_next.clear()
+        calls.clear()
+        again = c.flow(w, {}, object())
+        self.assertNotIn("topology", again, "same components: not walked again")
+        self.assertEqual(sorted(set(calls)), sorted({f"flow/process-groups/{G}/status?recursive=true", f"flow/process-groups/{K}/status?recursive=true",
+                                                     f"flow/process-groups/{GONE}/status?recursive=true", "flow/connections/n3/status"}))
+
+    def test_nifi_groups_job(self):
+        class Job:
+            def __init__(self, request):
+                self.request, self.lines = request, []
+
+            def left(self):
+                return 60
+
+            def log(self, text):
+                self.lines.append(text)
+
+        me = __import__("types").SimpleNamespace(cfg={}, watched=lambda member: {"member": member, "installDir": "/opt/nifi", "confDir": "/opt/nifi/conf", "https": {"host": "localhost", "port": 18443}, "nodeAddress": None})
+        with self.assertRaises(sx.Refused):
+            sx.ServiceExecutor.nifi_groups(me, Job({"member": "m", "groups": ["root"]}))
+        with self.assertRaises(sx.Refused):
+            sx.ServiceExecutor.nifi_groups(me, Job({"member": "m", "groups": [G] * 0}))
+        get = _scoped_get()
+
+        def caller(*a, **k):
+            def call(method, path, body, timeout):
+                try:
+                    return 200, json.dumps(get(path)).encode()
+                except sx.NifiAnswer as e:
+                    return e.status, e.text.encode()
+            return call
+
+        saved = (sx.read_properties, sx.nifi_context, sx.nifi_target, sx.nifi_caller)
+        sx.read_properties, sx.nifi_context, sx.nifi_target, sx.nifi_caller = (lambda p: {}), (lambda cfg: (object(), None)), (lambda w, props: ("localhost", "localhost", 18443)), caller
+        try:
+            job = Job({"member": "m", "groups": [G, GONE]})
+            out = sx.ServiceExecutor.nifi_groups(me, job)
+        finally:
+            sx.read_properties, sx.nifi_context, sx.nifi_target, sx.nifi_caller = saved
+        self.assertEqual([(g["id"], g["exists"]) for g in out["groups"]], [(G, True), (GONE, False)])
+        self.assertEqual(out["groups"][0]["path"][-1], {"id": P, "name": "Partner"})
+        self.assertEqual(out["topology"]["scope"], "groups")
+        self.assertEqual(job.lines, ["1 of 2 group(s) found, 3 neighbor(s)"])
 
 
 if __name__ == "__main__":
