@@ -246,6 +246,24 @@ CREATE TABLE IF NOT EXISTS service_todos (
   state TEXT NOT NULL, analysis INTEGER, draft TEXT,
   created_at TEXT NOT NULL, created_by TEXT NOT NULL, updated_at TEXT NOT NULL, closed_at TEXT, closed_by TEXT);
 CREATE UNIQUE INDEX IF NOT EXISTS service_todos_open ON service_todos (service, key) WHERE state = 'open';
+-- S39 (business-registration §7.1): a business registers the groups it runs through. One row = one registered group
+-- (with all its subgroups). owner is a business flw_… (role segment) or a shared module shm_… (role shared).
+CREATE TABLE IF NOT EXISTS flow_registrations (
+  owner TEXT NOT NULL, role TEXT NOT NULL CHECK (role IN ('segment', 'shared')),
+  service TEXT NOT NULL, group_id TEXT NOT NULL, group_name TEXT NOT NULL, group_path TEXT,
+  slice TEXT NOT NULL DEFAULT '*', link TEXT,
+  registered_by TEXT NOT NULL, registered_at TEXT NOT NULL,
+  PRIMARY KEY (owner, service, group_id, slice));
+CREATE UNIQUE INDEX IF NOT EXISTS flow_registrations_group ON flow_registrations (service, group_id, slice);
+CREATE INDEX IF NOT EXISTS flow_registrations_service ON flow_registrations (service);
+CREATE TABLE IF NOT EXISTS shared_modules (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS flow_handoffs (
+  id TEXT PRIMARY KEY, flow TEXT NOT NULL REFERENCES flows(id) ON DELETE CASCADE,
+  from_service TEXT NOT NULL, from_group TEXT NOT NULL, from_component TEXT NOT NULL, from_relationship TEXT,
+  to_service TEXT, to_group TEXT, to_system TEXT,
+  quote TEXT NOT NULL, declared_by TEXT NOT NULL, declared_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS flow_handoffs_flow ON flow_handoffs (flow);
 `;
 
 /** queued: waiting for the host's executor to claim it; the rest are the executor's states. */
@@ -1974,6 +1992,47 @@ export class Store {
       .map((r) => ({ id: r.id, flow: r.flow ?? null, service: r.service, at: r.at, by: r.by, kind: r.kind, text: r.text, revision: r.revision ?? null, verdict: r.verdict ?? null }));
   }
 
+  // S39 (business-registration §7.1): the registered groups. services/registration.ts decides; these only read and write.
+
+  /** Every registered group of a service, or of one owner (a business or a module). */
+  flowRegistrations(o: { service?: string; owner?: string } = {}): FlowRegistration[] {
+    const where = [o.service !== undefined ? "service = ?" : "", o.owner !== undefined ? "owner = ?" : ""].filter(Boolean).join(" AND ");
+    const args = [o.service, o.owner].filter((x): x is string => x !== undefined);
+    return (this.db.prepare(`SELECT * FROM flow_registrations ${where ? `WHERE ${where}` : ""} ORDER BY registered_at, rowid`).all(...args) as Row[]).map((r) => ({
+      owner: r.owner, role: r.role, service: r.service, groupId: r.group_id, groupName: r.group_name, groupPath: r.group_path ?? null,
+      slice: r.slice, link: r.link ?? null, registeredBy: r.registered_by, registeredAt: r.registered_at,
+    }));
+  }
+
+  /** Adds registered groups; one registered already (same service, group and slice) is refused. Call inside flowTransaction. */
+  addFlowRegistrations(rows: Omit<FlowRegistration, "registeredAt">[]) {
+    const at = this.stamp();
+    const insert = this.db.prepare("INSERT INTO flow_registrations (owner, role, service, group_id, group_name, group_path, slice, link, registered_by, registered_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    for (const r of rows) {
+      try { insert.run(r.owner, r.role, r.service, r.groupId, r.groupName, r.groupPath, r.slice, r.link, r.registeredBy, at); } catch (error) {
+        if (/UNIQUE|constraint/i.test(String((error as Error).message))) throw new StoreError("flow-registrations/taken", `Group ${r.groupId} of ${r.service} is registered already.`);
+        throw error;
+      }
+    }
+  }
+
+  /** Removes an owner's registrations of one group (every slice); true when there was one. */
+  removeFlowRegistration(owner: string, service: string, group: string): boolean {
+    return Number(this.db.prepare("DELETE FROM flow_registrations WHERE owner = ? AND service = ? AND group_id = ?").run(owner, service, group).changes) > 0;
+  }
+
+  /** Removes all of an owner's registrations; how many rows went. */
+  removeFlowRegistrations(owner: string): number {
+    return Number(this.db.prepare("DELETE FROM flow_registrations WHERE owner = ?").run(owner).changes);
+  }
+
+  sharedModule(id: string): SharedModule | null {
+    const r = this.db.prepare("SELECT * FROM shared_modules WHERE id = ?").get(id) as Row | undefined;
+    return r ? { id: r.id, name: r.name, createdBy: r.created_by, createdAt: r.created_at, updatedAt: r.updated_at } : null;
+  }
+
+  deleteSharedModule(id: string) { this.db.prepare("DELETE FROM shared_modules WHERE id = ?").run(id); }
+
   /** Step 3b: an anomaly seen (again). Opens one, or adds `count` to the open one and moves its last time, light and detail. */
   noteFlowAnomaly(a: { flow: string; service: string; ref: string; anomaly: Anomaly | FlowNote; light: Light; at: string; count: number; detail: Record<string, unknown>; replace?: boolean }) {
     const open = this.db.prepare("SELECT id, count, last_at FROM flow_anomalies WHERE flow = ? AND service = ? AND ref = ? AND anomaly = ? AND state = 'open'").get(a.flow, a.service, a.ref, a.anomaly) as Row | undefined;
@@ -2181,6 +2240,14 @@ export interface FlowAnomaly {
   id: number; flow: string; service: string; ref: string; anomaly: Anomaly | FlowNote; light: Light; state: "open" | "closed";
   firstAt: string; lastAt: string; count: number; detail: Record<string, unknown>; closedAt: string | null;
 }
-export type FlowChangeKind ="found" | "updated" | "confirmed" | "renamed" | "stuck" | "split-asked" | "not-right" | "ignored" | "watched" | "rejected";
+export type FlowChangeKind ="found" | "updated" | "confirmed" | "renamed" | "stuck" | "split-asked" | "not-right" | "ignored" | "watched" | "rejected"
+  // S39 (§7.1): a business's registration.
+  | "register" | "add-group" | "remove-group" | "rename" | "declare-handoff" | "unregister";
+/** S39 (§7.1): one registered group of a business (role segment) or of a shared module (role shared). */
+export interface FlowRegistration {
+  owner: string; role: "segment" | "shared"; service: string; groupId: string; groupName: string; groupPath: string | null;
+  slice: string; link: string | null; registeredBy: string; registeredAt: string;
+}
+export interface SharedModule { id: string; name: string; createdBy: string; createdAt: string; updatedAt: string }
 export interface FlowChange { id: number; flow: string | null; service: string; at: string; by: string; kind: FlowChangeKind; text: string; revision: number | null; verdict: GateVerdict | null }
 export interface ServiceCert { member: string; store: string; path: string | null; type: string | null; alias: string | null; chain: number | null; subject: string | null; issuer: string | null; notBefore: string | null; notAfter: string | null; readAt: string; error: string | null }
