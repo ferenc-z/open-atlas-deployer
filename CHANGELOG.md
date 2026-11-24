@@ -9,7 +9,11 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   letter store) no longer makes every business sending into it report `exit-unregistered`. A schedule whose worker
   names match processors (or groups named like them) in the registered groups now joins the chain as questions
   (`worker-unplaced` with candidates) instead of being left out. Service executor 0.9.8: reading only the registered
-  groups, a fragment names up to 200 processors (was 5), so such workers can be offered as candidates.
+  groups, a fragment names up to 200 processors (was 5), so such workers can be offered as candidates. The Register
+  page no longer says "This draft is gone" right after registering. The `nifi-ops` skill: a hand-over NiFi does not
+  show is recorded only after the owner described or confirmed it (the quote is their words about it), and `look
+  topology` shows only registered groups.
+- [ ] OMA: 重新发布 Deploy Assistant（`nifi-ops` skill 改了口头交接的问法）
 - S39 step 9 (registration is the default): `DEPLOYER_REGISTERED_GROUPS` is now **on by default**; set it to `0` to turn
   it off, an emergency way back to reading the whole canvas. With it on, a service shows only what was registered: a
   service with no registration has no businesses and no gaps. The businesses and models of the old whole-canvas way are

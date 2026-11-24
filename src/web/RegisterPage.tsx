@@ -140,7 +140,8 @@ export function RegisterPage({ workbenchUrl, environment, actions, canAsk }: { w
             <span className="fl-muted">{preview ? summaryOf(preview) : draft?.groups.length ? `${draft.groups.length} ${draft.groups.length === 1 ? "group" : "groups"} added` : ""}</span>
             <button type="button" className="fl-linkbtn" style={{ marginLeft: "auto" }} onClick={() => void startOver()}>Start over</button>
           </div>
-          {(error || pollError) && <p className="fl-error" style={{ margin: 0 }}>{error || pollError}</p>}
+          {/* Registering deletes the draft: a read that was on its way then answers 404, which is no error any more. */}
+          {(error || (pollError && !done)) && <p className="fl-error" style={{ margin: 0 }}>{error || pollError}</p>}
           {!draft && !error && <div className="bz-empty" style={{ textAlign: "center" }}>Opening a draft…</div>}
           {draft && !preview && (
             <div className="bz-empty" style={{ textAlign: "center" }}>
