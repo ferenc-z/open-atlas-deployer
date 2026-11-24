@@ -94,7 +94,9 @@ test("chain: shared modules join by port id; passing through one joins the busin
   const modules: ChainModule[] = [
     { id: "shm_v", name: "Validate", service: "n1", group: { id: "V", name: "Validate" }, entries: [{ id: "i", channel: { type: "external", system: "port:V:in" } }],
       exits: [{ id: "o", component: "V:orders", channel: { type: "external", system: "port:V:orders" }, when: [{ attr: "biz.type", op: "equals", value: "order" }] }] },
-    { id: "shm_e", name: "Errors", service: "n1", group: { id: "E", name: "Errors" }, entries: [{ id: "i", channel: { type: "external", system: "port:E:in" } }], exits: [] },
+    { id: "shm_e", name: "Errors", service: "n1", group: { id: "E", name: "Errors" }, entries: [{ id: "i", channel: { type: "external", system: "port:E:in" } }],
+      // An error step writes out of NiFi (S39 UAT 2026-11-25: this exit made every business into it report a gap).
+      exits: [{ id: "w", component: "E:write", channel: { type: "external", system: "Write error log" } }] },
   ];
   const svc = [{ id: "n1", addresses: [], topology: t }];
   const p = chain(inp([["n1", "A"], ["n1", "B"], ["n1", "Z"]], svc, { modules }));

@@ -507,8 +507,13 @@ export function chain(input: ChainInput): Preview {
       text: `这条业务没有自己的起点${m ? `：数据从公共模块 ${m.group.name} 进到 ${at.group.name}，模块前面是哪个组没有登记` : `，${at.group.name} 的数据从哪来要问负责人`}。` });
   }
   // A module that passes data on (it has exits) but none of its exits comes back here: where it goes is not registered.
-  // An exit into another module's entry (an error step's dead letters to the DLQ, step 4) does not pass it on.
-  const onward = (m: ChainModule) => m.exits.some((x) => { const k = keyOf(m.service, x.channel, "exit"); return !(k && modEntryKey.has(k)); });
+  // An exit into another module's entry (an error step's dead letters to the DLQ, step 4) does not pass it on, and neither
+  // does a processor that writes out of NiFi (an error log, an audit trail): the data ends there, the module only takes in.
+  const onward = (m: ChainModule) => m.exits.some((x) => {
+    const k = keyOf(m.service, x.channel, "exit");
+    if (k) return !modEntryKey.has(k);
+    return x.channel?.type === "external" && /^(port|link):/u.test(x.channel.system ?? "");
+  });
   for (const e of [...edges.values()]) {
     if (e.kind !== "shared-entry" || !segs.has(e.from)) continue;
     const id = [...modSegs.entries()].find(([, s]) => s.id === e.to)![0];
