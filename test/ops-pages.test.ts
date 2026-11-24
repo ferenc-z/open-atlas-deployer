@@ -4,7 +4,7 @@ import { test } from "node:test";
 import { contextPage, SUGGESTIONS } from "../src/web/ask-ai.ts";
 import { makeOpsClient } from "../src/web/ops-client.ts";
 import { makeMockOpsClient, sortCards } from "../src/web/ops-mock.ts";
-import { actionLabel, businessLabel, cardLight, changeRow, nextLine, summaryParts, worstLight } from "../src/web/ops-view.ts";
+import { actionLabel, businessesLine, cardLight, changeRow, nextLine, summaryParts, worstLight } from "../src/web/ops-view.ts";
 import type { ServiceCard } from "../src/server/services/ops-types.ts";
 
 test("client: each call takes the route of §10.2.2", async () => {
@@ -26,9 +26,10 @@ test("client: each call takes the route of §10.2.2", async () => {
 test("sample data: the overview is worst first and counts the to-dos", async () => {
   const ops = makeMockOpsClient();
   const o = await ops.overview();
-  assert.deepEqual(o.services.map((s) => s.id), ["c250-prod", "n112-edge", "n200-test", "n192-legacy"]);
+  assert.deepEqual(o.services.map((s) => s.id), ["c250-prod", "n200-test", "n112-edge", "n192-legacy"]);
   assert.equal(o.services[0]!.todoCount, 3);
-  assert.deepEqual(summaryParts(o.services), { failing: 2, attention: 1, waiting: 6 });
+  // S39: the card is the machine's; business health is on the Businesses page.
+  assert.deepEqual(summaryParts(o.services), { failing: 1, attention: 1, waiting: 5 });
 });
 
 test("sample data: Check now runs a round, then the check-up time moves", async () => {
@@ -81,6 +82,7 @@ const card = (over: Partial<ServiceCard> & { m?: ServiceCard["machine"]["light"]
   id: "x", kind: "standalone", environment: "uat", label: "NiFi",
   machine: { light: over.m ?? "healthy", sentence: "" },
   business: { light: over.b ?? "healthy", sentence: "", flowCount: 2, toConfirm: 0, ...(over.business ?? {}) },
+  ...(over.businesses ? { businesses: over.businesses } : {}),
   todoCount: over.todoCount ?? 0,
 });
 
@@ -88,17 +90,25 @@ test("lights: the worse of two, unknown between attention and healthy; the card'
   assert.equal(worstLight("healthy", "unknown"), "unknown");
   assert.equal(worstLight("attention", "unknown"), "attention");
   assert.equal(worstLight("failing", "attention"), "failing");
-  assert.equal(cardLight(card({ m: "healthy", b: "failing" })), "failing");
-  assert.deepEqual(sortCards([card({ m: "healthy" }), { ...card({ b: "unknown" }), id: "a" }, { ...card({ m: "failing" }), id: "z" }]).map((c) => c.id), ["z", "a", "x"]);
+  // S39: the card's light is the machine's, whatever the businesses on it are doing.
+  assert.equal(cardLight(card({ m: "healthy", b: "failing" })), "healthy");
+  assert.equal(cardLight(card({ m: "attention", b: "healthy" })), "attention");
+  assert.deepEqual(sortCards([card({ m: "healthy" }), { ...card({ m: "unknown" }), id: "a" }, { ...card({ m: "failing" }), id: "z" }]).map((c) => c.id), ["z", "a", "x"]);
 });
 
 test("overview text: what waits for the person, and the business label", () => {
   assert.equal(nextLine(card({ todoCount: 1 })), "1 thing for you");
   assert.equal(nextLine(card({ todoCount: 3 })), "3 things for you");
-  assert.equal(nextLine(card({ business: { light: "unknown", sentence: "", flowCount: 0, toConfirm: 2 }, b: "unknown" })), "Confirm the flows the AI found");
+  // Flows to confirm are gone (S39): only the machine's to-dos wait here.
+  assert.equal(nextLine(card({ business: { light: "unknown", sentence: "", flowCount: 0, toConfirm: 2 }, b: "unknown" })), null);
   assert.equal(nextLine(card({})), null);
-  assert.equal(businessLabel(card({})), "Business · 2 flows");
-  assert.equal(businessLabel(card({ business: { light: "unknown", sentence: "", flowCount: 0, toConfirm: 2 } })), "Business · to confirm");
+  // The card's bottom line: counts from the server when it gives them, else the count and the worst light.
+  assert.equal(businessesLine(card({ business: { light: "healthy", sentence: "", flowCount: 0, toConfirm: 0 } })), "No businesses registered here");
+  assert.equal(businessesLine(card({ businesses: { count: 4, failing: 1, attention: 1 } })), "4 businesses run here · 1 failing, 1 attention");
+  assert.equal(businessesLine(card({ businesses: { count: 1, failing: 0, attention: 0 } })), "1 business runs here · healthy");
+  assert.equal(businessesLine(card({ businesses: { count: 3, failing: 0, attention: 0 } })), "3 businesses run here · all healthy");
+  assert.equal(businessesLine(card({ b: "failing" })), "2 businesses run here · some failing");
+  assert.equal(businessesLine(card({})), "2 businesses run here");
 });
 
 test("to-do actions: Apply is fixed text, the others use the AI's label or a default; a change row reads the contract's shapes", () => {
@@ -115,5 +125,5 @@ test("Ask AI: the service page and the overview are the service context; the flo
   assert.equal(contextPage("services"), "service");
   assert.equal(contextPage("flow"), "flow");
   assert.equal(contextPage("status"), "status");
-  for (const k of ["services", "flows", "flow"]) assert.ok(SUGGESTIONS[k]!.length >= 3);
+  for (const k of ["services", "businesses", "register", "flow"]) assert.ok(SUGGESTIONS[k]!.length >= 3);
 });

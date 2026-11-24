@@ -1,11 +1,19 @@
 // Screen 4 (prototype Business.dc.html): one flow. The verdict on the left and the diagram on the right; Problems now beside
-// Last 7 days; "About this flow" folded. Deployer does not change the canvas: a problem's fix is made in NiFi (Open in NiFi).
+// Last 7 days; "About this flow" folded (S39: who registered it and when, the shared modules it uses, the registered groups,
+// the registration history, Add or remove groups / Rename / Unregister). Deployer does not change the canvas: a problem's fix
+// is made in NiFi (Open in NiFi); groups are added and removed by telling Ask AI.
 
 import { useCallback, useEffect, useState } from "react";
 import { FlowGraphView } from "./FlowGraphView.tsx";
 import { ANOMALY_LABEL, groupsText, LightPill, RenameField, shortDay, shortTime, StuckEditor, UNKNOWN_REASON } from "./FlowParts.tsx";
 import type { FlowDetail, Light } from "../server/services/ops-types.ts";
-import { flowHref, openAskAi } from "./flow-routes.ts";
+import type { BusinessDetail, RegDraft } from "./biz-types.ts";
+import type { ApiError } from "./api.ts";
+import { draftChanges, refusalOf } from "./biz-view.ts";
+import { Refusal } from "./RegisterPage.tsx";
+import { ask } from "./Confirm.tsx";
+import { biz } from "./biz-data.ts";
+import { businessesHref, openAskAi } from "./flow-routes.ts";
 import { flows } from "./flows-data.ts";
 import { usePageFocus } from "./focus.ts";
 import "./flows.css";
@@ -27,30 +35,77 @@ function LightIcon({ light }: { light: Light }) {
   );
 }
 
-export function FlowDetailPage({ flow, service, isAdmin, onBack, onOpenFlow }: { flow: string; service?: string; isAdmin: boolean; onBack: (service: string) => void; onOpenFlow: (flow: string, service: string) => void }) {
+export function FlowDetailPage({ flow, service, isAdmin, onBack, onOpenService }: { flow: string; service?: string; isAdmin: boolean; onBack: () => void; onOpenService: (service: string) => void }) {
   usePageFocus("flow", flow);
   usePageFocus("service", service);
-  const [d, setD] = useState<FlowDetail | undefined>();
+  const [d, setD] = useState<BusinessDetail | undefined>();
   const [error, setError] = useState("");
   const [about, setAbout] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const load = useCallback(() => flows.detail(flow, service).then((v) => { setD(v); setError(""); }, (e: Error) => setError(e.message)), [flow, service]);
   useEffect(() => { setD(undefined); void load(); }, [load]);
+  // The drafts the assistant made to change this business (7.9): read every few seconds, so a draft made in the Ask AI drawer shows up here.
+  const [drafts, setDrafts] = useState<RegDraft[]>([]);
+  const [refusal, setRefusal] = useState<{ draft: string; r: ReturnType<typeof refusalOf>; empty: boolean } | undefined>();
+  const [confirmed, setConfirmed] = useState("");
+  const [working, setWorking] = useState(false);
+  const loadDrafts = useCallback(() => biz.draftsOf(flow).then((r) => setDrafts(r.drafts), () => undefined), [flow]);
+  useEffect(() => { void loadDrafts(); const t = setInterval(() => void loadDrafts(), 3000); return () => clearInterval(t); }, [loadDrafts]);
   if (!d) return <div className="fl wide">{error ? <p className="fl-error">{error}</p> : <p className="fl-muted">Loading…</p>}</div>;
   const f = d.flow;
-  const home = service ?? f.services[0] ?? "";
-  const others = f.services.filter((s) => s !== home);
+  const reg = d.registration;
   const lead = d.problems[0];
+  const confirmChanges = async (draft: RegDraft) => {
+    setWorking(true); setRefusal(undefined); setError(""); setConfirmed("");
+    try {
+      const r = await biz.commit(draft.draft);
+      setConfirmed(`Changes confirmed: ${r.name} now has ${r.preview.groups.length} ${r.preview.groups.length === 1 ? "group" : "groups"}.`);
+      await Promise.all([load(), loadDrafts()]);
+    } catch (e) {
+      const x = e as ApiError;
+      setRefusal({ draft: draft.draft, r: refusalOf({ ...(x.code ? { code: x.code } : {}), message: x.message, body: x.body }, "Confirm changes"), empty: x.code === "register/empty" });
+    } finally { setWorking(false); }
+  };
+  const discard = async (draft: RegDraft) => {
+    if (!(await ask("Discard these changes? The business stays as it is registered now.", { confirm: "Discard", danger: true }))) return;
+    try { await biz.discardDraft(draft.draft); setRefusal(undefined); await loadDrafts(); } catch (e) { setError((e as Error).message); }
+  };
+  const unregister = async () => {
+    if (!(await ask(`Unregister “${f.name}”? Deployer stops watching it and its problems close. NiFi is not touched. Its registration history is deleted with it.`, { confirm: "Unregister", danger: true }))) return;
+    try { await biz.unregister(f.id); onBack(); } catch (e) { setError((e as Error).message); }
+  };
+  // The registration history: the server's merged rows (7.7 item 8); an older server only has the model history.
+  const changes = reg?.changes ?? d.history.map((h) => ({ at: h.at, by: h.by === "ai" ? "AI" : "You", text: h.text + (h.verdict && h.verdict !== "published" ? ` (${h.verdict})` : "") }));
+  const groups = reg?.groups ?? f.groups.map((g) => ({ service: g.service, id: g.id, name: g.name, how: "", nifiUrl: null as string | null }));
   const border = d.light === "unknown" ? "" : d.light;
   const stateWord = d.light === "unknown" && d.reason ? UNKNOWN_REASON[d.reason] : lead ? ANOMALY_LABEL[lead.anomaly] : null;
   return (
     <div className="fl wide">
       <div className="fl-row" style={{ gap: "6px 14px" }}>
-        <a href="#" onClick={(e) => { e.preventDefault(); onBack(home); }}>← {home}</a>
-        {others.length > 0 && <span className="fl-muted" style={{ fontSize: 14 }}>also on</span>}
-        {others.map((s) => <a key={s} href={flowHref(f.id, s)} onClick={(e) => { e.preventDefault(); onOpenFlow(f.id, s); }}>{s}</a>)}
+        <a href={businessesHref()} onClick={(e) => { e.preventDefault(); onBack(); }}>← All businesses</a>
+        {f.services.length > 0 && <span className="fl-muted" style={{ fontSize: 14 }}>runs on</span>}
+        {f.services.map((s) => <a key={s} href="#" onClick={(e) => { e.preventDefault(); onOpenService(s); }}>{s}</a>)}
       </div>
       {error && <p className="fl-error">{error}</p>}
+      {confirmed && <p role="status" style={{ margin: 0, color: "#1E6B34", fontWeight: 600 }}>{confirmed}</p>}
+      {reg && drafts.map((dr) => {
+        const changes = draftChanges(dr, { name: f.name, reg });
+        const mine = refusal?.draft === dr.draft ? refusal : undefined;
+        return (
+          <section key={dr.draft} className="fl-card bz-draft" aria-label="Changes waiting for you">
+            <h3 style={{ margin: 0 }}>Changes waiting for you</h3>
+            <span className="fl-muted" style={{ fontSize: 14 }}>The assistant prepared these from your conversation. Nothing changes until you confirm.</span>
+            {changes.length === 0 ? <span>The draft is the same as the registered business.</span> : <ul style={{ margin: 0, paddingLeft: 18 }}>{changes.map((c, i) => <li key={i}>{c}</li>)}</ul>}
+            <div className="fl-row" style={{ gap: 10 }}>
+              <button type="button" className="fl-btn primary" disabled={working || changes.length === 0} onClick={() => void confirmChanges(dr)}>{working ? "Confirming…" : "Confirm changes"}</button>
+              <button type="button" className="fl-btn" disabled={working} onClick={() => void discard(dr)}>Discard</button>
+            </div>
+            {mine && (mine.empty
+              ? <div className="rg-problem" role="alert"><b>Not confirmed</b><span>These changes take away every group. To stop watching this business, unregister it instead.</span><div className="fl-row"><button type="button" className="fl-btn small" style={{ borderColor: "#E8B4AE", color: "#B3261E" }} onClick={() => void unregister()}>Unregister…</button></div></div>
+              : <Refusal r={mine.r} />)}
+          </section>
+        );
+      })}
 
       <section className={`fl-top ${border}`}>
         <div className="left">
@@ -68,7 +123,7 @@ export function FlowDetailPage({ flow, service, isAdmin, onBack, onOpenFlow }: {
         <div className="right">
           <span className="fl-muted" style={{ fontWeight: 600 }}>How the data flows</span>
           <FlowGraphView graph={f.graph} />
-          <span className="fl-muted" style={{ fontSize: 12 }}>Scroll sideways to see the whole flow · shaded = a service · box = a process group · dashed = outside NiFi · red dashed = where data is lost</span>
+          <span className="fl-muted" style={{ fontSize: 12 }}>Scroll sideways to see the whole flow · shaded = a service · box = a process group · dashed = outside NiFi · red dashed = where data is lost · purple dashed = a handoff you described (NiFi can't see it)</span>
         </div>
       </section>
 
@@ -121,13 +176,26 @@ export function FlowDetailPage({ flow, service, isAdmin, onBack, onOpenFlow }: {
             <div className="fl-facts">
               <div><span className="k">Entrance</span><span>{f.entries.length ? f.entries.map((e) => e.text).join("、") : "—"}</span></div>
               <div><span className="k">Exits</span><span>{f.exits.length ? f.exits.map((e) => e.text).join("、") : "—"}</span></div>
-              <div><span className="k">Process groups</span><span>{groupsText(f.groups)}</span></div>
               <div>
                 <span className="k">Find a file by</span>
                 {d.findBy.length === 0 ? <span>—</span> : d.findBy.map((c, i) => (
                   <button key={i} type="button" className="fl-linkbtn" title="Opens Ask AI" onClick={openAskAi}>{CUE[c.cue]} (attribute {c.attribute})</button>
                 ))}
               </div>
+              {reg && <div><span className="k">Registered</span><span>{reg.by} · {shortTime(reg.at)} · no approval needed</span></div>}
+              {reg && <div><span className="k">Shared modules</span><span>{reg.shared.length ? reg.shared.map((m) => m.name).join("、") : "None"}</span></div>}
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              <span style={{ fontSize: 14, fontWeight: 600 }}>Registered process groups ({groups.length})</span>
+              {groups.map((g) => (
+                <div key={`${g.service}:${g.id}`} className="bz-group">
+                  <span style={{ fontWeight: 600 }}>{g.name}</span>
+                  <span className="fl-muted" style={{ fontSize: 14 }}>{g.service}</span>
+                  <span className="how">{g.how}</span>
+                  {g.nifiUrl && <a href={g.nifiUrl} target="_blank" rel="noopener noreferrer" style={{ fontSize: 13 }}>Open in NiFi</a>}
+                </div>
+              ))}
+              <span className="fl-muted">Add and remove groups by telling Ask AI, for example "add Invoice_Archive on n112" (pasting its link works too).</span>
             </div>
             <StuckEditor stuck={f.stuck} canEdit={isAdmin} showSave onSave={async (attentionMinutes, failingMinutes) => { await flows.act(f.id, { kind: "stuck", attentionMinutes, failingMinutes }); await load(); }} />
             <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
@@ -136,14 +204,21 @@ export function FlowDetailPage({ flow, service, isAdmin, onBack, onOpenFlow }: {
               {f.risks.map((r, i) => <div key={i} className="fl-risk">{r.text}</div>)}
             </div>
             <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              <span style={{ fontSize: 14, fontWeight: 600 }}>Model history</span>
-              {d.history.map((h, i) => (
-                <span key={i} style={{ fontSize: 14, color: "#3C3C39" }}>{shortDay(h.at.slice(0, 10))} · {h.by === "ai" ? "AI" : "You"} · {h.text}{h.verdict && h.verdict !== "published" ? ` (${h.verdict})` : ""}</span>
+              <span style={{ fontSize: 14, fontWeight: 600 }}>Registration history</span>
+              {changes.length === 0 && <span className="fl-muted">Nothing recorded yet.</span>}
+              {changes.map((h, i) => (
+                <span key={i} style={{ fontSize: 14, color: "#3C3C39" }}>{shortTime(h.at)} · {h.by} · {h.text}{"quote" in h && h.quote ? ` · “${h.quote}”` : ""}</span>
               ))}
             </div>
-            {isAdmin && (renaming
-              ? <RenameField name={f.name} onCancel={() => setRenaming(false)} onSave={async (name) => { await flows.act(f.id, { kind: "rename", name }); setRenaming(false); await load(); }} />
-              : <div><button type="button" className="fl-btn small" onClick={() => setRenaming(true)}>Rename</button></div>)}
+            {renaming
+              ? <RenameField name={f.name} onCancel={() => setRenaming(false)} onSave={async (name) => { await biz.rename(f.id, name); setRenaming(false); await load(); }} />
+              : (
+                <div className="fl-actions">
+                  <button type="button" className="fl-btn small" title="Opens Ask AI" onClick={openAskAi}>Add or remove groups</button>
+                  <button type="button" className="fl-btn small" onClick={() => setRenaming(true)}>Rename</button>
+                  <button type="button" className="fl-btn small" style={{ borderColor: "#E8B4AE", color: "#B3261E" }} onClick={() => void unregister()}>Unregister</button>
+                </div>
+              )}
           </div>
         )}
       </section>

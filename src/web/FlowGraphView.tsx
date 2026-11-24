@@ -11,7 +11,7 @@ import "./flows.css";
 
 const LIGHT_WORD: Record<Light, string> = { failing: "Failing", attention: "Attention", healthy: "Healthy", unknown: "Unknown" };
 const LIGHT_COLOR: Record<Light, string> = { failing: "#B3261E", attention: "#8A5300", healthy: "#1E6B34", unknown: "#4F4F4B" };
-const EDGE_WORDS: Record<EdgeKind, string> = { data: "to", s2s: "over site-to-site to", failure: "on failure to", retry: "on retry back to", drop: "when it fails, data is dropped at" };
+const EDGE_WORDS: Record<EdgeKind, string> = { data: "to", s2s: "over site-to-site to", failure: "on failure to", retry: "on retry back to", drop: "when it fails, data is dropped at", declared: "by a handoff you described, to" };
 
 export function FlowGraphView({ graph }: { graph: FlowGraph }) {
   const key = useMemo(() => JSON.stringify(graph), [graph]);
@@ -53,7 +53,7 @@ export function FlowGraphView({ graph }: { graph: FlowGraph }) {
             })}
           </svg>
           {laid.nodes.map((n) => {
-            const cls = ["fl-node", n.kind === "external" ? (n.dropTarget ? "drop" : "external") : "", n.kind === "group" && n.light && n.light !== "unknown" ? n.light : ""].filter(Boolean).join(" ");
+            const cls = ["fl-node", n.kind === "external" ? (n.dropTarget ? "drop" : "external") : "", n.kind === "group" && n.light && n.light !== "unknown" ? n.light : "", n.module ? "shared" : ""].filter(Boolean).join(" ");
             return (
               <div key={n.id} className={cls} style={{ left: n.x, top: n.y, width: n.width, height: n.height }}>
                 <span>

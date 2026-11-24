@@ -2079,6 +2079,12 @@ export class Store {
       places: r.places ? JSON.parse(r.places) : [], flow: r.flow ?? null, createdAt: r.created_at, updatedAt: r.updated_at } : null;
   }
 
+  /** The open drafts that change one registered business, newest first (S39 step 8: the business page's "Confirm changes"). */
+  registrationDraftsOf(flow: string): RegistrationDraft[] {
+    const rows = this.db.prepare("SELECT id FROM registration_drafts WHERE flow = ? AND updated_at >= ? ORDER BY updated_at DESC").all(flow, new Date(this.now().getTime() - REGISTRATION_DRAFT_TTL_MS).toISOString()) as Row[];
+    return rows.map((r) => this.registrationDraft(r.id)).filter((d): d is RegistrationDraft => d !== null);
+  }
+
   /** Saves a draft's name, groups and hand-overs, its worker places and the last preview when given (preview null clears
    *  it); touches it. */
   putRegistrationDraft(d: Pick<RegistrationDraft, "id" | "name" | "groups" | "handoffs"> & { preview?: unknown; places?: WorkerPlace[] }) {

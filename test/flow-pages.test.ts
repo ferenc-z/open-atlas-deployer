@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { makeFlowClient } from "../src/web/flow-client.ts";
-import { flowHref, flowsHref, parseFlowRoute } from "../src/web/flow-routes.ts";
+import { businessesHref, flowHref, parseFlowRoute, registerHref } from "../src/web/flow-routes.ts";
 import type { FlowAction, FlowGraph } from "../src/server/services/ops-types.ts";
 import { fromElk, nodeSize, toElk } from "../src/web/flowgraph.ts";
 import { layoutFlow } from "../src/web/flowlayout.ts";
@@ -117,7 +117,12 @@ test("sample data answers like the server: confirm, rename (a person's name), st
 });
 
 test("hash routes: the links parse back", () => {
-  assert.deepEqual(parseFlowRoute(flowsHref("n192-legacy")), { kind: "flows", service: "n192-legacy" });
+  assert.deepEqual(parseFlowRoute(businessesHref()), { kind: "businesses" });
+  assert.deepEqual(parseFlowRoute(businessesHref("n192-legacy")), { kind: "businesses", service: "n192-legacy" });
+  assert.deepEqual(parseFlowRoute(registerHref()), { kind: "register" });
+  // The old per-service confirmation link lands on that service's businesses.
+  assert.deepEqual(parseFlowRoute("#/flows/n192-legacy"), { kind: "businesses", service: "n192-legacy" });
+  assert.equal(parseFlowRoute("#/register/x"), null);
   assert.deepEqual(parseFlowRoute(flowHref("flw_1", "c250-prod")), { kind: "flow", flow: "flw_1", service: "c250-prod" });
   assert.deepEqual(parseFlowRoute(flowHref("flw_1")), { kind: "flow", flow: "flw_1" });
   assert.equal(parseFlowRoute("#/other"), null);

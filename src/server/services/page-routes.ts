@@ -8,7 +8,7 @@ import { isKey } from "../keys.ts";
 import type { AnalysisRecord, Store } from "../store.ts";
 import type { Visited } from "./analyses.ts";
 import type { AnalysisView, Light } from "./ops-types.ts";
-import { flowDetail, servicePage, servicesOverview, type PageSources } from "./page-views.ts";
+import { businessList, flowDetail, registrationInfo, servicePage, servicesOverview, type PageSources } from "./page-views.ts";
 
 type Reject = (c: Context, status: 400 | 401 | 403 | 404 | 409 | 429 | 503, code: string, message: string, details?: string[]) => Response;
 export interface PageRouteDeps {
@@ -54,6 +54,15 @@ export function mountPages(api: Hono, d: PageRouteDeps) {
     const p = await d.authenticate(c, "view");
     if (p instanceof Response) return p;
     const detail = flowDetail(d.store, c.req.param("flow"));
-    return detail ? c.json(detail) : d.reject(c, 404, "flow/unknown", `No business ${c.req.param("flow")}.`);
+    if (!detail) return d.reject(c, 404, "flow/unknown", `No business ${c.req.param("flow")}.`);
+    const registration = registrationInfo(d.store, c.req.param("flow"), detail.flow);
+    return c.json(registration ? { ...detail, registration } : detail);
+  });
+
+  // S39 step 8: the Businesses page's list (registered businesses only; shared modules are GET /api/registrations/modules).
+  api.get("/api/businesses", async (c) => {
+    const p = await d.authenticate(c, "view");
+    if (p instanceof Response) return p;
+    return c.json({ businesses: businessList(d.store) });
   });
 }

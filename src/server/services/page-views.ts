@@ -5,6 +5,7 @@
 
 import type { ExecutorInfo } from "../handoff.ts";
 import type { Store } from "../store.ts";
+import type { BusinessRow, RegistrationInfo } from "../../web/biz-types.ts";
 import { ANOMALY_LABEL, anomalyText, businessLight, flowLight } from "./business.ts";
 import { flowCard, type GraphExtras } from "./flow-views.ts";
 import { LIGHT_ORDER, type AnalysisState, type AnalysisTrigger, type AnalysisView, type Anomaly, type FlowNote, type BusinessLightView, type FlowCard, type FlowDetail, type FlowProblem, type FlowRow, type GateVerdict, type Light, type Lights, type ServiceCard, type ServicePage, type ServicesOverview, type TodoView, type UnknownReason } from "./ops-types.ts";
@@ -82,6 +83,7 @@ export function servicesOverview(store: Store, executor: Executor, src: PageSour
       id: s.id, kind: s.kind, environment: s.environment, label: s.label,
       machine: { light: m.light, sentence: m.sentence },
       business: { light: b.light, ...(b.reason ? { reason: b.reason } : {}), sentence: b.sentence, flowCount: b.flows.length, toConfirm: b.toConfirm, ...(b.confirmedAt ? { confirmedAt: b.confirmedAt } : {}) },
+      businesses: businessCounts(registeredRows(store, s.id, b)),
       todoCount: todos.length,
       ...(next ? { nextCheckAt: next } : {}),
       ...(src.todos ? { aiHasPlan: todos.some((t) => t.source === "analysis" && t.action !== null) || Boolean(latest && latest.state === "done" && todos.some((t) => t.action)) } : {}),
@@ -104,6 +106,8 @@ export function servicePage(store: Store, executor: Executor, id: string, src: P
     service: { id, kind: s.kind, environment: s.environment, label: s.label, webUrl: s.webUrl },
     machine, business,
     analysis: src.analyses?.latest(id, { machine: machine.light, business: business.light }) ?? null,
+    // S39 step 8: the registered businesses that run here, listed (as "affected") only while the machine is not healthy.
+    ...affectedOf(registeredRows(store, id, business), machine.light),
     todos: [...(src.todos?.open(id) ?? [])].sort((a, b) => ORDER[a.severity] - ORDER[b.severity] || (a.createdAt < b.createdAt ? -1 : 1)),
     config: {
       revision: store.serviceConfig(id)?.revision ?? null,
@@ -179,3 +183,78 @@ export function flowDetail(store: Store, flow: string, now: Date = new Date()): 
     history: store.flowChanges({ flow, limit: 100 }).map((c) => ({ at: c.at, by: c.by === "ai" ? "ai" as const : "person" as const, text: c.text, verdict: c.verdict })),
   };
 }
+
+// ---- S39 step 8: what the Businesses page and the business detail read of the registration ----------------------------
+
+/** The registered businesses (the owners of segment registrations). */
+const registeredIds = (store: Store): Set<string> => new Set(store.flowRegistrations().filter((r) => r.role === "segment").map((r) => r.owner));
+
+/** The registered businesses that run on a service as the lights see them (FlowRow), worst first. */
+export function registeredRows(store: Store, service: string, view: BusinessLightView = businessLight(store, service)): FlowRow[] {
+  const ids = registeredIds(store);
+  return view.flows.filter((f) => ids.has(f.id));
+}
+
+/** GET /api/businesses: every registered business, its light and what the list shows of the registration. */
+export function businessList(store: Store): BusinessRow[] {
+  const regs = store.flowRegistrations().filter((r) => r.role === "segment");
+  const owners = [...new Set(regs.map((r) => r.owner))];
+  const rows = new Map<string, FlowRow>();
+  for (const svc of new Set(regs.map((r) => r.service))) for (const f of registeredRows(store, svc)) rows.set(f.id, f);
+  return owners.map((id) => {
+    const mine = regs.filter((r) => r.owner === id);
+    const first = mine[0]!;
+    const row = rows.get(id);
+    return {
+      id, name: store.flow(id)?.name ?? id, light: row?.light ?? "unknown", sentence: row?.sentence ?? "Not known yet: no data has been read for it.",
+      anomalies: row?.anomalies ?? [], services: row?.services?.length ? row.services : [...new Set(mine.map((r) => r.service))],
+      groupCount: new Set(mine.map((r) => `${r.service}\0${r.groupId}`)).size, handoffCount: store.flowHandoffs(id).length,
+      registeredBy: first.registeredBy, registeredById: first.registeredBy, registeredAt: first.registeredAt,
+    };
+  });
+}
+
+/** The history as the page shows it: the rows of one registration action (`op`) read as one. */
+export function mergedChanges(store: Store, flow: string): RegistrationInfo["changes"] {
+  const out: RegistrationInfo["changes"] = [];
+  const byOp = new Map<string, RegistrationInfo["changes"][number]>();
+  for (const c of store.flowChanges({ flow, limit: 200 })) {
+    const by = c.by === "ai" ? "AI" : c.by;
+    if (!c.op) { out.push({ at: c.at, by, text: c.text }); continue; }
+    const have = byOp.get(c.op);
+    if (!have) { const row = { at: c.at, by, text: c.text }; byOp.set(c.op, row); out.push(row); }
+    else if (!have.text.split("；").includes(c.text)) have.text += `；${c.text}`;
+  }
+  return out;
+}
+
+/** The registration block of the business detail (web/biz-types.ts RegistrationInfo). */
+export function registrationInfo(store: Store, flow: string, card: FlowCard): RegistrationInfo | undefined {
+  const regs = store.flowRegistrations({ owner: flow }).filter((r) => r.role === "segment");
+  if (!regs.length) return undefined;
+  const web = new Map(services(store).map((s) => [s.id, s.webUrl] as const));
+  const models = new Map<string, ReturnType<Store["flowModel"]>>();
+  const mine = store.flowSegments(flow);
+  const stepsOf = (service: string, group: string) => {
+    if (!models.has(service)) models.set(service, store.flowModel(service));
+    const seg = models.get(service)?.model.segments.find((s) => s.group.id === group && mine.some((x) => x.service === service && x.segment === s.id));
+    return seg ? seg.steps.map((s) => s.name).slice(0, 3).join(" → ") : "";
+  };
+  const seen = new Set<string>();
+  const groups: RegistrationInfo["groups"] = [];
+  for (const r of regs) {
+    const key = `${r.service}\0${r.groupId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    groups.push({ service: r.service, id: r.groupId, name: r.groupName, ...(r.groupPath ? { path: r.groupPath } : {}), how: stepsOf(r.service, r.groupId), nifiUrl: nifiLink(web.get(r.service) ?? null, r.groupId, null) });
+  }
+  return {
+    by: regs[0]!.registeredBy, at: regs[0]!.registeredAt, groups,
+    shared: card.graph.nodes.filter((n) => n.module).map((n) => ({ id: String(n.module), name: n.label })),
+    handoffs: store.flowHandoffs(flow).map((h) => ({ id: h.id, from: h.from, to: h.to, quote: h.quote })),
+    changes: mergedChanges(store, flow),
+  };
+}
+
+export const businessCounts = (rows: FlowRow[]) => ({ count: rows.length, failing: rows.filter((f) => f.light === "failing").length, attention: rows.filter((f) => f.light === "attention").length });
+const affectedOf = (rows: FlowRow[], machine: Light) => ({ businessCount: rows.length, affected: machine === "healthy" ? [] : rows });

@@ -74,7 +74,7 @@ export async function runHostOperation(operation: string, payload: Payload, acti
 /** "Try asking": examples for this page. The chat cannot be pre-filled (the embed protocol has only a context), so a click copies the question. */
 // When the browser refuses both ways of copying, the question is shown selected in a field so Ctrl+C copies it: a click
 // never ends without something on the page saying what happened.
-function TryAsking({ items }: { items: string[] }) {
+export function TryAsking({ items }: { items: string[] }) {
   const [result, setResult] = useState<{ q: string; ok: boolean } | undefined>();
   const manual = useRef<HTMLInputElement>(null);
   const copy = async (q: string) => { setResult({ q, ok: await copyText(q) }); };
@@ -94,23 +94,30 @@ function TryAsking({ items }: { items: string[] }) {
   );
 }
 
-export function AssistantPanel({ workbenchUrl, environment, page, app, focus = {}, suggestions = [], actions, onClose, onSetup }: { workbenchUrl: string; environment?: string; page: string; app?: string; focus?: Record<string, string>; suggestions?: string[]; actions: HostActions; onClose: () => void; onSetup?: () => void }) {
+/** Workbench refuses a context with a value outside [\w .:@/-]{1,64}, so such a value is left out rather than the whole context. */
+export function pageContext(environment: string | undefined, page: string, extra: Record<string, string | undefined>): Record<string, string> {
+  const opened = Object.fromEntries(Object.entries(extra).filter((e): e is [string, string] => e[1] !== undefined && /^[a-z_]{1,24}$/u.test(e[0]) && /^[\w .:@/-]{1,64}$/u.test(e[1])).slice(0, 5));
+  return { env: environment ?? "unknown", page, ...opened };
+}
+
+/** Workbench's embedded chat (one iframe) with the page context sent to it and the page's host operations answered. The Ask AI
+ *  drawer and the Register page's left column are both this: the same chat (same key), put in a different place. `onState`
+ *  says whether the chat has said "ready" (loading), or has not after 10 seconds (slow: unreachable, or a certificate this
+ *  browser does not trust), so a page can fall back to something that works without it. */
+export function AssistantFrame({ workbenchUrl, environment, context, actions, onState }: { workbenchUrl: string; environment?: string; context: Record<string, string>; actions: HostActions; onState?: (state: "loading" | "ready" | "slow") => void }) {
   const frame = useRef<HTMLIFrameElement>(null);
   const base = new URL(workbenchUrl, window.location.href);
   const origin = base.origin;
   const src = new URL(`embed/chat?app=deployer&key=${encodeURIComponent(`env:${environment ?? "unknown"}`)}&title=${encodeURIComponent(`Deployer ${(environment ?? "").toUpperCase()}`)}`, base.href.endsWith("/") ? base.href : `${base.href}/`).href;
-  // Workbench refuses a context with a value outside [\w .:@/-]{1,64}, so such a value is left out rather than the whole context.
-  const opened = Object.fromEntries(Object.entries(focus).filter(([k, v]) => /^[a-z_]{1,24}$/u.test(k) && /^[\w .:@/-]{1,64}$/u.test(v)).slice(0, 5));
-  const context = { env: environment ?? "unknown", page, ...(app ? { app } : {}), ...opened };
   const contextKey = JSON.stringify(context);
   // Workbench drops any message without the protocol version (docs/app-chat-embed: "messages all carry v: 1").
   const send = (message: Record<string, unknown>) => frame.current?.contentWindow?.postMessage({ v: 1, ...message }, origin);
-  // A frame Workbench cannot load (unreachable, or a certificate this browser does not trust) stays blank without an
-  // error, so after a while without "ready" the panel says so and offers Workbench in a tab of its own.
+  // A frame Workbench cannot load stays blank without an error, so after a while without "ready" the page says so and offers Workbench in a tab of its own.
   const [ready, setReady] = useState(false);
   const [slow, setSlow] = useState(false);
   const [attempt, setAttempt] = useState(0);
   useEffect(() => { setSlow(false); const t = setTimeout(() => setSlow(true), 10_000); return () => clearTimeout(t); }, [attempt]);
+  useEffect(() => { onState?.(ready ? "ready" : slow ? "slow" : "loading"); }, [ready, slow]);
 
   useEffect(() => {
     const onMessage = (e: MessageEvent) => {
@@ -123,8 +130,23 @@ export function AssistantPanel({ workbenchUrl, environment, page, app, focus = {
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, [origin, actions]);
+  }, [origin, actions, contextKey]);
   useEffect(() => { send({ type: "workbench-chat:context", pageContext: context }); }, [contextKey]);
+  return (
+    <>
+      {!ready && slow && (
+        <div className="assistant-hint">
+          <p>The assistant has not loaded from Workbench ({origin}). The frame stays blank when Workbench is unreachable or this browser does not trust its certificate.</p>
+          <p><a href={src} target="_blank" rel="noreferrer">Open Workbench in a new tab</a> to see the error, then <button className="link" onClick={() => setAttempt(attempt + 1)}>try again</button>.</p>
+        </div>
+      )}
+      <iframe key={attempt} ref={frame} src={src} title="Deploy Assistant" />
+    </>
+  );
+}
+
+export function AssistantPanel({ workbenchUrl, environment, page, app, focus = {}, suggestions = [], actions, onClose, onSetup }: { workbenchUrl: string; environment?: string; page: string; app?: string; focus?: Record<string, string>; suggestions?: string[]; actions: HostActions; onClose: () => void; onSetup?: () => void }) {
+  const context = pageContext(environment, page, { ...(app ? { app } : {}), ...focus });
 
   // D34: a column beside the page, not over it. Its width can be dragged and is remembered; it can fold into a strip
   // (the conversation stays loaded) or take the whole content area. Under 1100px it is a drawer over the page.
@@ -167,13 +189,7 @@ export function AssistantPanel({ workbenchUrl, environment, page, app, focus = {
         )}
         {mode !== "collapsed" && <AiMissing use="assistant" what="The Deploy Assistant" {...(onSetup ? { onSetup } : {})} />}
         {mode !== "collapsed" && suggestions.length > 0 && <TryAsking items={suggestions} />}
-        {!ready && slow && mode !== "collapsed" && (
-          <div className="assistant-hint">
-            <p>The assistant has not loaded from Workbench ({origin}). The frame stays blank when Workbench is unreachable or this browser does not trust its certificate.</p>
-            <p><a href={src} target="_blank" rel="noreferrer">Open Workbench in a new tab</a> to see the error, then <button className="link" onClick={() => setAttempt(attempt + 1)}>try again</button>.</p>
-          </div>
-        )}
-        <iframe key={attempt} ref={frame} src={src} title="Deploy Assistant" />
+        <AssistantFrame workbenchUrl={workbenchUrl} {...(environment ? { environment } : {})} context={context} actions={actions} />
       </aside>
     </>
   );

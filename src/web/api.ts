@@ -10,6 +10,7 @@ import type { AiItem, AiStatus, AiUse } from "../server/setup-ai.ts";
 import type { SettingRow } from "../server/deployer-settings.ts";
 import { makeFlowClient } from "./flow-client.ts";
 import { makeOpsClient } from "./ops-client.ts";
+import { makeBizClient } from "./biz-client.ts";
 
 export type { SettingRow };
 export type { AiItem, AiStatus, AiUse, AuditEntry, EnvironmentStatus, Manifest, Principal, RegisteredApp, SetupStatus, SetupStep };
@@ -22,10 +23,15 @@ export type Me =
 export class ApiError extends Error {
   readonly status: number;
   readonly details: string[];
-  constructor(status: number, message: string, details: string[] = []) {
+  /** The server's error code (`register/gaps-open`, …) and the whole body, for the answers that carry more (the gaps, who holds a group). */
+  readonly code: string | undefined;
+  readonly body: Record<string, unknown>;
+  constructor(status: number, message: string, details: string[] = [], code?: string, body: Record<string, unknown> = {}) {
     super(message);
     this.status = status;
     this.details = details;
+    this.code = code;
+    this.body = body;
   }
 }
 
@@ -40,7 +46,7 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new ApiError(response.status, data.message ?? `HTTP ${response.status}`, data.details ?? []);
+  if (!response.ok) throw new ApiError(response.status, data.message ?? `HTTP ${response.status}`, data.details ?? [], typeof data.error === "string" ? data.error : undefined, data);
   return data as T;
 }
 
@@ -326,6 +332,8 @@ export const serviceGraph = () => call<GraphState>("GET", "services/graph");
 export const publishServiceGraph = () => call<GraphRun>("POST", "services/graph/publish");
 // Step 6b: the flow pages (pages-rethink 10.2.2 items 6, 7, 8). flows-data.ts decides whether the pages use these or the sample data.
 export const flowClient = makeFlowClient(call);
+// S39 step 8: the businesses list and the register verb (business-registration.md 7.5).
+export const bizClient = makeBizClient(call);
 
 // Step 6a: the overview and the service page (items 1-5, 9, 10). ops-data.ts decides whether the pages use these or the sample data.
 export const opsClient = makeOpsClient(call);

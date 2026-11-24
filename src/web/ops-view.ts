@@ -6,30 +6,39 @@ import type { AnalysisTrigger, ConfigChange, Light, ServiceCard, ServicesOvervie
 /** The worse of two lights. */
 export const worstLight = (a: Light, b: Light): Light => (LIGHT_ORDER[a] <= LIGHT_ORDER[b] ? a : b);
 
-/** A card's worst light: it colours the bar on the card's top. */
-export const cardLight = (c: ServiceCard): Light => worstLight(c.machine.light, c.business.light);
+/** A card's light (S39: the machine's only; business health lives on the Businesses page): it colours the bar on the card's top. */
+export const cardLight = (c: ServiceCard): Light => c.machine.light;
 
-/** What waits for the person on one card: the open to-dos, else the flows to confirm. */
+/** What waits for the person on one card: the open to-dos (the machine's). */
 export function nextLine(c: ServiceCard): string | null {
   if (c.todoCount > 0) return `${c.todoCount} ${c.todoCount === 1 ? "thing" : "things"} for you${c.aiHasPlan ? " · AI has a plan" : ""}`;
-  if (c.business.toConfirm > 0) return "Confirm the flows the AI found";
   return null;
 }
 
-/** The heading's counts: services by their worst light, and what waits for the person (a service with only flows to confirm counts one). */
+/** The heading's counts: services by their machine light, and what waits for the person. */
 export function summaryParts(cards: ServiceCard[]): { failing: number; attention: number; waiting: number } {
   let failing = 0, attention = 0, waiting = 0;
   for (const c of cards) {
     const l = cardLight(c);
     if (l === "failing") failing++;
     else if (l === "attention") attention++;
-    waiting += c.todoCount + (c.todoCount === 0 && c.business.toConfirm > 0 ? 1 : 0);
+    waiting += c.todoCount;
   }
   return { failing, attention, waiting };
 }
 
-/** "Business · 3 flows" (or "to confirm" when none is confirmed yet). */
-export const businessLabel = (c: ServiceCard): string => (c.business.flowCount > 0 ? `Business · ${c.business.flowCount} ${c.business.flowCount === 1 ? "flow" : "flows"}` : c.business.toConfirm > 0 ? "Business · to confirm" : "Business");
+/** The card's bottom line: how many registered businesses run on the service and how many of them have a problem. */
+export function businessesLine(c: ServiceCard): string {
+  const count = c.businesses?.count ?? c.business.flowCount;
+  if (count === 0) return "No businesses registered here";
+  const noun = `${count} ${count === 1 ? "business runs" : "businesses run"} here`;
+  if (c.businesses) {
+    const problems = [c.businesses.failing > 0 ? `${c.businesses.failing} failing` : "", c.businesses.attention > 0 ? `${c.businesses.attention} attention` : ""].filter(Boolean);
+    return problems.length ? `${noun} · ${problems.join(", ")}` : `${noun} · ${count === 1 ? "healthy" : "all healthy"}`;
+  }
+  // No counts from the server: only the worst light is known.
+  return c.business.light === "failing" ? `${noun} · some failing` : c.business.light === "attention" ? `${noun} · some need attention` : noun;
+}
 
 /** Why an analysis was made, for the line under "AI analysis". */
 export const TRIGGER_TEXT: Record<AnalysisTrigger, string> = {
