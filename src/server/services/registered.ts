@@ -115,7 +115,8 @@ export function canvasChanges(store: Store, service: string): CanvasChange[] {
     const groups: CanvasChange["groups"] = [];
     for (const r of rows) {
       const g = topo.groups.find((x) => x.id === r.groupId);
-      const gone = (topo.missing ?? []).includes(r.groupId) || (topo.scope === "groups" && !g);
+      // A group registered after the latest snapshot is not in it yet (only registered groups are read): not gone.
+      const gone = (topo.missing ?? []).includes(r.groupId) || (topo.scope === "groups" && !g && now.takenAt >= r.registeredAt);
       if (gone) groups.push({ id: r.groupId, name: r.groupName, what: "gone", text: `组「${r.groupName}」在画布上找不到了` });
       else if (g && g.name !== r.groupName) groups.push({ id: r.groupId, name: r.groupName, what: "renamed", text: `组「${r.groupName}」在画布上改名成了「${g.name}」` });
       else if (g && r.slice !== WHOLE && !g.fragments.some((f) => f.key === r.slice)) groups.push({ id: r.groupId, name: r.groupName, what: "slice", text: `组「${r.groupName}」里登记的那一片不在了（组里的连线变了，片要重新选）` });
