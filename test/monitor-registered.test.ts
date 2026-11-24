@@ -144,6 +144,7 @@ test("the graph draws port: and link: exits as inside, and a module by its modul
   assert.ok(!g.nodes.some((n) => n.kind === "external" && /port:/.test(n.label)), JSON.stringify(g.nodes));
   const mod = g.nodes.find((n) => n.module === MOD)!;
   assert.deepEqual([mod.label, mod.detail], ["公共校验", "公共模块"]);
+  assert.ok(!g.nodes.some((n) => n.detail === "公共环节" && n.label === "校验"), "the module's group is not drawn a second time");
   assert.ok(g.edges.some((e) => e.from === "n1/A" && e.to === mod.id));
   assert.ok(g.nodes.some((n) => n.kind === "external" && n.label === "db"), "a real outside exit stays");
 });

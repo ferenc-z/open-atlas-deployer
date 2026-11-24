@@ -77,10 +77,12 @@ export function flowGraph(store: Store, flow: string, extras: GraphExtras = {}, 
     const port = c?.channel.startsWith("s2s:") ? c.channel.split("/").slice(1).join("/") : undefined;
     edge({ from: ia, to: ib, kind: s2s ? "s2s" : b.seq < a.seq ? "retry" : "data", ...(port ? { label: port } : c?.channel.startsWith("mq:") ? { label: c.channel.slice(3) } : {}) });
   }
-  // Shared steps the business feeds (an error handling group: failure).
+  // Shared steps the business feeds (an error handling group: failure). A group registered as a shared module is drawn
+  // below as the module (S39 UAT 2026-11-25: drawn here too, every module showed twice).
+  const moduleGroups = new Set([...models.entries()].flatMap(([svc, md]) => (md?.segments ?? []).filter((x) => x.role === "shared" && x.module).map((x) => `${svc}\0${x.group.id}`)));
   for (const m of ms) {
     const ua = units.get(nodeId(m.service, m.s.id))!;
-    for (const sh of sk.shared.filter((x) => x.service === m.service && sk.edges.some((e) => ua.has(e.from) && e.to === x.id))) {
+    for (const sh of sk.shared.filter((x) => x.service === m.service && !moduleGroups.has(`${x.service}\0${x.group.id}`) && sk.edges.some((e) => ua.has(e.from) && e.to === x.id))) {
       const id = `${m.service}/shared:${sh.group.id}`;
       if (!g.nodes.some((n) => n.id === id)) g.nodes.push({ id, kind: "group", service: m.service, label: sh.group.name, detail: "公共环节" });
       edge({ from: nodeId(m.service, m.s.id), to: id, kind: FAILURE.test(sh.group.name) ? "failure" : "data" });
@@ -96,7 +98,7 @@ export function flowGraph(store: Store, flow: string, extras: GraphExtras = {}, 
     const svc = a ? l.to.service : l.from.service;
     const id = `${svc}/module:${sh.module}`;
     if (!g.nodes.some((n) => n.id === id)) g.nodes.push({ id, kind: "group", service: svc, label: store.sharedModule(sh.module)?.name ?? sh.group.name, detail: "公共模块", module: sh.module });
-    edge(a ? { from: nodeId(a.service, a.s.id), to: id, kind: "data" } : { from: id, to: nodeId(b!.service, b!.s.id), kind: "data" });
+    edge(a ? { from: nodeId(a.service, a.s.id), to: id, kind: FAILURE.test(sh.group.name) ? "failure" : "data" } : { from: id, to: nodeId(b!.service, b!.s.id), kind: "data" });
   }
   // An entry or exit on a canvas port or connection (port:, link:) is a hand-over inside what is registered, not the world outside.
   const inside = (e: Endpoint) => e.channel.type === "external" && /^(port|link):/.test(e.channel.system ?? "");
