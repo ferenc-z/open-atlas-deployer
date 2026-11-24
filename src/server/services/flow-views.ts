@@ -6,7 +6,9 @@
 import type { FlowRecord, Store } from "../store.ts";
 import { DEFAULT_STUCK, pendingView } from "./flowmodel.ts";
 import type { Endpoint2, FlowCard, FlowGraph, FlowsReview, FlowStatus, Light, StuckTimes } from "./ops-types.ts";
+import { watchedFlows } from "./registered.ts";
 import { skeletonOf, type Skeleton } from "./skeleton.ts";
+import { registeredGroupsOn } from "./watch.ts";
 import { links } from "./trace/channels.ts";
 import { toTraceModel, WHOLE, type Endpoint, type ModelV2, type Segment } from "./trace/model.ts";
 
@@ -81,6 +83,20 @@ export function flowGraph(store: Store, flow: string, extras: GraphExtras = {}, 
       edge({ from: nodeId(m.service, m.s.id), to: id, kind: FAILURE.test(sh.group.name) ? "failure" : "data" });
     }
   }
+  // S39 step 7: a shared module the business hands data to or takes it from (a segment with role shared and a module id,
+  // joined over a canvas port) is drawn as the module, by its `module`; its name is the module's.
+  const segOf = (service: string, id: string) => models.get(service)?.segments.find((x) => x.id === id);
+  for (const l of ch) {
+    const a = ms.find((x) => x.service === l.from.service && x.s.id === l.from.business), b = ms.find((x) => x.service === l.to.service && x.s.id === l.to.business);
+    const sh = !a && b ? segOf(l.from.service, l.from.business) : a && !b ? segOf(l.to.service, l.to.business) : undefined;
+    if (!sh || sh.role !== "shared" || !sh.module) continue;
+    const svc = a ? l.to.service : l.from.service;
+    const id = `${svc}/module:${sh.module}`;
+    if (!g.nodes.some((n) => n.id === id)) g.nodes.push({ id, kind: "group", service: svc, label: store.sharedModule(sh.module)?.name ?? sh.group.name, detail: "公共模块", module: sh.module });
+    edge(a ? { from: nodeId(a.service, a.s.id), to: id, kind: "data" } : { from: id, to: nodeId(b!.service, b!.s.id), kind: "data" });
+  }
+  // An entry or exit on a canvas port or connection (port:, link:) is a hand-over inside what is registered, not the world outside.
+  const inside = (e: Endpoint) => e.channel.type === "external" && /^(port|link):/.test(e.channel.system ?? "");
   // The outside: entries and exits not joined to another segment of the business.
   const joinedIn = (m: Member, e: Endpoint) => ch.some((l) => l.to.service === m.service && l.to.business === m.s.id && l.to.endpoint === e.id && ms.some((x) => x.service === l.from.service && x.s.id === l.from.business));
   const joinedOut = (m: Member, e: Endpoint) => ch.some((l) => l.from.service === m.service && l.from.business === m.s.id && l.from.endpoint === e.id && ms.some((x) => x.service === l.to.service && x.s.id === l.to.business));
@@ -88,13 +104,13 @@ export function flowGraph(store: Store, flow: string, extras: GraphExtras = {}, 
   for (const m of ms) {
     const id = nodeId(m.service, m.s.id);
     for (const e of m.s.entries) {
-      if (joinedIn(m, e) || (e.channel.type !== "external" && fedBySegment(m)) || (e.channel.type === "external" && fedBySegment(m) && /待 AI/.test(e.channel.system ?? ""))) continue;
+      if (joinedIn(m, e) || inside(e) || (e.channel.type !== "external" && fedBySegment(m)) || (e.channel.type === "external" && fedBySegment(m) && /待 AI/.test(e.channel.system ?? ""))) continue;
       const ext = `ext:${id}:in:${e.id}`;
       g.nodes.push({ id: ext, kind: "external", service: null, label: e.channel.type === "external" ? e.channel.system! : e.channel.type === "mq" ? `MQ ${e.channel.exchange}` : `S2S ${e.channel.port}`, detail: e.channel.type === "mq" ? e.channel.routingKey! : e.channel.type });
       edge({ from: ext, to: id, kind: e.channel.type === "s2s" ? "s2s" : "data" });
     }
     for (const e of m.s.exits) {
-      if (joinedOut(m, e)) continue;
+      if (joinedOut(m, e) || inside(e)) continue;
       const ext = `ext:${id}:out:${e.id}`;
       g.nodes.push({ id: ext, kind: "external", service: null, label: e.channel.type === "external" ? e.channel.system! : e.channel.type === "mq" ? `MQ ${e.channel.exchange}` : `${e.channel.service} · ${e.channel.port}`, detail: e.channel.type === "mq" ? e.channel.routingKey! : e.channel.type });
       edge({ from: id, to: ext, kind: e.channel.type === "s2s" ? "s2s" : "data", ...(e.relationship ? { label: e.relationship } : {}) });
@@ -145,14 +161,14 @@ export function flowCard(store: Store, f: FlowRecord, extras: GraphExtras = {}, 
 /** #6 GET /api/services/:id/flows. intro: the AI's (step 4's analysis) when there is one. */
 export function flowsReview(store: Store, service: string, intro?: string | null): FlowsReview {
   const ctx = { skeleton: skeletonOf(store, new Date()), models: new Map<string, ModelV2 | null>() };
-  const rows = store.flows(service);
+  const rows = watchedFlows(store, service);
   const cards = rows.map((f) => flowCard(store, f, {}, ctx));
   const order = (s: FlowStatus) => (s === "proposed" ? 0 : s === "gone" ? 1 : 2);
   const flows = cards.filter((c) => c.status !== "ignored").sort((a, b) => order(a.status) - order(b.status) || (a.pending ? 0 : 1) - (b.pending ? 0 : 1));
   const model = store.flowModel(service)?.model;
   return {
     service, intro: intro ?? DEFAULT_INTRO, flows, ignored: cards.filter((c) => c.status === "ignored"),
-    shared: (model?.segments ?? []).filter((s) => s.role === "shared").map((s) => ({ service, group: s.group.id, name: s.group.name })),
+    shared: (model?.segments ?? []).filter((s) => s.role === "shared" && (!registeredGroupsOn() || s.module)).map((s) => ({ service, group: s.group.id, name: s.group.name })),
     allConfirmed: flows.length > 0 && flows.every((c) => c.status === "confirmed" && !c.pending),
   };
 }

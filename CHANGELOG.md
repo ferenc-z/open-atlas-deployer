@@ -5,10 +5,98 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
 
 ## Unreleased
 
+- S39 step 7 (monitoring looks at what is registered): with `DEPLOYER_REGISTERED_GROUPS=1`, describe, the brief, the
+  business light and the flows page list only registered businesses and shared modules, and the gaps (`no-exit`,
+  `s2s-unpaired`, `topology-changed`, `unconfirmed`, `no-stuck-times`) only count their groups; a service with nothing
+  registered has no gaps. New gap `executor-old` (the service executor does not name `flow-groups@1`). A registered group
+  renamed, gone, with a vanished slice or changed on the canvas opens a to-do `canvas:<owner>` "需要负责人确认" (closes by
+  itself). The runtime handover-lost check uses the gate's bucket rule (only buckets both sides have, not the first of
+  either). The business graph draws `port:`/`link:` as inside and a module node by its `module`. The check-up no longer
+  builds the model: the brief has no skeleton draft or rebuild flag, `look kind model` no `draft`, `run_model` /
+  `publish_model` refuse `from: "skeleton"`, `publish_model` refuses to change segments a registration wrote, and
+  `service-checkup` loses the model part and the two verbs from its `allowed_tools`.
+- [ ] OMA: 重新发布 service-checkup
+
+- Service executor 0.9.7 (S39 step 1, reading only the registered businesses): a watch entry with `groups` (ids of
+  process groups at any depth) has only those groups read: each group's recursive status
+  (`flow/process-groups/<id>/status`) for the counts, and for the topology each group with its subgroups plus one hop
+  out (the connections in its parent that end at its ports: `neighbors`, and `links` between two registered groups;
+  an RPG beside it counts as its S2S exit). The topology body says `scope: "groups"`; its groups carry `parent` and
+  `path`, and `missing` lists the registered groups NiFi does not have. `groups: []` reads no counts and no topology
+  (the machine's numbers as ever); no `groups` key reads the whole canvas as before. The 500-group cap on the whole
+  canvas is gone: the round's time budget (20 seconds; with groups 10 + 2 per group, at most 120) is the only limit.
+  New read job `nifi-groups` (`nifi-groups@1`): up to 20 groups read now, each with its name, path, ports, ends, S2S,
+  sizes, pieces and neighbors, plus the scoped topology. The heartbeat names `flow-groups@1` and `nifi-groups@1`. The
+  Deployer gives a cluster's groups to one node (the first whose executor is fresh, names `flow-groups@1` and whose
+  NiFi answered) and `[]` to the others. Nothing is registered yet (step 2), so every service is still read whole.
+
+- S39 step 2 (second half): registering reads the group through the service executor's `nifi-groups` job (the first
+  member whose heartbeat names `nifi-groups@1`, the next member when one fails; no such executor: `register/executor-old`).
+  `registeredGroups(store, service)` reads `flow_registrations` (a business's and a shared module's groups), and is
+  `undefined`, never `[]`, for a service with none. **It is off by default**: only `DEPLOYER_REGISTERED_GROUPS=1` makes the
+  watch carry `groups`, because the skeleton, the model and the gates still assume the whole canvas (until the chaining,
+  step 3, is in) and a service read by groups would lose its counts and topology outside them. Registrations are stored
+  either way. Registration drafts (`registration_drafts`, a draft nobody touched for 24 hours goes): `POST
+  /api/registrations/drafts` makes one (`rgd_…`), `GET /api/registrations/drafts/<id>` reads it with the last preview, and
+  `register` add / remove / rename / declare-handoff with `draft` change only the draft. Preview and commit of a draft
+  still answer `register/not-implemented`.
+
+- S39 step 4: `register preview` (a draft's groups, kept on the draft; a business's plus links; or links alone) reads the
+  groups now (`nifi-groups` topology), adds e2e_trace's schedule definitions (a note when they cannot be read), the
+  shared modules, the told hand-overs and worker places, and answers `chain()`'s preview; no `request_id`. `register
+  place-worker` (with `draft` or `flow`; table `worker_places`, `registration_drafts.places`) says where a schedule's
+  worker runs, or `outside: true`; `worker-unplaced` gaps carry `worker` and candidate `places` (a registered group with
+  a processor of that name, or a similar group name) for the AI to ask about. `register shared` registers a shared
+  module (one group; entries = its input ports, S2S or MQ; exits = output ports, S2S sends or ends, with `when`);
+  `takeover: true` moves a group a business has into the module (that business and every business joined to it get a
+  `shared` history line). `GET /api/registrations/modules` lists modules with their own health (the group's counts in
+  the last hour), `GET …/modules/<id>` adds who uses it now; unregistering a module still used answers
+  `register/module-in-use`. Nothing is published yet (step 5).
+
+- S39 step 5: a registration takes effect at once, no approval. `register commit` (a draft, which then goes, or `name` +
+  `links` + `handoffs?`), and `add` (now with `handoffs?`), `remove`, `declare-handoff`, `place-worker` of a registered
+  business, `shared` with `commit: true` and `unregister` chain the registration again on what NiFi has now, refuse
+  while a gap is open (`register/gaps-open`, 409, with the gaps; a change to a registered business is refused only for
+  gaps it opens), write the chain into the model of every service it touches and publish them all in one transaction
+  (model source `register`; a service whose model comes out the same gets no revision). A business's segment is its
+  registered group (exits: the hand-overs to its other segments, the modules, told hand-overs with `declared`, the ends;
+  entries: its starts, with a file-name cue, and the hand-overs in); a module's segment is `role: "shared"` with
+  `module: "shm_…"` and its registered entries and exits. Two registered groups joined on the canvas name the same
+  channel on both sides (external `port:<module port id>` or `link:<connection / funnel / schedule step>`): the trace
+  follows the data across them under the same key, so it now passes through a module's canvas ports (`declared:` stays
+  unfollowed). The model parser keeps `module` and `declared`. The registration gate (`services/register-gate.ts`) judges
+  the new models together, on registered businesses only: coverage (every registered group is a segment), reachable,
+  no-dangling (told hand-overs are not dangling), s2s-balance (per 5-minute bucket both sides were counted in) and
+  no-regression; a refusal (`register/gate-rejected`, 409) names the business, the group and its link or both sides of
+  the hand-over. `flows` / `flow_segments` follow the registration (person's name, confirmed, upstream first);
+  `GET /api/registrations/modules` gives each module's model `segments`; `flow_changes` rows of one action carry the same
+  `op` (new column), one per service with that service's revision. `rename` still changes only the name (the models do
+  not carry it). **`DEPLOYER_REGISTERED_GROUPS` stays off by default**: with it on (checked on the lab dev instance) the
+  watch reads exactly the registered groups and the registration publishes and gates on that, but the old whole-canvas
+  paths (skeleton draft, `publish_model`'s gate, describe's gaps, the business graph drawing `port:` / `link:` as
+  outside, the runtime hand-over check on a partial first hour) are not adapted yet (steps 7–9); turning it on is step 9.
+
+- S39 step 6: the eighth MCP verb `register` (people and the Deploy Assistant; not the check-up's key) passes every
+  registration action through: `draft` (new, or `flow` for a copy of a registered business), `show`, `preview`, `add`,
+  `remove`, `rename`, `declare-handoff`, `place-worker`, `shared`, `modules`, `commit`, `unregister`. A refusal keeps the
+  route's details for the AI (`gaps`, `preview`, `problems`, `taken`, `candidates`…). The Assistant's key changes drafts
+  only: `commit`, `unregister` and a registered business's changes without a draft answer `register/person-only` (403);
+  a person presses Register / confirms on the page. `POST /api/registrations/drafts` takes `flow`: the draft starts as
+  that business (groups, told hand-overs, worker places, name; `registration_drafts.flow`, new column), and its `commit`
+  applies the difference as one change (chained, refused only for gaps it opens, gated, published; one history line per
+  kind). `publish_model` is no longer the Assistant's (internal; whether it leaves MCP is step 7). The Assistant's
+  prompt and the Skill `nifi-ops` describe the registration conversation instead of the business model.
+
 - Skills follow the Agent Skills layout OMA reads: `agents/skills/<name>/SKILL.md` (a folder named as the Skill, the
   frontmatter `name` the same), so the folder zips straight into OMA's Skill upload. `bin/publish-assistant.ts` reads
   the folders (a loose `*.md` there is an error); the Skill's text is unchanged, so no new Skill version and nothing to
   republish. `bin/check-oma-notes.sh` does not count a file moved without a change of text.
+
+### After upgrading
+
+- [ ] OMA: republish the Deploy Assistant (`agents/deploy-assistant.md`, allowed_tools: `register` in, `publish_model`
+  out) and the Skill `nifi-ops` (the registration conversation; the business-model section is gone), then point
+  `DEPLOYER_OMA_AGENT` and the Workbench Business Agent "Deploy Assistant" at the new agent.
 
 ## 0.3.0-rc.15
 

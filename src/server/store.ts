@@ -246,6 +246,37 @@ CREATE TABLE IF NOT EXISTS service_todos (
   state TEXT NOT NULL, analysis INTEGER, draft TEXT,
   created_at TEXT NOT NULL, created_by TEXT NOT NULL, updated_at TEXT NOT NULL, closed_at TEXT, closed_by TEXT);
 CREATE UNIQUE INDEX IF NOT EXISTS service_todos_open ON service_todos (service, key) WHERE state = 'open';
+-- S39 (business-registration §7.1): a business registers the groups it runs through. One row = one registered group
+-- (with all its subgroups). owner is a business flw_… (role segment) or a shared module shm_… (role shared).
+CREATE TABLE IF NOT EXISTS flow_registrations (
+  owner TEXT NOT NULL, role TEXT NOT NULL CHECK (role IN ('segment', 'shared')),
+  service TEXT NOT NULL, group_id TEXT NOT NULL, group_name TEXT NOT NULL, group_path TEXT,
+  slice TEXT NOT NULL DEFAULT '*', link TEXT,
+  registered_by TEXT NOT NULL, registered_at TEXT NOT NULL,
+  PRIMARY KEY (owner, service, group_id, slice));
+CREATE UNIQUE INDEX IF NOT EXISTS flow_registrations_group ON flow_registrations (service, group_id, slice);
+CREATE INDEX IF NOT EXISTS flow_registrations_service ON flow_registrations (service);
+CREATE TABLE IF NOT EXISTS shared_modules (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS flow_handoffs (
+  id TEXT PRIMARY KEY, flow TEXT NOT NULL REFERENCES flows(id) ON DELETE CASCADE,
+  from_service TEXT NOT NULL, from_group TEXT NOT NULL, from_component TEXT NOT NULL, from_relationship TEXT,
+  to_service TEXT, to_group TEXT, to_system TEXT,
+  quote TEXT NOT NULL, declared_by TEXT NOT NULL, declared_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS flow_handoffs_flow ON flow_handoffs (flow);
+-- S39 (§7.9): the registration page's draft: the groups, spoken hand-overs and name a person and the AI are putting
+-- together before Register. Nothing here is a registration; a draft nobody touched for a day goes.
+CREATE TABLE IF NOT EXISTS registration_drafts (
+  id TEXT PRIMARY KEY, created_by TEXT NOT NULL, name TEXT,
+  groups TEXT NOT NULL, handoffs TEXT NOT NULL, preview TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+-- S39 step 4 (§7.8 6): where the owner said a schedule's worker runs, when its name matches no registered group.
+-- service and group_id NULL: not in NiFi. A draft keeps its own in registration_drafts.places (added below).
+CREATE TABLE IF NOT EXISTS worker_places (
+  flow TEXT NOT NULL REFERENCES flows(id) ON DELETE CASCADE,
+  schedule TEXT NOT NULL, worker_name TEXT NOT NULL, service TEXT, group_id TEXT,
+  quote TEXT NOT NULL, placed_by TEXT NOT NULL, placed_at TEXT NOT NULL,
+  PRIMARY KEY (flow, schedule, worker_name));
 `;
 
 /** queued: waiting for the host's executor to claim it; the rest are the executor's states. */
@@ -398,6 +429,18 @@ export class Store {
     }
     // Phase 2 step 2: each sample's flat numbers (the Metrics tab, the rollups), next to step 1's raw body.
     if (!(this.db.prepare("PRAGMA table_info(service_samples)").all() as Row[]).some((c) => c.name === "point")) this.db.exec("ALTER TABLE service_samples ADD COLUMN point TEXT");
+    // S39 step 4 (§7.2): a shared module's entries and exits (the module's ports and split conditions), until the
+    // publishing (step 5) writes them into the services' models.
+    {
+      const have = (this.db.prepare("PRAGMA table_info(shared_modules)").all() as Row[]).map((c) => c.name);
+      for (const column of ["entries", "exits"]) if (!have.includes(column)) this.db.exec(`ALTER TABLE shared_modules ADD COLUMN ${column} TEXT`);
+      const draftCols = (this.db.prepare("PRAGMA table_info(registration_drafts)").all() as Row[]).map((c) => c.name);
+      if (!draftCols.includes("places")) this.db.exec("ALTER TABLE registration_drafts ADD COLUMN places TEXT");
+      // S39 step 6 (§7.9): a draft of changes to a registered business (its id); NULL for a new business.
+      if (!draftCols.includes("flow")) this.db.exec("ALTER TABLE registration_drafts ADD COLUMN flow TEXT");
+      // S39 step 5 (§7.7 8): the rows one registration action writes over several services share an op.
+      if (!(this.db.prepare("PRAGMA table_info(flow_changes)").all() as Row[]).some((c) => c.name === "op")) this.db.exec("ALTER TABLE flow_changes ADD COLUMN op TEXT");
+    }
     // S37 step 4: a bulletin's component and process group (the investigation page's links into NiFi).
     {
       const have = (this.db.prepare("PRAGMA table_info(service_bulletins)").all() as Row[]).map((c) => c.name);
@@ -1914,7 +1957,7 @@ export class Store {
   }
 
   /** Adds the next revision over `base` (0: none yet); another publish in between is refused. Call inside flowTransaction. */
-  insertFlowModel(service: string, base: number, model: ModelV2, source: "ai" | "e2e_trace" | "migrated", actor: Actor, gate: unknown, topologyFp: string | null = null): number {
+  insertFlowModel(service: string, base: number, model: ModelV2, source: "ai" | "e2e_trace" | "migrated" | "register", actor: Actor, gate: unknown, topologyFp: string | null = null): number {
     const was = (this.db.prepare("SELECT MAX(revision) AS r FROM flow_models WHERE service = ?").get(service) as Row | undefined)?.r ?? 0;
     if (was !== base) throw new StoreError("flow-model/stale", `${service}'s model is at revision ${was}, not ${base}: read it again (describe) and redo the draft on it.`);
     const revision = base + 1;
@@ -1962,16 +2005,149 @@ export class Store {
     ordered.forEach((s, seq) => this.db.prepare("INSERT INTO flow_segments (flow, seq, service, segment) VALUES (?, ?, ?, ?)").run(flow, seq, s.service, s.segment));
   }
 
-  addFlowChange(c: Omit<FlowChange, "id" | "at">) {
-    this.db.prepare("INSERT INTO flow_changes (flow, service, at, by, kind, text, revision, verdict) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-      .run(c.flow, c.service, this.stamp(), c.by, c.kind, c.text, c.revision, c.verdict);
+  addFlowChange(c: Omit<FlowChange, "id" | "at" | "op"> & { op?: string | null }) {
+    this.db.prepare("INSERT INTO flow_changes (flow, service, at, by, kind, text, revision, verdict, op) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(c.flow, c.service, this.stamp(), c.by, c.kind, c.text, c.revision, c.verdict, c.op ?? this.flowOpId);
+  }
+
+  private flowOpId: string | null = null;
+  /** S39 step 5 (§7.7 8): every flow_changes row written in `work` carries `op` (one registration action over several
+   *  services reads as one). */
+  flowOp<T>(op: string, work: () => T): T {
+    const was = this.flowOpId;
+    this.flowOpId = op;
+    try { return work(); } finally { this.flowOpId = was; }
   }
 
   /** Newest first: a business's history, or a service's. */
   flowChanges(o: { flow?: string; service?: string; limit?: number }): FlowChange[] {
     const where = o.flow ? "flow = ?" : "service = ?";
     return (this.db.prepare(`SELECT * FROM flow_changes WHERE ${where} ORDER BY id DESC LIMIT ?`).all(o.flow ?? o.service ?? "", Math.min(500, o.limit ?? 50)) as Row[])
-      .map((r) => ({ id: r.id, flow: r.flow ?? null, service: r.service, at: r.at, by: r.by, kind: r.kind, text: r.text, revision: r.revision ?? null, verdict: r.verdict ?? null }));
+      .map((r) => ({ id: r.id, flow: r.flow ?? null, service: r.service, at: r.at, by: r.by, kind: r.kind, text: r.text, revision: r.revision ?? null, verdict: r.verdict ?? null, op: r.op ?? null }));
+  }
+
+  // S39 (business-registration §7.1): the registered groups. services/registration.ts decides; these only read and write.
+
+  /** Every registered group of a service, or of one owner (a business or a module). */
+  flowRegistrations(o: { service?: string; owner?: string } = {}): FlowRegistration[] {
+    const where = [o.service !== undefined ? "service = ?" : "", o.owner !== undefined ? "owner = ?" : ""].filter(Boolean).join(" AND ");
+    const args = [o.service, o.owner].filter((x): x is string => x !== undefined);
+    return (this.db.prepare(`SELECT * FROM flow_registrations ${where ? `WHERE ${where}` : ""} ORDER BY registered_at, rowid`).all(...args) as Row[]).map((r) => ({
+      owner: r.owner, role: r.role, service: r.service, groupId: r.group_id, groupName: r.group_name, groupPath: r.group_path ?? null,
+      slice: r.slice, link: r.link ?? null, registeredBy: r.registered_by, registeredAt: r.registered_at,
+    }));
+  }
+
+  /** Adds registered groups; one registered already (same service, group and slice) is refused. Call inside flowTransaction. */
+  addFlowRegistrations(rows: Omit<FlowRegistration, "registeredAt">[]) {
+    const at = this.stamp();
+    const insert = this.db.prepare("INSERT INTO flow_registrations (owner, role, service, group_id, group_name, group_path, slice, link, registered_by, registered_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    for (const r of rows) {
+      try { insert.run(r.owner, r.role, r.service, r.groupId, r.groupName, r.groupPath, r.slice, r.link, r.registeredBy, at); } catch (error) {
+        if (/UNIQUE|constraint/i.test(String((error as Error).message))) throw new StoreError("flow-registrations/taken", `Group ${r.groupId} of ${r.service} is registered already.`);
+        throw error;
+      }
+    }
+  }
+
+  /** Removes an owner's registrations of one group (every slice); true when there was one. */
+  removeFlowRegistration(owner: string, service: string, group: string): boolean {
+    return Number(this.db.prepare("DELETE FROM flow_registrations WHERE owner = ? AND service = ? AND group_id = ?").run(owner, service, group).changes) > 0;
+  }
+
+  /** Removes all of an owner's registrations; how many rows went. */
+  removeFlowRegistrations(owner: string): number {
+    return Number(this.db.prepare("DELETE FROM flow_registrations WHERE owner = ?").run(owner).changes);
+  }
+
+  // S39 (§7.9): registration drafts. A draft not touched for REGISTRATION_DRAFT_TTL_MS does not exist (read as gone at once,
+  // deleted by pruneRegistrationDrafts).
+
+  /** A new draft; from (S39 step 6) starts it as a copy of a registered business, whose changes its commit applies. */
+  createRegistrationDraft(by: string, name: string | null = null, from?: { flow: string; groups: RegistrationDraftGroup[]; handoffs: RegistrationDraftHandoff[]; places: WorkerPlace[] }): RegistrationDraft {
+    const id = `rgd_${randomBytes(6).toString("hex")}`;
+    const at = this.stamp();
+    const groups = from?.groups ?? [], handoffs = from?.handoffs ?? [], places = from?.places ?? [];
+    this.db.prepare("INSERT INTO registration_drafts (id, created_by, name, groups, handoffs, preview, places, flow, created_at, updated_at) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)")
+      .run(id, by, name, JSON.stringify(groups), JSON.stringify(handoffs), JSON.stringify(places), from?.flow ?? null, at, at);
+    return { id, createdBy: by, name, groups, handoffs, preview: null, places, flow: from?.flow ?? null, createdAt: at, updatedAt: at };
+  }
+
+  registrationDraft(id: string): RegistrationDraft | null {
+    const r = this.db.prepare("SELECT * FROM registration_drafts WHERE id = ? AND updated_at >= ?").get(id, new Date(this.now().getTime() - REGISTRATION_DRAFT_TTL_MS).toISOString()) as Row | undefined;
+    return r ? { id: r.id, createdBy: r.created_by, name: r.name ?? null, groups: JSON.parse(r.groups), handoffs: JSON.parse(r.handoffs), preview: r.preview === null ? null : JSON.parse(r.preview),
+      places: r.places ? JSON.parse(r.places) : [], flow: r.flow ?? null, createdAt: r.created_at, updatedAt: r.updated_at } : null;
+  }
+
+  /** Saves a draft's name, groups and hand-overs, its worker places and the last preview when given (preview null clears
+   *  it); touches it. */
+  putRegistrationDraft(d: Pick<RegistrationDraft, "id" | "name" | "groups" | "handoffs"> & { preview?: unknown; places?: WorkerPlace[] }) {
+    const withPreview = d.preview !== undefined, withPlaces = d.places !== undefined;
+    this.db.prepare(`UPDATE registration_drafts SET name = ?, groups = ?, handoffs = ?, ${withPreview ? "preview = ?, " : ""}${withPlaces ? "places = ?, " : ""}updated_at = ? WHERE id = ?`)
+      .run(...[d.name, JSON.stringify(d.groups), JSON.stringify(d.handoffs), ...(withPreview ? [d.preview === null ? null : JSON.stringify(d.preview)] : []),
+        ...(withPlaces ? [JSON.stringify(d.places)] : []), this.stamp(), d.id] as (string | null)[]);
+  }
+
+  // S39 step 4 (§7.8 6): worker places of a registered business.
+  workerPlaces(flow: string): WorkerPlace[] {
+    return (this.db.prepare("SELECT * FROM worker_places WHERE flow = ? ORDER BY placed_at, schedule, worker_name").all(flow) as Row[]).map((r) => ({
+      schedule: r.schedule, worker: r.worker_name, service: r.service ?? null, group: r.group_id ?? null, quote: r.quote, placedBy: r.placed_by, placedAt: r.placed_at,
+    }));
+  }
+
+  /** Puts (or replaces) where a worker runs; place null removes it. Call inside flowTransaction with the change row. */
+  setWorkerPlace(flow: string, schedule: string, worker: string, place: Omit<WorkerPlace, "schedule" | "worker"> | null) {
+    this.db.prepare("DELETE FROM worker_places WHERE flow = ? AND schedule = ? AND worker_name = ?").run(flow, schedule, worker);
+    if (place) this.db.prepare("INSERT INTO worker_places (flow, schedule, worker_name, service, group_id, quote, placed_by, placed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(flow, schedule, worker, place.service, place.group, place.quote, place.placedBy, place.placedAt);
+  }
+
+  /** Deletes the drafts nobody touched for a day; how many went. */
+  pruneRegistrationDrafts(): number {
+    return Number(this.db.prepare("DELETE FROM registration_drafts WHERE updated_at < ?").run(new Date(this.now().getTime() - REGISTRATION_DRAFT_TTL_MS).toISOString()).changes);
+  }
+
+  sharedModule(id: string): SharedModule | null {
+    const r = this.db.prepare("SELECT * FROM shared_modules WHERE id = ?").get(id) as Row | undefined;
+    return r ? sharedModuleOf(r) : null;
+  }
+
+  sharedModules(): SharedModule[] {
+    return (this.db.prepare("SELECT * FROM shared_modules ORDER BY created_at, id").all() as Row[]).map(sharedModuleOf);
+  }
+
+  /** Adds a shared module or changes its name and endpoints (who made it and when stay). Call inside flowTransaction. */
+  putSharedModule(m: { id: string; name: string; createdBy: string; entries: unknown[]; exits: unknown[] }) {
+    const at = this.stamp();
+    this.db.prepare(`INSERT INTO shared_modules (id, name, created_by, created_at, updated_at, entries, exits) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET name = excluded.name, updated_at = excluded.updated_at, entries = excluded.entries, exits = excluded.exits`)
+      .run(m.id, m.name, m.createdBy, at, at, JSON.stringify(m.entries), JSON.stringify(m.exits));
+  }
+
+  deleteSharedModule(id: string) { this.db.prepare("DELETE FROM shared_modules WHERE id = ?").run(id); }
+
+  /** Puts (or replaces, by id) a told hand-over of a business. Call inside flowTransaction. */
+  putFlowHandoff(flow: string, h: RegistrationDraftHandoff) {
+    const to = "system" in h.to ? { service: null, group: null, system: h.to.system } : { service: h.to.service, group: h.to.group, system: null };
+    this.db.prepare(`INSERT INTO flow_handoffs (id, flow, from_service, from_group, from_component, from_relationship, to_service, to_group, to_system, quote, declared_by, declared_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET from_service = excluded.from_service, from_group = excluded.from_group,
+        from_component = excluded.from_component, from_relationship = excluded.from_relationship, to_service = excluded.to_service, to_group = excluded.to_group,
+        to_system = excluded.to_system, quote = excluded.quote, declared_by = excluded.declared_by, declared_at = excluded.declared_at`)
+      .run(h.id, flow, h.from.service, h.from.group, h.from.component, h.from.relationship ?? null, to.service, to.group, to.system, h.quote, h.declaredBy, h.declaredAt);
+  }
+
+  deleteFlowHandoff(id: string): boolean { return Number(this.db.prepare("DELETE FROM flow_handoffs WHERE id = ?").run(id).changes) > 0; }
+
+  deleteRegistrationDraft(id: string) { this.db.prepare("DELETE FROM registration_drafts WHERE id = ?").run(id); }
+
+  /** A business's told hand-overs (§7.3), in the draft's shape. */
+  flowHandoffs(flow: string): RegistrationDraftHandoff[] {
+    return (this.db.prepare("SELECT * FROM flow_handoffs WHERE flow = ? ORDER BY declared_at, id").all(flow) as Row[]).map((r) => ({
+      id: r.id,
+      from: { service: r.from_service, group: r.from_group, component: r.from_component, ...(r.from_relationship ? { relationship: r.from_relationship } : {}) },
+      to: r.to_system ? { system: r.to_system } : { service: r.to_service, group: r.to_group },
+      quote: r.quote, declaredBy: r.declared_by, declaredAt: r.declared_at,
+    }));
   }
 
   /** Step 3b: an anomaly seen (again). Opens one, or adds `count` to the open one and moves its last time, light and detail. */
@@ -2154,7 +2330,7 @@ export interface FlowCountRow {
   source: "sample" | "nifi-history";
 }
 /** §10.2.4 step 2: a stored v2 model revision. gate: the checks it was published with. */
-export interface StoredFlowModel { service: string; revision: number; model: ModelV2; source: "ai" | "e2e_trace" | "migrated"; publishedAt: string; publishedBy: string; gate: unknown; topologyFp?: string | null }
+export interface StoredFlowModel { service: string; revision: number; model: ModelV2; source: "ai" | "e2e_trace" | "migrated" | "register"; publishedAt: string; publishedBy: string; gate: unknown; topologyFp?: string | null }
 const toFlowModel = (r: Row): StoredFlowModel => ({ service: r.service, revision: r.revision, model: JSON.parse(r.body), source: r.source, publishedAt: r.published_at, publishedBy: r.published_by, gate: parse(r.gate), topologyFp: r.topology_fp ?? null });
 /** A change the gate held for a person (A8): the draft's segments of this service it would apply, those it removes.
  *  A business holds at most one per service (several services can each wait on the same business, e.g. the downstream
@@ -2181,6 +2357,39 @@ export interface FlowAnomaly {
   id: number; flow: string; service: string; ref: string; anomaly: Anomaly | FlowNote; light: Light; state: "open" | "closed";
   firstAt: string; lastAt: string; count: number; detail: Record<string, unknown>; closedAt: string | null;
 }
-export type FlowChangeKind ="found" | "updated" | "confirmed" | "renamed" | "stuck" | "split-asked" | "not-right" | "ignored" | "watched" | "rejected";
-export interface FlowChange { id: number; flow: string | null; service: string; at: string; by: string; kind: FlowChangeKind; text: string; revision: number | null; verdict: GateVerdict | null }
+export type FlowChangeKind ="found" | "updated" | "confirmed" | "renamed" | "stuck" | "split-asked" | "not-right" | "ignored" | "watched" | "rejected"
+  // S39 (§7.1): a business's registration.
+  | "register" | "add-group" | "remove-group" | "rename" | "declare-handoff" | "unregister" | "place-worker"
+  // S39 step 4: a shared module registered or changed; a business joined to it (or its group made into it).
+  | "shared";
+/** S39 (§7.1): one registered group of a business (role segment) or of a shared module (role shared). */
+export interface FlowRegistration {
+  owner: string; role: "segment" | "shared"; service: string; groupId: string; groupName: string; groupPath: string | null;
+  slice: string; link: string | null; registeredBy: string; registeredAt: string;
+}
+/** S39 (§7.9): how long a registration draft lives without being touched. */
+export const REGISTRATION_DRAFT_TTL_MS = 24 * 3600_000;
+export interface RegistrationDraftGroup { service: string; group: { id: string; name: string; path: string }; link: string | null; addedBy: string; addedAt: string }
+/** A spoken hand-over kept in a draft (the same fields as flow_handoffs). to is a group of the draft or the outside ({system}). */
+export interface RegistrationDraftHandoff {
+  id: string; from: { service: string; group: string; component: string; relationship?: string };
+  to: { service: string; group: string } | { system: string }; quote: string; declaredBy: string; declaredAt: string;
+}
+export interface RegistrationDraft {
+  id: string; createdBy: string; name: string | null; groups: RegistrationDraftGroup[]; handoffs: RegistrationDraftHandoff[];
+  /** The last preview the chaining made (step 3); null until then. */
+  preview: unknown | null; createdAt: string; updatedAt: string;
+  /** S39 step 4: the draft's worker places (worker_places' shape). */
+  places: WorkerPlace[];
+  /** S39 step 6: the registered business this draft changes (its commit applies the difference); null for a new one. */
+  flow: string | null;
+}
+/** S39 step 4 (§7.8 6): one worker placed by the owner; service/group null = not in NiFi. */
+export interface WorkerPlace { schedule: string; worker: string; service: string | null; group: string | null; quote: string; placedBy: string; placedAt: string }
+/** S39 (§7.2): entries and exits are the module's endpoints (chain.ts ChainModuleEndpoint); [] for a module from before step 4. */
+export interface SharedModule { id: string; name: string; createdBy: string; createdAt: string; updatedAt: string; entries: unknown[]; exits: unknown[] }
+const sharedModuleOf = (r: Row): SharedModule => ({ id: r.id, name: r.name, createdBy: r.created_by, createdAt: r.created_at, updatedAt: r.updated_at,
+  entries: r.entries ? JSON.parse(r.entries) : [], exits: r.exits ? JSON.parse(r.exits) : [] });
+/** op (S39 step 5): the registration action the row is part of (one per service it touched); null before step 5. */
+export interface FlowChange { id: number; flow: string | null; service: string; at: string; by: string; kind: FlowChangeKind; text: string; revision: number | null; verdict: GateVerdict | null; op?: string | null }
 export interface ServiceCert { member: string; store: string; path: string | null; type: string | null; alias: string | null; chain: number | null; subject: string | null; issuer: string | null; notBefore: string | null; notAfter: string | null; readAt: string; error: string | null }

@@ -3,7 +3,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { bucketOfWindow, flowRows, ingestFlow, pruneFlow, type Topology, type TopologyFragment } from "../src/server/services/flowcounts.ts";
+import { bucketOfWindow, flowRows, ingestFlow, pruneFlow, topologyFingerprint, type Topology, type TopologyFragment } from "../src/server/services/flowcounts.ts";
 import { addressOf, identify, skeletonOf, type SkeletonInput } from "../src/server/services/skeleton.ts";
 import { ingest } from "../src/server/services/metrics.ts";
 import { watchList, type ServiceSample } from "../src/server/services/watch.ts";
@@ -205,4 +205,27 @@ test("skeleton: an input port on the root canvas belongs to the groups it leads 
   assert.equal(sk.edges.some((e) => e.from.startsWith("n2/r2") || e.to.startsWith("n2/r2")), false, "the root canvas' own piece is not in the hand-over");
   assert.deepEqual(sk.questions.map((q) => [q.kind, q.service, q.group]), [["fan-out", "n1", "S"]], "the fan-out is the sender's, as for any port leading to two units");
   assert.ok(sk.flows.some((f) => f.key === "n2/r2/gen" && f.segments.length === 1), "the root piece stays a business of its own");
+});
+
+test("S39 step 1: the watch's registered groups; a cluster's groups read by one node (§7.7 question 6); scope in the fingerprint", () => {
+  const store = new Store(":memory:", () => NOW);
+  const member = { host: "local", installDir: "/lab/n112", serviceUser: "ferenc", startEnvironment: null, ports: { https: 18443 }, nodeAddress: null, discovery: null };
+  store.addStandalone({ kind: "standalone", id: "n112", service: "nifi", profile: "nifi-1.x", version: "1.12.1", webUrl: null, member } as never, "uat", admin);
+  const node = (d: string, https: number) => ({ host: "local", installDir: d, serviceUser: "ferenc", startEnvironment: null, ports: { https }, nodeAddress: "localhost", discovery: null });
+  store.addCluster({ kind: "cluster", id: "c250", service: "nifi", profile: "nifi-2.x", version: "2.5.0", webUrl: null, zookeeper: "zk:2181", zookeeperRoot: "/c250", nodes: [node("/lab/c250-1", 18445), node("/lab/c250-2", 18446)] } as never, "uat", admin);
+  assert.equal(watchList(store, "local").some((w) => "groups" in w), false, "nothing registered: no key, the whole canvas as before");
+  const groups = (s: string) => (s === "c250" ? ["g-1", "g-2"] : s === "n112" ? [] : undefined);
+  const of = (now = NOW) => Object.fromEntries(watchList(store, "local", groups, now.getTime()).map((w) => [w.member.split(":").pop(), w.groups]));
+  assert.deepEqual(of(), { "/lab/n112": [], "/lab/c250-1": [{ id: "g-1" }, { id: "g-2" }], "/lab/c250-2": [] }, "no beat yet: the first node");
+  store.setHeartbeat("local", { version: "0.9.7", kinds: ["nifi-groups@1", "flow-groups@1"], protocols: [2] }, "service");
+  const second = watchList(store, "local").find((w) => w.member.endsWith("/lab/c250-2"))!.member;
+  ingest(store, [{ service: "c250", member: second, at: NOW.toISOString(), process: { running: true }, nifi: { state: "ok" } } as ServiceSample]);
+  assert.deepEqual([of()["/lab/c250-1"], of()["/lab/c250-2"]], [[], [{ id: "g-1" }, { id: "g-2" }]], "the first node whose NiFi answered");
+  assert.deepEqual(of(new Date(NOW.getTime() + 60_000))["/lab/c250-1"], [{ id: "g-1" }, { id: "g-2" }], "the beat is old: back to the first node");
+
+  const canvas = topo("r", [{ id: "A", name: "A", root: false, fragments: [frag("a")] }]);
+  const scoped: Topology = { ...canvas, scope: "groups", missing: [], groups: [{ ...canvas.groups[0], parent: "P", path: [{ id: "r", name: "NiFi Flow" }, { id: "P", name: "P" }] }], neighbors: [] };
+  assert.equal(topologyFingerprint(canvas), topologyFingerprint({ ...canvas }), "the whole canvas' fingerprint is unchanged");
+  assert.notEqual(topologyFingerprint(scoped), topologyFingerprint(canvas));
+  assert.notEqual(topologyFingerprint({ ...scoped, groups: [{ ...scoped.groups[0], parent: "Q" }] }), topologyFingerprint(scoped), "moved to another parent");
 });

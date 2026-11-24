@@ -244,7 +244,7 @@ export class TraceEngine {
     for (const exit of exits) {
       const stepR = seg.steps.find((s) => s.step === exit.step)!;
       const sent = [...stepR.events].reverse().find((e) => e.state === "sent") ?? stepR.events[stepR.events.length - 1]!;
-      if (exit.channel.type === "external") {
+      if (exit.channel.type === "external" && !channelKey(service, exit, "exit")) {
         seg.handover = { exit: exit.id, channel: "external", to: { system: exit.channel.system! }, state: "outside" };
         // T13: NiFi's part ends here; say when and by what it left, and send the reader downstream.
         const by = stepR.position.name ?? stepR.name;
@@ -294,6 +294,12 @@ export class TraceEngine {
 
   /** The channel type's rule for carrying the key across a hand-over (T2, T3). */
   private async handover(exit: Endpoint, entry: Endpoint, sent: ObservedEvent, key: CorrelationKey, service: string, position: Position): Promise<Asked & { inferred: boolean; note?: string }> {
+    // S39 step 5: a canvas hand-over (a shared module's port, a connection between registered groups): the same data,
+    // under the same key, at the receiving side.
+    if (exit.channel.type === "external") {
+      const got = await this.byKey(service, key, iso(t(sent.at) - 60_000), iso(this.now().getTime()), position);
+      return { ...got, inferred: false };
+    }
     if (exit.channel.type === "s2s") {
       const from = iso(t(sent.at) - S2S_WINDOW_MS), to = iso(t(sent.at) + S2S_WINDOW_MS);
       const paired = await this.ask(service, (a) => Boolean(a.handover) && a.capabilities(service).handover.includes("s2s"), (a) => a.handover!({ service, channel: "s2s", sent, position, from, to }), "pair an S2S hand-over");

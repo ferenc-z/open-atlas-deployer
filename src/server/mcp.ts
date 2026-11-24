@@ -2,7 +2,8 @@
 // The bearer is an API key: personal (dpk_), the Deploy Assistant's service key (dps_) or the scheduled check-up's
 // key (dpc_). Which tools a key sees (pages-rethink §10.2.3): a personal key as its owner may (admin tools and
 // publish_model / record for a Workbench admin only); the Assistant's key the read-only and draft tools plus
-// publish_model and record (to-dos only, P4, P5); the check-up's key the managed-service verbs except draft_change.
+// record (to-dos only, P4, P5) and register (S39 step 6: drafts only, a person commits; publish_model is internal now);
+// the check-up's key the managed-service verbs except draft_change and register.
 // A tool a key may not use is not listed for it.
 //
 // Every tool is ONE request to the Deployer's own API, dispatched in-process as the key's principal, so a tool has
@@ -42,6 +43,8 @@ export interface Tool {
   request: (a: Record<string, unknown>) => { method: Method; path: string; query?: Record<string, unknown>; body?: unknown; headers?: Record<string, string> };
   /** What the AI gets of a successful answer, when not the route's body as it is (service ops: redacted, narrowed). */
   shape?: (body: any, a: Record<string, unknown>) => unknown;
+  /** What the AI gets of a refusal besides code and message (register: gaps, preview, problems), when the route has more. */
+  refusal?: (body: any) => Record<string, unknown>;
   /** Checks beyond the declared types (look's kind); the reason it is refused, or null. */
   check?: (a: Record<string, unknown>) => string | null;
   /** §10.2.3: who sees it, when not by readOnly / draft / admin (the managed-service verbs). */
@@ -293,22 +296,73 @@ function lookCheck(a: Record<string, unknown>): string | null {
 
 /** ⑰ run_model / publish_model: the draft as a base and changes (model-changes.ts), or whole as the fallback. */
 const MODEL_INPUT: Record<string, Property> = {
-  from: s("skeleton (the skeleton's draft over the current model) or current (the published model): the base the changes apply to."),
+  from: s("current (the published model): the base the changes apply to. skeleton is gone (S39 step 7)."),
   changes: { type: "array", items: { type: "object" }, description: `The changes, in order, each {op, …}: ${CHANGE_HELP}.` },
   flows: { type: "array", items: { type: "object" }, description: "Optional with from: notes on businesses {flow, name?, summary?, reason?, risks?, stuck?, ignore?} (as the note change)." },
   model: { type: "object", description: "Fallback, instead of from and changes: the whole draft {version: 2, service, sources, segments, flows?} (look kind model with detail full)." },
 };
 function modelInputCheck(a: Record<string, unknown>): string | null {
   if (a.model !== undefined && (a.from !== undefined || a.changes !== undefined)) return "give from with changes, or model, not both";
-  if (a.model === undefined && a.from === undefined) return "give from (skeleton or current) with changes, or the whole model";
+  if (a.model === undefined && a.from === undefined) return "give from (current) with changes, or the whole model";
   if (a.from !== undefined && a.from !== "skeleton" && a.from !== "current") return "from is skeleton or current";
   return null;
 }
 const modelBody = (a: Record<string, unknown>) => (a.model !== undefined ? { model: a.model } : { from: a.from, changes: a.changes ?? [], ...(a.flows ? { flows: a.flows } : {}) });
 
+/** S39 (business-registration §6, §7.5, §7.9): the eighth verb, registering businesses from NiFi links. One request to
+ *  POST /api/registrations/<action> (draft / show / modules read and make drafts); the route refuses commit, unregister and
+ *  a registered business's changes without a draft to the Assistant's key (register/person-only). A refusal keeps the
+ *  route's other fields (gaps, preview, problems, taken, candidates...) for the AI. */
+const REGISTER_ACTIONS = ["draft", "show", "preview", "add", "remove", "rename", "declare-handoff", "place-worker", "shared", "modules", "commit", "unregister"];
+const REGISTER: Tool = { name: "register", readOnly: false, destructive: false, access: { personal: "all", assistant: true, checkup: false },
+  description: "Registers businesses from NiFi links (a process group's UI address; its sub-groups come with it) and changes them. Work in a draft (rgd_…): the Register page gives its id in the page context; draft with flow starts one from a registered business to change it. action: draft (new draft: name?, flow?), show (the draft: draft), preview (chain the draft's groups as NiFi has them now: segments in order, edges, gaps; with draft, or links / flow to look only), add (links, each a string or {link, service} when the address matches no service), remove (groups [{service, group}]), rename (name), declare-handoff (a hand-over the owner tells: from {service, group, component, relationship?}, to {service, group} or {system} outside NiFi, quote: the owner's words; replace or remove a hof_…), place-worker (where a schedule's worker runs: schedule, worker, group {service, group} or outside: true, quote; remove to forget), shared (a shared module: name, links, entries [{port} | {mq}], exits [{component, relationship?, when?} | {mq}], takeover: true to take the group from the business that has it, commit: false previews), modules (the shared modules; module for one), commit (the draft becomes a business or its changes take effect: a person does it on the page), unregister (a person does it). Refusals keep their details: group-taken (taken, options), gaps-open (gaps, preview), gate-rejected (problems, checks), unknown-address (services), port-missing (candidates).",
+  properties: {
+    action: s(`One of ${REGISTER_ACTIONS.join(", ")}.`),
+    draft: s("The draft (rgd_…), for show, preview, add, remove, rename, declare-handoff, place-worker."),
+    flow: s("A registered business (flw_…): draft starts a draft of its changes from it; preview looks at it."),
+    module: s("A shared module (shm_…): shared changes it, modules reads it."),
+    name: s("draft, rename, shared: the name (the owner agrees to it)."),
+    links: { type: "array", description: "add, preview, shared: NiFi links, each a string or {link, service}." },
+    groups: { type: "array", items: { type: "object" }, description: "remove: [{service, group}] (group ids)." },
+    handoffs: { type: "array", items: { type: "object" }, description: "preview without a draft: told hand-overs not kept yet, as declare-handoff takes them." },
+    from: { type: "object", description: "declare-handoff: {service, group, component, relationship?}; component is the gap's component." },
+    to: { type: "object", description: "declare-handoff: {service, group} (a group of the draft) or {system} (outside NiFi)." },
+    quote: s("declare-handoff, place-worker: the owner's own words."),
+    replace: s("declare-handoff: the hand-over (hof_…) this one replaces."),
+    remove: s("declare-handoff: the hand-over (hof_…) to remove. place-worker: any text (e.g. \"yes\") forgets the worker's place."),
+    schedule: s("place-worker: the gap's worker.schedule."),
+    worker: s("place-worker: the gap's worker.worker (worker_name)."),
+    group: { type: "object", description: "place-worker: {service, group}, a group of the draft (one of the gap's places)." },
+    outside: { type: "boolean", description: "place-worker: the worker is not in NiFi." },
+    entries: { type: "array", items: { type: "object" }, description: "shared: the module's entries, {port} (id or name) or {mq: {exchange, routingKey}}." },
+    exits: { type: "array", items: { type: "object" }, description: "shared: the module's exits, {component, relationship?, when?} or {mq}." },
+    takeover: { type: "boolean", description: "shared: take the group from the business that has it (group-taken)." },
+    commit: { type: "boolean", description: "shared: true registers the module (only after the owner agreed); false previews." },
+    request_id: s("Any string new for each call (a call with an old one answers what it answered then)."),
+  },
+  required: ["action", "request_id"],
+  check: (a) => !REGISTER_ACTIONS.includes(a.action as string) ? `action is one of ${REGISTER_ACTIONS.join(", ")}`
+    : (a.action === "show" && !a.draft) ? "show needs draft" : null,
+  request: (a) => {
+    const { action, ...body } = a;
+    if (action === "draft") return { method: "POST", path: "/api/registrations/drafts", body: { ...(a.name !== undefined ? { name: a.name } : {}), ...(a.flow !== undefined ? { flow: a.flow } : {}) } };
+    if (action === "show") return { method: "GET", path: `/api/registrations/drafts/${enc(a.draft)}` };
+    if (action === "modules") return { method: "GET", path: a.module ? `/api/registrations/modules/${enc(a.module)}` : "/api/registrations/modules" };
+    // The route wants a request_id on writes; the MCP layer already answers retries, so any one does.
+    const remove = action === "place-worker" && body.remove !== undefined ? { remove: true } : {};
+    return { method: "POST", path: `/api/registrations/${enc(action)}`, body: { ...body, ...remove, request_id: "mcp" } };
+  },
+  shape: (b) => fitInline(redactStrings(b)),
+  refusal: (b) => {
+    const { error: _e, message: _m, details: _d, ...rest } = b;
+    const cut = fitInline(redactStrings(rest));
+    return cut && typeof cut === "object" && !Array.isArray(cut) ? cut as Record<string, unknown> : {};
+  },
+};
+
 const VERBS: Tool[] = [
   { name: "describe", readOnly: true, access: { personal: "all", assistant: true, checkup: true },
-    description: "Start here. Without service: every managed service (NiFi) with its machine light and business light (failing, attention, healthy, unknown), a sentence each, the number of open to-dos and its gaps. With service: the machine light (six checks: process, disk, heap, certificate, coordinator, collection, with member and since), the business light and its businesses, the open to-dos, the newest AI analysis (stale: over an hour old or a light changed since), the business model (revision), whether provenance can be read, and gaps: what keeps the business picture from being right (no-model, unconfirmed, gate-rejected, topology-changed, no-exit, no-stuck-times, s2s-unpaired, no-counts), each with fix: the verb (and arguments) that fixes it. flow adds that business's detail. Short by default (to-do details and long texts clipped); detail \"full\" for all of it. brief: true gives the check-up's brief instead (one service, or every service without service): the two lights and why, the businesses, the open to-dos, the gaps, a topology summary, the model's state (whether the canvas changed since the published revision, people's feedback since, rebuild or not), the skeleton draft against the model and this check-up's run_model of the skeleton draft (verdict, the failing checks with what they name, the changes).",
+    description: "Start here. Without service: every managed service (NiFi) with its machine light and business light (failing, attention, healthy, unknown), a sentence each, the number of open to-dos and its gaps. With service: the machine light (six checks: process, disk, heap, certificate, coordinator, collection, with member and since), the business light and its businesses, the open to-dos, the newest AI analysis (stale: over an hour old or a light changed since), the business model (revision), whether provenance can be read, and gaps: what keeps the business picture from being right (no-model, unconfirmed, gate-rejected, topology-changed, no-exit, no-stuck-times, s2s-unpaired, no-counts, executor-old; with registration on, only registered businesses and shared modules are listed, and so are only their groups' gaps), each with fix: the verb (and arguments) that fixes it. flow adds that business's detail. Short by default (to-do details and long texts clipped); detail \"full\" for all of it. brief: true gives the check-up's brief instead (one service, or every service without service): the two lights and why, the businesses, the open to-dos, the gaps, a topology summary, the model's state (whether the registered groups changed on the canvas since the published revision). The check-up does not build the business model.",
     properties: { service: s("Optional: one service."), flow: s("Optional with service: one business (flw_…) of it."), brief: { type: "boolean", description: "Optional: the check-up brief (see above)." }, detail: s("Optional: full for the whole answer (to-dos' details and actions, long texts).") },
     request: (a) => ({ method: "GET", path: "/api/describe", query: { service: a.service, flow: a.flow, brief: a.brief ? "1" : undefined } }),
     shape: (body, a) => (a.brief ? fitInline(redactStrings(body)) : a.detail === "full" ? redactStrings(body) : fitInline(describeShape(redactStrings(body), a))) },
@@ -327,7 +381,7 @@ const VERBS: Tool[] = [
     description: "Replays a business model draft against the last 7 days and saves nothing: the verdict publishing it would get (published, needs-confirmation, rejected), the checks (coverage, reachable, no-dangling, s2s-balance, no-regression) with why, the changes against the current model (inside, counts, cues take effect; new, gone, merge, split, cross-service wait for a person) and regressions (businesses right before and wrong with the draft). Give the draft as from + changes: the Deployer builds it on the skeleton's draft (from skeleton; the brief's skeletonDraft and look kind model list its segments, entries and exits by id) or the published model (from current), and answers the built draft in a line per segment (draft). model (the whole draft) is the fallback.",
     properties: { service: SERVICE, ...MODEL_INPUT },
     required: ["service"], check: modelInputCheck, request: (a) => ({ method: "POST", path: `/api/services/${enc(a.service)}/model/run`, body: modelBody(a) }), shape: (b) => fitInline(redactStrings(b)) },
-  { name: "publish_model", readOnly: false, destructive: false, access: { personal: "admin", assistant: true, checkup: true },
+  { name: "publish_model", readOnly: false, destructive: false, access: { personal: "admin", assistant: false, checkup: true },
     description: "Submits a business model draft; the Deployer runs the same gate as run_model. Answers verdict: published (revision), needs-confirmation (what is inside businesses took effect; new, gone, merged, split or cross-service businesses wait in pending for a person, with a to-do) or rejected (the model stays, reasons, a to-do; those businesses' lights are unknown until a publish passes). A name a person gave or confirmed is never changed. base must be the current revision (look kind model: base), or it is refused (409): read it again. source e2e_trace: the steps come from e2e_trace's schedules (look kind model: e2e), you only place them, a segment with the schedule's id each; a schedule not on this canvas is left out.",
     properties: { service: SERVICE, base: n("The revision the draft was made on (0 when there is none)."), ...MODEL_INPUT, note: s("What changed and why (kept with the business's history)."), source: s("Optional: ai (default) or e2e_trace."), request_id: REQUEST_ID },
     required: ["service", "base", "note", "request_id"], check: modelInputCheck,
@@ -341,6 +395,7 @@ const VERBS: Tool[] = [
     description: "Writes a change of a service's configuration into a new draft, the only change the AI can make: nothing is saved as a revision or applied to a host until a person does it on the page. Answers the draft's id, the check's findings, whether it needs a restart (none, restart on a standalone instance, rolling or whole-cluster on a cluster, and why) and the differences. Secrets are refused (config/secret-by-person, and nothing is drafted): keys the catalog marks sensitive or with a secret-looking name, set or removed, and secret values in XML; a person enters those on the page. In XML text keep each (hidden) as it is. Each call makes a new draft. Then end your reply with an open_service_change card.",
     properties: { service: SERVICE, changes: { type: "array", items: { type: "object" }, description: "The changes: {file, key, value} sets a key (added if new), {file, key, unset: true} removes it, {file, text} replaces an XML file's whole text (start from look kind config's). On a cluster add member (a member key) for one node; without it the change is for all nodes (the common layer), which a node with its own value does not take (config/node-override), so give member for a key whose value differs between the nodes." }, note: s("Why this change, in the person's words (kept with the draft and on the timeline)."), base: n("Optional: the revision this was read from; refused if it is no longer the newest."), request_id: REQUEST_ID }, required: ["service", "changes", "note", "request_id"],
     request: (a) => ({ method: "POST", path: `/api/services/${enc(a.service)}/config/drafts`, body: { ai: true, changes: a.changes, note: a.note, ...(a.base !== undefined ? { base: a.base } : {}) } }), shape: draftShape },
+  REGISTER,
 ];
 
 function manifestBody(a: Record<string, unknown>) {
@@ -454,7 +509,7 @@ export async function handleMcp(message: any, ctx: McpContext): Promise<unknown>
       }
       const answer = await ctx.call(tool.request(rest));
       const ok = answer.status < 400;
-      const result = ok ? text(tool.shape ? tool.shape(answer.body, rest) : answer.body) : text({ finding: { code: answer.body?.error ?? `http/${answer.status}`, at: [tool.name], expected: answer.body?.message ?? `HTTP ${answer.status}` }, ...(answer.body?.details?.length ? { details: answer.body.details } : {}) }, true);
+      const result = ok ? text(tool.shape ? tool.shape(answer.body, rest) : answer.body) : text({ finding: { code: answer.body?.error ?? `http/${answer.status}`, at: [tool.name], expected: answer.body?.message ?? `HTTP ${answer.status}` }, ...(answer.body?.details?.length ? { details: answer.body.details } : {}), ...(tool.refusal && answer.body && typeof answer.body === "object" ? tool.refusal(answer.body) : {}) }, true);
       store.audit({ id: principal.id, via: principal.via === "service" ? "service" : "key" }, `mcp.${tool.name}`, String(args.app ?? args.job ?? args.host ?? args.service ?? args.id ?? "-"), { key: principal.keyId ?? null, status: answer.status, ...(requestId ? { requestId } : {}), ...(typeof args.note === "string" ? { note: args.note } : {}) });
       if (!tool.readOnly && ok) store.saveMcpAnswer(keyId, String(requestId), tool.name, argsSha256, result);
       return rpc(id, result);

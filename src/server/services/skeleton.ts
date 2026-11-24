@@ -12,6 +12,7 @@
 // passes on what it gets, so the units it connects to are where the data is received (several of them: a fan-out).
 
 import type { Store } from "../store.ts";
+import type { ServiceMember } from "./draft.ts";
 import type { Topology, TopologyFragment } from "./flowcounts.ts";
 import { watchList } from "./watch.ts";
 
@@ -256,6 +257,27 @@ function strip(s: SkeletonSegment & { starts: number; remoteIn: string[] }): Ske
   return rest;
 }
 
+/** host:port (lower case, no trailing dot) each service's members answer on: a member's host, node address and
+ *  nifi.web.https.host, each with the HTTPS port (and the HTTP port too with http: true, for instances on plain http).
+ *  Shared by skeletonOf (S2S pairing) and the registration's link parsing (S39 §7.6). */
+export function memberAddresses(store: Store, members: { service: string; m: ServiceMember }[], opts: { http?: boolean } = {}): Map<string, Set<string>> {
+  const addresses = new Map<string, Set<string>>();
+  const httpsHosts = new Map<string, string | null>();
+  for (const host of new Set(members.map((x) => x.m.host))) {
+    for (const w of watchList(store, host)) httpsHosts.set(`${w.service}\0${w.member}`, w.https.host);
+  }
+  for (const { service, m } of members) {
+    const ports = [m.ports?.https, ...(opts.http ? [m.ports?.http] : [])].filter((p): p is number => typeof p === "number" && p > 0);
+    if (!ports.length) continue;
+    const set = addresses.get(service) ?? new Set<string>();
+    for (const h of [m.host, m.nodeAddress, ...[...httpsHosts].filter(([k]) => k.startsWith(`${service}\0`)).map(([, v]) => v)]) {
+      if (typeof h === "string" && h.trim()) for (const port of ports) set.add(`${h.trim().toLowerCase().replace(/\.$/, "")}:${port}`);
+    }
+    addresses.set(service, set);
+  }
+  return addresses;
+}
+
 /** The skeleton of every managed service from what the store holds: the newest topology, the addresses the members
  *  answer on (host, node address and nifi.web.https.host, each with the HTTPS port), the last 7 days' group counts. */
 export function skeletonOf(store: Store, now: Date, only?: string[]): Skeleton {
@@ -263,20 +285,7 @@ export function skeletonOf(store: Store, now: Date, only?: string[]): Skeleton {
     ...store.standalones().map((s) => ({ service: s.id, m: s.member })),
     ...store.clusters().flatMap((c) => c.nodes.map((m) => ({ service: c.id, m }))),
   ].filter((x) => !only || only.includes(x.service));
-  const addresses = new Map<string, Set<string>>();
-  const httpsHosts = new Map<string, string | null>();
-  for (const host of new Set(members.map((x) => x.m.host))) {
-    for (const w of watchList(store, host)) httpsHosts.set(`${w.service}\0${w.member}`, w.https.host);
-  }
-  for (const { service, m } of members) {
-    const port = m.ports?.https;
-    if (!port) continue;
-    const set = addresses.get(service) ?? new Set<string>();
-    for (const h of [m.host, m.nodeAddress, ...[...httpsHosts].filter(([k]) => k.startsWith(`${service}\0`)).map(([, v]) => v)]) {
-      if (typeof h === "string" && h.trim()) set.add(`${h.trim().toLowerCase().replace(/\.$/, "")}:${port}`);
-    }
-    addresses.set(service, set);
-  }
+  const addresses = memberAddresses(store, members);
   const since = new Date(now.getTime() - IDLE_DAYS * DAY).toISOString();
   const inputs: SkeletonInput[] = [...new Set(members.map((x) => x.service))].map((id) => {
     const recent = new Map(store.flowCountTotals(id, since).filter((r) => r.kind === "group").map((r) => [r.ref, r.flowfilesIn + r.flowfilesOut + r.transferred]));

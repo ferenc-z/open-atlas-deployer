@@ -17,12 +17,12 @@ export { EXECUTOR_KINDS, type ExecutorKind } from "./store.ts";
 export const PROTOCOL = 2;
 /** §8.6: the executor releases this Deployer ships with, one per kind (deployer_executor.py and service_executor.py
  *  VERSION): each kind is offered an upgrade only when its own version moved. A change to executor_core.py moves both. */
-export const EXECUTOR_VERSIONS: Record<ExecutorKind, string> = { deploy: "0.9.6", service: "0.9.6" };
+export const EXECUTOR_VERSIONS: Record<ExecutorKind, string> = { deploy: "0.9.6", service: "0.9.7" };
 /** The deploy executor's release (EXECUTOR_VERSIONS.deploy). */
 export const EXECUTOR_VERSION = EXECUTOR_VERSIONS.deploy;
 
 /** §16.3: the service executor's read channel (service_executor.py READ_JOBS): what it may be handed while a change runs there. */
-export const SERVICE_READ_KINDS = ["svc-discover", "svc-read", "svc-state", "log-read", "log-tail", "nifi-provenance"];
+export const SERVICE_READ_KINDS = ["svc-discover", "svc-read", "svc-state", "log-read", "log-tail", "nifi-provenance", "nifi-groups"];
 /** §16.3: jobs that must not run long after they were asked for (a stop when the executor comes back hours later). */
 const EXPIRING_KINDS = new Set(["svc-state", "svc-write", "svc-control"]);
 /** §16.3: how long such a job may wait in the queue when its request does not say (expiresAt). */
@@ -30,7 +30,7 @@ export const QUEUE_LIMIT_MS = 5 * 60_000;
 /** §16.3: jobs whose content (every secret of a configuration) is sealed while it waits in the queue. */
 const SEALED_KINDS = new Set(["svc-write"]);
 /** §15.2: jobs whose first form is "<kind>@1", so the plain kind alone in a heartbeat never counts. */
-const FIRST_FORM_KINDS = new Set(["nifi-provenance", "svc-state", "svc-write", "svc-control"]);
+const FIRST_FORM_KINDS = new Set(["nifi-provenance", "svc-state", "svc-write", "svc-control", "nifi-groups"]);
 
 export interface Heartbeat {
   /** S18: which executor sent it; absent from deploy executors before S18. */

@@ -75,7 +75,7 @@ export function analysisMessage(trigger: AnalysisTrigger, rows: Pick<AnalysisRec
   };
   return [
     `Deployer analysis (trigger: ${trigger}). Look at each service below and record it once, with its analysis_id and analysis.trigger "${trigger}".`,
-    ...(feedback ? ["The person's feedback is about the business named below: fix the model (look kind model → run_model → publish_model) or explain in the analysis why it stays as it is."] : []),
+    ...(feedback ? ["The person's feedback is about the business named below: you do not change the model (it is the owner's registration): look at the business's health again with it in mind, say in the analysis what you found, and that a wrong grouping is corrected by registering it again."] : []),
     "```json", JSON.stringify(body, null, 1), "```",
     ...(briefs?.length ? [
       "Each service's brief, built by the Deployer as this check-up started (what describe {brief: true} gives): work from it, and look only for what it does not say.",

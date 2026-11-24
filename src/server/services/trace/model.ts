@@ -200,7 +200,11 @@ export interface Exit extends Endpoint {
   component: string;
   /** Its relationship; none: any relationship of the component is this exit. */
   relationship?: string;
+  /** S39 §7.3: a hand-over the owner told (channel external "declared:<handoff>"): drawn dashed with the words, never
+   *  followed by the trace. */
+  declared?: DeclaredHandoff;
 }
+export interface DeclaredHandoff { handoff: string; to: { service: string; group: string } | { system: string }; quote: string; by?: string; at?: string }
 export interface Segment extends Business {
   /** role "segment": the business it belongs to; "shared": none. */
   flow?: string;
@@ -211,6 +215,8 @@ export interface Segment extends Business {
   /** Imported from e2e_trace's schedules: its steps, entries and match are e2e_trace's, the AI only places it. */
   origin?: "e2e_trace";
   exits: Exit[];
+  /** S39 §7.2: role "shared" written by a registration: the shared module (shm_…) it is. */
+  module?: string;
 }
 export interface ModelV2 { version: 2; service: string; sources: string[]; segments: Segment[] }
 /** What the AI says about a business when it publishes (kept in the flows table, not in the model body). */
@@ -227,6 +233,18 @@ export const emptyModelV2 = (service: string): ModelV2 => ({ version: 2, service
 /** The engine reads v1 businesses; a v2 segment is one. */
 export const toTraceModel = (m: ModelV2): TraceModel => ({ service: m.service, sources: m.sources, businesses: m.segments });
 export const STUCK_MINUTES_MAX = 30 * 24 * 60;
+
+const MODULE_ID = /^shm_[a-z0-9]{6,32}$/;
+/** An exit's told hand-over (§7.3), kept as written: it is the owner's (flow_handoffs), the model only carries it. */
+function declaredOf(v: unknown, at: string, errors: string[]): { declared?: DeclaredHandoff } {
+  if (v === undefined || v === null) return {};
+  const d = v as Any;
+  const to = d.to as Any;
+  const okTo = to && (text(to.system) || (text(to.service, 128) && text(to.group, 128)));
+  if (!text(d.handoff, 64) || !okTo || !text(d.quote, 2000)) { errors.push(`${at} is {handoff, to: {service, group} | {system}, quote, by?, at?}.`); return {}; }
+  return { declared: { handoff: d.handoff, to: text(to.system) ? { system: to.system } : { service: to.service, group: to.group }, quote: d.quote,
+    ...(text(d.by) ? { by: d.by } : {}), ...(text(d.at, 64) ? { at: d.at } : {}) } };
+}
 
 /** Checks a v2 model (a draft from the AI, or the e2e import placed by it); every problem is listed. */
 export function parseModelV2(service: string, body: unknown): { model: ModelV2; notes: FlowNote[] } | { errors: string[] } {
@@ -266,12 +284,14 @@ export function parseModelV2(service: string, body: unknown): { model: ModelV2; 
       const r = (Array.isArray(s.exits) ? s.exits[j] : {}) as Any;
       if (!text(r?.component, 128)) errors.push(`${at}.exits[${j}].component is the id of the component the data leaves by.`);
       if (r?.relationship !== undefined && r.relationship !== null && !text(r.relationship, 128)) errors.push(`${at}.exits[${j}].relationship is a relationship name.`);
-      return { ...e, component: String(r?.component ?? "").trim(), ...(text(r?.relationship, 128) ? { relationship: String(r.relationship).trim() } : {}) };
+      return { ...e, component: String(r?.component ?? "").trim(), ...(text(r?.relationship, 128) ? { relationship: String(r.relationship).trim() } : {}), ...declaredOf(r?.declared, `${at}.exits[${j}].declared`, errors) };
     });
+    if (s.module !== undefined && s.module !== null && s.module !== "" && (role !== "shared" || typeof s.module !== "string" || !MODULE_ID.test(s.module))) errors.push(`${at}.module is a shared module id (shm_…) on a shared step.`);
     segments.push({
       ...base, steps: base.steps.map(({ maxSeconds: _m, ...step }) => step), exits,
       ...(role === "segment" && typeof s.flow === "string" ? { flow: s.flow } : {}),
       group, slice: String(slice ?? WHOLE).trim(), role, ...(s.origin === "e2e_trace" ? { origin: "e2e_trace" as const } : {}),
+      ...(role === "shared" && typeof s.module === "string" && MODULE_ID.test(s.module) ? { module: s.module } : {}),
     });
   }
   const notes: FlowNote[] = [];

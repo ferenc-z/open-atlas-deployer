@@ -23,6 +23,7 @@ import { topologyFingerprint, topologyHash, type Topology, type TopologyFragment
 import { analysisMessage } from "../src/server/services/analyses.ts";
 import { CHECKUP_MESSAGE } from "../src/server/services/checkup-schedule.ts";
 import { INLINE_BUDGET, inlineBytes } from "../src/server/services/look-summary.ts";
+import { draftFromSkeleton } from "../src/server/services/flowmodel.ts";
 import { opsReads, todoSink } from "../src/server/services/todos.ts";
 import { Store, type FlowCountRow } from "../src/server/store.ts";
 import { Versions } from "../src/server/versions.ts";
@@ -90,7 +91,7 @@ test("three kinds of key: what each sees; the 22 old service tools are gone", as
   const viewer = await t.names("dpk_viewer"), admin = await t.names("dpk_admin"), assistant = await t.names("dps_assistant"), checkup = await t.names("dpc_checkup");
   assert.deepEqual(VERBS.filter((v) => viewer.includes(v)), ["describe", "look", "trace", "run_model", "draft_change"], "a viewer's key: no publish_model, no record");
   assert.deepEqual(VERBS.filter((v) => admin.includes(v)), VERBS);
-  assert.deepEqual(VERBS.filter((v) => assistant.includes(v)), VERBS, "P4, P5: the Assistant publishes the model and saves to-dos");
+  assert.deepEqual(VERBS.filter((v) => assistant.includes(v)), VERBS.filter((v) => v !== "publish_model"), "P5: the Assistant saves to-dos; publish_model is internal (S39 step 6)");
   assert.ok(assistant.includes("plan_deploy") && !assistant.includes("deploy"));
   assert.deepEqual(checkup.sort(), VERBS.filter((v) => v !== "draft_change").sort(), "the check-up: the verbs without draft_change, nothing else");
   for (const list of [viewer, admin, assistant, checkup]) for (const old of OLD) assert.ok(!list.includes(old), old);
@@ -115,8 +116,7 @@ test("describe and look: the lights, gaps pointing at their fix, and look's kind
   assert.equal((await t.tool("dps_assistant", "describe", { flow: "flw_x" })).value.finding.code, "describe/flow-needs-service");
 
   const model = (await t.tool("dps_assistant", "look", { service: "n1", kind: "model" })).value;
-  assert.deepEqual([model.kind, model.data.base, model.data.current, model.data.draft.lines.map((s: { id: string; new?: boolean }) => [s.id, s.new])], ["model", 0, null, [["A", true], ["B", true], ["C", true]]], "⑰ a line per segment, no whole draft");
-  assert.equal(model.data.draft.segments, 3);
+  assert.deepEqual([model.kind, model.data.base, model.data.current, model.data.draft], ["model", 0, null, null], "S39 step 7: no skeleton draft any more");
   const topo = (await t.tool("dps_assistant", "look", { service: "n1", kind: "topology" })).value.data;
   assert.deepEqual([topo.counts.units, topo.units.length, topo.links, topo.skeleton.flows.length], [3, 3, ["Ingest:out → Load:in"], 2], "⑰ a summary by default");
   const whole = (await t.tool("dps_assistant", "look", { service: "n1", kind: "topology", detail: "full" })).value.data;
@@ -134,14 +134,14 @@ test("describe and look: the lights, gaps pointing at their fix, and look's kind
 
 test("run_model and publish_model: the gate's verdicts, the to-do it opens, a stale base refused", async () => {
   const t = setup();
-  const draft = (await t.tool("dps_assistant", "look", { service: "n1", kind: "model", detail: "full" })).value.data.draft;
+  const draft = draftFromSkeleton(t.store, "n1", NOW);
   const run = (await t.tool("dpc_checkup", "run_model", { service: "n1", model: draft })).value;
   assert.equal(run.verdict, "needs-confirmation");
   assert.ok(run.checks.every((c: { ok: boolean }) => c.ok));
   assert.equal((await t.tool("dpc_checkup", "run_model", { service: "n1", model: { version: 1 } })).value.finding.code, "flow-model/invalid");
   assert.equal(t.store.flowModel("n1"), null, "run_model saves nothing");
 
-  const got = (await t.tool("dps_assistant", "publish_model", { service: "n1", base: 0, model: draft, note: "first" })).value;
+  const got = (await t.tool("dpk_admin", "publish_model", { service: "n1", base: 0, model: draft, note: "first" })).value;
   assert.deepEqual([got.verdict, got.revision], ["needs-confirmation", 1]);
   assert.match(got.todo, /^td_/);
   const todo = t.store.todo(got.todo)!;
@@ -173,7 +173,7 @@ test("record: the Assistant saves to-dos only; the check-up writes the analysis,
 
   // The check-up: into the running analysis the session was opened for; to-dos linked to it; one resolved.
   const running = t.store.addAnalysis({ service: "n1", run: "run-1", trigger: "schedule", state: "running", session: "s1", requestedBy: "deployer", startedAt: new Date().toISOString(), finishedAt: null, machineLight: "unknown", businessLight: "unknown", body: null, error: null });
-  const draft = (await t.tool("dpc_checkup", "look", { service: "n1", kind: "model", detail: "full" })).value.data.draft;
+  const draft = draftFromSkeleton(t.store, "n1", NOW);
   await t.tool("dpc_checkup", "publish_model", { service: "n1", base: 0, model: draft, note: "first" });
   const flow = t.store.flows("n1")[0]!.id;
   const wrote = (await t.tool("dpc_checkup", "record", { service: "n1", analysis_id: running, analysis: { ...analysis, stuckSuggestions: [{ flow, attentionMinutes: 20, failingMinutes: 120, basis: "平时 5 分钟内处理完" }], intro: "按 root 下的组分。" }, todos: [{ key: "disk:n1", severity: "failing", title: "磁盘快满", detail: "content 仓库 96%" }], resolve: [saved.todos[0]] })).value;
@@ -247,72 +247,36 @@ const CANVAS: Topology = {
 };
 const later = (minutes: number) => new Date(Date.now() + minutes * 60_000).toISOString();
 
-test("⑰ brief: the model kept while the canvas keeps its structure; rebuilt after a change or a person's feedback", async () => {
+test("⑰ brief (S39 step 7): no skeleton draft, no rebuild; the canvas state of what is registered, and a change is the owner's to confirm", async () => {
   const t = setup();
   const before = (await t.tool("dpc_checkup", "describe", { service: "n1", brief: true })).value;
-  assert.deepEqual([before.model.revision, before.model.rebuild, before.skeletonDraft.segments, before.skeletonDraft.lines.filter((l: { new?: boolean }) => l.new).length], [0, true, 3, 3], "no model yet: build it, from the draft's lines");
-  assert.equal(before.skeletonDraft.run.verdict, "needs-confirmation", "the brief has this check-up's replay of the skeleton draft");
-  assert.ok(Array.isArray(before.topology.questions) && before.topology.fingerprint);
-  assert.match(before.next, /from: "skeleton", changes/);
+  assert.deepEqual([before.skeletonDraft, before.topology.questions, before.model.rebuild, before.model.revision], [undefined, undefined, undefined, 0], "the check-up is not asked to build the model");
+  assert.match(before.next, /Do not build or publish a business model/);
+  assert.ok(before.topology.fingerprint);
 
-  const draft = (await t.tool("dpc_checkup", "look", { service: "n1", kind: "model", detail: "full" })).value.data.draft;
-  await t.tool("dpc_checkup", "publish_model", { service: "n1", base: 0, model: draft, note: "first" });
+  await t.tool("dpc_checkup", "publish_model", { service: "n1", base: 0, model: draftFromSkeleton(t.store, "n1", NOW), note: "first" });
   assert.ok(t.store.flowModel("n1")!.topologyFp, "the fingerprint is kept with the revision");
   // The executor walks the canvas again in another order, the link drawn again: a new snapshot, the same structure.
   const reordered: Topology = { ...CANVAS, groups: [...CANVAS.groups].reverse(), links: [{ ...CANVAS.links[0]!, connection: "A-B-again" }] };
   assert.ok(t.store.putTopology("n1", later(1), topologyHash(reordered), reordered));
   const kept = (await t.tool("dpc_checkup", "describe", { service: "n1", brief: true })).value;
-  assert.deepEqual([kept.model.topology, kept.model.rebuild], ["unchanged", false]);
+  assert.equal(kept.model.topology, "unchanged");
   assert.match(kept.model.note, /^拓扑未变，沿用已发布模型 r1/);
   assert.ok(!kept.gaps.some((g: { code: string }) => g.code === "topology-changed"), "a new snapshot of the same structure is no change");
-  assert.deepEqual([kept.topology.questions, kept.skeletonDraft.lines], [undefined, undefined], "no rebuild: no skeleton questions or draft lines in the brief");
-  assert.match(kept.next, /^Do not rebuild/);
   assert.ok(Buffer.byteLength(JSON.stringify(kept)) < 6000, `the brief stays small (${Buffer.byteLength(JSON.stringify(kept))} bytes)`);
 
-  // A person says a business is not right: rebuild, though the canvas is the same.
-  const flow = t.store.flows("n1")[0]!;
-  t.store.addFlowChange({ flow: flow.id, service: "n1", by: "admin", kind: "not-right", text: "人说不对：x", revision: null, verdict: null });
-  const fed = (await t.tool("dpc_checkup", "describe", { service: "n1", brief: true })).value;
-  assert.deepEqual([fed.model.topology, fed.model.rebuild, fed.model.feedback.length], ["unchanged", true, 1]);
-
-  // A structural change (a new link): changed, rebuild, the gap.
+  // A structural change (a new link): changed, the gap; still nothing to rebuild.
   const changed: Topology = { ...CANVAS, links: [...CANVAS.links, { connection: "B-C", from: { group: "B", fragment: "b", port: null }, to: { group: "C", fragment: "c", port: null } }] };
   t.store.putTopology("n1", later(2), topologyHash(changed), changed);
   const now = (await t.tool("dpc_checkup", "describe", { service: "n1", brief: true })).value;
-  assert.deepEqual([now.model.topology, now.model.rebuild], ["changed", true]);
+  assert.equal(now.model.topology, "changed");
+  assert.match(now.model.note, /Do not build or publish a business model/);
   assert.ok(now.gaps.some((g: { code: string }) => g.code === "topology-changed"));
 
   const all = (await t.tool("dpc_checkup", "describe", { brief: true })).value;
   assert.deepEqual(all.services.map((s: { service: { id: string } }) => s.service.id), ["n1"]);
+  const flow = t.store.flows("n1")[0]!;
   assert.equal((await t.tool("dpc_checkup", "describe", { service: "n1", flow: flow.id, brief: true })).value.finding.code, "describe/brief-flow");
-});
-
-test("⑰ brief (b2f33fc): the skeleton's draft moves a segment into another business across an S2S hand-over: rebuild, unless one of them waits for a person", async () => {
-  const t = setup();
-  const { store } = t;
-  store.addStandalone({ kind: "standalone", id: "n2", service: "nifi", profile: "nifi-1.x", version: "1.12.1", webUrl: null, member: { host: "local", installDir: "/lab/n2", serviceUser: "nifi", startEnvironment: null, ports: { https: 18444 }, discovery: null } } as never, "uat", { id: "admin", via: "cli" });
-  const ref = "https://local:18444/nifi#rep";
-  const t1: Topology = { ...CANVAS, groups: CANVAS.groups.map((g) => (g.id === "C" ? { ...g, fragments: [frag("c", { s2sOut: [ref] })] } : g)), s2sOut: [{ ref, name: "rep", targets: ["https://local:18444/nifi"], group: "C", fragment: "c", sources: [{ id: "p-c", name: "p-c", kind: "processor", relationships: ["success"] }] }] };
-  const t2: Topology = { root: { id: "root2", name: "NiFi Flow" }, links: [], s2sOut: [], groups: [{ id: "R", name: "Archive", root: false, fragments: [frag("r", { remoteIn: ["rep"], starts: 1 })] }], s2sIn: [{ id: "p-rep", name: "rep", group: "R", fragment: "r" }] };
-  store.putTopology("n1", later(1), topologyHash(t1), t1);
-  store.putTopology("n2", later(1), topologyHash(t2), t2);
-  const seg = (id: string, flow: string, entry: object, exit: object) => ({ id, name: id, match: [], steps: [{ id: "g", name: id, position: { kind: "process-group", id } }], entries: [{ id: "in", step: "g", channel: entry }], exits: [{ id: "out", step: "g", channel: exit, component: `p-${id.toLowerCase()}`, relationship: "success" }], flow, group: { id, name: id }, slice: "*", role: "segment" });
-  const ext = (system: string) => ({ type: "external", system });
-  const actor = { id: "assistant", via: "key" } as const;
-  store.insertFlowModel("n1", 0, { version: 2, service: "n1", sources: [], segments: [seg("A", "flw_ab", ext("src"), { type: "local" }), seg("B", "flw_ab", ext("a"), ext("db")), seg("C", "flw_c", ext("src"), { type: "s2s", service: "n2", port: "rep" })] } as never, "ai", actor, [], topologyFingerprint(t1));
-  store.insertFlowModel("n2", 0, { version: 2, service: "n2", sources: [], segments: [seg("R", "flw_r", { type: "s2s", port: "rep" }, ext("archive"))] } as never, "ai", actor, [], topologyFingerprint(t2));
-  const flow = (id: string, at: string) => store.putFlow({ id, name: id, nameBy: "ai", status: "confirmed", summary: "", reason: null, risks: [], pendings: [], stuck: null, createdAt: at, confirmedAt: at, confirmedBy: "admin", updatedAt: at } as never);
-  flow("flw_ab", "2026-11-19T08:00:00Z"); flow("flw_c", "2026-11-19T09:00:00Z"); flow("flw_r", "2026-11-19T10:00:00Z");
-  store.setFlowSegments("flw_ab", [{ service: "n1", segment: "A" }, { service: "n1", segment: "B" }]);
-  store.setFlowSegments("flw_c", [{ service: "n1", segment: "C" }]);
-  store.setFlowSegments("flw_r", [{ service: "n2", segment: "R" }]);
-  const brief = async () => (await t.tool("dpc_checkup", "describe", { service: "n2", brief: true })).value.model;
-  const join = await brief();
-  assert.deepEqual([join.topology, join.rebuild], ["unchanged", true], JSON.stringify(join));
-  assert.match(join.note, /^拓扑未变，但骨架要把 1 段并进另一条业务.*R → flw_c/);
-  store.putFlow({ ...store.flow("flw_c")!, pendings: [{ id: "pnd_x", kind: "merge", text: "2 条业务合成一条", service: "n2", at: later(0), segments: [], remove: [], notes: [] }] } as never);
-  const held = await brief();
-  assert.deepEqual([held.topology, held.rebuild], ["unchanged", false], "the join already waits for a person: no rebuild");
 });
 
 test("⑰ topologyFingerprint: order, connection ids and extra fields do not count; structure does", () => {
@@ -336,56 +300,28 @@ test("⑰ the first message carries the briefs; the scheduled one asks describe 
   assert.match(CHECKUP_MESSAGE, /describe \{brief: true\}/);
 });
 
-test("⑰ run_model / publish_model with from + changes: the Deployer builds the draft, the gate judges it as a whole one", async () => {
+test("⑰ run_model / publish_model with from current + changes: the Deployer builds the draft; from skeleton is gone", async () => {
   const t = setup();
-  const whole = (await t.tool("dpc_checkup", "look", { service: "n1", kind: "model", detail: "full" })).value.data.draft;
-  const byWhole = (await t.tool("dpc_checkup", "run_model", { service: "n1", model: whole })).value;
-  const bySkeleton = (await t.tool("dpc_checkup", "run_model", { service: "n1", from: "skeleton", changes: [] })).value;
-  assert.deepEqual([bySkeleton.verdict, bySkeleton.checks, bySkeleton.changes], [byWhole.verdict, byWhole.checks, byWhole.changes], "the same draft, the same gate");
-  assert.equal(bySkeleton.draft.lines.length, 3);
-  assert.equal(byWhole.draft, undefined, "a whole model sent gets no lines back");
-  assert.ok(inlineBytes(bySkeleton) < INLINE_BUDGET);
-
-  // Join Reports into Ingest's business, name it, then share it back; a change that names no segment is refused.
-  const key = bySkeleton.draft.lines.find((l: { id: string }) => l.id === "A").flow;
-  const joined = (await t.tool("dpc_checkup", "run_model", { service: "n1", from: "skeleton", changes: [{ op: "assign", segments: ["C"], flow: key }, { op: "note", flow: key, name: "Ingest and reports" }] })).value;
-  assert.equal(joined.draft.lines.find((l: { id: string }) => l.id === "C").flow, key);
-  assert.deepEqual(joined.draft.flows.find((f: { flow: string }) => f.flow === key)?.name, "Ingest and reports");
-  const bad = (await t.tool("dpc_checkup", "run_model", { service: "n1", from: "skeleton", changes: [{ op: "remove", segments: ["nope"] }] })).value;
-  assert.equal(bad.finding.code, "flow-model/changes");
-  assert.match(bad.details[0], /no segment nope/);
+  const whole = draftFromSkeleton(t.store, "n1", NOW);
   assert.equal((await t.tool("dpc_checkup", "run_model", { service: "n1", from: "current", changes: [] })).value.finding.code, "flow-model/no-current");
-  assert.equal((await t.tool("dpc_checkup", "run_model", { service: "n1", model: whole, from: "skeleton" })).value.finding.code, "mcp/arguments");
+  const byWhole = (await t.tool("dpc_checkup", "run_model", { service: "n1", model: whole })).value;
+  assert.equal(byWhole.draft, undefined, "a whole model sent gets no lines back");
+  const skeleton = (await t.tool("dpc_checkup", "run_model", { service: "n1", from: "skeleton", changes: [] })).value;
+  assert.equal(skeleton.finding.code, "flow-model/from");
+  assert.match(skeleton.finding.message ?? JSON.stringify(skeleton), /skeleton is gone/);
+  assert.equal((await t.tool("dpc_checkup", "run_model", { service: "n1", model: whole, from: "current" })).value.finding.code, "mcp/arguments");
   assert.equal((await t.tool("dpc_checkup", "run_model", { service: "n1" })).value.finding.code, "mcp/arguments");
 
-  const pub = (await t.tool("dpc_checkup", "publish_model", { service: "n1", base: 0, from: "skeleton", changes: [], flows: [{ flow: key, name: "Ingest" }], note: "first" })).value;
-  assert.deepEqual([pub.revision, pub.draft.segments], [1, 3]);
+  const pub = (await t.tool("dpc_checkup", "publish_model", { service: "n1", base: 0, model: whole, note: "first" })).value;
+  assert.equal(pub.revision, 1);
+  const bySame = (await t.tool("dpc_checkup", "run_model", { service: "n1", from: "current", changes: [] })).value;
+  assert.equal(bySame.draft.lines.length, 3);
+  assert.ok(inlineBytes(bySame) < INLINE_BUDGET);
+  const bad = (await t.tool("dpc_checkup", "run_model", { service: "n1", from: "current", changes: [{ op: "remove", segments: ["nope"] }] })).value;
+  assert.equal(bad.finding.code, "flow-model/changes");
+  assert.match(bad.details[0], /no segment nope/);
   const shared = (await t.tool("dpc_checkup", "run_model", { service: "n1", from: "current", changes: [{ op: "share", segments: ["C"] }, { op: "add-exit", segment: "B", exit: { channel: { type: "external", system: "Warehouse" }, component: "b" } }] })).value;
   const lines = Object.fromEntries(shared.draft.lines.map((l: { id: string }) => [l.id, l]));
   assert.deepEqual([lines.C.role, lines.C.flow, lines.B.exits.at(-1)], ["shared", null, "out-1 external:Warehouse @b"]);
 });
 
-test("⑰ stale hand-overs: an S2S link the model keeps as external is rebuilt once the other side published since", async () => {
-  const { staleHandovers } = await import("../src/server/services/checkup-brief.ts");
-  const seg = (service: string, group: string) => ({ id: `${service}/${group}`, service, group: { id: group, name: group }, fragment: null, root: false, processors: 3, names: [], traffic: "yes" as const });
-  const sk = { flows: [{ key: "a/g1", segments: [seg("a", "g1"), seg("b", "g2")], exceptions: [], reason: null }], shared: [], empty: [], edges: [{ from: "a/g1", to: "b/g2", kind: "s2s" as const }], questions: [], noTopology: [] };
-  const ext = { channel: { type: "external" } }, s2s = { channel: { type: "s2s" } };
-  const modelB = (entry: { channel: { type: string } }) => ({ publishedAt: "2026-11-23T02:00:00Z", model: { segments: [{ group: { id: "g2" }, entries: [entry], exits: [] }] } });
-  assert.deepEqual(staleHandovers(sk, "b", modelB(ext), () => "2026-11-23T07:00:00Z"), [{ peer: "a", group: "g2", side: "in" }], "kept as external, the other side newer: rebuild");
-  assert.deepEqual(staleHandovers(sk, "b", modelB(ext), () => "2026-11-23T01:00:00Z"), [], "the other side published nothing since: leave it");
-  assert.deepEqual(staleHandovers(sk, "b", modelB(ext), () => null), [], "the other side has no model");
-  assert.deepEqual(staleHandovers(sk, "b", modelB(s2s), () => "2026-11-23T07:00:00Z"), [], "carried as S2S already: no ping-pong");
-  const modelA = { publishedAt: "2026-11-23T02:00:00Z", model: { segments: [{ group: { id: "g1" }, entries: [], exits: [ext] }] } };
-  assert.deepEqual(staleHandovers(sk, "a", modelA, () => "2026-11-23T07:00:00Z"), [{ peer: "b", group: "g1", side: "out" }], "the sending side too");
-
-  // The other side published before this one, but its model already has the hand-over as S2S on that port: rebuild.
-  const portSk = { ...sk, edges: [{ from: "a/g1", to: "b/g2", kind: "s2s" as const, port: "p" }] };
-  const modelOf = (exits: object[], entries: object[] = []) => ({ publishedAt: "2026-11-23T02:00:00Z", model: { segments: [{ group: { id: "g1" }, entries, exits }] } }) as never;
-  const bHas = (port: string) => () => ({ segments: [{ group: { id: "g2" }, entries: [{ channel: { type: "s2s", port } }], exits: [] }] });
-  const older = () => "2026-11-23T01:00:00Z";
-  assert.deepEqual(staleHandovers(portSk, "a", modelOf([ext]), older, bHas("p")), [{ peer: "b", group: "g1", side: "out" }], "the other model carries it");
-  assert.deepEqual(staleHandovers(portSk, "a", modelOf([ext]), older, bHas("other")), [], "the other model has another port only");
-  assert.deepEqual(staleHandovers(portSk, "a", modelOf([{ channel: { type: "s2s", service: "c", port: "q" } }, ext]), older, bHas("p")), [{ peer: "b", group: "g1", side: "out" }], "an S2S exit to a third service does not carry this one");
-  assert.deepEqual(staleHandovers(portSk, "a", modelOf([{ channel: { type: "s2s", service: "b", port: "p" } }]), older, bHas("p")), [], "carried: no ping-pong");
-  assert.deepEqual(staleHandovers(portSk, "a", { publishedAt: "2026-11-23T02:00:00Z", model: { segments: [] } }, older, bHas("p")), [], "a group the model leaves out is the AI's call");
-});

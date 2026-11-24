@@ -127,8 +127,8 @@ export interface StuckTimes { attentionMinutes: number; failingMinutes: number; 
 export interface FlowGraph {
   services: { id: string; label: string }[];
   /** detail: the node's second line (§10.3), e.g. "Dropped · 7 个". */
-  /** module: a registered shared module (S39), drawn as a green dashed box. */
-  nodes: { id: string; kind: "group" | "external"; service: string | null; label: string; detail?: string; light?: Light; module?: boolean }[];
+  /** module: the shared module (shm_…) a group node is (S39 step 7), drawn as the module. */
+  nodes: { id: string; kind: "group" | "external"; service: string | null; label: string; detail?: string; light?: Light; module?: string }[];
   /** declared: a handoff the owner described (S39), drawn purple dashed; its label carries the owner's words. */
   edges: { from: string; to: string; kind: "data" | "s2s" | "failure" | "retry" | "drop" | "declared"; label?: string }[];
 }

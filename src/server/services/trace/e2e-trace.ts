@@ -221,6 +221,14 @@ export class E2eTraceSource {
     }).filter((f) => f.worker);
   }
 
+  /** S39 step 4: the schedule definitions as rows (schedule_header, schedule_detail; latest revisions) for the
+   *  registration's chaining; null when the service has no e2e_trace source. */
+  async schedules(service: string): Promise<{ headers: Row[]; details: Row[] } | null> {
+    if (!this.client(service)) return null;
+    const [headers, details] = await Promise.all([this.run(service, "e2e_schedules", {}), this.run(service, "e2e_schedule_steps", {})]);
+    return { headers: headers.rows, details: details.rows };
+  }
+
   /** T6: the schedules as businesses (schedule_header + schedule_detail, latest revisions), merged into the stored model. */
   async importModel(service: string, current: TraceModel): Promise<{ model: TraceModel; imported: string[]; replaced: string[]; notes: string[] }> {
     const [headers, details] = await Promise.all([this.run(service, "e2e_schedules", {}), this.run(service, "e2e_schedule_steps", {})]);
