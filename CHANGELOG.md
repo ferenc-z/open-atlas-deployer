@@ -29,6 +29,18 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   `register` add / remove / rename / declare-handoff with `draft` change only the draft. Preview and commit of a draft
   still answer `register/not-implemented`.
 
+- S39 step 4: `register preview` (a draft's groups, kept on the draft; a business's plus links; or links alone) reads the
+  groups now (`nifi-groups` topology), adds e2e_trace's schedule definitions (a note when they cannot be read), the
+  shared modules, the told hand-overs and worker places, and answers `chain()`'s preview; no `request_id`. `register
+  place-worker` (with `draft` or `flow`; table `worker_places`, `registration_drafts.places`) says where a schedule's
+  worker runs, or `outside: true`; `worker-unplaced` gaps carry `worker` and candidate `places` (a registered group with
+  a processor of that name, or a similar group name) for the AI to ask about. `register shared` registers a shared
+  module (one group; entries = its input ports, S2S or MQ; exits = output ports, S2S sends or ends, with `when`);
+  `takeover: true` moves a group a business has into the module (that business and every business joined to it get a
+  `shared` history line). `GET /api/registrations/modules` lists modules with their own health (the group's counts in
+  the last hour), `GET …/modules/<id>` adds who uses it now; unregistering a module still used answers
+  `register/module-in-use`. Nothing is published yet (step 5).
+
 - Skills follow the Agent Skills layout OMA reads: `agents/skills/<name>/SKILL.md` (a folder named as the Skill, the
   frontmatter `name` the same), so the folder zips straight into OMA's Skill upload. `bin/publish-assistant.ts` reads
   the folders (a loose `*.md` there is an error); the Skill's text is unchanged, so no new Skill version and nothing to

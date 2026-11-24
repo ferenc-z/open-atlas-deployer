@@ -1,13 +1,14 @@
 // S39 business-registration §7.1, §7.5, §7.6 (step 2): a business registers the process groups it runs through. This
 // module holds the link parsing (NiFi 1.x and 2.x UI addresses -> group id and managed service), the checks that
 // precede a registration (the group exists, nobody else has it) and the registration's own actions: add, remove,
-// rename, unregister. preview and commit (the chaining of segments, step 3), declare-handoff and shared (step 4) are
-// not here yet. The routes (registration-routes.ts) only translate a RegError into HTTP.
+// rename, unregister. preview and shared (step 4) are in register-chain.ts; commit and declare-handoff of a business
+// wait for step 5. The routes (registration-routes.ts) only translate a RegError into HTTP.
 
 import { randomBytes } from "node:crypto";
-import { StoreError, type Actor, type FlowRegistration, type RegistrationDraft, type RegistrationDraftGroup, type RegistrationDraftHandoff, type Store } from "../store.ts";
+import { StoreError, type Actor, type FlowRegistration, type RegistrationDraft, type RegistrationDraftGroup, type RegistrationDraftHandoff, type Store, type WorkerPlace } from "../store.ts";
 import { memberAddresses } from "./skeleton.ts";
 import type { ServiceMember } from "./draft.ts";
+import type { Topology } from "./flowcounts.ts";
 
 /** §7.4: the most groups one nifi-groups read asks for. */
 export const GROUPS_PER_READ = 20;
@@ -23,10 +24,10 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export type RegisterCode =
   | "register/bad-request" | "register/bad-link" | "register/root-group" | "register/unknown-address" | "register/ambiguous-address"
   | "register/group-missing" | "register/executor-old" | "register/executor-offline" | "register/group-taken" | "register/not-found"
-  | "register/empty" | "register/not-implemented" | "register/bad-handoff";
+  | "register/empty" | "register/not-implemented" | "register/bad-handoff" | "register/port-missing" | "register/module-in-use";
 const STATUS: Record<RegisterCode, 400 | 404 | 409 | 501 | 503> = {
   "register/bad-request": 400, "register/bad-handoff": 400, "register/bad-link": 400, "register/root-group": 400, "register/unknown-address": 400, "register/ambiguous-address": 400,
-  "register/group-missing": 404, "register/not-found": 404, "register/group-taken": 409, "register/empty": 409,
+  "register/group-missing": 404, "register/not-found": 404, "register/port-missing": 404, "register/group-taken": 409, "register/empty": 409, "register/module-in-use": 409,
   "register/executor-old": 503, "register/executor-offline": 503, "register/not-implemented": 501,
 };
 
@@ -55,10 +56,17 @@ export interface GroupInfo {
   [more: string]: unknown;
 }
 
+/** One nifi-groups answer: the groups, and the scoped topology of exactly those groups (§7.4, scope "groups"; the
+ *  chaining's input, step 3). */
+export interface GroupScan { groups: GroupInfo[]; topology: Topology | null }
+
 /** Reads groups of a managed service through the first usable member's service executor (job kind nifi-groups, at most
  *  GROUPS_PER_READ ids). Throws RegError register/executor-old (no nifi-groups@1 in the heartbeat) or register/executor-offline
- *  (no member answers). Step 1 provides the real one; tests pass a fake. */
-export interface GroupReader { read(service: string, ids: string[]): Promise<GroupInfo[]> }
+ *  (no member answers). read gives the groups only, scan the topology with them. Step 1 provides the real one; tests pass a fake. */
+export interface GroupReader {
+  read(service: string, ids: string[]): Promise<GroupInfo[]>;
+  scan(service: string, ids: string[]): Promise<GroupScan>;
+}
 
 // --- links (§7.6) ---------------------------------------------------------------------------------------------
 
@@ -189,7 +197,7 @@ export class Registrations {
   }
 
   /** One flow_changes row per service the action touched (§7.1). */
-  private log(flow: string, kind: "register" | "add-group" | "remove-group" | "rename" | "unregister", actor: Actor, text: (service: string) => string, services: string[]) {
+  private log(flow: string, kind: "register" | "add-group" | "remove-group" | "rename" | "unregister" | "place-worker", actor: Actor, text: (service: string) => string, services: string[]) {
     for (const service of services.length ? services : ["-"]) this.store.addFlowChange({ flow, service, by: actor.id, kind, text: text(service), revision: null, verdict: null });
   }
 
@@ -214,7 +222,7 @@ export class Registrations {
 
   /** The groups of these links, read from NiFi and checked: they exist, and nobody but the owner (ownKey: a business, or a
    *  draft, which owns ownGroups) has them or one around or inside them. Writes nothing. */
-  private async stage(links: unknown, ownKey: string, ownGroups: RegistrationDraftGroup[]): Promise<{ added: RegisteredGroup[]; unchanged: RegisteredGroup[] }> {
+  async stage(links: unknown, ownKey: string, ownGroups: RegistrationDraftGroup[]): Promise<{ added: RegisteredGroup[]; unchanged: RegisteredGroup[] }> {
     const addresses = serviceAddresses(this.store);
     const resolved = this.dedupe(linkAsks(links).map((a) => resolveLink(this.store, a, addresses)));
     const byService = new Map<string, ResolvedLink[]>();
@@ -280,6 +288,8 @@ export class Registrations {
       for (const w of wanted) {
         const name = mine.find((m) => m.service === w.service && m.groupId === w.group)!.groupName;
         if (this.store.removeFlowRegistration(flow.id, w.service, w.group)) removed.push({ ...w, name });
+        // A worker placed in a group that leaves is asked about again.
+        for (const p of this.store.workerPlaces(flow.id)) if (p.service === w.service && p.group === w.group) this.store.setWorkerPlace(flow.id, p.schedule, p.worker, null);
       }
       this.log(flow.id, "remove-group", actor, (s) => `去掉了组${removed.filter((r) => r.service === s).map((r) => `"${r.name}"`).join("、")}`, [...new Set(removed.map((r) => r.service))]);
       this.store.auditFlow(actor, flow.id, "register-remove");
@@ -340,6 +350,7 @@ export class Registrations {
       ...d,
       groups: d.groups.filter((g) => !gone(g.service, g.group.id)),
       handoffs: d.handoffs.filter((h) => !dropped.includes(h)),
+      places: d.places.filter((p) => !(p.service && p.group && gone(p.service, p.group))),
     });
     return { draft: d.id, removed: wanted, droppedHandoffs: dropped.map((h) => h.id) };
   }
@@ -387,6 +398,52 @@ export class Registrations {
     };
     this.store.putRegistrationDraft({ ...d, handoffs: [...d.handoffs.filter((h) => h.id !== handoff.id), handoff] });
     return { draft: d.id, handoff };
+  }
+
+  /** place-worker (§7.8 6): where a schedule's worker runs, in the owner's words, when its worker_name matches no
+   *  registered group: a group of the business (or draft), or outside: true (not in NiFi); remove: true forgets it.
+   *  The chaining uses it from then on (chain() placements) and stops asking. */
+  placeWorker(target: { flow?: unknown; draft?: unknown }, b: Record<string, unknown>, actor: Actor): { flow?: string; draft?: string; schedule: string; worker: string; place: WorkerPlace | null } {
+    const schedule = typeof b.schedule === "number" ? String(b.schedule) : typeof b.schedule === "string" ? b.schedule.trim() : "";
+    const worker = typeof b.worker === "string" ? b.worker.trim() : "";
+    if (!schedule || schedule.length > NAME_MAX || !worker || worker.length > NAME_MAX) throw new RegError("register/bad-request", "schedule is the schedule_id (or its name), worker its worker_name (the gap's worker says both).");
+    const drafted = target.draft !== undefined;
+    const d = drafted ? this.draft(target.draft) : null;
+    const flow = drafted ? null : this.flowOf(target.flow);
+    const groups = d ? d.groups.map((g) => ({ service: g.service, id: g.group.id, name: g.group.name }))
+      : this.store.flowRegistrations({ owner: flow!.id }).map((r) => ({ service: r.service, id: r.groupId, name: r.groupName }));
+    let place: WorkerPlace | null = null;
+    if (b.remove !== true) {
+      if (typeof b.quote !== "string" || !b.quote.trim() || b.quote.length > QUOTE_MAX) throw new RegError("register/bad-request", `quote is the owner's own words, 1 to ${QUOTE_MAX} characters.`);
+      let service: string | null = null, group: string | null = null;
+      if (b.outside === true) { if (b.group !== undefined) throw new RegError("register/bad-request", "Give group or outside: true, not both."); }
+      else {
+        const g = b.group as Record<string, unknown> | undefined;
+        if (!g || typeof g.service !== "string" || typeof g.group !== "string") throw new RegError("register/bad-request", "group is {service, group} (a group of this registration), or outside: true when the worker is not in NiFi.");
+        const hit = groups.find((x) => x.service === g.service && x.id === (g.group as string).toLowerCase());
+        if (!hit) throw new RegError("register/bad-handoff", `The worker's group is not a group of this ${drafted ? "draft" : "business"}: add its link first.`);
+        service = hit.service; group = hit.id;
+      }
+      place = { schedule, worker, service, group, quote: b.quote.trim(), placedBy: actor.id, placedAt: new Date().toISOString() };
+    }
+    const same = (p: WorkerPlace) => p.schedule === schedule && p.worker.toLowerCase() === worker.toLowerCase();
+    if (d) {
+      const rest = d.places.filter((p) => !same(p));
+      if (!place && rest.length === d.places.length) throw new RegError("register/not-found", `The draft has no place for ${worker} of schedule ${schedule}.`);
+      this.store.putRegistrationDraft({ ...d, places: place ? [...rest, place] : rest });
+      return { draft: d.id, schedule, worker, place };
+    }
+    const had = this.store.workerPlaces(flow!.id).find(same);
+    if (!place && !had) throw new RegError("register/not-found", `The business has no place for ${worker} of schedule ${schedule}.`);
+    this.store.flowTransaction(() => {
+      if (had) this.store.setWorkerPlace(flow!.id, had.schedule, had.worker, null);
+      if (place) this.store.setWorkerPlace(flow!.id, schedule, worker, { service: place.service, group: place.group, quote: place.quote, placedBy: place.placedBy, placedAt: place.placedAt });
+      const name = place?.group ? groups.find((x) => x.service === place!.service && x.id === place!.group)!.name : "";
+      this.log(flow!.id, "place-worker", actor, () => place ? `schedule ${schedule} 的 worker ${worker} ${place.group ? `在组"${name}"` : "不在 NiFi 上"}（负责人说："${place.quote}"）` : `去掉了 schedule ${schedule} 的 worker ${worker} 的位置`,
+        [place?.service ?? had?.service ?? "-"]);
+      this.store.auditFlow(actor, flow!.id, "register-place-worker");
+    });
+    return { flow: flow!.id, schedule, worker, place };
   }
 
   private checkName(name: unknown): string {

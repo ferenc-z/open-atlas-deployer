@@ -71,7 +71,11 @@ export interface ChainInput {
   /** Known S2S senders (sendersOf over every managed service's latest topology): a registered remote input port fed by
    *  a group not registered here is then a gap, not an entry. Without them such a port is an entry from outside. */
   senders?: ChainSender[];
+  /** Where the owner said a worker runs (worker_places, §7.8 6): a group of this registration, or none (not in NiFi). */
+  placements?: ChainPlacement[];
 }
+/** One worker placed by the owner: schedule is the schedule_id (or its name), worker its worker_name; no group = not in NiFi. */
+export interface ChainPlacement { schedule: string; worker: string; service?: string | null; group?: string | null; quote?: string }
 
 /** The S2S senders in topologies (whole-canvas or scoped): in-group RPG ports and, scoped, the RPGs beside a group. */
 export function sendersOf(list: { service: string; topology: Topology | null | undefined }[]): ChainSender[] {
@@ -106,6 +110,11 @@ export interface PreviewGap {
   candidates?: { component: string; name: string }[];
   /** disconnected: the segments of the part not joined to the rest. */
   segments?: string[];
+  /** worker-unplaced: which worker (place-worker takes schedule and name). */
+  worker?: { schedule: string; scheduleName: string; seq: number; name: string };
+  /** worker-unplaced: groups it may be in, for the AI to ask about (never placed by code): a registered group with a
+   *  processor of that name (the topology names at most 5 processors per piece), or a group of a similar name. */
+  places?: { service: string; group: { id: string; name: string }; basis: "processor-name" | "group-name"; processor?: string }[];
 }
 export interface Preview {
   name: string; groups: PreviewGroup[]; segments: PreviewSegment[]; layers: string[][]; edges: PreviewEdge[];
@@ -350,6 +359,21 @@ export function chain(input: ChainInput): Preview {
     const all = byName.get(norm(name)) ?? [];
     return new Set(all.map((s) => `${s.service}\0${s.group.id}`)).size === 1 ? all[0] : undefined;
   };
+  /** Candidates for an unplaced worker: only for the AI to ask about. */
+  const placesFor = (worker: string): NonNullable<PreviewGap["places"]> => {
+    const got: NonNullable<PreviewGap["places"]> = [];
+    const seen = new Set<string>();
+    for (const s of segs.values()) {
+      const key = `${s.service}\0${s.group.id}`;
+      const proc = s.frags.flatMap((f) => f.names).find((n) => norm(n) === norm(worker));
+      if (proc !== undefined && !seen.has(key)) { seen.add(key); got.push({ service: s.service, group: s.group, basis: "processor-name", processor: proc }); }
+    }
+    for (const s of segs.values()) {
+      const key = `${s.service}\0${s.group.id}`;
+      if (!seen.has(key) && similar(s.group.name, worker)) { seen.add(key); got.push({ service: s.service, group: s.group, basis: "group-name" }); }
+    }
+    return got;
+  };
   const triggers: (MqEnd & { schedule: string })[] = [];
   const finals = new Map<string, { schedule: string; worker: string }[]>();
   const workerKeys = new Set<string>();
@@ -365,9 +389,16 @@ export function chain(input: ChainInput): Preview {
     const finalRow = rows.find((d) => str(h.final_worker_id) !== undefined && Number(d.worker_id) === Number(h.final_worker_id))
       ?? (finalSeq !== undefined ? rows.find((d) => Number(d.schedule_seq) === finalSeq) : undefined);
     if (finalRow) rows = rows.filter((d) => Number(d.schedule_seq) <= Number(finalRow.schedule_seq));
-    const placed = rows.map((d) => place(d.worker_name));
+    // The owner's word first (worker_places), then the group named worker_name.
+    const told = rows.map((d) => (input.placements ?? []).find((p) => (p.schedule === String(h.schedule_id) || norm(p.schedule) === norm(h.schedule_name)) && norm(p.worker) === norm(d.worker_name)));
+    const outside = told.map((p) => Boolean(p && !p.group));
+    const placed = rows.map((d, i) => {
+      const p = told[i];
+      if (p?.group) return resolve(p.service ?? "", p.group, null);
+      return p ? undefined : place(d.worker_name);
+    });
     const manager = place(h.manager_name);
-    if (!placed.some(Boolean) && !manager) continue;
+    if (!placed.some(Boolean) && !manager && !told.some(Boolean)) continue;
     if (str(h.final_worker_id) !== undefined && !finalRow) out.notes.push(`schedule ${name}：final_worker_id ${h.final_worker_id} 不在它的步骤里。`);
     if (manager) { manager.origin = "e2e_trace"; manager.steps.push(String(h.manager_name)); }
     let prev: { seg: Seg; seq: number } | undefined;
@@ -375,10 +406,14 @@ export function chain(input: ChainInput): Preview {
     rows.forEach((d, i) => {
       const seg = placed[i];
       const worker = String(d.worker_name ?? `worker ${d.worker_id}`);
+      if (outside[i]) { skipped.push(`第 ${d.schedule_seq} 步 ${worker}（负责人说不在 NiFi 上）`); return; }
       if (!seg) {
         const near = placed.slice(0, i).reverse().find(Boolean) ?? placed.slice(i + 1).find(Boolean) ?? manager;
+        const p = told[i];
         gap({ kind: "worker-unplaced", segment: near?.id ?? null, neighbor: { service: "" },
-          text: `schedule ${name} 第 ${d.schedule_seq} 步 ${worker} 对不上登记的组（按组名对 worker_name），要问负责人它在哪个组，或者不在 NiFi 上。` });
+          worker: { schedule: String(h.schedule_id), scheduleName: name, seq: Number(d.schedule_seq), name: worker }, places: placesFor(worker),
+          text: p ? `schedule ${name} 第 ${d.schedule_seq} 步 ${worker}：负责人说过在 ${p.service} 的组 ${p.group}，那个组现在不在这条业务登记的组里，要再问一次。`
+            : `schedule ${name} 第 ${d.schedule_seq} 步 ${worker} 对不上登记的组（按组名对 worker_name），要问负责人它在哪个组，或者不在 NiFi 上。` });
         skipped.push(`第 ${d.schedule_seq} 步 ${worker}`);
         return;
       }
@@ -467,11 +502,13 @@ export function chain(input: ChainInput): Preview {
       text: `这条业务没有自己的起点${m ? `：数据从公共模块 ${m.group.name} 进到 ${at.group.name}，模块前面是哪个组没有登记` : `，${at.group.name} 的数据从哪来要问负责人`}。` });
   }
   // A module that passes data on (it has exits) but none of its exits comes back here: where it goes is not registered.
+  // An exit into another module's entry (an error step's dead letters to the DLQ, step 4) does not pass it on.
+  const onward = (m: ChainModule) => m.exits.some((x) => { const k = keyOf(m.service, x.channel, "exit"); return !(k && modEntryKey.has(k)); });
   for (const e of [...edges.values()]) {
     if (e.kind !== "shared-entry" || !segs.has(e.from)) continue;
     const id = [...modSegs.entries()].find(([, s]) => s.id === e.to)![0];
     const m = (input.modules ?? []).find((x) => x.id === id)!;
-    if (!m.exits.length || [...edges.values()].some((x) => x.kind === "shared-exit" && x.from === e.to && segs.has(x.to))) continue;
+    if (!onward(m) || [...edges.values()].some((x) => x.kind === "shared-exit" && x.from === e.to && segs.has(x.to))) continue;
     gap({ kind: "exit-unregistered", segment: e.from, ...(e.component ? { component: e.component } : {}), neighbor: nb(m.service, m.group),
       text: `${segs.get(e.from)!.group.name} 经 ${e.via} 进了公共模块 ${m.name}，模块的出口没有接回这条业务登记的组。` });
   }
@@ -506,6 +543,27 @@ export function chain(input: ChainInput): Preview {
   out.layers = layers(out.segments.map((s) => s.id), out.edges);
   out.gaps = dedupeGaps(out.gaps).map((g, i) => ({ ...g, id: `gap${i + 1}` }));
   return out;
+}
+
+/** Group name and worker_name alike (for candidates only): without case, spaces and - _ . the same, one inside the
+ *  other (3 letters at least), or a few letters apart. */
+export function similar(a: string, b: string): boolean {
+  const k = (s: string) => s.toLowerCase().replace(/[\s_\-.]+/g, "");
+  const x = k(a), y = k(b);
+  if (!x || !y) return false;
+  if (x === y) return true;
+  if (Math.min(x.length, y.length) >= 3 && (x.includes(y) || y.includes(x))) return true;
+  return distance(x, y) <= Math.max(1, Math.floor(Math.max(x.length, y.length) / 5));
+}
+
+function distance(a: string, b: string): number {
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) cur[j] = Math.min(prev[j]! + 1, cur[j - 1]! + 1, prev[j - 1]! + (a[i - 1] === b[j - 1] ? 0 : 1));
+    prev = cur;
+  }
+  return prev[b.length]!;
 }
 
 /** s2 before s10, segments before modules. */

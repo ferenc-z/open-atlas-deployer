@@ -21,6 +21,7 @@ import { ServiceLogs } from "../src/server/services/logs.ts";
 import { registeredGroups, registeredGroupsOn, watchList } from "../src/server/services/watch.ts";
 import { parseLink, RegError, Registrations, resolveLink, serviceAddresses, type GroupInfo, type GroupReader } from "../src/server/services/registration.ts";
 import { Store, type Actor, type FlowRecord } from "../src/server/store.ts";
+import type { Topology } from "../src/server/services/flowcounts.ts";
 import { Versions } from "../src/server/versions.ts";
 
 import type { DatabaseSync } from "node:sqlite";
@@ -55,6 +56,14 @@ const reader: GroupReader = {
   async read(service, ids) {
     reads.push({ service, ids });
     return ids.map((id) => canvas[service]?.find((g) => g.id === id) ?? { id, exists: false });
+  },
+  // A scoped topology of the groups asked: each one piece with a start of its own, nothing around.
+  async scan(service, ids) {
+    const groups = await this.read(service, ids);
+    const t = { scope: "groups", root: { id: ROOT_ID, name: "NiFi Flow" }, links: [], s2sIn: [], s2sOut: [], ends: [], neighbors: [], missing: [],
+      groups: groups.filter((g) => g.exists).map((g) => ({ id: g.id, name: g.name!, root: false, parent: g.path?.at(-1)?.id ?? null, path: g.path ?? [],
+        fragments: [{ key: "f", processors: 1, names: ["p"], inputs: [], outputs: [], remoteIn: [], s2sOut: [], starts: 1 }] })) };
+    return { groups, topology: t as unknown as Topology };
   },
 };
 
@@ -159,7 +168,7 @@ test("add: a group that is not there, the same group in two links, bad input", a
 test("add: the executor's own refusals pass through (old, offline)", async () => {
   const { store } = setup();
   for (const code of ["register/executor-old", "register/executor-offline"] as const) {
-    const regs = new Registrations(store, { read: async () => { throw new RegError(code, "x"); } });
+    const regs = new Registrations(store, { read: async () => { throw new RegError(code, "x"); }, scan: async () => { throw new RegError(code, "x"); } });
     const e = await refused(regs.add("flw_aaaaaa", [l1(G1)], admin), code);
     assert.equal(e.status, 503);
   }
@@ -319,10 +328,15 @@ test("route: who may call, request_id on writes, the actions of this step and th
   assert.equal((await t.post("remove", { flow: "flw_aaaaaa", groups: [{ service: "c2", group: G3 }], request_id: "r8" }, "dpk_viewer")).status, 200);
   assert.equal((await t.post("unregister", { flow: "flw_bbbbbb", request_id: "r9" }, "dpk_viewer")).status, 200);
   assert.equal((await t.post("unregister", { flow: "flw_bbbbbb", request_id: "r10" }, "dpk_viewer")).status, 404);
-  for (const action of ["preview", "commit", "declare-handoff", "shared"]) {
+  for (const action of ["commit", "declare-handoff"]) {
     const later = await t.post(action, { links: [l1(G1)] }, "dpk_viewer");
     assert.deepEqual([later.status, later.body.error], [501, "register/not-implemented"], action);
   }
+  // Step 4: preview needs no request_id; shared does only with commit: true.
+  const pv = await t.post("preview", { links: [l2(G3)] }, "dpk_viewer");
+  assert.equal(pv.status, 200, JSON.stringify(pv.body));
+  assert.deepEqual(pv.body.segments.map((s: { group: { name: string } }) => s.group.name), ["对账"]);
+  assert.equal((await t.post("shared", { name: "m", links: [l2(G3)], entries: [{ port: "x" }], commit: true }, "dpk_viewer")).body.error, "register/bad-request");
   assert.equal((await t.post("nope", {}, "dpk_viewer")).status, 404);
 });
 
@@ -504,10 +518,10 @@ test("route: drafts are made and read; the actions take `draft` and change only 
   const ho = await t.post("declare-handoff", { draft: id, from: { service: "n1", group: G1, component: "PutSFTP" }, to: { system: "客户" }, quote: "给客户", request_id: "d5" }, "dps_assistant");
   assert.equal(ho.status, 200, JSON.stringify(ho.body));
   assert.equal((await t.post("add", { draft: "rgd_000000000000", links: [l1(G2)], request_id: "d6" }, "dpk_viewer")).status, 404);
-  for (const action of ["preview", "commit", "shared"]) {
-    const later = await t.post(action, { draft: id, links: [l1(G1)], request_id: "d7" }, "dpk_viewer");
-    assert.deepEqual([later.status, later.body.error], [501, "register/not-implemented"], action);
-  }
+  const commit = await t.post("commit", { draft: id, request_id: "d7" }, "dpk_viewer");
+  assert.deepEqual([commit.status, commit.body.error], [501, "register/not-implemented"]);
+  assert.equal((await t.post("shared", { draft: id, links: [l1(G1)], request_id: "d7" }, "dpk_viewer")).body.error, "register/bad-request", "a module takes no draft");
+  assert.equal((await t.post("preview", { draft: id, links: [l1(G1)] }, "dpk_viewer")).body.error, "register/bad-request", "a draft is previewed with its own groups");
   const got = await t.draftGet(id, "dpk_viewer");
   assert.equal(got.status, 200);
   assert.deepEqual([got.body.draft, got.body.name, got.body.groups.length, got.body.handoffs.length, got.body.preview], [id, "订单入库", 2, 1, null]);

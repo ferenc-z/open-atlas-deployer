@@ -62,6 +62,7 @@ import { e2eImport, mountE2eTrace } from "./services/trace/e2e-routes.ts";
 import { mountFlows } from "./services/flow-routes.ts";
 import { mountAnalyses } from "./services/analysis-routes.ts";
 import { mountRegistrations } from "./services/registration-routes.ts";
+import { RegisterChain, type ScheduleRows } from "./services/register-chain.ts";
 import { Registrations, type GroupReader } from "./services/registration.ts";
 import type { Analyses } from "./services/analyses.ts";
 import type { ModelDeps } from "./services/flowmodel.ts";
@@ -1342,7 +1343,10 @@ export function createApp({ config, store, sessions, observer, deployments, vers
   // §10.2.2 #3, #4, #5 (step 5): Look again now, Check now, following an analysis.
   mountAnalyses(api, { store, ...(deps.analyses ? { analyses: deps.analyses } : {}), authenticate, reject, registered: registeredService });
   // S39 §7.5 (step 2): POST /api/registrations/<action>.
-  mountRegistrations(api, { registrations: new Registrations(store, deps.groupReader), authenticate, reject, actorOf });
+  // S39 step 4: preview (chain() on what NiFi has now, with e2e_trace's schedules), shared modules, worker places.
+  const registrations = new Registrations(store, deps.groupReader);
+  const chains = new RegisterChain({ store, registrations, ...(deps.groupReader ? { reader: deps.groupReader } : {}), schedules: (id) => e2eTrace.schedules(id) as Promise<ScheduleRows | null> });
+  mountRegistrations(api, { registrations, chains, store, authenticate, reject, actorOf });
   // §10.2 step 4: the routes behind the MCP verbs (describe, the model, record, look's extra kinds) and the to-do buttons.
   const ops = mountOps(api, {
     store, executor: (host) => handoff.executor(host, "service"), model: flowModelDeps, flowSearch: (id, q) => provenance.flowSearch(id, q),
