@@ -36,10 +36,17 @@ export interface WatchEntry {
 export const FLOW_GROUPS_KIND = "flow-groups@1";
 const BEAT_FRESH_MS = 30_000;
 
-/** S39: the groups registered for a service (ids); undefined while the service has no registration. Step 2 reads
- *  flow_registrations here; until then nothing is registered and every service is read whole, as before. */
-export function registeredGroups(_store: Store, _service: string): string[] | undefined {
-  return undefined;
+/** S39 (step 2): the switch that lets the watch carry the registered groups. Off unless DEPLOYER_REGISTERED_GROUPS=1:
+ *  the skeleton, the model and the gates still assume the whole canvas (step 3 changes that), so the real services are
+ *  read whole until then. */
+export const registeredGroupsOn = (env: NodeJS.ProcessEnv = process.env): boolean => env.DEPLOYER_REGISTERED_GROUPS === "1";
+
+/** S39: the groups registered for a service (ids, a business's and a shared module's, once each); undefined while the
+ *  switch is off or the service has no registration (never []: that would stop the service's counts and topology). */
+export function registeredGroups(store: Store, service: string, on = registeredGroupsOn()): string[] | undefined {
+  if (!on) return undefined;
+  const ids = [...new Set(store.flowRegistrations({ service }).map((r) => r.groupId))];
+  return ids.length ? ids : undefined;
 }
 
 /** §7.7 question 6: which node of a cluster reads its registered groups. A group's status is the cluster's total on

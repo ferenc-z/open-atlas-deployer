@@ -16,6 +16,9 @@ import { Handoff } from "../src/server/handoff.ts";
 import type { Keys } from "../src/server/keys.ts";
 import { Observer } from "../src/server/observe.ts";
 import { SecretBox } from "../src/server/secretbox.ts";
+import { HandoffGroupReader } from "../src/server/services/group-reader.ts";
+import { ServiceLogs } from "../src/server/services/logs.ts";
+import { registeredGroups, registeredGroupsOn, watchList } from "../src/server/services/watch.ts";
 import { parseLink, RegError, Registrations, resolveLink, serviceAddresses, type GroupInfo, type GroupReader } from "../src/server/services/registration.ts";
 import { Store, type Actor, type FlowRecord } from "../src/server/store.ts";
 import { Versions } from "../src/server/versions.ts";
@@ -277,7 +280,19 @@ function route() {
     const res = await app.request(`/deploy/api/registrations/${action}`, { method: "POST", headers, body: JSON.stringify(body) });
     return { status: res.status, body: (await res.json()) as Record<string, any> };
   };
-  return { store, post };
+  const draftPost = async (body: unknown, key?: string) => {
+    const headers = new Headers({ "content-type": "application/json" });
+    if (key) headers.set("authorization", `Bearer ${key}`);
+    const res = await app.request("/deploy/api/registrations/drafts", { method: "POST", headers, body: JSON.stringify(body) });
+    return { status: res.status, body: (await res.json()) as Record<string, any> };
+  };
+  const draftGet = async (id: string, key?: string) => {
+    const headers = new Headers();
+    if (key) headers.set("authorization", `Bearer ${key}`);
+    const res = await app.request(`/deploy/api/registrations/drafts/${id}`, { headers });
+    return { status: res.status, body: (await res.json()) as Record<string, any> };
+  };
+  return { store, post, draftPost, draftGet };
 }
 
 test("route: who may call, request_id on writes, the actions of this step and the ones that wait", async () => {
@@ -309,4 +324,197 @@ test("route: who may call, request_id on writes, the actions of this step and th
     assert.deepEqual([later.status, later.body.error], [501, "register/not-implemented"], action);
   }
   assert.equal((await t.post("nope", {}, "dpk_viewer")).status, 404);
+});
+
+// --- step 2, second half: the real reader, the watch switch, the drafts ---------------------------------------------
+
+const KINDS_NEW = ["svc-discover", "svc-read", "nifi-groups", "nifi-groups@1", "flow-groups@1"];
+const KEY1 = "local:/lab/c250-1", KEY2 = "local:/lab/c250-2";
+
+function readerLab(kinds: string[] | null = KINDS_NEW) {
+  const store = new Store(":memory:");
+  const node = (installDir: string, https: number) => ({ host: "local", installDir, serviceUser: "ferenc", startEnvironment: null, ports: { https }, nodeAddress: "localhost", discovery: null });
+  store.addCluster({ kind: "cluster", id: "c250", service: "nifi", profile: "nifi-2.x", version: "2.5.0", webUrl: null, zookeeper: "zk:2181", zookeeperRoot: "/c250", nodes: [node("/lab/c250-1", 18445), node("/lab/c250-2", 18446)] } as never, "uat", admin);
+  const handoff = new Handoff(store);
+  if (kinds) handoff.heartbeat("local", { executor: "service", version: "0.9.7", protocols: [2], kinds, at: "", project: "", registries: [], databaseBackup: {}, busy: null }, "service");
+  const logs = new ServiceLogs(store, handoff, { pollMs: 5, waitMs: 3000 });
+  const groupReader = new HandoffGroupReader(handoff, logs, { pollMs: 5, waitMs: 400 });
+  const claim = async () => { for (let i = 0; i < 400; i++) { const j = await handoff.next("local", 0, undefined, "service"); if (j) return j; await new Promise((r) => setTimeout(r, 5)); } throw new Error("no job"); };
+  const answer = (id: unknown, state: "succeeded" | "failed" | "refused", result: unknown = {}, message?: string) =>
+    handoff.putStatus(String(id), { state, steps: [], result: result as never, ...(message ? { message } : {}) });
+  return { store, handoff, groupReader, claim, answer };
+}
+
+test("reader: asks the first member's executor for nifi-groups, the next member when one fails, the answer's groups come back", async () => {
+  const x = readerLab();
+  const running = x.groupReader.read("c250", [G1, G2]);
+  const a = await x.claim();
+  assert.deepEqual([a.kind, a.member, a.groups, a.timeoutSeconds], ["nifi-groups", KEY1, [G1, G2], 30]);
+  x.answer(a.id, "failed", {}, "reading the groups failed: timed out");
+  const b = await x.claim();
+  assert.equal(b.member, KEY2, "the other node");
+  x.answer(b.id, "succeeded", { groups: [{ id: G1, exists: true, name: "收单" }, { id: G2, exists: false }, { nonsense: 1 }], topology: { scope: "groups" } });
+  assert.deepEqual((await running).map((g) => [g.id, g.exists, g.name]), [[G1, true, "收单"], [G2, false, undefined]]);
+});
+
+test("reader: a refusal is not tried again; every member failing or silent is executor-offline", async () => {
+  const x = readerLab();
+  const refusedRead = x.groupReader.read("c250", [G1]);
+  x.answer((await x.claim()).id, "refused", {}, "groups must be 1 to 20 process group ids");
+  await refused(refusedRead, "register/bad-request");
+  const bothFail = x.groupReader.read("c250", [G1]);
+  x.answer((await x.claim()).id, "failed", {}, "no monitor certificate");
+  x.answer((await x.claim()).id, "failed", {}, "NiFi did not answer");
+  const e = await refused(bothFail, "register/executor-offline");
+  assert.match(e.message, /NiFi did not answer/);
+  const silent = await refused(x.groupReader.read("c250", [G1]), "register/executor-offline");
+  assert.match(silent.message, /did not answer in time/);
+});
+
+test("reader: an executor that does not name nifi-groups@1 is executor-old, none online is executor-offline, an unknown service is unknown-address", async () => {
+  await refused(readerLab(["svc-discover", "svc-read", "nifi-groups"]).groupReader.read("c250", [G1]), "register/executor-old");
+  await refused(readerLab(null).groupReader.read("c250", [G1]), "register/executor-offline");
+  await refused(readerLab().groupReader.read("nope", [G1]), "register/unknown-address");
+});
+
+test("watch: registeredGroups is off by default, undefined (never []) without a registration, and counts a module's groups once", () => {
+  const store = new Store(":memory:");
+  seed(store);
+  store.putFlow(flow("flw_aaaaaa", "订单入库"));
+  const row = (owner: string, role: "segment" | "shared", service: string, groupId: string) => ({ owner, role, service, groupId, groupName: groupId, groupPath: null, slice: "*", link: null, registeredBy: "a" });
+  store.addFlowRegistrations([row("flw_aaaaaa", "segment", "n1", G1), row("shm_aaaaaa", "shared", "n1", G2), row("flw_aaaaaa", "segment", "c2", G3)]);
+  assert.equal(registeredGroups(store, "n1", false), undefined, "switch off: the whole canvas as before");
+  assert.deepEqual(registeredGroups(store, "n1", true), [G1, G2], "a shared module's group counts too");
+  assert.deepEqual(registeredGroups(store, "c2", true), [G3]);
+  store.removeFlowRegistrations("flw_aaaaaa");
+  assert.equal(registeredGroups(store, "c2", true), undefined, "no registration left: undefined, not []");
+  assert.deepEqual(registeredGroups(store, "n1", true), [G2]);
+  // The environment switch.
+  assert.equal(registeredGroupsOn({}), false);
+  assert.equal(registeredGroupsOn({ DEPLOYER_REGISTERED_GROUPS: "0" }), false);
+  assert.equal(registeredGroupsOn({ DEPLOYER_REGISTERED_GROUPS: "1" }), true);
+  // Off, the watch carries no groups key at all; on, the registered service has one and the others none.
+  assert.equal(watchList(store, "h-a1").some((w) => "groups" in w), false);
+  const on = watchList(store, "h-a1", (s) => registeredGroups(store, s, true));
+  assert.deepEqual(on.map((w) => [w.service, w.groups]), [["n1", [{ id: G2 }]]]);
+});
+
+test("drafts: made, read, changed through the actions, refused what is not a draft's", async () => {
+  const store = new Store(":memory:");
+  seed(store);
+  reads.length = 0;
+  const regs = new Registrations(store, reader);
+  const d = regs.createDraft(admin);
+  assert.match(d.id, /^rgd_[0-9a-f]{12}$/);
+  assert.ok(/^[\w .:@/-]{1,64}$/.test(d.id), "fits a Workbench context");
+  assert.deepEqual([d.name, d.groups, d.handoffs, d.preview], [null, [], [], null]);
+  const added = await regs.draftAdd(d.id, [l1(G1), l1(G2), l2(G3)], admin);
+  assert.deepEqual(added.added.map((a) => [a.service, a.group.name]), [["n1", "收单"], ["n1", "入库"], ["c2", "对账"]]);
+  assert.equal(store.flowRegistrations().length, 0, "nothing is registered");
+  assert.equal(store.flowChanges({ service: "n1" }).length, 0, "no change row either");
+  // Again: unchanged.
+  const again = await regs.draftAdd(d.id, [l1(G1)], admin);
+  assert.deepEqual([again.added.length, again.unchanged.length], [0, 1]);
+  assert.equal(regs.draft(d.id).groups.length, 3);
+  await refused(regs.draftAdd(d.id, [l1("22222222-2222-2222-2222-222222222222")], admin), "register/group-missing");
+  await refused(regs.draftAdd(d.id, ["not a link"], admin), "register/bad-link");
+  assert.equal(regs.draftRename(d.id, " 订单入库 ").name, "订单入库");
+  assert.equal(regs.draft(d.id).name, "订单入库");
+  await refused(() => regs.draftRename(d.id, " "), "register/bad-request");
+  await refused(() => regs.draft("rgd_000000000000"), "register/not-found");
+  await refused(() => regs.draft("x"), "register/bad-request");
+  // A group another business has is refused for a draft too, and the draft does not take it.
+  store.putFlow(flow("flw_bbbbbb", "对账"));
+  await regs.add("flw_bbbbbb", [l2(G3)], admin);
+  const d2 = regs.createDraft(admin, "另一条");
+  assert.equal(d2.name, "另一条");
+  const e = await refused(regs.draftAdd(d2.id, [l2(G3)], admin), "register/group-taken");
+  assert.equal((e.extra.taken as { by: { name: string } }[])[0]!.by.name, "对账");
+  assert.equal(regs.draft(d2.id).groups.length, 0);
+});
+
+test("drafts: spoken hand-overs are kept, replaced and removed; a group that leaves takes its hand-overs", async () => {
+  const store = new Store(":memory:");
+  seed(store);
+  const regs = new Registrations(store, reader);
+  const d = regs.createDraft(admin);
+  await regs.draftAdd(d.id, [l1(G1), l1(G2)], admin);
+  const give = { from: { service: "n1", group: G1, component: "PutSFTP", relationship: "success" }, to: { service: "n1", group: G2 }, quote: "文件落到 /data/in，入库那边的 ListFile 扫它" };
+  const h = regs.draftDeclareHandoff(d.id, give, admin).handoff!;
+  assert.match(h.id, /^hof_[0-9a-f]{12}$/);
+  assert.deepEqual([h.from.component, h.quote, h.declaredBy], ["PutSFTP", give.quote, "admin@x"]);
+  const replaced = regs.draftDeclareHandoff(d.id, { ...give, to: { system: "客户 SFTP" }, quote: "其实是交给客户", replace: h.id }, admin).handoff!;
+  assert.equal(replaced.id, h.id);
+  assert.deepEqual(regs.draft(d.id).handoffs.map((x) => [x.id, x.to, x.quote]), [[h.id, { system: "客户 SFTP" }, "其实是交给客户"]]);
+  for (const bad of [{ ...give, from: { ...give.from, group: G3 } }, { ...give, to: { service: "n1", group: G3 } }])
+    await refused(() => regs.draftDeclareHandoff(d.id, bad, admin), "register/bad-handoff");
+  for (const bad of [{ ...give, quote: " " }, { ...give, from: { ...give.from, component: "" } }, { quote: "x" }, { ...give, replace: "hof_nope" }])
+    await refused(() => regs.draftDeclareHandoff(d.id, bad, admin), "replace" in bad ? "register/not-found" : "register/bad-request");
+  const second = regs.draftDeclareHandoff(d.id, give, admin).handoff!;
+  assert.equal(regs.draft(d.id).handoffs.length, 2);
+  assert.deepEqual(regs.draftDeclareHandoff(d.id, { remove: second.id }, admin), { draft: d.id, removed: second.id });
+  // G2 leaves: a hand-over to it goes too, one to the outside stays.
+  regs.draftDeclareHandoff(d.id, give, admin);
+  const out = regs.draftRemove(d.id, [{ service: "n1", group: G2.toUpperCase() }]);
+  assert.equal(out.droppedHandoffs.length, 1);
+  assert.deepEqual(regs.draft(d.id).handoffs.map((x) => x.id), [h.id]);
+  assert.deepEqual(regs.draft(d.id).groups.map((g) => g.group.id), [G1]);
+  await refused(() => regs.draftRemove(d.id, [{ service: "n1", group: G2 }]), "register/not-found");
+  await refused(() => regs.draftRemove(d.id, []), "register/bad-request");
+});
+
+test("drafts: a draft nobody touched for 24 hours is gone; touching it keeps it", async () => {
+  let now = new Date("2026-11-24T08:00:00Z");
+  const store = new Store(":memory:", () => now);
+  seed(store);
+  const regs = new Registrations(store, reader);
+  const kept = regs.createDraft(admin), lost = regs.createDraft(admin);
+  now = new Date("2026-11-25T07:00:00Z");
+  regs.draftRename(kept.id, "还在");
+  now = new Date("2026-11-25T08:30:00Z");
+  assert.equal(store.registrationDraft(lost.id), null, "past a day: read as gone before anything deletes it");
+  await refused(() => regs.draft(lost.id), "register/not-found");
+  assert.equal(regs.draft(kept.id).name, "还在");
+  assert.equal(store.pruneRegistrationDrafts(), 1);
+  assert.equal(store.pruneRegistrationDrafts(), 0);
+  assert.equal(regs.draft(kept.id).name, "还在");
+  store.putRegistrationDraft({ ...regs.draft(kept.id), preview: { segments: [] } });
+  assert.deepEqual(regs.draft(kept.id).preview, { segments: [] }, "the last preview is kept for the page");
+  const cur = regs.draft(kept.id);
+  store.putRegistrationDraft({ id: cur.id, name: "改名不动 preview", groups: cur.groups, handoffs: cur.handoffs });
+  assert.deepEqual(regs.draft(kept.id).preview, { segments: [] });
+});
+
+test("route: drafts are made and read; the actions take `draft` and change only it; preview and commit still wait", async () => {
+  const t = route();
+  assert.equal((await t.draftPost({})).status, 401);
+  assert.equal((await t.draftPost({}, "dpc_checkup")).status, 403, "the check-up's key cannot make one");
+  const made = await t.draftPost({}, "dpk_viewer");
+  assert.equal(made.status, 200);
+  const id = made.body.draft as string;
+  assert.match(id, /^rgd_/);
+  const add = await t.post("add", { draft: id, links: [l1(G1), l2(G3)], request_id: "d1" }, "dps_assistant");
+  assert.equal(add.status, 200, JSON.stringify(add.body));
+  assert.deepEqual(add.body.added.map((a: { service: string }) => a.service), ["n1", "c2"]);
+  assert.equal(t.store.flowRegistrations().length, 0, "the draft only");
+  assert.equal((await t.post("add", { draft: id, links: [l1(G2)] }, "dpk_viewer")).body.error, "register/bad-request", "request_id on a draft's writes too");
+  assert.equal((await t.post("add", { draft: id, flow: "flw_aaaaaa", links: [l1(G2)], request_id: "d2" }, "dpk_viewer")).body.error, "register/bad-request", "draft or flow, not both");
+  assert.equal((await t.post("unregister", { draft: id, request_id: "d3" }, "dpk_viewer")).body.error, "register/bad-request");
+  assert.equal((await t.post("rename", { draft: id, name: "订单入库", request_id: "d4" }, "dpk_viewer")).status, 200);
+  const ho = await t.post("declare-handoff", { draft: id, from: { service: "n1", group: G1, component: "PutSFTP" }, to: { system: "客户" }, quote: "给客户", request_id: "d5" }, "dps_assistant");
+  assert.equal(ho.status, 200, JSON.stringify(ho.body));
+  assert.equal((await t.post("add", { draft: "rgd_000000000000", links: [l1(G2)], request_id: "d6" }, "dpk_viewer")).status, 404);
+  for (const action of ["preview", "commit", "shared"]) {
+    const later = await t.post(action, { draft: id, links: [l1(G1)], request_id: "d7" }, "dpk_viewer");
+    assert.deepEqual([later.status, later.body.error], [501, "register/not-implemented"], action);
+  }
+  const got = await t.draftGet(id, "dpk_viewer");
+  assert.equal(got.status, 200);
+  assert.deepEqual([got.body.draft, got.body.name, got.body.groups.length, got.body.handoffs.length, got.body.preview], [id, "订单入库", 2, 1, null]);
+  assert.equal(got.body.groups[0].group.name, "收单");
+  assert.equal((await t.draftGet("rgd_000000000000", "dpk_viewer")).status, 404);
+  assert.equal((await t.draftGet(id)).status, 401);
+  const rm = await t.post("remove", { draft: id, groups: [{ service: "c2", group: G3 }], request_id: "d8" }, "dpk_viewer");
+  assert.equal(rm.status, 200);
+  assert.equal((await t.draftGet(id, "dpk_viewer")).body.groups.length, 1);
 });

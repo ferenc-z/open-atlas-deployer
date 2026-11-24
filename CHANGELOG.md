@@ -18,6 +18,17 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   Deployer gives a cluster's groups to one node (the first whose executor is fresh, names `flow-groups@1` and whose
   NiFi answered) and `[]` to the others. Nothing is registered yet (step 2), so every service is still read whole.
 
+- S39 step 2 (second half): registering reads the group through the service executor's `nifi-groups` job (the first
+  member whose heartbeat names `nifi-groups@1`, the next member when one fails; no such executor: `register/executor-old`).
+  `registeredGroups(store, service)` reads `flow_registrations` (a business's and a shared module's groups), and is
+  `undefined`, never `[]`, for a service with none. **It is off by default**: only `DEPLOYER_REGISTERED_GROUPS=1` makes the
+  watch carry `groups`, because the skeleton, the model and the gates still assume the whole canvas (until the chaining,
+  step 3, is in) and a service read by groups would lose its counts and topology outside them. Registrations are stored
+  either way. Registration drafts (`registration_drafts`, a draft nobody touched for 24 hours goes): `POST
+  /api/registrations/drafts` makes one (`rgd_…`), `GET /api/registrations/drafts/<id>` reads it with the last preview, and
+  `register` add / remove / rename / declare-handoff with `draft` change only the draft. Preview and commit of a draft
+  still answer `register/not-implemented`.
+
 - Skills follow the Agent Skills layout OMA reads: `agents/skills/<name>/SKILL.md` (a folder named as the Skill, the
   frontmatter `name` the same), so the folder zips straight into OMA's Skill upload. `bin/publish-assistant.ts` reads
   the folders (a loose `*.md` there is an error); the Skill's text is unchanged, so no new Skill version and nothing to

@@ -16,6 +16,7 @@ import { Briefs, collectFacts } from "./brief.ts";
 import { opsBusinessHooks, opsPageSources, servicesOverview } from "./services/page-views.ts";
 import { BusinessScanner, businessCheckAll, SCAN_MINUTES } from "./services/business.ts";
 import { ServiceLogs } from "./services/logs.ts";
+import { HandoffGroupReader } from "./services/group-reader.ts";
 import { ServiceProvenance } from "./services/provenance.ts";
 import { Drift } from "./drift.ts";
 import { environmentStatus, hostStateOf } from "./observe.ts";
@@ -142,7 +143,7 @@ const serviceLogs = new ServiceLogs(store, deployments.handoff);
 const serviceProvenance = new ServiceProvenance(store, deployments.handoff, serviceLogs);
 const businessScanner = new BusinessScanner(store, serviceProvenance);
 // Steps 3b + 4: the pages read the to-dos and analyses (opsReads); describe reads the real business light.
-const app = createApp({ config, store, takeover, changes: serviceChanges, ...(configReview ? { configReview } : {}), graph: nifiOpsGraph, logs: serviceLogs, provenance: serviceProvenance, pageSources, businessHooks, businessScanner, analyses, sessions: new WorkbenchSessions(config.workbenchUrl), observer, deployments, versions, env, peer, onboarding, drift, briefs, keys, workbench, workbenchKey, deployerSettings,
+const app = createApp({ config, store, takeover, groupReader: new HandoffGroupReader(deployments.handoff, serviceLogs), changes: serviceChanges, ...(configReview ? { configReview } : {}), graph: nifiOpsGraph, logs: serviceLogs, provenance: serviceProvenance, pageSources, businessHooks, businessScanner, analyses, sessions: new WorkbenchSessions(config.workbenchUrl), observer, deployments, versions, env, peer, onboarding, drift, briefs, keys, workbench, workbenchKey, deployerSettings,
   // D45: the image sets DEPLOYER_RESTART_BY_EXIT; the container's restart policy starts it again with the new settings.
   ...(process.env.DEPLOYER_RESTART_BY_EXIT === "true" ? { restart: () => setTimeout(() => { store.close(); process.exit(75); }, 300) } : {}) });
 // Job records follow the executor's status files even while nobody has the page open.
@@ -174,6 +175,7 @@ const serviceUpkeep = (cleanup: boolean) => {
     // Ops step 3b: the business light's bulletins, queues, S2S hand-overs and error groups.
     businessCheckAll(store);
     store.dropOldExecutorContent();
+    store.pruneRegistrationDrafts();
     deployments.handoff.expireQueued();
     if (cleanup) { prune(store, new Date()); pruneFlow(store, new Date()); }
   } catch (error) { console.error("service metrics:", error); }

@@ -4,7 +4,8 @@
 // rename, unregister. preview and commit (the chaining of segments, step 3), declare-handoff and shared (step 4) are
 // not here yet. The routes (registration-routes.ts) only translate a RegError into HTTP.
 
-import { StoreError, type Actor, type FlowRegistration, type Store } from "../store.ts";
+import { randomBytes } from "node:crypto";
+import { StoreError, type Actor, type FlowRegistration, type RegistrationDraft, type RegistrationDraftGroup, type RegistrationDraftHandoff, type Store } from "../store.ts";
 import { memberAddresses } from "./skeleton.ts";
 import type { ServiceMember } from "./draft.ts";
 
@@ -13,15 +14,18 @@ export const GROUPS_PER_READ = 20;
 /** §7.5: links per request. */
 export const LINKS_MAX = 20;
 export const NAME_MAX = 200;
+export const QUOTE_MAX = 2000;
+/** §7.9: a draft id; short enough and made of the characters Workbench allows in a page context ([\w .:@/-]{1,64}). */
+export const DRAFT_ID = /^rgd_[0-9a-f]{12}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** §7.5 error codes, with the HTTP status each one answers with. */
 export type RegisterCode =
   | "register/bad-request" | "register/bad-link" | "register/root-group" | "register/unknown-address" | "register/ambiguous-address"
   | "register/group-missing" | "register/executor-old" | "register/executor-offline" | "register/group-taken" | "register/not-found"
-  | "register/empty" | "register/not-implemented";
+  | "register/empty" | "register/not-implemented" | "register/bad-handoff";
 const STATUS: Record<RegisterCode, 400 | 404 | 409 | 501 | 503> = {
-  "register/bad-request": 400, "register/bad-link": 400, "register/root-group": 400, "register/unknown-address": 400, "register/ambiguous-address": 400,
+  "register/bad-request": 400, "register/bad-handoff": 400, "register/bad-link": 400, "register/root-group": 400, "register/unknown-address": 400, "register/ambiguous-address": 400,
   "register/group-missing": 404, "register/not-found": 404, "register/group-taken": 409, "register/empty": 409,
   "register/executor-old": 503, "register/executor-offline": 503, "register/not-implemented": 501,
 };
@@ -192,43 +196,8 @@ export class Registrations {
   /** add: the groups of these links join the business. Refused when a link's group is missing or somebody else has it. */
   async add(flowId: unknown, links: unknown, actor: Actor): Promise<RegisterResult> {
     const flow = this.flowOf(flowId);
-    const addresses = serviceAddresses(this.store);
-    const resolved = this.dedupe(linkAsks(links).map((a) => resolveLink(this.store, a, addresses)));
-    const byService = new Map<string, ResolvedLink[]>();
-    for (const r of resolved) byService.set(r.service, [...(byService.get(r.service) ?? []), r]);
-
-    // Read the new groups, and the groups already registered in the same services: whether one lies inside another is
-    // told by the path the read gives (the registration keeps names only).
-    const infos = new Map<string, Map<string, GroupInfo>>();
-    for (const [service, rs] of byService) {
-      const ask = new Set(rs.map((r) => r.groupId));
-      for (const e of this.store.flowRegistrations({ service })) ask.add(e.groupId);
-      infos.set(service, await this.read(service, [...ask]));
-    }
-    const missing = resolved.filter((r) => infos.get(r.service)?.get(r.groupId)?.exists !== true);
-    if (missing.length) throw new RegError("register/group-missing", `${missing.length === 1 ? "This group does" : "These groups do"} not exist in NiFi: ${missing.map((m) => `${m.groupId} (${m.service})`).join(", ")}. Was it deleted, or is the link of another instance?`, { groups: missing.map((m) => ({ service: m.service, group: m.groupId, link: m.link })) });
-
-    const taken: Taken[] = [];
-    const added: RegisteredGroup[] = [], unchanged: RegisteredGroup[] = [];
-    const rows: Omit<FlowRegistration, "registeredAt">[] = [];
-    for (const r of resolved) {
-      const map = infos.get(r.service)!, info = map.get(r.groupId)!;
-      const shown: RegisteredGroup = { service: r.service, group: { id: r.groupId, name: info.name ?? r.groupId, path: crumbs(info) }, link: r.link };
-      const ancestors = new Set((info.path ?? []).map((p) => p.id.toLowerCase()));
-      let already = false;
-      for (const e of this.store.flowRegistrations({ service: r.service })) {
-        const other = map.get(e.groupId);
-        const relation: Taken["relation"] | null = e.groupId === r.groupId ? "same" : ancestors.has(e.groupId) ? "inside"
-          : other?.exists && (other.path ?? []).some((p) => p.id.toLowerCase() === r.groupId) ? "contains" : null;
-        if (!relation) continue;
-        if (e.owner === flow.id) { if (relation !== "contains") already = true; continue; }
-        taken.push({ service: r.service, group: { id: e.groupId, name: e.groupName }, relation, by: { ...this.ownerOf(e.owner), registeredBy: e.registeredBy } });
-      }
-      if (already) { unchanged.push(shown); continue; }
-      added.push(shown);
-      rows.push({ owner: flow.id, role: "segment", service: r.service, groupId: r.groupId, groupName: shown.group.name, groupPath: shown.group.path, slice: "*", link: r.link, registeredBy: actor.id });
-    }
-    if (taken.length) throw takenError(taken);
+    const { added, unchanged } = await this.stage(links, flow.id, []);
+    const rows: Omit<FlowRegistration, "registeredAt">[] = added.map((a) => ({ owner: flow.id, role: "segment", service: a.service, groupId: a.group.id, groupName: a.group.name, groupPath: a.group.path, slice: "*", link: a.link, registeredBy: actor.id }));
     try {
       this.store.flowTransaction(() => {
         this.store.addFlowRegistrations(rows);
@@ -241,6 +210,50 @@ export class Registrations {
       throw error;
     }
     return { flow: flow.id, added, unchanged, revisions: [], published: false };
+  }
+
+  /** The groups of these links, read from NiFi and checked: they exist, and nobody but the owner (ownKey: a business, or a
+   *  draft, which owns ownGroups) has them or one around or inside them. Writes nothing. */
+  private async stage(links: unknown, ownKey: string, ownGroups: RegistrationDraftGroup[]): Promise<{ added: RegisteredGroup[]; unchanged: RegisteredGroup[] }> {
+    const addresses = serviceAddresses(this.store);
+    const resolved = this.dedupe(linkAsks(links).map((a) => resolveLink(this.store, a, addresses)));
+    const byService = new Map<string, ResolvedLink[]>();
+    for (const r of resolved) byService.set(r.service, [...(byService.get(r.service) ?? []), r]);
+
+    // Read the new groups, and the groups already registered in the same services: whether one lies inside another is
+    // told by the path the read gives (the registration keeps names only).
+    const infos = new Map<string, Map<string, GroupInfo>>();
+    for (const [service, rs] of byService) {
+      const ask = new Set(rs.map((r) => r.groupId));
+      for (const e of this.store.flowRegistrations({ service })) ask.add(e.groupId);
+      for (const g of ownGroups) if (g.service === service) ask.add(g.group.id);
+      infos.set(service, await this.read(service, [...ask]));
+    }
+    const missing = resolved.filter((r) => infos.get(r.service)?.get(r.groupId)?.exists !== true);
+    if (missing.length) throw new RegError("register/group-missing", `${missing.length === 1 ? "This group does" : "These groups do"} not exist in NiFi: ${missing.map((m) => `${m.groupId} (${m.service})`).join(", ")}. Was it deleted, or is the link of another instance?`, { groups: missing.map((m) => ({ service: m.service, group: m.groupId, link: m.link })) });
+
+    const taken: Taken[] = [];
+    const added: RegisteredGroup[] = [], unchanged: RegisteredGroup[] = [];
+    for (const r of resolved) {
+      const map = infos.get(r.service)!, info = map.get(r.groupId)!;
+      const shown: RegisteredGroup = { service: r.service, group: { id: r.groupId, name: info.name ?? r.groupId, path: crumbs(info) }, link: r.link };
+      const ancestors = new Set((info.path ?? []).map((p) => p.id.toLowerCase()));
+      let already = false;
+      const there = [...this.store.flowRegistrations({ service: r.service }),
+        ...ownGroups.filter((g) => g.service === r.service).map((g) => ({ owner: ownKey, groupId: g.group.id, groupName: g.group.name, registeredBy: g.addedBy }))];
+      for (const e of there) {
+        const other = map.get(e.groupId);
+        const relation: Taken["relation"] | null = e.groupId === r.groupId ? "same" : ancestors.has(e.groupId) ? "inside"
+          : other?.exists && (other.path ?? []).some((p) => p.id.toLowerCase() === r.groupId) ? "contains" : null;
+        if (!relation) continue;
+        if (e.owner === ownKey) { if (relation !== "contains") already = true; continue; }
+        taken.push({ service: r.service, group: { id: e.groupId, name: e.groupName }, relation, by: { ...this.ownerOf(e.owner), registeredBy: e.registeredBy } });
+      }
+      if (already) { unchanged.push(shown); continue; }
+      added.push(shown);
+    }
+    if (taken.length) throw takenError(taken);
+    return { added, unchanged };
   }
 
   private dedupe(rs: ResolvedLink[]): ResolvedLink[] {
@@ -286,6 +299,99 @@ export class Registrations {
       this.store.auditFlow(actor, flow.id, "register-rename");
     });
     return { flow: flow.id, name: next };
+  }
+
+  // --- drafts (§7.9): the same actions on a draft; nothing is registered, nothing is published ---------------------
+
+  createDraft(actor: Actor, name?: unknown): RegistrationDraft {
+    if (name !== undefined && name !== null) this.checkName(name);
+    return this.store.createRegistrationDraft(actor.id, name === undefined || name === null ? null : String(name).trim());
+  }
+
+  draft(id: unknown): RegistrationDraft {
+    if (typeof id !== "string" || !DRAFT_ID.test(id)) throw new RegError("register/bad-request", "draft is a draft id (rgd_…).");
+    const d = this.store.registrationDraft(id);
+    if (!d) throw new RegError("register/not-found", `No registration draft ${id} (a draft nobody touched for a day is gone).`);
+    return d;
+  }
+
+  async draftAdd(id: unknown, links: unknown, actor: Actor): Promise<{ draft: string; added: RegisteredGroup[]; unchanged: RegisteredGroup[] }> {
+    const d = this.draft(id);
+    const { added, unchanged } = await this.stage(links, d.id, d.groups);
+    const at = new Date().toISOString();
+    const fresh = this.draft(d.id);
+    this.store.putRegistrationDraft({ ...fresh, groups: [...fresh.groups, ...added.map((a): RegistrationDraftGroup => ({ service: a.service, group: a.group, link: a.link, addedBy: actor.id, addedAt: at }))] });
+    return { draft: d.id, added, unchanged };
+  }
+
+  /** A group leaving the draft takes the spoken hand-overs that name it. */
+  draftRemove(id: unknown, groups: unknown): { draft: string; removed: { service: string; group: string }[]; droppedHandoffs: string[] } {
+    const d = this.draft(id);
+    if (!Array.isArray(groups) || groups.length < 1 || groups.length > LINKS_MAX
+      || !groups.every((g) => g && typeof g === "object" && typeof g.service === "string" && typeof g.group === "string")) {
+      throw new RegError("register/bad-request", `groups is a list of 1 to ${LINKS_MAX} {service, group}.`);
+    }
+    const wanted = groups.map((g: { service: string; group: string }) => ({ service: g.service, group: g.group.toLowerCase() }));
+    const lost = wanted.filter((w) => !d.groups.some((g) => g.service === w.service && g.group.id === w.group));
+    if (lost.length) throw new RegError("register/not-found", `The draft has no group ${lost.map((l) => `${l.group} (${l.service})`).join(", ")}.`);
+    const gone = (service: string, group: string) => wanted.some((w) => w.service === service && w.group === group.toLowerCase());
+    const dropped = d.handoffs.filter((h) => gone(h.from.service, h.from.group) || ("group" in h.to && gone(h.to.service, h.to.group)));
+    this.store.putRegistrationDraft({
+      ...d,
+      groups: d.groups.filter((g) => !gone(g.service, g.group.id)),
+      handoffs: d.handoffs.filter((h) => !dropped.includes(h)),
+    });
+    return { draft: d.id, removed: wanted, droppedHandoffs: dropped.map((h) => h.id) };
+  }
+
+  draftRename(id: unknown, name: unknown): { draft: string; name: string } {
+    const d = this.draft(id);
+    const next = this.checkName(name);
+    this.store.putRegistrationDraft({ ...d, name: next });
+    return { draft: d.id, name: next };
+  }
+
+  /** Keeps (or replaces, or removes) a spoken hand-over of the draft. From and to must be groups of the draft; to may be the
+   *  outside ({system}). Whether the component is in the group is not known before the chaining (step 3). */
+  draftDeclareHandoff(id: unknown, b: Record<string, unknown>, actor: Actor): { draft: string; handoff?: RegistrationDraftHandoff; removed?: string } {
+    const d = this.draft(id);
+    const find = (v: unknown, what: string): number => {
+      const i = typeof v === "string" ? d.handoffs.findIndex((h) => h.id === v) : -1;
+      if (i < 0) throw new RegError("register/not-found", `The draft has no hand-over ${String(v)} (${what}).`);
+      return i;
+    };
+    if (b.remove !== undefined) {
+      const i = find(b.remove, "remove");
+      this.store.putRegistrationDraft({ ...d, handoffs: d.handoffs.filter((_, j) => j !== i) });
+      return { draft: d.id, removed: d.handoffs[i]!.id };
+    }
+    const own = (service: unknown, group: unknown, role: string) => {
+      if (typeof service !== "string" || typeof group !== "string" || !d.groups.some((g) => g.service === service && g.group.id === group.toLowerCase()))
+        throw new RegError("register/bad-handoff", `The ${role} is not a group of this draft: add its link first.`);
+      return { service, group: group.toLowerCase() };
+    };
+    const from = b.from as Record<string, unknown> | undefined, to = b.to as Record<string, unknown> | undefined;
+    if (!from || typeof from !== "object" || !to || typeof to !== "object") throw new RegError("register/bad-request", "from is {service, group, component, relationship?}, to is {service, group} or {system}.");
+    if (typeof from.component !== "string" || !from.component.trim()) throw new RegError("register/bad-request", "from.component is the component (id or name) the data leaves from.");
+    if (from.relationship !== undefined && (typeof from.relationship !== "string" || !from.relationship)) throw new RegError("register/bad-request", "from.relationship is a relationship name.");
+    if (typeof b.quote !== "string" || !b.quote.trim() || b.quote.length > QUOTE_MAX) throw new RegError("register/bad-request", `quote is the owner's own words, 1 to ${QUOTE_MAX} characters.`);
+    const fromG = own(from.service, from.group, "from");
+    let target: RegistrationDraftHandoff["to"];
+    if (typeof to.system === "string" && to.system.trim()) target = { system: to.system.trim() };
+    else target = own(to.service, to.group, "to");
+    const at = new Date().toISOString();
+    const handoff: RegistrationDraftHandoff = {
+      id: b.replace !== undefined ? d.handoffs[find(b.replace, "replace")]!.id : `hof_${randomBytes(6).toString("hex")}`,
+      from: { ...fromG, component: from.component.trim(), ...(from.relationship !== undefined ? { relationship: from.relationship as string } : {}) },
+      to: target, quote: b.quote.trim(), declaredBy: actor.id, declaredAt: at,
+    };
+    this.store.putRegistrationDraft({ ...d, handoffs: [...d.handoffs.filter((h) => h.id !== handoff.id), handoff] });
+    return { draft: d.id, handoff };
+  }
+
+  private checkName(name: unknown): string {
+    if (typeof name !== "string" || !name.trim() || name.trim().length > NAME_MAX) throw new RegError("register/bad-request", `name is 1 to ${NAME_MAX} characters.`);
+    return name.trim();
   }
 
   /** unregister: a business (or a shared module) and all its registered groups go; flow_segments and handoffs with it. */

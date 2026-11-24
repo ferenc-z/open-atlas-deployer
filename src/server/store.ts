@@ -264,6 +264,12 @@ CREATE TABLE IF NOT EXISTS flow_handoffs (
   to_service TEXT, to_group TEXT, to_system TEXT,
   quote TEXT NOT NULL, declared_by TEXT NOT NULL, declared_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS flow_handoffs_flow ON flow_handoffs (flow);
+-- S39 (§7.9): the registration page's draft: the groups, spoken hand-overs and name a person and the AI are putting
+-- together before Register. Nothing here is a registration; a draft nobody touched for a day goes.
+CREATE TABLE IF NOT EXISTS registration_drafts (
+  id TEXT PRIMARY KEY, created_by TEXT NOT NULL, name TEXT,
+  groups TEXT NOT NULL, handoffs TEXT NOT NULL, preview TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 `;
 
 /** queued: waiting for the host's executor to claim it; the rest are the executor's states. */
@@ -2026,6 +2032,33 @@ export class Store {
     return Number(this.db.prepare("DELETE FROM flow_registrations WHERE owner = ?").run(owner).changes);
   }
 
+  // S39 (§7.9): registration drafts. A draft not touched for REGISTRATION_DRAFT_TTL_MS does not exist (read as gone at once,
+  // deleted by pruneRegistrationDrafts).
+
+  createRegistrationDraft(by: string, name: string | null = null): RegistrationDraft {
+    const id = `rgd_${randomBytes(6).toString("hex")}`;
+    const at = this.stamp();
+    this.db.prepare("INSERT INTO registration_drafts (id, created_by, name, groups, handoffs, preview, created_at, updated_at) VALUES (?, ?, ?, '[]', '[]', NULL, ?, ?)").run(id, by, name, at, at);
+    return { id, createdBy: by, name, groups: [], handoffs: [], preview: null, createdAt: at, updatedAt: at };
+  }
+
+  registrationDraft(id: string): RegistrationDraft | null {
+    const r = this.db.prepare("SELECT * FROM registration_drafts WHERE id = ? AND updated_at >= ?").get(id, new Date(this.now().getTime() - REGISTRATION_DRAFT_TTL_MS).toISOString()) as Row | undefined;
+    return r ? { id: r.id, createdBy: r.created_by, name: r.name ?? null, groups: JSON.parse(r.groups), handoffs: JSON.parse(r.handoffs), preview: r.preview === null ? null : JSON.parse(r.preview), createdAt: r.created_at, updatedAt: r.updated_at } : null;
+  }
+
+  /** Saves a draft's name, groups and hand-overs, and the last preview when one is given (null clears it); touches it. */
+  putRegistrationDraft(d: Pick<RegistrationDraft, "id" | "name" | "groups" | "handoffs"> & { preview?: unknown }) {
+    const withPreview = d.preview !== undefined;
+    this.db.prepare(`UPDATE registration_drafts SET name = ?, groups = ?, handoffs = ?, ${withPreview ? "preview = ?, " : ""}updated_at = ? WHERE id = ?`)
+      .run(...[d.name, JSON.stringify(d.groups), JSON.stringify(d.handoffs), ...(withPreview ? [d.preview === null ? null : JSON.stringify(d.preview)] : []), this.stamp(), d.id] as (string | null)[]);
+  }
+
+  /** Deletes the drafts nobody touched for a day; how many went. */
+  pruneRegistrationDrafts(): number {
+    return Number(this.db.prepare("DELETE FROM registration_drafts WHERE updated_at < ?").run(new Date(this.now().getTime() - REGISTRATION_DRAFT_TTL_MS).toISOString()).changes);
+  }
+
   sharedModule(id: string): SharedModule | null {
     const r = this.db.prepare("SELECT * FROM shared_modules WHERE id = ?").get(id) as Row | undefined;
     return r ? { id: r.id, name: r.name, createdBy: r.created_by, createdAt: r.created_at, updatedAt: r.updated_at } : null;
@@ -2247,6 +2280,19 @@ export type FlowChangeKind ="found" | "updated" | "confirmed" | "renamed" | "stu
 export interface FlowRegistration {
   owner: string; role: "segment" | "shared"; service: string; groupId: string; groupName: string; groupPath: string | null;
   slice: string; link: string | null; registeredBy: string; registeredAt: string;
+}
+/** S39 (§7.9): how long a registration draft lives without being touched. */
+export const REGISTRATION_DRAFT_TTL_MS = 24 * 3600_000;
+export interface RegistrationDraftGroup { service: string; group: { id: string; name: string; path: string }; link: string | null; addedBy: string; addedAt: string }
+/** A spoken hand-over kept in a draft (the same fields as flow_handoffs). to is a group of the draft or the outside ({system}). */
+export interface RegistrationDraftHandoff {
+  id: string; from: { service: string; group: string; component: string; relationship?: string };
+  to: { service: string; group: string } | { system: string }; quote: string; declaredBy: string; declaredAt: string;
+}
+export interface RegistrationDraft {
+  id: string; createdBy: string; name: string | null; groups: RegistrationDraftGroup[]; handoffs: RegistrationDraftHandoff[];
+  /** The last preview the chaining made (step 3); null until then. */
+  preview: unknown | null; createdAt: string; updatedAt: string;
 }
 export interface SharedModule { id: string; name: string; createdBy: string; createdAt: string; updatedAt: string }
 export interface FlowChange { id: number; flow: string | null; service: string; at: string; by: string; kind: FlowChangeKind; text: string; revision: number | null; verdict: GateVerdict | null }
