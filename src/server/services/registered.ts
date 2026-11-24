@@ -56,8 +56,28 @@ export function restrictTopology(t: Topology, ids: Set<string>): Topology {
   };
 }
 
-/** The fingerprint of just these groups' part of the canvas. */
-export const registeredFingerprint = (t: Topology | null | undefined, ids: Set<string>): string | null => (t ? topologyFingerprint(restrictTopology(t, ids)) : null);
+/** The fingerprint of just these groups' part of the canvas: what is inside them (pieces, ports, processors, ends, S2S).
+ *  Left out (S39 UAT 2026-11-25): the connections between groups and the one hop out, which change whenever a neighbour
+ *  is registered or not, and processor names past the first five (executors before 0.9.8 sent only five). */
+export const registeredFingerprint = (t: Topology | null | undefined, ids: Set<string>): string | null => {
+  if (!t) return null;
+  const r = restrictTopology(t, ids);
+  const groups = r.groups.map((g) => ({ ...g, fragments: (g.fragments ?? []).map((f) => ({ ...f, names: (f.names ?? []).slice(0, 5) })) }));
+  return topologyFingerprint({ ...r, groups, links: [], ...(r.neighbors ? { neighbors: [] } : {}) });
+};
+
+/** What to compare a registration's groups against: the canvas when the model was published, or, when that snapshot was
+ *  read before these groups were registered (only registered groups are read), the first snapshot after it that has them. */
+function baseline(store: Store, service: string, publishedAt: string, ids: string[]): Topology | undefined {
+  const has = (t: Topology | undefined) => !t || t.scope !== "groups" || ids.every((id) => t.groups.some((g) => g.id === id));
+  const then = store.latestTopology(service, publishedAt)?.body as Topology | undefined;
+  if (has(then)) return then;
+  for (const s of store.topologies(service, publishedAt)) {
+    const t = store.latestTopology(service, s.takenAt)?.body as Topology | undefined;
+    if (t && has(t)) return t;
+  }
+  return undefined;
+}
 
 /** describe's executor-old gap: the switch is on, something is registered, and the executors of the service answer but
  *  none names flow-groups@1 (they would read the whole canvas, not the registered groups). An offline one is another thing. */
@@ -86,7 +106,6 @@ export function canvasChanges(store: Store, service: string): CanvasChange[] {
   const regs = store.flowRegistrations({ service });
   if (!m || !now || !regs.length) return [];
   const topo = now.body as Topology;
-  const then = store.latestTopology(service, m.publishedAt)?.body as Topology | undefined;
   const owners = new Map<string, typeof regs>();
   for (const r of regs) owners.set(r.owner, [...(owners.get(r.owner) ?? []), r]);
   const out: CanvasChange[] = [];
@@ -103,7 +122,7 @@ export function canvasChanges(store: Store, service: string): CanvasChange[] {
     }
     if (!groups.length) {
       const ids = new Set(rows.map((r) => r.groupId));
-      const was = registeredFingerprint(then, ids), is = registeredFingerprint(topo, ids);
+      const was = registeredFingerprint(baseline(store, service, m.publishedAt, [...ids]), ids), is = registeredFingerprint(topo, ids);
       if (was && is && was !== is) groups.push({ id: rows[0]!.groupId, name: rows[0]!.groupName, what: "changed", text: `组「${rows.map((r) => r.groupName).join("、")}」里的处理器或连线变了` });
     }
     if (groups.length) out.push({ owner, role, name, groups });

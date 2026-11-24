@@ -80,6 +80,13 @@ test("a change in a group nobody registered is none; a registered group renamed,
   assert.equal(registeredFingerprint(was, new Set(["A", "M"])), registeredFingerprint(withO, new Set(["A", "M"])));
   store.putTopology("n1", "2026-11-24T11:00:00Z", "h2", withO);
   assert.deepEqual(canvasChanges(store, "n1"), []);
+  // S39 UAT: a neighbour registered later turns the one hop out into a link, and an executor 0.9.8 names more processors:
+  // neither is a change inside the registered groups.
+  const linked = { ...was, links: [{ from: { group: "A", port: "P1" }, to: { group: "M", port: "in" } }] } as unknown as Topology;
+  const named = { ...was, groups: was.groups.map((g) => ({ ...g, fragments: g.fragments.map((f) => ({ ...f, names: ["f", "g", "h", "i", "j", "k"] })) })) };
+  const five = { ...was, groups: was.groups.map((g) => ({ ...g, fragments: g.fragments.map((f) => ({ ...f, names: ["f", "g", "h", "i", "j"] })) })) };
+  assert.equal(registeredFingerprint(was, new Set(["M"])), registeredFingerprint(linked, new Set(["M"])));
+  assert.equal(registeredFingerprint(five, new Set(["A"])), registeredFingerprint(named, new Set(["A"])));
   canvasChangeTodos(store, "n1");
   assert.equal(store.todos("n1").length, 0);
   // A is renamed on the canvas.
