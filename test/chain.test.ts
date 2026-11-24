@@ -140,6 +140,23 @@ test("chain: schedules place workers by worker_name = group name and the manager
   assert.deepEqual(names(p), [["mgr"], ["reader"], ["loader"], ["next_mgr"], ["mailer"]]);
 });
 
+test("chain: a schedule whose workers only match processors in the registered groups is asked about, with candidates", () => {
+  // S39 UAT 2026-11-25: worker names that are processor names, not group names, made the schedule vanish from the chain.
+  const t = scoped([grp("A", "cx-mail", [frag("a", { names: ["mail_reader"], starts: 1 })]), grp("B", "cx-post", [frag("b", { names: ["erp_poster"] })])]);
+  const headers = [
+    { schedule_id: 7, schedule_name: "mail_parse", manager_name: null, trigger_exchange_name: "ex.trigger", trigger_routing_key: "m", final_schedule_seq: null, final_worker_id: null },
+    { schedule_id: 8, schedule_name: "elsewhere", manager_name: null, trigger_exchange_name: "ex.trigger", trigger_routing_key: "x", final_schedule_seq: null, final_worker_id: null },
+  ];
+  const d = (s: number, seq: number, name: string) => ({ schedule_id: s, schedule_seq: seq, worker_id: s * 10 + seq, worker_name: name, worker_exchange_name: "ex.worker", worker_routing_key: `w.${name}` });
+  const details = [d(7, 1, "mail_reader"), d(7, 2, "erp_poster"), d(7, 3, "approval_notifier"), d(8, 1, "far_worker")];
+  const p = chain(inp([["n1", "A"], ["n1", "B"]], [{ id: "n1", addresses: [], topology: t }], { schedules: { headers, details } }));
+  const asked = p.gaps.filter((g) => g.kind === "worker-unplaced");
+  assert.deepEqual(asked.map((g) => [g.worker?.name, (g.places ?? []).map((x) => [x.group.name, x.basis])]), [
+    ["mail_reader", [["cx-mail", "processor-name"]]], ["erp_poster", [["cx-post", "processor-name"]]], ["approval_notifier", []],
+  ]);
+  assert.ok(!p.gaps.some((g) => g.worker?.name === "far_worker"));
+});
+
 test("chain: told hand-overs are declared edges with the owner's words and close the gap they answer", () => {
   const t = scoped([grp("A", "Export", [frag("a", { outputs: ["out"], starts: 1 })]), grp("B", "Import", [frag("b", { starts: 1 })])], {
     neighbors: [nbr("A", "out", "out", { kind: "processor", id: "p1", name: "PutSFTP", group: "P" })],

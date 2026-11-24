@@ -403,7 +403,10 @@ export function chain(input: ChainInput): Preview {
       return p ? undefined : place(d.worker_name);
     });
     const manager = place(h.manager_name);
-    if (!placed.some(Boolean) && !manager && !told.some(Boolean)) continue;
+    // Nothing placed yet: the schedule is still this business's when a registered group runs one of its workers by name
+    // (a processor or a group named like the worker, §7.8 6). Its workers become questions with those candidates, never
+    // placed by code; a schedule with no such trace in these groups belongs to another business.
+    if (!placed.some(Boolean) && !manager && !told.some(Boolean) && !rows.some((d) => placesFor(String(d.worker_name ?? "")).length)) continue;
     if (str(h.final_worker_id) !== undefined && !finalRow) out.notes.push(`schedule ${name}：final_worker_id ${h.final_worker_id} 不在它的步骤里。`);
     if (manager) { manager.origin = "e2e_trace"; manager.steps.push(String(h.manager_name)); }
     let prev: { seg: Seg; seq: number } | undefined;
