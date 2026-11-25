@@ -6,6 +6,7 @@ import { test } from "node:test";
 import { BusinessScanner, businessCheck, businessLight, classifyEvents, flowLight, locator } from "../src/server/services/business.ts";
 import type { Topology } from "../src/server/services/flowcounts.ts";
 import { flowDetail } from "../src/server/services/page-views.ts";
+import { moduleHealth } from "../src/server/services/register-chain.ts";
 import type { ModelV2, Segment } from "../src/server/services/trace/model.ts";
 import { Store, type FlowCountRow, type FlowRecord } from "../src/server/store.ts";
 
@@ -200,4 +201,40 @@ test("#8 the business detail: light and problems with titles, the graph's lights
   assert.deepEqual(d.findBy, [{ cue: "fileName", attribute: "filename" }]);
   assert.deepEqual(d.history.map((h) => [h.by, h.text, h.verdict]), [["ai", "AI 找到这条业务", "published"]]);
   assert.equal(flowDetail(store, "flw_none", clock.t), undefined);
+});
+
+test("S39 §7.8 ⑦: two businesses share a registered error module; each shows only its own segment's failures, the module the total", () => {
+  const { store, clock, row } = world();
+  const MOD = "shm_errors1", FLOW2 = "flw_billing1";
+  // A second business Billing (B) on n1; both Ingest and Billing send their failures to E, now a registered module.
+  const t1 = store.latestTopology("n1")!.body as Topology;
+  store.putTopology("n1", "2026-11-19T10:05:00Z", "h1b", {
+    ...t1,
+    groups: [...t1.groups, { id: "B", name: "Billing", root: false, fragments: [frag("b")] }],
+    links: [...t1.links, { connection: "l2", from: { group: "B", fragment: "b", port: "err" }, to: { group: "E", fragment: "e", port: "in" } }],
+  });
+  const m = store.flowModel("n1")!.model;
+  const seg = (o: Partial<Segment>): Segment => ({ id: "x", name: "x", match: [], steps: [], entries: [], exits: [], group: { id: "x", name: "x" }, slice: "*", role: "segment", ...o } as Segment);
+  const m1: ModelV2 = { ...m, segments: [
+    ...m.segments.map((s) => (s.id === "E" ? { ...s, module: MOD } : s)),
+    seg({ id: "B", name: "Billing", flow: FLOW2, group: { id: "B", name: "Billing" }, steps: [{ id: "g", name: "Billing", position: { kind: "process-group", id: "B" } }],
+      entries: [{ id: "in", step: "g", channel: { type: "external", system: "erp" } }], exits: [{ id: "out", step: "g", channel: { type: "external", system: "ledger" }, component: "p-ledger", relationship: "success" }] }),
+  ] };
+  store.flowTransaction(() => store.insertFlowModel("n1", 1, m1, "register", { id: "admin", via: "cli" }, []));
+  store.putFlow({ ...store.flow(FLOW)!, id: FLOW2, name: "Billing" });
+  store.setFlowSegments(FLOW2, [{ service: "n1", segment: "B" }]);
+  store.putSharedModule({ id: MOD, name: "Errors", createdBy: "admin", entries: [], exits: [] });
+  store.flowTransaction(() => store.addFlowRegistrations([{ owner: MOD, role: "shared", service: "n1", groupId: "E", groupName: "Errors", groupPath: null, slice: "*", link: null, registeredBy: "admin" }]));
+  // Counted the old way before the rule: Ingest had the module's total open as its own.
+  store.noteFlowAnomaly({ flow: FLOW, service: "n1", ref: "E", anomaly: "processing-failed", light: "attention", at: "2026-11-19T11:45:00Z", count: 90, detail: { segment: "A", errorGroup: "Errors", received: 90, shared: true } });
+  // The module received 93; Ingest's own failure queue holds 2; Billing has nothing of its own.
+  store.putFlowCounts([row("n1", "2026-11-19T11:50:00Z", "group", "E", 93, 0), row("n1", "2026-11-19T11:00:00Z", "group", "B", 5, 5)]);
+  store.addServiceSamples([{ service: "n1", member: "local:/lab/8443", at: "2026-11-19T11:59:00Z", nifi: { backpressure: { top: [{ id: "c9", name: "failure", groupId: "A", sourceName: "PutDB", destinationName: "Output", destinationId: "p-out", flowFilesQueued: 2 }] } } }] as never);
+  businessCheck(store, "n1", clock.t);
+  const mine = (flow: string) => store.flowAnomalies({ state: "open" }).filter((a) => a.flow === flow).map((a) => `${a.anomaly} ${a.ref} ${a.count}`);
+  assert.deepEqual(mine(FLOW), ["processing-failed c9 2"], "Ingest: only its own segment's failures; the module's 93 (and the 90 counted before) are not its own");
+  assert.deepEqual(mine(FLOW2), [], "Billing: nothing failed in its own segment");
+  assert.equal(flowLight(store, store.flow(FLOW2)!).light, "healthy");
+  const h = moduleHealth(store, store.sharedModule(MOD)!, clock.t);
+  assert.equal(h.flowfilesIn, 93, "the module's own health has the total");
 });

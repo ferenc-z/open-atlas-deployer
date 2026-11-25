@@ -5,6 +5,9 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
 
 ## Unreleased
 
+- S39 §7.8 ⑦ (owner 2026-11-25): what a registered shared module receives (an error module's failures) is only the
+  module's own health; a business fails only in its own segments. Before, every business sending into an error module
+  showed the module's total as its own processing-failed; those open entries close on the next check.
 - S39 UAT fixes (2026-11-25): a shared module whose exits only write out of NiFi (an error log, an audit trail, a dead
   letter store) no longer makes every business sending into it report `exit-unregistered`. A schedule whose worker
   names match processors (or groups named like them) in the registered groups now joins the chain as questions

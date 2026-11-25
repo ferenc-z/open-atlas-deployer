@@ -2,7 +2,8 @@
 // (B2). Six anomalies (B3) plus e2e_trace's failures (P3), each found per business on its segments (group, slice,
 // exits), kept in flow_anomalies and opened and closed like the machine's alerts:
 //   processing-failed  data routed to failure (a provenance event with relationship failure, a queue named failure that
-//                      holds data, or a shared error-handling group that received data)            attention
+//                      holds data, or an unregistered shared error-handling group that received data;
+//                      a registered shared module's failures are the module's own, §7.8 ⑦)          attention
 //   invalid-data       the same with relationship invalid (validation processors)                    attention
 //   stuck              a queue that has not been empty for the business's two stuck times (B4)        attention / failing
 //   handover-lost      S2S: sent by one service and not received by the other (the hour's counts)     failing
@@ -211,12 +212,14 @@ export function handoverConditions(store: Store, service: string, locate: Return
 }
 
 /** processing-failed through a shared error-handling group (A7 ③, a name like error / failure): data it received in the
- *  last QUIET_MINUTES counts for each business that links into it (several feeders: each of them, it cannot tell which). */
+ *  last QUIET_MINUTES counts for each business that links into it (several feeders: each of them, it cannot tell which).
+ *  S39 §7.8 ⑦ (owner 2026-11-25): a registered shared module (a shared segment with a module id) is left out. What it
+ *  receives is only the module's own health (moduleHealth); a business fails only in its own segments. */
 export function errorGroupConditions(store: Store, service: string, locate: ReturnType<typeof locator>, now: Date): Observation[] {
   const model = store.flowModel(service)?.model;
   const topo = store.latestTopology(service)?.body as Topology | undefined;
   if (!model || !topo) return [];
-  const errorGroups = model.segments.filter((s) => s.role === "shared" && FAILURE_GROUP.test(s.group.name));
+  const errorGroups = model.segments.filter((s) => s.role === "shared" && !s.module && FAILURE_GROUP.test(s.group.name));
   if (!errorGroups.length) return [];
   const counts = store.flowCounts(service, new Date(now.getTime() - QUIET_MINUTES * MIN).toISOString(), now.toISOString());
   const out: Observation[] = [];
@@ -273,6 +276,10 @@ export function businessCheck(store: Store, service: string, now: Date = new Dat
     // Queue- and count-based events are a current amount: replace, do not add up every minute.
     for (const o of events.filter((x) => x.anomaly !== "processor-error")) store.noteFlowAnomaly({ flow: o.place.flow, service, ref: o.ref, anomaly: o.anomaly, light: o.light, at: o.at, count: o.count, detail: o.detail, replace: true });
     record(store, service, events.filter((x) => x.anomaly === "processor-error"), now, { kinds: ["stuck", "handover-lost"], seen });
+    // §7.8 ⑦: what a business had open for a registered module's group (counted before the rule) closes now, not after
+    // QUIET_MINUTES: it is the module's, not the business's.
+    const moduleGroups = new Set((store.flowModel(service)?.model.segments ?? []).filter((s) => s.role === "shared" && s.module).map((s) => s.group.id));
+    if (moduleGroups.size) for (const a of store.flowAnomalies({ service, state: "open" })) if (a.detail.errorGroup !== undefined && moduleGroups.has(a.ref)) store.closeFlowAnomaly(a.id, now.toISOString());
     store.setServiceFact(service, "*", BULLETINS_AT, now.toISOString());
   });
 }
