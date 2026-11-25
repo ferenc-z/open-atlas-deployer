@@ -169,10 +169,14 @@ export class RegisterChain {
     // The registered groups and the groups around them (an S2S sender in a whole-canvas topology is named by the unit
     // under root, an ancestor of the registered group: not an unregistered sender).
     const near = new Set<string>();
+    const modules = o.modules ?? this.modules();
     for (const [svc, ids] of byService) {
       const s = services.find((x) => x.id === svc);
       if (!s) continue;
-      s.topology = (await this.scan(svc, ids)).topology;
+      // §7.8 8: the shared modules on this service are read too (their ports' neighbors and the processors that write out
+      // of NiFi), so a business that ends in a module, or in a module after a module, is seen to end there.
+      const mods = modules.filter((m) => m.service === svc).map((m) => m.group.id);
+      s.topology = (await this.scan(svc, [...ids, ...mods])).topology;
       for (const g of s.topology?.groups ?? []) {
         if (!ids.includes(g.id)) continue;
         near.add(`${svc}\0${g.id}`);
@@ -186,7 +190,7 @@ export class RegisterChain {
     const p = chain({
       name: o.name ?? "", ...(o.flow ? { flow: o.flow } : {}),
       groups: groups.map((g) => ({ service: g.service, group: g.group, slice: g.slice ?? "*", link: g.link ?? null })),
-      services, modules: o.modules ?? this.modules(), handoffs: o.handoffs ?? [], senders, ...(schedules ? { schedules } : {}),
+      services, modules, handoffs: o.handoffs ?? [], senders, ...(schedules ? { schedules } : {}),
       placements: (o.placements ?? []).map((x) => ({ schedule: x.schedule, worker: x.worker, service: x.service, group: x.group, quote: x.quote })),
     });
     if (!schedules && !notes.length) notes.push(this.d.schedules ? "这些服务没有配置 e2e_trace 或没读到 schedule 定义，这次只按画布串，没有 schedule 这部分。" : "这个 Deployer 没接 e2e_trace，这次只按画布串，没有 schedule 这部分。");
