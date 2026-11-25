@@ -5,6 +5,46 @@
 - `contract.edn`：Graph 契约，约 75 KB。里面的 `:workspace/id "deployer"` 和 `:graph/id "e2e-trace"` 是占位，上传前要换成 Studio 草稿里的真实 id。
 - `saved-queries.json`：Deployer 按名字调用的 8 个存好的查询。名字、参数一个都不能改。
 
+## 对 Studio Graph 的要求
+
+Deployer 只通过数据面的 `run_saved_query` 按名字调这 8 个查询，自己不写 EQL。所以下面每一条都是硬要求，不满足时 Deployer 读不到或读错。
+
+**Studio**
+- 有 Builder MCP（9631）和数据面 MCP（9632），Deployer 容器都能访问到。已测版本：Studio 2.11.3。
+- Graph 放在哪个 workspace 都可以，名字也可以自定，但要发布过（Deployer 读的是已发布版本），在 Deployer 上配服务时写全名 `<workspace>/<graph>`。
+- graph token（`oat_v1.`）能读这个 Graph 的数据面就够了。由 Deployer 签发时，Deployer 用的 workspace token（`oaw_v1.`）要有这个 workspace 的读写权限。建议 token 由专门的 Studio 成员生成，避免人员变动后失效。
+
+**数据源**
+- 只有一个，id 必须是 `e2e-trace-ch`，类型 `sql`，只读。契约按这个 id 引用。
+- 连接 ClickHouse 的是 Studio 的容器；JDBC URL 写 Studio 能连到的地址，库是 `e2e_trace`。
+- 账号密码用 Studio 凭据引用（`${E2E_TRACE_DB_USER}`、`${E2E_TRACE_DB_PASSWORD}`），账号只需要 `e2e_trace` 库的 SELECT。
+
+**契约**
+- 用 `contract.edn` 原文，只把两个占位 id（`"deployer"`、`"e2e-trace"`）换成 Studio 草稿里的 `:workspace/id`、`:graph/id`。不要改实体、字段或查询。
+
+**存好的查询**
+- 8 个，名字、参数名、参数类型、eql 都和 `saved-queries.json` 一致。少一个或改名，Deployer 对应的功能就没有：
+
+| 查询 | 参数 | Deployer 用来做什么 |
+|---|---|---|
+| `e2e_schedules` | 无 | 读 schedule 定义（登记时串联 worker） |
+| `e2e_schedule_steps` | 无 | 读 schedule 的步骤 |
+| `e2e_records_by_correlation` | `correlation_id`、`from`、`to` | 按业务键追数据 |
+| `e2e_records_by_file` | `file_name`、`from`、`to` | 按文件名找数据 |
+| `e2e_records_by_subject` | `email_subject`、`from`、`to` | 按邮件主题找数据 |
+| `e2e_records_by_sender` | `email_from`、`from`、`to` | 按发件人找数据 |
+| `e2e_failures` | `from`、`to` | 时间段内失败的运行记录（最多 200 条） |
+| `e2e_worker_durations` | `from`、`to` | 每个 worker 的 P95 耗时（判断"慢"） |
+
+`from`、`to` 是 ISO 时间字符串，所有参数都是 string。
+
+**ClickHouse（Graph 背后的数据）**
+- 已测版本 22.8。库名固定 `e2e_trace`（查询里写死了）。
+- `rt_dwd_l1_trace_log`：运行记录，按 `receive_datetime` 带时间范围查。要有这些列：`correlation_id`、`schedule_id`、`schedule_name`、`schedule_seq`、`manager_name`、`worker_id`、`worker_name`、`process_stage`（start / processing / end）、`process_status`（success / failure）、`node_name`、`has_next_worker`、`next_worker_names`（数组）、`final_worker_name`、`file_name`、`source_path`、`email_from`、`email_subject`、`receive_datetime`（DateTime64）。
+- `schedule_header`（用 `FINAL` 读，ReplacingMergeTree）：`schedule_id`、`schedule_name`、`schedule_desc`、`schedule_type`、`manager_id`、`manager_name`、`manager_mq_name`、`trigger_exchange_name`、`trigger_routing_key`、`final_schedule_seq`、`final_worker_id`、`project_name`、`on_demand_flag`。最多读 500 个 schedule。
+- `schedule_detail`（用 `FINAL` 读）：`schedule_id`、`schedule_name`、`schedule_seq`、`worker_id`、`worker_name`、`worker_message_name`、`previous_worker_id`、`previous_worker_name`、`worker_exchange_name`、`worker_routing_key`、`manager_exchange_name`、`manager_routing_key`。最多读 2000 步。
+- worker 要能对到 NiFi 里的组：`schedule_detail.worker_name` 要和 worker 所在 NiFi 组的组名对应，对不上的由登记对话里负责人确认。
+
 ## 交给 agent 的话
 
 把两个文件给连着 Studio Builder MCP 的 agent，原样发下面这段（尖括号里的值换成你的）：
