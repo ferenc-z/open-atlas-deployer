@@ -1,0 +1,168 @@
+[
+  {
+    "name": "e2e_records_by_correlation",
+    "description": "Run records of one correlation id, in a time range (required), oldest first; at most 500.",
+    "params": [
+      {
+        "name": "correlation_id",
+        "type": "string",
+        "required": true,
+        "description": "The correlation id to look for.",
+        "example": "aaaaaaaa-0000-4000-8000-00000000000a"
+      },
+      {
+        "name": "from",
+        "type": "string",
+        "required": true,
+        "description": "Start of the time range, ISO time (inclusive).",
+        "example": "2020-01-01T00:00:00Z"
+      },
+      {
+        "name": "to",
+        "type": "string",
+        "required": true,
+        "description": "End of the time range, ISO time (exclusive).",
+        "example": "2100-01-01T00:00:00Z"
+      }
+    ],
+    "eql": "{:entity {:e2e.by_correlation/correlation_id ?correlation_id :e2e.by_correlation/from ?from :e2e.by_correlation/to ?to} :query [{:e2e.by_correlation/records [:e2e.record/row_key :e2e.record/correlation_id :e2e.record/schedule_id :e2e.record/schedule_name :e2e.record/schedule_seq :e2e.record/manager_name :e2e.record/worker_id :e2e.record/worker_name :e2e.record/process_stage :e2e.record/process_status :e2e.record/node_name :e2e.record/has_next_worker :e2e.record/next_worker_names :e2e.record/final_worker_name :e2e.record/file_name :e2e.record/source_path :e2e.record/email_from :e2e.record/email_subject :e2e.record/received_at]}]}"
+  },
+  {
+    "name": "e2e_records_by_file",
+    "description": "Run records by file name, in a time range (required), oldest first; at most 200.",
+    "params": [
+      {
+        "name": "file_name",
+        "type": "string",
+        "required": true,
+        "description": "The file name to look for.",
+        "example": "INV-A-001.pdf"
+      },
+      {
+        "name": "from",
+        "type": "string",
+        "required": true,
+        "description": "Start of the time range, ISO time (inclusive).",
+        "example": "2020-01-01T00:00:00Z"
+      },
+      {
+        "name": "to",
+        "type": "string",
+        "required": true,
+        "description": "End of the time range, ISO time (exclusive).",
+        "example": "2100-01-01T00:00:00Z"
+      }
+    ],
+    "eql": "{:entity {:e2e.by_file/file_name ?file_name :e2e.by_file/from ?from :e2e.by_file/to ?to} :query [{:e2e.by_file/records [:e2e.record/row_key :e2e.record/correlation_id :e2e.record/schedule_id :e2e.record/schedule_name :e2e.record/schedule_seq :e2e.record/manager_name :e2e.record/worker_id :e2e.record/worker_name :e2e.record/process_stage :e2e.record/process_status :e2e.record/node_name :e2e.record/has_next_worker :e2e.record/next_worker_names :e2e.record/final_worker_name :e2e.record/file_name :e2e.record/source_path :e2e.record/email_from :e2e.record/email_subject :e2e.record/received_at]}]}"
+  },
+  {
+    "name": "e2e_records_by_subject",
+    "description": "Run records whose mail subject contains a text, in a time range (required), oldest first; at most 200.",
+    "params": [
+      {
+        "name": "email_subject",
+        "type": "string",
+        "required": true,
+        "description": "The email subject to look for.",
+        "example": "Invoice"
+      },
+      {
+        "name": "from",
+        "type": "string",
+        "required": true,
+        "description": "Start of the time range, ISO time (inclusive).",
+        "example": "2020-01-01T00:00:00Z"
+      },
+      {
+        "name": "to",
+        "type": "string",
+        "required": true,
+        "description": "End of the time range, ISO time (exclusive).",
+        "example": "2100-01-01T00:00:00Z"
+      }
+    ],
+    "eql": "{:entity {:e2e.by_subject/email_subject ?email_subject :e2e.by_subject/from ?from :e2e.by_subject/to ?to} :query [{:e2e.by_subject/records [:e2e.record/row_key :e2e.record/correlation_id :e2e.record/schedule_id :e2e.record/schedule_name :e2e.record/schedule_seq :e2e.record/manager_name :e2e.record/worker_id :e2e.record/worker_name :e2e.record/process_stage :e2e.record/process_status :e2e.record/node_name :e2e.record/has_next_worker :e2e.record/next_worker_names :e2e.record/final_worker_name :e2e.record/file_name :e2e.record/source_path :e2e.record/email_from :e2e.record/email_subject :e2e.record/received_at]}]}"
+  },
+  {
+    "name": "e2e_records_by_sender",
+    "description": "Run records whose mail sender contains a text, in a time range (required), oldest first; at most 200.",
+    "params": [
+      {
+        "name": "email_from",
+        "type": "string",
+        "required": true,
+        "description": "The email from to look for.",
+        "example": "billing"
+      },
+      {
+        "name": "from",
+        "type": "string",
+        "required": true,
+        "description": "Start of the time range, ISO time (inclusive).",
+        "example": "2020-01-01T00:00:00Z"
+      },
+      {
+        "name": "to",
+        "type": "string",
+        "required": true,
+        "description": "End of the time range, ISO time (exclusive).",
+        "example": "2100-01-01T00:00:00Z"
+      }
+    ],
+    "eql": "{:entity {:e2e.by_sender/email_from ?email_from :e2e.by_sender/from ?from :e2e.by_sender/to ?to} :query [{:e2e.by_sender/records [:e2e.record/row_key :e2e.record/correlation_id :e2e.record/schedule_id :e2e.record/schedule_name :e2e.record/schedule_seq :e2e.record/manager_name :e2e.record/worker_id :e2e.record/worker_name :e2e.record/process_stage :e2e.record/process_status :e2e.record/node_name :e2e.record/has_next_worker :e2e.record/next_worker_names :e2e.record/final_worker_name :e2e.record/file_name :e2e.record/source_path :e2e.record/email_from :e2e.record/email_subject :e2e.record/received_at]}]}"
+  },
+  {
+    "name": "e2e_failures",
+    "description": "Run records that ended in failure (process_status failure), in a time range (required), oldest first; at most 200.",
+    "params": [
+      {
+        "name": "from",
+        "type": "string",
+        "required": true,
+        "description": "Start of the time range, ISO time (inclusive).",
+        "example": "2020-01-01T00:00:00Z"
+      },
+      {
+        "name": "to",
+        "type": "string",
+        "required": true,
+        "description": "End of the time range, ISO time (exclusive).",
+        "example": "2100-01-01T00:00:00Z"
+      }
+    ],
+    "eql": "{:entity {:e2e.failures/from ?from :e2e.failures/to ?to} :query [{:e2e.failures/records [:e2e.record/row_key :e2e.record/correlation_id :e2e.record/schedule_id :e2e.record/schedule_name :e2e.record/schedule_seq :e2e.record/manager_name :e2e.record/worker_id :e2e.record/worker_name :e2e.record/process_stage :e2e.record/process_status :e2e.record/node_name :e2e.record/has_next_worker :e2e.record/next_worker_names :e2e.record/final_worker_name :e2e.record/file_name :e2e.record/source_path :e2e.record/email_from :e2e.record/email_subject :e2e.record/received_at]}]}"
+  },
+  {
+    "name": "e2e_schedules",
+    "description": "Every schedule (business process) with its manager, trigger and final worker: schedule_header, latest revision.",
+    "params": [],
+    "eql": "[{:e2e.schedule/all [:e2e.schedule/schedule_id :e2e.schedule/schedule_name :e2e.schedule/schedule_desc :e2e.schedule/schedule_type :e2e.schedule/manager_id :e2e.schedule/manager_name :e2e.schedule/manager_mq_name :e2e.schedule/trigger_exchange_name :e2e.schedule/trigger_routing_key :e2e.schedule/final_schedule_seq :e2e.schedule/final_worker_id :e2e.schedule/project_name :e2e.schedule/on_demand_flag]}]"
+  },
+  {
+    "name": "e2e_schedule_steps",
+    "description": "Every schedule's steps in order (worker, exchanges, routing keys): schedule_detail, latest revision.",
+    "params": [],
+    "eql": "[{:e2e.step/all [:e2e.step/row_key :e2e.step/schedule_id :e2e.step/schedule_name :e2e.step/schedule_seq :e2e.step/worker_id :e2e.step/worker_name :e2e.step/worker_message_name :e2e.step/previous_worker_id :e2e.step/previous_worker_name :e2e.step/worker_exchange_name :e2e.step/worker_routing_key :e2e.step/manager_exchange_name :e2e.step/manager_routing_key]}]"
+  },
+  {
+    "name": "e2e_worker_durations",
+    "description": "Each worker's P95 duration (start → end, successful runs) and the number of runs counted, in a time range.",
+    "params": [
+      {
+        "name": "from",
+        "type": "string",
+        "required": true,
+        "description": "Start of the time range, ISO time (inclusive).",
+        "example": "2020-01-01T00:00:00Z"
+      },
+      {
+        "name": "to",
+        "type": "string",
+        "required": true,
+        "description": "End of the time range, ISO time (exclusive).",
+        "example": "2100-01-01T00:00:00Z"
+      }
+    ],
+    "eql": "{:entity {:e2e.durations/from ?from :e2e.durations/to ?to} :query [{:e2e.durations/workers [:e2e.duration/row_key :e2e.duration/schedule_name :e2e.duration/worker_name :e2e.duration/p95_seconds :e2e.duration/samples]}]}"
+  }
+]
