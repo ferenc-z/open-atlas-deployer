@@ -70,7 +70,7 @@ from executor_core import (  # noqa: F401
     Refused, Restarting, load_env_file, now_iso, version_key, write_json)
 # <<< executor_core
 
-VERSION = "0.9.6"
+VERSION = "0.9.8"
 # Job kinds, plus what a deploy may ask for (bundle files, migrations): an older executor is not sent those.
 KINDS = ["build", "deploy", "env", "env-read", "bundle", "db-migration", "executor-upgrade", "deployer-upgrade"]
 ENV_FILE_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*\.env$")

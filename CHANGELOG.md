@@ -3,7 +3,7 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
-## Unreleased
+## 0.3.0-rc.16
 
 - S39 §7.8 ⑦ (owner 2026-11-25): what a registered shared module receives (an error module's failures) is only the
   module's own health; a business fails only in its own segments. Before, every business sending into an error module
@@ -18,7 +18,6 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   groups. The Deploy Assistant's prompt and the `nifi-ops` skill: a processor that writes out of NiFi is a module's (or
   business's) end and is listed as an exit; making a shared module (also a takeover) is committed by the Assistant
   itself after the owner's yes, nothing waits on the page.
-- [ ] OMA: 重新发布 Deploy Assistant（§7.8 8、9：模块可以是业务终点、转模块由助手直接提交、`look topology` 带 draft 查缺口邻居）
 - S39 UAT fixes (2026-11-25): a shared module whose exits only write out of NiFi (an error log, an audit trail, a dead
   letter store) no longer makes every business sending into it report `exit-unregistered`. A schedule whose worker
   names match processors (or groups named like them) in the registered groups now joins the chain as questions
@@ -30,7 +29,6 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   "公共环节"). The "登记的组在画布上变了" to-do no longer opens when nothing inside the groups changed (a neighbour
   registered, a group just registered or just added, the executor upgrade); the old "Confirm the flows the AI found"
   to-do is closed once registration is on.
-- [ ] OMA: 重新发布 Deploy Assistant（`nifi-ops` skill 改了口头交接的问法）
 - S39 step 9 (registration is the default): `DEPLOYER_REGISTERED_GROUPS` is now **on by default**; set it to `0` to turn
   it off, an emergency way back to reading the whole canvas. With it on, a service shows only what was registered: a
   service with no registration has no businesses and no gaps. The businesses and models of the old whole-canvas way are
@@ -47,7 +45,6 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   builds the model: the brief has no skeleton draft or rebuild flag, `look kind model` no `draft`, `run_model` /
   `publish_model` refuse `from: "skeleton"`, `publish_model` refuses to change segments a registration wrote, and
   `service-checkup` loses the model part and the two verbs from its `allowed_tools`.
-- [ ] OMA: 重新发布 service-checkup
 
 - Service executor 0.9.7 (S39 step 1, reading only the registered businesses): a watch entry with `groups` (ids of
   process groups at any depth) has only those groups read: each group's recursive status
@@ -126,9 +123,18 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
 
 ### After upgrading
 
-- [ ] OMA: republish the Deploy Assistant (`agents/deploy-assistant.md`, allowed_tools: `register` in, `publish_model`
-  out) and the Skill `nifi-ops` (the registration conversation; the business-model section is gone), then point
-  `DEPLOYER_OMA_AGENT` and the Workbench Business Agent "Deploy Assistant" at the new agent.
+- [ ] OMA: republish the Deploy Assistant (`agents/deploy-assistant.md`: `register` in and `publish_model` out of
+  `allowed_tools`; the Skill `nifi-ops`: the registration conversation, hand-overs only after the owner described them,
+  modules as business ends, `look topology` with `draft`) and the Service Check-up (`service-checkup`: the model part and
+  `run_model` / `publish_model` are gone). Run `bin/publish-assistant.ts` against this environment's OMA, then point
+  `DEPLOYER_OMA_AGENT` (and the Workbench Business Agent "Deploy Assistant") and `DEPLOYER_OMA_CHECKUP_AGENT` at the new
+  agents. Existing conversations keep the old agent: start a new chat.
+- [ ] Upgrade the service executors to 0.9.8 (the Executors page; 0.9.7 or later is required for `flow-groups@1` /
+  `nifi-groups@1`, else the gap `executor-old` shows). The deploy executor is moved to 0.9.8 as well (no code change) so
+  both go out in one executor release.
+- [ ] Registration is on by default now (`DEPLOYER_REGISTERED_GROUPS=0` turns it off): clear `flows`, `flow_segments`,
+  `flow_changes`, `flow_anomalies` and `flow_models` (nothing is migrated), then register each service's businesses
+  again through the Deploy Assistant.
 
 ## 0.3.0-rc.15
 
