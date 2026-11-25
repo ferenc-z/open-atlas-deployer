@@ -250,7 +250,7 @@ function lookRequest(a: Record<string, unknown>): ReturnType<Tool["request"]> {
     case "event": return { method: "GET", path: `${base}/provenance/events/${enc(a.eventId)}`, query: { node: a.member } };
     case "bulletins": return { method: "GET", path: `${base}/bulletins`, query: { level: Array.isArray(a.levels) ? a.levels[0] : undefined, from: a.from, to: a.to, limit: a.limit } };
     case "queues": case "members": return { method: "GET", path: `${base}/status` };
-    case "topology": return { method: "GET", path: `${base}/topology` };
+    case "topology": return { method: "GET", path: `${base}/topology`, query: { draft: typeof a.draft === "string" ? a.draft : undefined, group: typeof a.draft === "string" && typeof a.group === "string" ? a.group : undefined } };
     case "flow-counts": return { method: "GET", path: `${base}/flow-counts`, query: { from: a.from, to: a.to, ref: a.component, limit: a.limit } };
     case "events": return { method: "GET", path: `${base}/events`, query: { from: a.from, to: a.to, kind: q, limit: a.limit } };
     case "evidence": return { method: "GET", path: `${base}/investigate`, query: { member: a.member, from: a.from, to: a.to, focus: q, compact: "1" } };
@@ -371,6 +371,7 @@ const VERBS: Tool[] = [
     properties: { service: SERVICE, kind: s(`One of ${LOOK_KINDS.join(", ")}.`), from: s("Optional ISO time (UTC)."), to: s("Optional ISO time (UTC), now by default."), member: s("Optional: a member key (look kind members: members[].key) or, for provenance, a node's clusterNodeId."), component: s("Optional: a component id (provenance, components) or a flow-counts ref."), query: s("Optional: see kind."), uuid: s("Optional: a FlowFile UUID (provenance, lineage)."), eventId: n("Optional: a provenance event id (event, lineage)."), fields: strs("Optional metrics fields."), levels: strs("Optional log levels (TRACE … FATAL) or a bulletin level."), regex: { type: "boolean", description: "Optional: logs query is a regular expression." }, series: { type: "boolean", description: "Optional: metrics with every point." }, revision: n("Optional: a configuration revision (config, config-diff)."), base: n("Optional: config-diff from this revision."), file: s("Optional: one file name (config, property), e.g. nifi.properties."), limit: n("Optional: at most this many rows."),
       detail: s("Optional: full for the whole answer. topology, model, provenance, bulletins and logs are a summary by default (counts, groups, the top rows, what was left out and how to get it)."),
       group: s("Optional (topology): one unit (a group id or name) whole: its pieces' processor names, ports, links, S2S, ends."),
+      draft: s("Optional (topology with group): a registration draft (rgd_…). Only registered groups are shown otherwise; with the draft, a group its gaps name as neighbor on this service (give its id) is read from NiFi now."),
       offset: n("Optional (provenance, bulletins, logs): skip this many events, groups or lines (paging the summary, or with detail full the rows).") },
     required: ["service", "kind"], check: lookCheck, request: lookRequest, shape: lookShape },
   { name: "trace", readOnly: true, access: { personal: "all", assistant: true, checkup: true },

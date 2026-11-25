@@ -1354,6 +1354,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
   const ops = mountOps(api, {
     store, executor: (host) => handoff.executor(host, "service"), model: flowModelDeps, flowSearch: (id, q) => provenance.flowSearch(id, q),
     authenticate, reject, registered: registeredService, actorOf, call: (p, spec) => callAs(p, spec), ...(deps.businessHooks ? { hooks: deps.businessHooks } : {}),
+    ...(deps.groupReader ? { scanGroups: async (service: string, ids: string[]) => (await chains.scan(service, ids)).topology } : {}),
   });
   // ⑰: the analyses' first message carries each service's brief.
   deps.analyses?.useBrief((services, at) => ops.briefs(services, at));

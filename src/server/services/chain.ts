@@ -509,19 +509,35 @@ export function chain(input: ChainInput): Preview {
     gap({ kind: "entry-unregistered", segment: at.id, ...(m ? { neighbor: nb(m.service, m.group) } : {}),
       text: `这条业务没有自己的起点${m ? `：数据从公共模块 ${m.group.name} 进到 ${at.group.name}，模块前面是哪个组没有登记` : `，${at.group.name} 的数据从哪来要问负责人`}。` });
   }
-  // A module that passes data on (it has exits) but none of its exits comes back here: where it goes is not registered.
-  // An exit into another module's entry (an error step's dead letters to the DLQ, step 4) does not pass it on, and neither
-  // does a processor that writes out of NiFi (an error log, an audit trail): the data ends there, the module only takes in.
-  const onward = (m: ChainModule) => m.exits.some((x) => {
+  // §7.8 8 (owner 2026-11-25): a business may end in a shared module, also in a module after a module. A module the data
+  // can end in: no exits (it ends there), a processor that writes out of NiFi in its group or as an exit (an error log, an
+  // audit trail), or an exit into another module's entry that can end in turn. Only a module whose every exit leads on to
+  // groups that are not registered, with none coming back here, leaves a gap.
+  const nextModules = (m: ChainModule, x: ChainModule["exits"][number]): ChainModule[] => {
     const k = keyOf(m.service, x.channel, "exit");
-    if (k) return !modEntryKey.has(k);
-    return x.channel?.type === "external" && /^(port|link):/u.test(x.channel.system ?? "");
-  });
+    if (k) return modEntryKey.get(k) ?? [];
+    const port = portOf(x) ?? x.component;
+    const t = services.get(m.service)?.topology;
+    return (t?.neighbors ?? []).flatMap((n) => n.group === m.group.id && n.side === "out" && (n.port.id === port || n.port.name === port) && n.other.kind === "group" && n.other.port
+      ? [modEntryPort.get(`${m.service}\0${n.other.port.id}`)].filter((y): y is ChainModule => !!y) : []);
+  };
+  const canEnd = (m: ChainModule, seen = new Set<string>()): boolean => {
+    if (seen.has(m.id)) return false;
+    seen.add(m.id);
+    if (!m.exits.length) return true;
+    if ((services.get(m.service)?.topology?.ends ?? []).some((e) => e.group === m.group.id)) return true;
+    return m.exits.some((x) => {
+      const k = keyOf(m.service, x.channel, "exit");
+      const onward = k !== null || (x.channel?.type === "external" && /^(port|link):/u.test(x.channel.system ?? ""));
+      if (!onward) return true; // writes out of NiFi
+      return nextModules(m, x).some((n) => canEnd(n, seen));
+    });
+  };
   for (const e of [...edges.values()]) {
     if (e.kind !== "shared-entry" || !segs.has(e.from)) continue;
     const id = [...modSegs.entries()].find(([, s]) => s.id === e.to)![0];
     const m = (input.modules ?? []).find((x) => x.id === id)!;
-    if (!onward(m) || [...edges.values()].some((x) => x.kind === "shared-exit" && x.from === e.to && segs.has(x.to))) continue;
+    if (canEnd(m) || [...edges.values()].some((x) => x.kind === "shared-exit" && x.from === e.to && segs.has(x.to))) continue;
     gap({ kind: "exit-unregistered", segment: e.from, ...(e.component ? { component: e.component } : {}), neighbor: nb(m.service, m.group),
       text: `${segs.get(e.from)!.group.name} 经 ${e.via} 进了公共模块 ${m.name}，模块的出口没有接回这条业务登记的组。` });
   }

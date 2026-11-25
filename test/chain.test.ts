@@ -108,6 +108,18 @@ test("chain: shared modules join by port id; passing through one joins the busin
   // Without B: the data goes into Validate and none of its exits comes back.
   const q = chain(inp([["n1", "A"]], svc, { modules }));
   assert.deepEqual(q.gaps.map((g) => [g.kind, g.component, g.neighbor?.group?.name]), [["exit-unregistered", "A:to-check", "Validate"]]);
+  // §7.8 8: a business may end in a module. Validate's exit leads into a Publish module that writes out of NiFi: joined.
+  const t2 = scoped([...t.groups, grp("V", "Validate", [frag("v", { inputs: ["in"], outputs: ["orders"] })]), grp("W", "Publish", [frag("w", { inputs: ["in"] })])], {
+    neighbors: [...t.neighbors!, nbr("V", "out", "orders", { kind: "group", id: "W", name: "Publish", group: "P", port: { id: "W:in", name: "in" } })],
+    ends: [{ id: "put", name: "Publish table", type: "PutFile", group: "W", fragment: "w", relationships: [] }],
+  });
+  const pub: ChainModule = { id: "shm_w", name: "Publish", service: "n1", group: { id: "W", name: "Publish" }, entries: [{ id: "i", channel: { type: "external", system: "port:W:in" } }],
+    exits: [{ id: "o", component: "W:errors", channel: { type: "external", system: "port:W:errors" } }] };
+  const ends = chain(inp([["n1", "A"]], [{ id: "n1", addresses: [], topology: t2 }], { modules: [...modules, pub] }));
+  assert.deepEqual(ends.gaps, []);
+  // A module without exits is where the data ends.
+  const bare = chain(inp([["n1", "A"]], svc, { modules: [{ ...modules[0]!, exits: [] }, modules[1]!] }));
+  assert.deepEqual(bare.gaps, []);
   // Without A: Route has no start of its own and only the module feeds it.
   const r = chain(inp([["n1", "B"]], svc, { modules }));
   assert.deepEqual(r.gaps.map((g) => [g.kind, g.neighbor?.group?.name]), [["entry-unregistered", "Validate"]]);

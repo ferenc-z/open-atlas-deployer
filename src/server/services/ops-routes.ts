@@ -48,6 +48,8 @@ export interface OpsRouteDeps {
   /** One request to this API as a principal (the to-do's "Apply": the configuration draft route, as the person). */
   call: Call;
   hooks?: BusinessHooks;
+  /** §7.8 9: reads these groups from NiFi now (the registration chain's scan), for look topology with a draft. */
+  scanGroups?: (service: string, ids: string[]) => Promise<Topology | null>;
   now?: () => Date;
 }
 
@@ -263,6 +265,22 @@ export function mountOps(api: Hono, d: OpsRouteDeps) {
     if (p instanceof Response) return p;
     const id = c.req.param("id");
     if (!d.registered(id)) return unknown(c, id);
+    // §7.8 9 (owner 2026-11-25): with a registration draft, the groups its gaps name on this service (the one hop out) can
+    // be read too, from NiFi now: name, ports, the first processor names. Anywhere else only the registered groups.
+    const draftId = c.req.query("draft"), wanted = c.req.query("group")?.toLowerCase();
+    if (draftId && wanted && d.scanGroups) {
+      const draft = d.store.registrationDraft(draftId);
+      if (!draft) return d.reject(c, 404, "register/not-found", `No registration draft ${draftId} (drafts are kept for a day).`);
+      const gaps = ((draft.preview as { gaps?: { neighbor?: { service?: string; group?: { id?: string } } }[] } | null)?.gaps ?? []);
+      const near = new Set([
+        ...draft.groups.filter((g) => g.service === id).map((g) => g.group.id.toLowerCase()),
+        ...gaps.filter((g) => g.neighbor?.service === id && g.neighbor.group?.id).map((g) => g.neighbor!.group!.id!.toLowerCase()),
+      ]);
+      if (near.has(wanted)) {
+        const live = await d.scanGroups(id, [wanted]);
+        return c.json({ takenAt: now().toISOString(), topology: live, draft: draftId, skeleton: { flows: [], shared: [], empty: [], questions: [] } });
+      }
+    }
     const t = d.store.latestTopology(id);
     const sk = skeletonOf(d.store, now(), [id]);
     // Switch on: only the registered groups are the service's canvas as far as monitoring goes (S39 step 7).

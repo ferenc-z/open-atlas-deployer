@@ -96,6 +96,14 @@ test("register: the Assistant fills a draft, a refusal keeps gaps and preview, a
   const preview = (await t.register("dps_assistant", { action: "preview", draft: d.draft })).value;
   const gap = preview.gaps.find((g: { kind: string }) => g.kind === "exit-unregistered");
   assert.ok(gap, JSON.stringify(preview.gaps));
+  // §7.8 9: with the draft, look topology reads the neighbor its gap names (D) from NiFi; without it, only registered groups.
+  const near = await t.http("dps_assistant", "GET", `services/n1/topology?draft=${d.draft}&group=${D}`);
+  assert.equal(near.status, 200);
+  assert.deepEqual(near.body.topology.groups.map((g: { name: string }) => g.name), ["对账写"]);
+  const plain = await t.http("dps_assistant", "GET", `services/n1/topology?group=${D}`);
+  assert.equal(plain.body.topology, null, "no draft: nothing read beyond what is registered");
+  const far = await t.http("dps_assistant", "GET", `services/n1/topology?draft=${d.draft}&group=00000000-0000-0000-0000-000000000009`);
+  assert.equal(far.body.draft, undefined, "a group the draft does not name is not read");
 
   await t.register("dps_assistant", { action: "rename", draft: d.draft, name: "对账" });
   // The Assistant's key never commits; it says so in a way the model can act on.

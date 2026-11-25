@@ -10,6 +10,15 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   showed the module's total as its own processing-failed; those open entries close on the next check.
 - S39 pre-release UAT (2026-11-25): the sentence "Tell the AI" copies after a refused Register no longer doubles the
   full stops of the server's gap sentences ("…in。；…in。。").
+- S39 §7.8 8 and 9 (owner 2026-11-25): a business may end in a shared module, also in a module after a module: a module
+  without exits, or one that writes out of NiFi, or one whose exit leads into a module that can end, no longer leaves
+  `exit-unregistered` ("模块的出口没有接回…"); only a module whose exits all lead on to unregistered groups does. So a
+  business's last group can be taken over into a module. `look topology` with `draft` and `group` reads a group of
+  that registration draft, or a neighbor its gaps name, from NiFi now; anywhere else it still shows only registered
+  groups. The Deploy Assistant's prompt and the `nifi-ops` skill: a processor that writes out of NiFi is a module's (or
+  business's) end and is listed as an exit; making a shared module (also a takeover) is committed by the Assistant
+  itself after the owner's yes, nothing waits on the page.
+- [ ] OMA: 重新发布 Deploy Assistant（§7.8 8、9：模块可以是业务终点、转模块由助手直接提交、`look topology` 带 draft 查缺口邻居）
 - S39 UAT fixes (2026-11-25): a shared module whose exits only write out of NiFi (an error log, an audit trail, a dead
   letter store) no longer makes every business sending into it report `exit-unregistered`. A schedule whose worker
   names match processors (or groups named like them) in the registered groups now joins the chain as questions
