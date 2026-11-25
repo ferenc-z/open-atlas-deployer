@@ -134,8 +134,10 @@ export function previewStale(d: RegDraft): boolean {
 
 /** The one sentence a refused Register becomes, for the person to paste to the assistant (its input cannot be pre-filled). */
 export function tellAiText(why: { code?: string; message: string; gaps?: PreviewGap[]; problems?: { text: string }[] }, button = "Register"): string {
-  if (why.code === "register/gate-rejected" && why.problems?.length) return `点 ${button} 被闸门拒绝了，问题是：${why.problems.map((p) => p.text).join("；")}。请帮我看看怎么处理，处理好了我再点。`;
-  if (why.code === "register/gaps-open" && why.gaps?.length) return `点 ${button} 被拒绝了，还有 ${why.gaps.length} 个地方接不上：${why.gaps.map((g) => g.text).join("；")}。请帮我逐个处理。`;
+  // The server's sentences end with their own full stop: joined as they are they read "…。；…。。".
+  const list = (texts: string[]) => texts.map((t) => t.trim().replace(/[。．.；;]+$/u, "")).join("；");
+  if (why.code === "register/gate-rejected" && why.problems?.length) return `点 ${button} 被闸门拒绝了，问题是：${list(why.problems.map((p) => p.text))}。请帮我看看怎么处理，处理好了我再点。`;
+  if (why.code === "register/gaps-open" && why.gaps?.length) return `点 ${button} 被拒绝了，还有 ${why.gaps.length} 个地方接不上：${list(why.gaps.map((g) => g.text))}。请帮我逐个处理。`;
   return `点 ${button} 被拒绝了：${why.message} 请帮我看看怎么处理。`;
 }
 

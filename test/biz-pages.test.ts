@@ -122,6 +122,9 @@ test("register: a refused Register becomes the lines to show and one sentence fo
   assert.match(gate.tell, /^点 Register 被闸门拒绝了.*s2s-balance/u);
   const gaps = refusalOf({ code: "register/gaps-open", message: "open", body: { gaps: [{ id: "g1", text: "Archive 接不上" }] } }, "Confirm changes");
   assert.match(gaps.tell, /^点 Confirm changes 被拒绝了，还有 1 个地方接不上：Archive 接不上/u);
+  // The server's gap sentences end with "。": the sentence has no "。；" or "。。".
+  const two = refusalOf({ code: "register/gaps-open", message: "open", body: { gaps: [{ id: "g1", text: "A 连到没登记的组 B 的 in。" }, { id: "g2", text: "C 连到没登记的组 D 的 in。" }] } });
+  assert.equal(two.tell, "点 Register 被拒绝了，还有 2 个地方接不上：A 连到没登记的组 B 的 in；C 连到没登记的组 D 的 in。请帮我逐个处理。");
 });
 
 test("business: a draft of changes is listed against what is registered", () => {
