@@ -128,6 +128,20 @@ test("check: the toolkit certificate passes for its nodes", () => {
   assert.equal(r.ok, true);
 });
 
+test("check: a certificate without an EKU passes with a notice; one with an EKU lacking a use fails", () => {
+  const o = toolkit();
+  const ks = o.keystore as { certificate: { eku: string[] | null } };
+  const without = { ...o, keystore: { ...ks, certificate: { ...ks.certificate, eku: null } } } as typeof o;
+  const r = checkForService(without, { hosts: HOSTS, now: new Date() });
+  const eku = item(r, "eku")!;
+  assert.equal(eku.ok, true);
+  assert.equal(eku.notice, true);
+  assert.equal(eku.message, "Certificate has no EKU; NiFi does not restrict its use");
+  assert.equal(r.ok, true);
+  const lacking = { ...o, keystore: { ...ks, certificate: { ...ks.certificate, eku: ["serverAuth"] } } } as typeof o;
+  assert.equal(item(checkForService(lacking, { hosts: HOSTS, now: new Date() }), "eku")!.ok, false);
+});
+
 test("check: SAN not covering a node; CN is not looked at", () => {
   const r = checkForService(toolkit(), { hosts: [...HOSTS, "nifi-3.lab", "S2S", "10.0.0.1"], now: new Date() });
   assert.equal(r.ok, false);

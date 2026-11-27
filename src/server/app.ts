@@ -27,6 +27,9 @@ import { PeerError, type Peer, type PeerStatus } from "./peer.ts";
 import { EXECUTOR_KINDS, EXECUTOR_VERSION, EXECUTOR_VERSIONS, ExecutorUnsupported, hostIds, hostOf, newJobId, SERVICE_READ_KINDS, tokenSha256, type ExecutorKind, type Heartbeat } from "./handoff.ts";
 import { lineDiff } from "./ingress.ts";
 import { environmentStatus, hostStateOf, parseDockerPs, type Observer } from "./observe.ts";
+import { CertError, type ParsedKeystore, type ParsedTruststore } from "./certs/keystore.ts";
+import { checkForService, type OpenedUpload } from "./certs/check.ts";
+import { currentPem, readUpload, sealVersion, UPLOAD_FILE_MAX, UPLOAD_FILES_MAX, type ReadUpload, type UploadedFile } from "./certs/library.ts";
 import { StoreError, type Actor, type ServiceConfigDraft, type Store } from "./store.ts";
 import { withoutSealed } from "./services/config.ts";
 import { ConfigDocError } from "./services/configdoc.ts";
@@ -852,6 +855,109 @@ export function createApp({ config, store, sessions, observer, deployments, vers
       standalones: store.standalones().map((s) => ({ ...s, configRevision: configured(s.id), ...status(s.id) })),
       clusters: store.clusters().map((s) => ({ ...s, configRevision: configured(s.id), ...status(s.id) })),
     });
+  });
+  // S41 step 3: the certificate library. Admin only for everything that is not the summary; no answer holds a file, a
+  // password or a key (the sealed blob stays in the store). Upload: multipart, field "file" once per file (config.json and
+  // the keystore and truststore it names), "name" for a new entry or "cert" for a new version of one.
+  const certTargets = () => {
+    // The name a node answers to: its cluster node address, else the host in the service's web address, else its host id.
+    const hostOf = (m: { host: string; nodeAddress?: string | null }, webUrl?: string | null) => {
+      if (m.nodeAddress) return m.nodeAddress;
+      try { if (webUrl) return new URL(webUrl).hostname; } catch { /* not an address */ }
+      return m.host;
+    };
+    return [
+      ...store.standalones().map((x) => ({ id: x.id, hosts: [hostOf(x.member, x.webUrl)] })),
+      ...store.clusters().map((x) => ({ id: x.id, hosts: [...new Set(x.nodes.map((n) => hostOf(n, x.webUrl)))] })),
+    ];
+  };
+  const certBound = () => new Map(store.serviceCertBindings().map((b) => [b.service, b]));
+  const certForm = async (c: Context): Promise<Response | { upload: ReadUpload; keystore: ParsedKeystore; truststore: ParsedTruststore; fields: Record<string, string> }> => {
+    const form = await c.req.formData().catch(() => null);
+    if (!form) return reject(c, 400, "cert/upload", "Send the files as multipart form data.");
+    const files: UploadedFile[] = [], fields: Record<string, string> = {};
+    for (const [key, v] of form.entries()) {
+      if (typeof v === "string") { fields[key] = v; continue; }
+      if (key !== "file") continue;
+      if (v.size > UPLOAD_FILE_MAX) return reject(c, 400, "cert/too-big", `${v.name} is larger than ${UPLOAD_FILE_MAX / 1024} KiB.`);
+      files.push({ name: v.name, bytes: Buffer.from(await v.arrayBuffer()) });
+    }
+    if (files.length === 0 || files.length > UPLOAD_FILES_MAX) return reject(c, 400, "cert/upload", `Send config.json, the keystore and the truststore (at most ${UPLOAD_FILES_MAX} files).`);
+    try {
+      const upload = readUpload(files);
+      const { keystore, truststore } = upload.opened;
+      const bad = [keystore, truststore].find((x) => x instanceof CertError);
+      if (bad instanceof CertError) return reject(c, 400, `cert/${bad.kind}`, [keystore, truststore].filter((x) => x instanceof CertError).map((x) => (x as CertError).message).join(" "));
+      return { upload, keystore: keystore as ParsedKeystore, truststore: truststore as ParsedTruststore, fields };
+    } catch (error) {
+      if (error instanceof CertError) return reject(c, 400, `cert/${error.kind}`, error.message);
+      throw error;
+    }
+  };
+  api.get("/api/nifi-certs/summary", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    return c.json({ certificates: store.nifiCerts().map((x) => ({ name: x.name, ownService: x.ownService, versions: x.versions.map((v) => ({ version: v.version, subject: v.subject, san: v.san.map((e) => e.value), issuer: v.issuer, notAfter: v.notAfter, usedBy: v.usedBy })) })) });
+  });
+  api.get("/api/nifi-certs", async (c) => {
+    const p = await authenticate(c, "admin");
+    if (p instanceof Response) return p;
+    const bound = certBound();
+    return c.json({ keyConfigured: !!takeover?.box, certs: store.nifiCerts(), services: certTargets().map((t) => ({ ...t, bound: bound.has(t.id) ? { cert: bound.get(t.id)!.cert, version: bound.get(t.id)!.version } : null })) });
+  });
+  api.get("/api/nifi-certs/:id", async (c) => {
+    const p = await authenticate(c, "admin");
+    if (p instanceof Response) return p;
+    const found = store.nifiCert(c.req.param("id"));
+    return found ? c.json(found) : reject(c, 404, "cert/unknown", "No such certificate.");
+  });
+  // What an upload is and how it fits every managed service; nothing is saved.
+  api.post("/api/nifi-certs/check", async (c) => {
+    const p = await authenticate(c, "admin");
+    if (p instanceof Response) return p;
+    const u = await certForm(c);
+    if (u instanceof Response) return u;
+    const bound = certBound();
+    const services = certTargets().map((t) => {
+      const b = bound.get(t.id), sealed = b && store.nifiCertSealed(b.cert, b.version);
+      const current = sealed && takeover?.box ? currentPem(sealed, takeover.box) : undefined;
+      return { ...t, bound: b ? { cert: b.cert, version: b.version } : null, ...checkForService(u.upload.opened as OpenedUpload, { hosts: t.hosts, ...(current ? { current } : {}) }) };
+    });
+    const k = u.keystore, t = u.truststore;
+    return c.json({
+      passwordsRead: true,
+      version: { subject: k.certificate.subject, san: k.certificate.san, issuer: k.certificate.issuer, notBefore: k.certificate.notBefore, notAfter: k.certificate.notAfter, eku: k.certificate.eku, sha256: k.certificate.sha256, keystoreType: k.format, truststoreType: t.format, trusted: t.certificates.length },
+      services,
+    });
+  });
+  api.post("/api/nifi-certs", async (c) => {
+    const p = await authenticate(c, "admin");
+    if (p instanceof Response) return p;
+    const box = takeover?.box;
+    if (!box) return reject(c, 503, "cert/no-key", "DEPLOYER_CREDENTIAL_ENCRYPTION_KEY is not set: certificates cannot be kept.");
+    const u = await certForm(c);
+    if (u instanceof Response) return u;
+    try {
+      const sealed = sealVersion(u.upload, box);
+      if (u.fields.cert) return c.json({ cert: u.fields.cert, version: store.addNifiCertVersion(u.fields.cert, sealed, actorOf(p)) });
+      const name = (u.fields.name ?? "").trim();
+      if (!name) return reject(c, 400, "cert/name", "Give a name for a new certificate, or cert to add a version to one.");
+      return c.json(store.addNifiCert(name, u.fields.service?.trim() || null, sealed, actorOf(p)));
+    } catch (error) {
+      if (error instanceof StoreError) return reject(c, error.code === "cert/unknown" ? 404 : error.code === "cert/name" ? 400 : 409, error.code, error.message);
+      throw error;
+    }
+  });
+  api.delete("/api/nifi-certs/:id/versions/:version", async (c) => {
+    const p = await authenticate(c, "admin");
+    if (p instanceof Response) return p;
+    try {
+      store.removeNifiCertVersion(c.req.param("id"), Number(c.req.param("version")), actorOf(p));
+      return c.json({ removed: true });
+    } catch (error) {
+      if (error instanceof StoreError) return reject(c, error.code === "cert/unknown" ? 404 : 409, error.code, error.message, error.details);
+      throw error;
+    }
   });
   api.get("/api/services/:id/config", async (c) => {
     const p = await authenticate(c, "view");

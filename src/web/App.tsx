@@ -11,6 +11,7 @@ import { OnboardingPage } from "./Onboarding.tsx";
 import { BriefCard, DriftBanner } from "./Brief.tsx";
 import { HostsPage } from "./Hosts.tsx";
 import { ServicesPage, TakeoverPage } from "./Services.tsx";
+import { CertificatesPage } from "./Certificates.tsx";
 import { ServicesSummaryCard } from "./OverviewPage.tsx";
 import { IngressPage } from "./Ingress.tsx";
 import { NeedsYou, Platform, usePlatform } from "./Platform.tsx";
@@ -22,7 +23,7 @@ import { RegisterPage } from "./RegisterPage.tsx";
 import { FlowDetailPage } from "./FlowDetailPage.tsx";
 import { parseFlowRoute, type FlowRoute } from "./flow-routes.ts";
 
-type Tab = "setup" | "status" | "history" | "hosts" | "settings" | "env" | "registry" | "onboarding" | "ingress" | "keys" | "audit" | "services" | "takeover" | "businesses" | "register" | "flow";
+type Tab = "setup" | "status" | "history" | "hosts" | "settings" | "env" | "registry" | "onboarding" | "ingress" | "keys" | "audit" | "services" | "takeover" | "businesses" | "register" | "flow" | "certs";
 type Panel = { kind: "deploy"; app: string; initial?: { version: string; pinFrom?: string } } | { kind: "job"; id: string } | undefined;
 
 const VERDICT: Record<string, { label: string; tone: string }> = {
@@ -122,6 +123,7 @@ export function App() {
           {shown === "businesses" && <BusinessesPage key={flowRoute?.kind === "businesses" ? flowRoute.service ?? "" : ""} {...(flowRoute?.kind === "businesses" && flowRoute.service ? { service: flowRoute.service } : {})} me={{ id: p.id, displayName: p.displayName }} />}
           {shown === "register" && <RegisterPage workbenchUrl={me.workbenchUrl} {...(me.environment ? { environment: me.environment } : {})} actions={actions} canAsk={p.via === "workbench"} />}
           {shown === "flow" && flowRoute?.kind === "flow" && <FlowDetailPage key={`${flowRoute.flow}:${flowRoute.service ?? ""}`} flow={flowRoute.flow} {...(flowRoute.service ? { service: flowRoute.service } : {})} isAdmin={p.permissions.includes("admin")} onBack={() => go("businesses")} onOpenService={(s) => { go("services"); openService(s); }} />}
+          {shown === "certs" && <CertificatesPage isAdmin={p.permissions.includes("admin")} onOpenService={(id) => { go("services"); openService(id); }} />}
           {shown === "takeover" && <TakeoverPage isAdmin={p.permissions.includes("admin")} onRegistered={() => go("services")} />}
           {shown === "settings" && <SettingsPage />}
           {shown === "env" && <EnvPage />}
@@ -152,7 +154,7 @@ function Sidebar({ principal, environment, tab, setTab, setupOnly, onSignedOut }
     ["Deploy", [["status", "Overview"], ["history", "Deploy history"], ["hosts", "Hosts"], ["settings", "Environment settings"]]],
     ["Apps", [["registry", "Apps & manifests"], ["onboarding", "Onboarding & assessments"], ["env", "Environment variables"], ["ingress", "Ingress"]]],
     // S3: managed services (NiFi) have their own pages, apart from the apps.
-    ["Services", [["services", "Managed services"], ["businesses", "Businesses"], ["takeover", "Takeover"]]],
+    ["Services", [["services", "Managed services"], ["businesses", "Businesses"], ["takeover", "Takeover"], ["certs", "Certificates"]]],
     ["Admin", [["keys", "API keys"], ...(principal.permissions.includes("admin") ? [["audit", "Audit"] as [Tab, string]] : [])]],
   ];
   const prod = environment?.toLowerCase() === "prod";

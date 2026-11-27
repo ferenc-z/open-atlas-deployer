@@ -24,6 +24,8 @@ export interface CheckItem {
   code: CheckCode;
   ok: boolean;
   message: string;
+  /** Passes, but worth a line on the page (owner 2026-11-27: a certificate without an EKU extension). */
+  notice?: boolean;
   /** san: the host names the certificate does not cover. */
   missing?: string[];
   /** open: why a file did not open. */
@@ -86,11 +88,13 @@ export function checkForService(opened: OpenedUpload, input: ServiceCheckInput):
   if (ks instanceof CertError) return { ok: false, items };
   const cert = ks.certificate;
 
-  const eku = cert.eku ?? [];
-  const lacking = ["clientAuth", "serverAuth"].filter((u) => !eku.includes(u));
-  items.push(lacking.length === 0
-    ? { code: "eku", ok: true, message: "Extended key usage has clientAuth and serverAuth." }
-    : { code: "eku", ok: false, message: cert.eku ? `Extended key usage lacks ${lacking.join(" and ")}.` : "The certificate has no extended key usage; NiFi needs clientAuth and serverAuth." });
+  const eku = cert.eku;
+  const lacking = eku ? ["clientAuth", "serverAuth"].filter((u) => !eku.includes(u)) : [];
+  items.push(!eku
+    ? { code: "eku", ok: true, notice: true, message: "Certificate has no EKU; NiFi does not restrict its use" }
+    : lacking.length === 0
+      ? { code: "eku", ok: true, message: "Extended key usage has clientAuth and serverAuth." }
+      : { code: "eku", ok: false, message: `Extended key usage lacks ${lacking.join(" and ")}.` });
 
   const missing = [...new Set(input.hosts)].filter((h) => !covers(cert, h));
   items.push(missing.length === 0

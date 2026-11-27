@@ -339,3 +339,28 @@ export const bizClient = makeBizClient(call);
 export const opsClient = makeOpsClient(call);
 /** A to-do's set-threshold action (admin): the same call as the old thresholds form. */
 export const putThresholds = (id: string, overrides: Record<string, number>) => call<unknown>("PUT", `services/${encodeURIComponent(id)}/thresholds`, { thresholds: overrides });
+
+// S41 step 3: the certificate library (admin). Uploads are multipart: one "file" per file picked.
+export type NifiCertView = import("../server/store.ts").NifiCert;
+export type CertVersionView = import("../server/store.ts").CertVersion;
+export type CertCheckItem = import("../server/certs/check.ts").CheckItem;
+export type CertServiceView = { id: string; hosts: string[]; bound: { cert: string; version: number } | null };
+export type CertLibrary = { keyConfigured: boolean; certs: NifiCertView[]; services: CertServiceView[] };
+export type CertUploadCheck = {
+  passwordsRead: true;
+  version: Omit<CertVersionView, "cert" | "version" | "uploadedAt" | "uploadedBy" | "usedBy">;
+  services: (CertServiceView & { ok: boolean; items: CertCheckItem[] })[];
+};
+async function uploadCall<T>(path: string, fields: Record<string, string>, files: File[]): Promise<T> {
+  const form = new FormData();
+  for (const [k, v] of Object.entries(fields)) form.set(k, v);
+  for (const f of files) form.append("file", f, f.name);
+  const response = await fetch(`${BASE}api/${path}`, { method: "POST", credentials: "same-origin", headers: { "x-csrf-token": csrfToken }, body: form });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new ApiError(response.status, data.message ?? `HTTP ${response.status}`, data.details ?? [], typeof data.error === "string" ? data.error : undefined, data);
+  return data as T;
+}
+export const nifiCerts = () => call<CertLibrary>("GET", "nifi-certs");
+export const checkNifiCert = (files: File[]) => uploadCall<CertUploadCheck>("nifi-certs/check", {}, files);
+export const saveNifiCert = (files: File[], target: { name: string } | { cert: string }) => uploadCall<{ cert: string; version: number }>("nifi-certs", target, files);
+export const removeNifiCertVersion = (cert: string, version: number) => call<{ removed: true }>("DELETE", `nifi-certs/${encodeURIComponent(cert)}/versions/${version}`);

@@ -47,6 +47,16 @@ export interface ServiceMemberFile {
   member: string; file: string; path: string; expectedSha256: string; revision: number; appliedAt: string; change: string | null; actualSha256: string | null; actualAt: string | null;
 }
 
+// S41 step 3: the certificate library. A cert has versions; a version's files, passwords and PEM are one sealed blob that no
+// read here returns (nifiCertSealed is for the rollout steps). A service is bound to one version.
+export interface CertVersion {
+  cert: string; version: number; subject: string; san: { type: string; value: string }[]; issuer: string; notBefore: string; notAfter: string;
+  eku: string[] | null; sha256: string; keystoreType: string; truststoreType: string; trusted: number; uploadedAt: string; uploadedBy: string; usedBy: string[];
+}
+export interface NifiCert { id: string; name: string; ownService: string | null; createdAt: string; createdBy: string; versions: CertVersion[] }
+export type NewCertVersion = Omit<CertVersion, "cert" | "version" | "uploadedAt" | "uploadedBy" | "usedBy"> & { sealed: string };
+export interface CertBinding { service: string; cert: string; version: number; boundAt: string; boundBy: string }
+
 export class StoreError extends Error {
   readonly code: string;
   readonly details: string[];
@@ -277,6 +287,15 @@ CREATE TABLE IF NOT EXISTS worker_places (
   schedule TEXT NOT NULL, worker_name TEXT NOT NULL, service TEXT, group_id TEXT,
   quote TEXT NOT NULL, placed_by TEXT NOT NULL, placed_at TEXT NOT NULL,
   PRIMARY KEY (flow, schedule, worker_name));
+CREATE TABLE IF NOT EXISTS nifi_certs (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, own_service TEXT, created_at TEXT NOT NULL, created_by TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS nifi_cert_versions (
+  cert TEXT NOT NULL REFERENCES nifi_certs(id), version INTEGER NOT NULL, subject TEXT NOT NULL, san TEXT NOT NULL, issuer TEXT NOT NULL,
+  not_before TEXT NOT NULL, not_after TEXT NOT NULL, eku TEXT, sha256 TEXT NOT NULL, keystore_type TEXT NOT NULL, truststore_type TEXT NOT NULL,
+  trusted INTEGER NOT NULL, sealed TEXT NOT NULL, uploaded_at TEXT NOT NULL, uploaded_by TEXT NOT NULL, PRIMARY KEY (cert, version));
+CREATE TABLE IF NOT EXISTS service_cert_bindings (
+  service TEXT PRIMARY KEY, cert TEXT NOT NULL, version INTEGER NOT NULL, bound_at TEXT NOT NULL, bound_by TEXT NOT NULL,
+  FOREIGN KEY (cert, version) REFERENCES nifi_cert_versions(cert, version));
 `;
 
 /** queued: waiting for the host's executor to claim it; the rest are the executor's states. */
@@ -1696,6 +1715,88 @@ export class Store {
       for (const c of rows) insert.run(service, member, c.store, c.path, c.type, c.alias, c.chain, c.subject, c.issuer, c.notBefore, c.notAfter, readAt, c.error);
     });
     return true;
+  }
+
+  // S41 step 3: the certificate library.
+  private certVersionRows(cert?: string): CertVersion[] {
+    const used = this.db.prepare("SELECT service, cert, version FROM service_cert_bindings ORDER BY service").all() as Row[];
+    const rows = (cert === undefined ? this.db.prepare("SELECT * FROM nifi_cert_versions ORDER BY cert, version DESC").all() : this.db.prepare("SELECT * FROM nifi_cert_versions WHERE cert = ? ORDER BY version DESC").all(cert)) as Row[];
+    return rows.map((r) => ({
+      cert: r.cert, version: r.version, subject: r.subject, san: JSON.parse(r.san), issuer: r.issuer, notBefore: r.not_before, notAfter: r.not_after, eku: parse(r.eku),
+      sha256: r.sha256, keystoreType: r.keystore_type, truststoreType: r.truststore_type, trusted: r.trusted, uploadedAt: r.uploaded_at, uploadedBy: r.uploaded_by,
+      usedBy: used.filter((u) => u.cert === r.cert && u.version === r.version).map((u) => u.service),
+    }));
+  }
+
+  nifiCerts(): NifiCert[] {
+    const versions = this.certVersionRows();
+    return (this.db.prepare("SELECT * FROM nifi_certs ORDER BY name").all() as Row[]).map((r) => ({
+      id: r.id, name: r.name, ownService: r.own_service ?? null, createdAt: r.created_at, createdBy: r.created_by, versions: versions.filter((v) => v.cert === r.id),
+    }));
+  }
+
+  nifiCert(id: string): NifiCert | undefined { return this.nifiCerts().find((c) => c.id === id); }
+
+  private insertCertVersion(cert: string, v: NewCertVersion, actor: Actor, at: string): number {
+    if (this.db.prepare("SELECT 1 FROM nifi_cert_versions WHERE cert = ? AND sha256 = ?").get(cert, v.sha256)) throw new StoreError("cert/duplicate", "This certificate is already a version of this entry.");
+    const version = ((this.db.prepare("SELECT MAX(version) AS v FROM nifi_cert_versions WHERE cert = ?").get(cert) as Row).v ?? 0) + 1;
+    this.db.prepare(`INSERT INTO nifi_cert_versions (cert, version, subject, san, issuer, not_before, not_after, eku, sha256, keystore_type, truststore_type, trusted, sealed, uploaded_at, uploaded_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(cert, version, v.subject, JSON.stringify(v.san), v.issuer, v.notBefore, v.notAfter, v.eku && JSON.stringify(v.eku), v.sha256, v.keystoreType, v.truststoreType, v.trusted, v.sealed, at, actor.id);
+    this.insertAudit(actor, "cert.version-added", `${cert}#${version}`, { subject: v.subject, notAfter: v.notAfter });
+    return version;
+  }
+
+  /** A new entry (a name, or one service's own certificate) with its first version. */
+  addNifiCert(name: string, ownService: string | null, v: NewCertVersion, actor: Actor): { cert: string; version: number } {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._ -]{0,63}$/.test(name)) throw new StoreError("cert/name", "The name is 1 to 64 letters, digits, spaces, dots, dashes or underscores.");
+    if (this.db.prepare("SELECT 1 FROM nifi_certs WHERE name = ?").get(name)) throw new StoreError("cert/name-taken", `A certificate named ${name} exists: upload to it as a new version.`);
+    const id = `nc_${randomBytes(5).toString("hex")}`, at = this.now().toISOString();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare("INSERT INTO nifi_certs (id, name, own_service, created_at, created_by) VALUES (?, ?, ?, ?, ?)").run(id, name, ownService, at, actor.id);
+      const version = this.insertCertVersion(id, v, actor, at);
+      this.db.exec("COMMIT");
+      return { cert: id, version };
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
+
+  addNifiCertVersion(cert: string, v: NewCertVersion, actor: Actor): number {
+    if (!this.db.prepare("SELECT 1 FROM nifi_certs WHERE id = ?").get(cert)) throw new StoreError("cert/unknown", "No such certificate.");
+    return this.insertCertVersion(cert, v, actor, this.now().toISOString());
+  }
+
+  /** The sealed files, passwords and PEM of a version: for the rollout steps only, never for a response. */
+  nifiCertSealed(cert: string, version: number): string | undefined {
+    return (this.db.prepare("SELECT sealed FROM nifi_cert_versions WHERE cert = ? AND version = ?").get(cert, version) as Row | undefined)?.sealed;
+  }
+
+  /** Removes a version no service uses; the entry goes with its last version. */
+  removeNifiCertVersion(cert: string, version: number, actor: Actor) {
+    const v = this.certVersionRows(cert).find((x) => x.version === version);
+    if (!v) throw new StoreError("cert/unknown", "No such certificate version.");
+    if (v.usedBy.length) throw new StoreError("cert/in-use", `Version ${version} is used by ${v.usedBy.join(", ")}.`, v.usedBy);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare("DELETE FROM nifi_cert_versions WHERE cert = ? AND version = ?").run(cert, version);
+      if (!this.db.prepare("SELECT 1 FROM nifi_cert_versions WHERE cert = ?").get(cert)) this.db.prepare("DELETE FROM nifi_certs WHERE id = ?").run(cert);
+      this.insertAudit(actor, "cert.version-removed", `${cert}#${version}`, { subject: v.subject });
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
+
+  serviceCertBindings(): CertBinding[] {
+    return (this.db.prepare("SELECT * FROM service_cert_bindings ORDER BY service").all() as Row[]).map((r) => ({ service: r.service, cert: r.cert, version: r.version, boundAt: r.bound_at, boundBy: r.bound_by }));
+  }
+
+  bindServiceCert(service: string, cert: string, version: number, actor: Actor) {
+    if (!this.db.prepare("SELECT 1 FROM nifi_cert_versions WHERE cert = ? AND version = ?").get(cert, version)) throw new StoreError("cert/unknown", "No such certificate version.");
+    this.db.prepare("INSERT OR REPLACE INTO service_cert_bindings (service, cert, version, bound_at, bound_by) VALUES (?, ?, ?, ?, ?)").run(service, cert, version, this.now().toISOString(), actor.id);
+    this.insertAudit(actor, "cert.bound", service, { cert, version });
+  }
+
+  unbindServiceCert(service: string, actor: Actor) {
+    this.db.prepare("DELETE FROM service_cert_bindings WHERE service = ?").run(service);
+    this.insertAudit(actor, "cert.unbound", service, {});
   }
 
   serviceCerts(service: string): ServiceCert[] {

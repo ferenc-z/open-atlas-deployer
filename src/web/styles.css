@@ -469,3 +469,19 @@ button.change-now.state-paused { color: var(--warn); border-color: var(--warn); 
 
 pre.raw { white-space: pre-wrap; word-break: break-word; max-height: 24rem; overflow: auto; padding: 0.5rem; background: var(--code-bg, rgba(127,127,127,0.08)); }
 
+
+/* S41: the certificate library page. */
+.cert-head.warn { color: var(--warn); } .cert-head.bad { color: var(--bad); } .cert-head.muted { color: inherit; }
+.cert-card, .cert-add { display: flex; flex-direction: column; gap: 16px; margin-bottom: 16px; }
+.cert-title { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px; }
+.cert-name { font-size: 20px; }
+.cert-facts { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr)); gap: 6px 24px; font-size: 14px; }
+.cert-drop { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 28px 20px; border: 2px dashed var(--border); border-radius: 12px; background: var(--bg); color: inherit; height: auto; cursor: pointer; }
+.cert-drop-title { font-size: 16px; font-weight: 600; }
+.cert-stage { display: flex; flex-direction: column; gap: 12px; padding: 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--info-bg); }
+.cert-box { width: 32px; height: 32px; padding: 0; border-radius: 6px; font-weight: 700; background: var(--surface); }
+.cert-box.on { background: #1B1B1B; color: #fff; border-color: #1B1B1B; }
+.cert-ok { color: var(--ok); } .cert-bad { color: var(--bad); } .cert-notice { color: var(--warn); }
+.cert-saved { display: flex; flex-direction: column; gap: 6px; padding: 12px 16px; border-radius: 10px; background: var(--ok-bg); }
+.cert-saved strong { color: var(--ok); }
+.cert-versions { display: flex; flex-direction: column; gap: 6px; }
