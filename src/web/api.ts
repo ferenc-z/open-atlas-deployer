@@ -203,7 +203,7 @@ export const stopJob = (job: string) => call<{ job: Job }>("POST", `jobs/${encod
 import type { ApiKey } from "../server/keys.ts";
 export type ApiKeyView = ApiKey;
 export const keys = () => call<{ keys: ApiKey[] }>("GET", "keys");
-export const createKey = (kind: "personal" | "service", name: string, days: number) => call<{ key: string; record: ApiKey }>("POST", "keys", { kind, name, days });
+export const createKey = (kind: "personal" | "service" | "checkup", name: string, days: number) => call<{ key: string; record: ApiKey }>("POST", "keys", { kind, name, days });
 export const revokeKey = (id: string) => call<{ revoked: true }>("DELETE", `keys/${encodeURIComponent(id)}`);
 
 // Phase 8: drift, the daily brief, deploys announced in Workbench.

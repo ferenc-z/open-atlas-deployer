@@ -5,6 +5,8 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
 
 ## 0.3.0-rc.17
 
+- API keys page: an admin can create a check-up key ("Check-up key", for the Service Check-up agent's Vault); the
+  form offered only personal and service keys, so the check-up's Vault held a service key and its calls failed.
 - S41 lab check fixes: the home page's Services card title shows the worst of the services and the certificate alerts
   (it said "Healthy" with a certificate failing or needing attention). A keystore or truststore whose file name says
   PKCS12 or JKS and whose content is the other (a PKCS12 replaced by a JKS, the path kept) gets an info finding on

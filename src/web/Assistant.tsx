@@ -203,7 +203,7 @@ export function KeysPage({ isAdmin }: { isAdmin: boolean }) {
   const [error, setError] = useState("");
   const [name, setName] = useState("");
   const [days, setDays] = useState(90);
-  const [kind, setKind] = useState<"personal" | "service">("personal");
+  const [kind, setKind] = useState<"personal" | "service" | "checkup">("personal");
   const [made, setMade] = useState<string | undefined>();
   const refresh = () => api.keys().then((r) => setList(r.keys), (e: Error) => setError(e.message));
   useEffect(() => { refresh(); }, []);
@@ -220,7 +220,7 @@ export function KeysPage({ isAdmin }: { isAdmin: boolean }) {
         <div className="row">
           <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Name, e.g. My Claude Code" />
           <select value={days} onChange={(e) => setDays(Number(e.target.value))}>{[7, 30, 90, 365].map((d) => <option key={d} value={d}>{d} days</option>)}</select>
-          {isAdmin && <select value={kind} onChange={(e) => setKind(e.target.value as "personal" | "service")}><option value="personal">Personal key</option><option value="service">Service key (read-only, for OMA Vault)</option></select>}
+          {isAdmin && <select value={kind} onChange={(e) => setKind(e.target.value as "personal" | "service" | "checkup")}><option value="personal">Personal key</option><option value="service">Service key (read-only, for OMA Vault)</option><option value="checkup">Check-up key (for the Service Check-up agent's Vault)</option></select>}
           <button className="primary" disabled={!name.trim()}>Create</button>
         </div>
         {made && <div className="banner warn">Shown only once; copy it now: <code className="mono">{made}</code> <button type="button" className="link" onClick={() => navigator.clipboard?.writeText(made)}>Copy</button></div>}
@@ -231,7 +231,7 @@ export function KeysPage({ isAdmin }: { isAdmin: boolean }) {
         <tbody>
           {(list ?? []).map((k) => (
             <tr key={k.id} className={k.revokedAt ? "muted" : ""}>
-              <td>{k.name}</td><td>{k.kind === "service" ? "Service (read-only)" : "Personal"}</td><td className="mono">{k.prefix}…</td><td>{k.owner}</td>
+              <td>{k.name}</td><td>{k.kind === "service" ? "Service (read-only)" : k.kind === "checkup" ? "Check-up" : "Personal"}</td><td className="mono">{k.prefix}…</td><td>{k.owner}</td>
               <td>{new Date(k.expiresAt).toLocaleDateString("en-US")}</td><td>{k.lastUsedAt ? new Date(k.lastUsedAt).toLocaleString("en-US", { hour12: false }) : "—"}</td>
               <td>{k.revokedAt ? "Revoked" : <button className="link" onClick={() => revoke(k.id)}>Revoke</button>}</td>
             </tr>
