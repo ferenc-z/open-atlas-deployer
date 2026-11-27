@@ -22,12 +22,31 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   newer version of its entry as a draft, binds the certificate in use with no draft and no restart (reading the stores
   from the hosts first when no revision has them, a new revision "read"), and takes an upload (kept in the library,
   then bound if it is what the hosts have, else drafted). Admins only.
+- S40 (S41 step 5): the service executor connects to its NiFi with the certificate chosen for the service from the
+  certificate library, the NiFi's own (e.g. `CN=S2S, OU=NIFI`), for reads, the collector, the FlowFile trace and a
+  cluster's node disconnect/connect alike; the monitor and operator certificates are gone. The heartbeat's watch
+  entries name the bound version only; the executor fetches the PEM chain, key and CA bundle with its own token from
+  `GET /executor/v1/nifi-certs/<service>` (only services on its host; another host's or an unknown one is 404) when
+  that version changes, and keeps it in memory (the key touches disk only in a mode-600 temporary file while ssl
+  loads it). While a change puts another library version's key store on the nodes, that version's CA joins the
+  bundle; the client certificate stays the bound one until the binding moves. No certificate chosen: the REST state
+  is `no-certificate` and the to-do says to choose one. The takeover draft has a certificate step per item (confirm
+  waits for it) and shows the DN, as the certificate has it, to copy into NiFi; the Takeover page lists the policies
+  for that one identity (standalone: add it as a user first). Service executor 0.9.10 (`nifi-certs@1`):
+  `EXECUTOR_NIFI_CLIENT_CERT/KEY`, `EXECUTOR_NIFI_OPERATOR_CERT/KEY`, `EXECUTOR_NIFI_CA` and
+  `EXECUTOR_NIFI_CA_RELAXED` are ignored, with one line at start naming those still set; `VERIFY_X509_STRICT` is
+  always off for the NiFi connection (nifi-toolkit CAs do not mark Basic Constraints critical; only the bundle is
+  trusted and the host name is checked). The lab's `lab.sh grant` gives the policies to each NiFi's node identity.
 
 ### After upgrading
 
 - [ ] Upgrade the service executors to 0.9.9 (the Executors page) before a draft replaces a key or trust store; a
   service taken over before needs its stores read in before they can be changed: on its Certificates page, "Read the
   stores and find the certificate in use".
+- [ ] Before the service executors go to 0.9.10: upload each NiFi's certificate to the certificate library and bind
+  every service taken over before to it, and give its DN the policies on the Takeover page (`modify the controller`
+  too on a cluster); until then 0.9.10 cannot call that NiFi. Then remove the `EXECUTOR_NIFI_*` certificate lines
+  from `service-executor.env`.
 
 ## 0.3.0-rc.16
 

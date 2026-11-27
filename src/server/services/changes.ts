@@ -239,7 +239,7 @@ export class ServiceChanges {
       else if (m.serviceUser === "root") error("change/service-user", `${key}: NiFi is not run as root (S10).`, key);
       else if (hb && hb.isRoot === false && hb.user && hb.user !== m.serviceUser) error("change/other-user", `${key}: the service executor runs as ${hb.user} and cannot act as ${m.serviceUser}.`, key);
       if (kind !== "stop" && control && control.killMode && control.killMode !== "process") error("change/kill-mode", `${m.host}: the service executor's unit has KillMode=${control.killMode}: NiFi would die with it. Run its install.sh again first.`, key);
-      if (service.kind === "cluster" && kind !== "start" && !full && control && !control.operatorCert) error("change/no-operator-cert", `${m.host}: the service executor has no operator certificate (EXECUTOR_NIFI_OPERATOR_CERT): it cannot disconnect a node.`, key);
+      if (service.kind === "cluster" && kind !== "start" && !full && control && !control.operatorCert) error("change/no-operator-cert", `${m.host}: the service executor has no certificate for this NiFi (choose one on the Certificates page): it cannot disconnect a node.`, key);
       if (kind !== "stop" && !m.startEnvironment) out.push({ severity: "warning", code: "change/no-start-env", message: `${key}: no start environment is known (it never ran under the Deployer's eye): NiFi starts with what its own scripts set.`, member: key, introduced: true });
     }
     return { findings: out, executors };

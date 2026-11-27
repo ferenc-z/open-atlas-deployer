@@ -5,6 +5,7 @@
 import calendar
 import gzip
 import hashlib
+import io
 import json
 import os
 import pathlib
@@ -26,6 +27,15 @@ import service_executor as sx  # noqa: E402
 from test_deployer_executor import FakeApi, load_module  # noqa: E402
 
 NO_ENV = {"HOME": "/nonexistent"}
+
+
+CERT_REF = {"cert": "nc_lab", "version": 1}
+
+
+def give_cert(ex, service, ctx="ctx", error=None):
+    """S40: as if the Deployer had sent the service's certificate (NifiCerts), with ctx standing for its context. A
+    watch entry with "cert": CERT_REF names the same version, so a heartbeat keeps it."""
+    ex.nifi_certs.held[service] = {"ref": sx.watch_cert(CERT_REF), "ctx": ctx, "error": error, "at": time.monotonic(), "subject": "CN=S2S, OU=NIFI"}
 
 
 def cfg(root, **over):
@@ -101,7 +111,7 @@ class RegistrationTest(Base):
         beat = self.api.beats[-1]
         self.assertEqual(beat["executor"], "service")
         self.assertEqual(beat["protocols"], [2])
-        self.assertEqual(beat["kinds"], ["svc-discover", "svc-read", "svc-state", "log-read", "log-tail", "nifi-provenance", "nifi-groups", "svc-write", "svc-control", "executor-upgrade", "svc-discover@2", "svc-read@2", "svc-read@3", "nifi-provenance@1", "svc-state@1", "svc-write@1", "svc-write@2", "svc-control@1", "nifi-groups@1", "flow-groups@1"],
+        self.assertEqual(beat["kinds"], ["svc-discover", "svc-read", "svc-state", "log-read", "log-tail", "nifi-provenance", "nifi-groups", "svc-write", "svc-control", "executor-upgrade", "svc-discover@2", "svc-read@2", "svc-read@3", "nifi-provenance@1", "svc-state@1", "svc-write@1", "svc-write@2", "svc-control@1", "nifi-groups@1", "flow-groups@1", "nifi-certs@1"],
                          "the service jobs and what they can do (§15.2); never the deploy ones")
         name, root = sx.ServiceExecutor.user()
         self.assertEqual((beat["user"], beat["isRoot"]), (name, root))
@@ -792,7 +802,7 @@ class LabCollector(sx.Collector):
         super().__init__(*a, **kw)
         self.calls, self.down, self.hang, self.keytool_runs = [], set(), set(), []
 
-    def context(self):
+    def context(self, service):
         return "ctx", None
 
     def fetch(self, ctx, connect, port, sni, path, timeout):
@@ -927,31 +937,43 @@ class RestTrimTest(unittest.TestCase):
         self.assertEqual(sx.endpoint("0.0.0.0", "nifi1.corp"), ("localhost", "nifi1.corp"), "bound everywhere: localhost, checked against the node's name")
         self.assertEqual(sx.endpoint("", None), ("localhost", "localhost"))
 
-    def test_the_monitor_certificate_and_the_relaxed_ca(self):
-        self.assertEqual(sx.nifi_context({})[0], None)
-        self.assertIn("EXECUTOR_NIFI_CLIENT_CERT", sx.nifi_context({})[1])
-        ctx, why = sx.nifi_context({"nifi_client_cert": "/nonexistent.crt", "nifi_client_key": "/nonexistent.key"})
-        self.assertIsNone(ctx)
-        self.assertIn("cannot load the monitor certificate", why)
+    def test_the_tls_context_trusts_only_the_bundle_and_leaves_no_key_file(self):
+        openssl = shutil.which("openssl")
+        if not openssl:
+            self.skipTest("openssl is not installed")
+        with tempfile.TemporaryDirectory() as d:
+            subprocess.run([openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=S2S/OU=NIFI", "-days", "2",
+                            "-keyout", f"{d}/k.pem", "-out", f"{d}/c.pem"], check=True, capture_output=True)
+            cert, key = pathlib.Path(f"{d}/c.pem").read_text(), pathlib.Path(f"{d}/k.pem").read_text()
+            scratch = pathlib.Path(d) / "work"
+            scratch.mkdir()
+            ctx = sx.tls_context(cert, key, cert, scratch)
+            self.assertEqual(list(scratch.iterdir()), [], "the key file is gone once loaded")
+            self.assertEqual(ctx.verify_flags & getattr(sx.ssl, "VERIFY_X509_STRICT", 0), 0, "toolkit CAs pass")
+            self.assertTrue(ctx.check_hostname)
+            self.assertEqual([c["subject"] for c in ctx.get_ca_certs()], [((("commonName", "S2S"),), (("organizationalUnitName", "NIFI"),))], "only the bundle")
+            with self.assertRaisesRegex(ValueError, "no CA"):
+                sx.tls_context(cert, key, "", scratch)
+            with self.assertRaisesRegex(ValueError, "no certificate or key"):
+                sx.tls_context(cert, "", cert, scratch)
+            other = subprocess.run([openssl, "genpkey", "-algorithm", "RSA"], check=True, capture_output=True, text=True).stdout
+            with self.assertRaises(sx.ssl.SSLError):
+                sx.tls_context(cert, other, cert, scratch)
+            self.assertEqual(list(scratch.iterdir()), [], "not even when loading fails")
 
-        class Ctx:
-            verify_flags = getattr(sx.ssl, "VERIFY_X509_STRICT", 0x20) | 0x1
-
-            def load_cert_chain(self, cert, key):
-                self.chain = (cert, key)
-        made = []
-        real = sx.ssl.create_default_context
-        sx.ssl.create_default_context = lambda cafile=None: made.append(cafile) or Ctx()
-        try:
-            strict = sx.nifi_context({"nifi_client_cert": "/m.crt", "nifi_client_key": "/m.key", "nifi_ca": "/ca.crt"})[0]
-            relaxed = sx.nifi_context({"nifi_client_cert": "/m.crt", "nifi_client_key": "/m.key", "nifi_ca": "/ca.crt", "nifi_ca_relaxed": True})[0]
-        finally:
-            sx.ssl.create_default_context = real
-        flag = getattr(sx.ssl, "VERIFY_X509_STRICT", 0x20)
-        self.assertEqual((strict.verify_flags & flag, relaxed.verify_flags & flag, relaxed.verify_flags & 0x1), (flag, 0, 0x1), "only the strict flag goes")
-        self.assertEqual((made, relaxed.chain), (["/ca.crt", "/ca.crt"], ("/m.crt", "/m.key")))
-        c = sx.config(environ={"EXECUTOR_COLLECT_SECONDS": "5", "EXECUTOR_NIFI_CA_RELAXED": "1"})
-        self.assertEqual((c["collect_seconds"], c["nifi_ca_relaxed"]), (30, True))
+    def test_the_certificate_settings_of_before_are_ignored_with_a_hint(self):
+        old = {"EXECUTOR_NIFI_CLIENT_CERT": "/m.crt", "EXECUTOR_NIFI_CLIENT_KEY": "/m.key", "EXECUTOR_NIFI_CA": "/ca.crt", "EXECUTOR_NIFI_CA_RELAXED": "1",
+               "EXECUTOR_NIFI_OPERATOR_CERT": "/o.crt", "EXECUTOR_NIFI_OPERATOR_KEY": "/o.key"}
+        c = sx.config(environ=old)
+        self.assertEqual(c["retired_env"], sorted(old))
+        self.assertFalse([k for k in c if k.startswith("nifi_")], "none of them is read")
+        self.assertEqual(sx.config(environ={})["retired_env"], [])
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            sx.ServiceExecutor({**cfg(d), "retired_env": ["EXECUTOR_NIFI_CA"]}, out=out, api=FakeApi())
+        self.assertIn("ignored: EXECUTOR_NIFI_CA (S40", out.getvalue())
+        c = sx.config(environ={"EXECUTOR_COLLECT_SECONDS": "5"})
+        self.assertEqual(c["collect_seconds"], 30)
         self.assertEqual((sx.config(environ={})["collect_seconds"], sx.config(environ={"EXECUTOR_COLLECT_SECONDS": "900"})["collect_seconds"]), (60, 300))
         # Back pressure (owner 2026-11-07): every 5 minutes and the fullest 5 by default, within 30-3600 s and 1-50.
         self.assertEqual((sx.config(environ={})["backpressure_seconds"], sx.config(environ={})["backpressure_top"]), (300, 5))
@@ -1024,7 +1046,8 @@ class CollectorTest(Base):
         self.api.watch = [self.watch[0]]
         ex.heartbeat()
         self.assertEqual([w["service"] for w in ex.watch], ["n112"], "a removal counts from the next beat")
-        self.assertEqual(ex.beat_body(None)["collector"], {"seconds": 60, "backpressureSeconds": 300, "watching": 1, "backlog": 0, "certificate": False})
+        self.assertEqual(ex.beat_body(None)["collector"], {"seconds": 60, "backpressureSeconds": 300, "watching": 1, "backlog": 0, "certificate": False,
+                                                            "certificates": {"n112": {"cert": None, "version": None, "ready": False, "error": sx.NO_CERT}}})
         self.api.watch = None
         ex.heartbeat()
         self.assertEqual(ex.watch, [], "a Deployer that sends no list: nothing is watched")
@@ -1169,8 +1192,8 @@ class CollectorTest(Base):
         self.assertNotIn("cluster", rest)
 
         c = self.collector()
-        c.context = lambda: (None, "no monitor certificate")
-        self.assertEqual(c.state(entry)["rest"], {"state": "no-certificate", "error": "no monitor certificate"})
+        c.context = lambda service: (None, "no certificate is chosen")
+        self.assertEqual(c.state(entry)["rest"], {"state": "no-certificate", "error": "no certificate is chosen"})
 
     def test_svc_state_filters_the_start_environment_as_the_deployer_does(self):
         # The same variables as test/services.test.ts "the start environment keeps what starting NiFi needs".
@@ -1286,13 +1309,13 @@ class CollectorTest(Base):
         self.assertTrue(all(v.startswith("skipped") for v in node["errors"].values()))
         self.assertIn("status", node)
 
-    def test_without_the_monitor_certificate_only_proc_and_the_disks(self):
+    def test_without_a_certificate_only_proc_and_the_disks(self):
         c = sx.Collector(cfg(self.root), proc=self.proc.root, uid=os.geteuid())
         c.run_keytool = LabCollector.run_keytool.__get__(c)
         c.keytool_runs = []
         samples = self.by_service(c.round(sx.watch_entries(self.watch)))
         self.assertEqual(samples["c250-1"]["nifi"]["state"], "no-certificate")
-        self.assertIn("EXECUTOR_NIFI_CLIENT_CERT", samples["c250-1"]["nifi"]["error"])
+        self.assertEqual(samples["c250-1"]["nifi"]["error"], sx.NO_CERT)
         self.assertTrue(samples["c250-1"]["process"]["running"])
         self.assertTrue(samples["c250-1"]["disks"])
         self.assertTrue(samples["c250-1"]["certs"]["stores"], "the certificates are read from the files all the same")
@@ -2776,7 +2799,7 @@ class ProvenanceTest(Base):
         job = sx.ReadJob({"id": "nifi-provenance-0001", "kind": "nifi-provenance", "member": "nope", "op": "search-options"}, 30)
         with self.assertRaisesRegex(sx.Refused, "not an installation this executor watches"):
             ex.nifi_provenance(job)
-        with self.assertRaisesRegex(sx.Failed, "monitor certificate"):
+        with self.assertRaisesRegex(sx.Failed, "provenance needs the service's NiFi certificate: no certificate is chosen"):
             ex.nifi_provenance(sx.ReadJob({**job.request, "member": "local:/opt/nifi"}, 30))
         nifi = FakeNifi()
         ex.nifi_call = lambda w, props: (nifi, props.get("nifi.cluster.is.node") == "true")
@@ -3124,11 +3147,13 @@ class SvcControlTest(Base):
     # --- the heartbeat ---
 
     def test_the_heartbeat_says_what_control_has_without_a_path(self):
-        ex = self.make_ex(nifi_operator_cert="/secret/place/op.crt", nifi_operator_key="/secret/place/op.key")
+        ex = self.make_ex()
+        ex.watch = sx.watch_entries([{"service": "c", "member": "local:node", "installDir": "/opt/nifi"}])
+        give_cert(ex, "c", ctx="secret-context")
         ex.heartbeat()
         beat = self.api.beats[-1]
         self.assertEqual(beat["control"], {"operatorCert": True, "killMode": None, "runuser": bool(sx.shutil.which("runuser"))})
-        self.assertNotIn("/secret/place", json.dumps(beat))
+        self.assertNotIn("secret-context", json.dumps(beat, default=str))
         self.ex.heartbeat()
         self.assertFalse(self.api.beats[-1]["control"]["operatorCert"])
         self.cgroup.write_text("0::/system.slice/x.service\n")
@@ -3311,32 +3336,29 @@ class FakeCluster:
 
 
 class SvcControlNodeTest(Base):
-    """node-*: fake REST; which certificate is loaded is the real code's (ssl's load_cert_chain is watched)."""
-
-    CERTS = {"nifi_operator_cert": "/certs/operator.crt", "nifi_operator_key": "/certs/operator.key", "nifi_client_cert": "/certs/monitor.crt", "nifi_client_key": "/certs/monitor.key"}
+    """node-*: fake REST; the context handed to NiFi's caller is the service's certificate (S40), the one the reads use."""
 
     def setUp(self):
         super().setUp()
         self.home = nifi_home(self.root, "nifi", "2.5.0", {"nifi.web.https.port": "18445", "nifi.cluster.is.node": "true", "nifi.web.https.host": "localhost"})
         self.api = WatchApi()
         self.api.watch = [{"service": "c", "member": "local:node", "profile": "nifi", "installDir": str(self.home), "confDir": str(self.home / "conf"),
-                           "https": {"host": "localhost", "port": 18445}, "nodeAddress": "localhost", "logDir": None, "files": []}]
-        self.ex = self.make_ex(**self.CERTS)
+                           "https": {"host": "localhost", "port": 18445}, "nodeAddress": "localhost", "logDir": None, "files": [], "cert": CERT_REF}]
+        self.ex = self.make_ex()
         self.loaded = []
-        load = mock.patch.object(sx.ssl.SSLContext, "load_cert_chain", side_effect=lambda cert, key=None: self.loaded.append(cert))
-        load.start()
-        self.addCleanup(load.stop)
         poll = mock.patch.object(sx, "CONTROL_POLL", 0.01)
         poll.start()
         self.addCleanup(poll.stop)
         self.jobs = 0
         self.targets = []
 
-    def make_ex(self, **over):
+    def make_ex(self, cert=True, **over):
         ex = sx.ServiceExecutor(cfg(self.root, **over), out=self.devnull, api=self.api)
         ex.sleep = lambda s: None
         ex.CGROUP = str(self.root / "none")
         ex.watch = sx.watch_entries(self.api.watch)
+        if cert:
+            give_cert(ex, "c", ctx="c-ctx")
         return ex
 
     def job(self, action, cluster, timeout=5, ex=None, nodeId="node-1", member="local:node"):
@@ -3346,18 +3368,19 @@ class SvcControlNodeTest(Base):
 
         def caller(ctx, connect, sni, port, limit=None):
             self.targets.append((connect, sni, port))
+            self.loaded.append(ctx)
             return cluster.call
         with mock.patch.object(sx, "nifi_caller", caller):
             (ex or self.ex).handle({"protocol": 2, "id": job_id, "kind": "svc-control", "action": action, "change": "c1", "member": member, "nodeId": nodeId, "timeoutSeconds": timeout})
         return self.api.status[job_id]
 
-    def test_disconnect_asks_and_waits_with_the_operator_certificate_only(self):
+    def test_disconnect_asks_and_waits_with_the_services_certificate(self):
         cluster = FakeCluster()
         done = self.job("node-disconnect", cluster)
         self.assertEqual(done["state"], "succeeded", done.get("message"))
         self.assertEqual(cluster.puts, [{"node": {"nodeId": "node-1", "status": "DISCONNECTING"}}])
         self.assertEqual((done["result"]["before"], done["result"]["status"], done["result"]["nodeId"]), ("CONNECTED", "DISCONNECTED", "node-1"))
-        self.assertEqual(self.loaded, ["/certs/operator.crt"])
+        self.assertEqual(self.loaded, ["c-ctx"])
         self.assertEqual(self.targets, [("localhost", "localhost", 18445)])
 
     def test_offload_and_connect(self):
@@ -3379,19 +3402,20 @@ class SvcControlNodeTest(Base):
         self.assertEqual(self.job("node-disconnect", cluster)["state"], "succeeded")
         self.assertEqual(cluster.puts, [])
 
-    def test_without_the_operator_certificate_it_is_refused_and_the_monitor_one_is_no_fallback(self):
-        ex = self.make_ex(nifi_client_cert="/certs/monitor.crt", nifi_client_key="/certs/monitor.key")
+    def test_without_a_certificate_it_is_refused(self):
+        self.api.watch[0]["cert"] = None
+        ex = self.make_ex(cert=False, nifi_operator_cert="/certs/operator.crt", nifi_operator_key="/certs/operator.key")
         cluster = FakeCluster()
         done = self.job("node-disconnect", cluster, ex=ex)
         self.assertEqual(done["state"], "refused")
-        self.assertIn("EXECUTOR_NIFI_OPERATOR_CERT", done["message"])
+        self.assertEqual(done["message"], sx.NO_CERT)
         self.assertEqual((self.loaded, cluster.puts, cluster.gets), ([], [], 0))
 
-    def test_a_certificate_that_does_not_load_is_refused(self):
-        with mock.patch.object(sx.ssl.SSLContext, "load_cert_chain", side_effect=OSError(2, "No such file")):
-            done = self.job("node-disconnect", FakeCluster())
+    def test_a_certificate_that_could_not_be_fetched_is_refused(self):
+        give_cert(self.ex, "c", ctx=None, error="cannot get the certificate of c: HTTP 503")
+        done = self.job("node-disconnect", FakeCluster())
         self.assertEqual(done["state"], "refused")
-        self.assertIn("operator certificate", done["message"])
+        self.assertIn("cannot get the certificate of c", done["message"])
 
     def test_nifi_saying_no_ends_it_at_once(self):
         cluster = FakeCluster(put_answers=[409])
@@ -3434,23 +3458,94 @@ class SvcControlNodeTest(Base):
         self.assertEqual(self.job("node-disconnect", cluster)["state"], "refused")
         self.assertEqual((self.loaded, cluster.puts, cluster.gets), ([], [], 0))
 
-    def test_reads_and_the_collector_never_get_the_operator_certificate(self):
+    def test_reads_the_collector_and_node_calls_use_the_same_certificate_of_the_service(self):
         collector = self.ex.make_collector()
-        self.assertFalse([k for k in collector.cfg if "operator" in k])
-        self.assertIn("/certs/operator.crt", json.dumps(self.ex.cfg, default=str), "the fixture has it")
-        collector.context()
-        sx.nifi_context(self.ex.cfg)
-        self.assertEqual(self.loaded, ["/certs/monitor.crt"] * 2)
-        # A whole svc-state, a sample, and provenance's call.
-        self.loaded.clear()
-        api_calls = []
-        with mock.patch.object(sx.Collector, "fetch", side_effect=lambda *a: api_calls.append(a) or (503, b"")), \
-                mock.patch.object(sx.Discovery, "running", return_value={(str(self.home), str(self.home / "conf")): {"pid": os.getpid(), "bootstrapPid": None, "uid": os.geteuid(), "environment": {}, "problems": []}}):
-            self.ex.state(sx.ReadJob({"id": "state-job-0001", "member": "local:node"}, 10))
-            self.ex.make_collector().round(self.ex.watch)
-        self.ex.nifi_call(self.ex.watch[0], {"nifi.web.https.port": "18445"})
-        self.assertTrue(api_calls, "it did call")
-        self.assertEqual(set(self.loaded), {"/certs/monitor.crt"})
+        self.assertEqual(collector.context("c"), ("c-ctx", None))
+        self.assertEqual(collector.context("other"), (None, sx.NO_CERT), "another service's certificate is not lent")
+        made = []
+        with mock.patch.object(sx, "nifi_caller", lambda ctx, *a, **kw: made.append(ctx) or (lambda *x: (200, b"{}"))):
+            self.ex.nifi_call(self.ex.watch[0], {"nifi.web.https.port": "18445"})
+        self.assertEqual(made, ["c-ctx"])
+
+
+class NifiCertsTest(unittest.TestCase):
+    """S40: the certificate of each watched service comes from the Deployer when the watch entry's version changes."""
+
+    class Api:
+        def __init__(self):
+            self.calls, self.fail = [], None
+
+        def call(self, method, path, **kw):
+            self.calls.append((method, path))
+            if self.fail:
+                raise sx.Failed(self.fail)
+            return {"certificatePem": "CERT", "privateKeyPem": "KEY", "caPem": "CA", "subject": "CN=S2S, OU=NIFI"}
+
+    def setUp(self):
+        self.api, self.said = self.Api(), []
+        self.made = []
+        patch = mock.patch.object(sx, "tls_context", side_effect=lambda c, k, ca, scratch: self.made.append((c, k, ca)) or f"ctx{len(self.made)}")
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.certs = sx.NifiCerts(self.api, log=self.said.append)
+
+    @staticmethod
+    def watch(*entries):
+        return sx.watch_entries([{"service": s, "member": f"local:/opt/{s}", "installDir": f"/opt/{s}", **({"cert": c} if c is not ... else {})} for s, c in entries])
+
+    def test_the_watch_entry_names_a_version_never_a_key(self):
+        self.assertEqual(sx.watch_cert({"cert": "nc_1", "version": 2, "sha256": "ab", "pending": {"cert": "nc_2", "version": 1}, "privateKeyPem": "x"}),
+                         {"cert": "nc_1", "version": 2, "sha256": "ab", "pending": {"cert": "nc_2", "version": 1}})
+        for bad in (None, {}, {"cert": "nc_1"}, {"cert": "", "version": 1}, {"cert": "nc_1", "version": True}, "nc_1#1"):
+            self.assertIsNone(sx.watch_cert(bad), bad)
+
+    def test_fetched_once_per_version_and_again_when_it_changes(self):
+        v1 = {"cert": "nc_1", "version": 1}
+        self.certs.sync(self.watch(("a/b", v1), ("a/b", v1)))
+        self.assertEqual(self.api.calls, [("GET", "/executor/v1/nifi-certs/a%2Fb")], "once per service, its id quoted")
+        self.assertEqual(self.certs.context("a/b"), ("ctx1", None))
+        self.assertEqual(self.made, [("CERT", "KEY", "CA")])
+        self.certs.sync(self.watch(("a/b", v1)))
+        self.assertEqual(len(self.api.calls), 1, "the same version is not fetched again")
+        self.certs.sync(self.watch(("a/b", {"cert": "nc_1", "version": 1, "pending": {"cert": "nc_1", "version": 2}})))
+        self.assertEqual(len(self.api.calls), 2, "a change starts: the CA bundle grows")
+        self.assertIn("also trusting the CA of nc_1 version 2", self.said[-1])
+        self.certs.sync(self.watch(("a/b", {"cert": "nc_1", "version": 2})))
+        self.assertEqual((len(self.api.calls), self.certs.context("a/b")), (3, ("ctx3", None)))
+        summary = self.certs.summary()
+        self.assertEqual(summary, {"a/b": {"cert": "nc_1", "version": 2, "ready": True}})
+        self.assertNotIn("KEY", json.dumps(summary))
+
+    def test_none_chosen_a_failure_and_a_service_gone(self):
+        self.certs.sync(self.watch(("a", None), ("old", ...)))
+        self.assertEqual(self.certs.context("a"), (None, sx.NO_CERT))
+        self.assertEqual(self.certs.context("old"), (None, sx.NO_CERT), "an older Deployer names none")
+        self.assertEqual(self.api.calls, [])
+        self.certs.sync(self.watch(("a", {"cert": "nc_1", "version": 1})))
+        self.api.fail = "the Deployer answered GET /executor/v1/nifi-certs/a with HTTP 503"
+        self.certs.sync(self.watch(("a", {"cert": "nc_1", "version": 2})))
+        self.assertEqual(self.certs.context("a"), ("ctx1", None), "the previous certificate is used meanwhile")
+        self.assertIn("HTTP 503", self.certs.summary()["a"]["error"])
+        self.certs.sync(self.watch(("a", {"cert": "nc_1", "version": 2})))
+        self.assertEqual(len(self.api.calls), 2, "not again before RETRY_SECONDS")
+        self.certs.held["a"]["at"] -= sx.NifiCerts.RETRY_SECONDS + 1
+        self.api.fail = None
+        self.certs.sync(self.watch(("a", {"cert": "nc_1", "version": 2})))
+        self.assertEqual((len(self.api.calls), self.certs.context("a")), (3, ("ctx2", None)))
+        self.certs.sync(self.watch(("a", None)))
+        self.assertEqual(self.certs.context("a"), (None, sx.NO_CERT), "unbound: the certificate goes at once")
+        self.certs.sync([])
+        self.assertEqual(self.certs.held, {})
+
+    def test_a_heartbeat_reply_keeps_it_current(self):
+        api = WatchApi()
+        api.watch = [{"service": "c", "member": "local:/opt/nifi", "installDir": "/opt/nifi", "cert": {"cert": "nc_1", "version": 1}}]
+        api.call = self.api.call
+        with tempfile.TemporaryDirectory() as d:
+            ex = sx.ServiceExecutor(cfg(d), out=io.StringIO(), api=api)
+            ex.heartbeat()
+            self.assertEqual(ex.nifi_certs.context("c"), ("ctx1", None))
+            self.assertTrue(ex.beat_body(None)["collector"]["certificate"])
 
 
 class ReleaseTest(Base):
@@ -3773,7 +3868,7 @@ class ScopedGroupsTest(unittest.TestCase):
             def log(self, text):
                 self.lines.append(text)
 
-        me = __import__("types").SimpleNamespace(cfg={}, watched=lambda member: {"member": member, "installDir": "/opt/nifi", "confDir": "/opt/nifi/conf", "https": {"host": "localhost", "port": 18443}, "nodeAddress": None})
+        me = __import__("types").SimpleNamespace(cfg={}, watched=lambda member: {"service": "s", "member": member, "installDir": "/opt/nifi", "confDir": "/opt/nifi/conf", "https": {"host": "localhost", "port": 18443}, "nodeAddress": None})
         with self.assertRaises(sx.Refused):
             sx.ServiceExecutor.nifi_groups(me, Job({"member": "m", "groups": ["root"]}))
         with self.assertRaises(sx.Refused):
@@ -3788,13 +3883,14 @@ class ScopedGroupsTest(unittest.TestCase):
                     return e.status, e.text.encode()
             return call
 
-        saved = (sx.read_properties, sx.nifi_context, sx.nifi_target, sx.nifi_caller)
-        sx.read_properties, sx.nifi_context, sx.nifi_target, sx.nifi_caller = (lambda p: {}), (lambda cfg: (object(), None)), (lambda w, props: ("localhost", "localhost", 18443)), caller
+        me.nifi_certs = mock.Mock(context=lambda service: (object(), None))
+        saved = (sx.read_properties, sx.nifi_target, sx.nifi_caller)
+        sx.read_properties, sx.nifi_target, sx.nifi_caller = (lambda p: {}), (lambda w, props: ("localhost", "localhost", 18443)), caller
         try:
             job = Job({"member": "m", "groups": [G, GONE]})
             out = sx.ServiceExecutor.nifi_groups(me, job)
         finally:
-            sx.read_properties, sx.nifi_context, sx.nifi_target, sx.nifi_caller = saved
+            sx.read_properties, sx.nifi_target, sx.nifi_caller = saved
         self.assertEqual([(g["id"], g["exists"]) for g in out["groups"]], [(G, True), (GONE, False)])
         self.assertEqual(out["groups"][0]["path"][-1], {"id": P, "name": "Partner"})
         self.assertEqual(out["topology"]["scope"], "groups")

@@ -3,13 +3,15 @@
 #
 #   lab.sh start  [name...]   ZooKeeper (if a cluster member is named) + NiFi
 #   lab.sh stop   [name...]   NiFi, then ZooKeeper when all are named
-#   lab.sh status [name...]   process, system-diagnostics with the monitor cert,
+#   lab.sh status [name...]   process, system-diagnostics with the operator cert,
 #                             cluster connection summary
 #   lab.sh wait   [name...]   wait until system-diagnostics answers (max 5 min)
-#   lab.sh grant              (once after first start) give monitor/nginx/
-#                             operator their policies, using the operator cert
+#   lab.sh grant              (once after first start) give each NiFi's node
+#                             identity (S40: the service executor connects with
+#                             the NiFi's own certificate) and nginx their
+#                             policies, using the operator cert (initial admin)
 #   lab.sh curl NAME PATH [cert]   GET https://localhost:PORT/nifi-api/PATH
-#                             with cert monitor (default) | operator | nginx
+#                             with cert operator (default) | nginx | monitor
 #   lab.sh nginx start|stop|status  the lab's nginx (nginx.conf, 127.0.0.1:18543-18546)
 #                             as this user; status asks each address for flow/about
 #
@@ -49,7 +51,7 @@ app_pid() { # name -> pid of the NiFi JVM (not the bootstrap), empty if none
 }
 
 api() { # name path [cert]
-  local port; port=$(inst_field "$1" 4); local c="${3:-monitor}"
+  local port; port=$(inst_field "$1" 4); local c="${3:-operator}"
   curl -sS --max-time 20 --cacert "$PEM/ca.crt" --cert "$PEM/$c.crt" --key "$PEM/$c.key" \
     "https://localhost:$port/nifi-api/$2"
 }
@@ -58,7 +60,7 @@ diag() { # name -> "HTTP <code> version <v> heap <used>/<max>"
   local port; port=$(inst_field "$1" 4)
   local out code
   out=$(curl -sS --max-time 20 -w '\n%{http_code}' --cacert "$PEM/ca.crt" \
-    --cert "$PEM/monitor.crt" --key "$PEM/monitor.key" \
+    --cert "$PEM/operator.crt" --key "$PEM/operator.key" \
     "https://localhost:$port/nifi-api/system-diagnostics" 2>/dev/null)
   code="${out##*$'\n'}"
   if [ "$code" = 200 ]; then
@@ -116,37 +118,46 @@ except Exception as e: print("unavailable", e)')"
       done
     done ;;
   grant)
-    gr=(
-      "/flow|read|$CLIENT_MONITOR" "/system|read|$CLIENT_MONITOR" "/controller|read|$CLIENT_MONITOR"
-      # S28: the service executor queries provenance with the monitor certificate: "query provenance" and "view
-      # provenance" of the whole flow (the root process group; components inherit it).
-      "/provenance|read|$CLIENT_MONITOR" "/provenance-data/process-groups/@root|read|$CLIENT_MONITOR"
-      # Owner 2026-11-07: and "view the data" of the whole flow, so provenance events carry the FlowFile attributes
-      # (NiFi hides them without it; it would also allow reading content, which the executor never asks for).
-      "/data/process-groups/@root|read|$CLIENT_MONITOR"
-      # Engine test 2026-11-22: and "view the component" of the whole flow, or the flow walk (topology) sees ids
-      # instead of group, port and processor names and no RPG contents (n192 had been left without it).
-      "/process-groups/@root|read|$CLIENT_MONITOR"
+    # S40: the service executor calls its NiFi with the certificate chosen for the service in the Deployer's certificate
+    # library, the NiFi's own (here each instance's node certificate, CN=<host>, OU=NIFI; a cluster's service uses one
+    # of its nodes'). Its identity gets what the executor reads and, on a cluster, modify the controller (rolling
+    # changes disconnect and connect nodes). grant.py adds the identity as a user where it is not one (a standalone).
+    executor_policies() { # identity
+      local id="$1"
+      printf '%s\n' "/flow|read|$id" "/system|read|$id" "/controller|read|$id"
+      # S28: provenance of the whole flow (the root process group; components inherit it), and "view the data", so
+      # events carry the FlowFile attributes (content is never asked for).
+      printf '%s\n' "/provenance|read|$id" "/provenance-data/process-groups/@root|read|$id" "/data/process-groups/@root|read|$id"
+      # Engine test 2026-11-22: "view the component" of the whole flow, or the flow walk sees ids instead of names.
+      printf '%s\n' "/process-groups/@root|read|$id"
+    }
+    nginx=(
       "/proxy|read|$CLIENT_NGINX" "/proxy|write|$CLIENT_NGINX"
       # P8: nginx calls NiFi as itself for Studio (S20): monitoring reads (provenance is the Deployer's own since S28).
       "/flow|read|$CLIENT_NGINX" "/system|read|$CLIENT_NGINX" "/controller|read|$CLIENT_NGINX"
-      "/system|read|$CLIENT_OPERATOR" "/provenance|read|$CLIENT_OPERATOR"
     )
     done_cluster=""
     for n in "${names[@]}"; do
       if is_member "$n"; then [ -n "$done_cluster" ] && continue; done_cluster=1; fi
-      # A cluster replicates a request to the node that holds the data with the receiving node as proxy, and NiFi
-      # checks "view the data" for every identity in the chain: the nodes need it too, or attributes stay hidden.
-      extra=()
+      ids=()
       if is_member "$n"; then
-        for m in $(instances); do is_member "$m" && extra+=("/data/process-groups/@root|read|$(node_dn "$(inst_field "$m" 5)")"); done
+        # Every node's identity: the service may be bound to either node's certificate, and a request replicated to
+        # the node that holds the data is checked for every identity on the way ("view the data").
+        for m in $(instances); do is_member "$m" && ids+=("$(node_dn "$(inst_field "$m" 5)")"); done
+      else
+        ids=("$(node_dn "$(inst_field "$n" 5)")")
       fi
+      gr=()
+      for id in "${ids[@]}"; do
+        while IFS= read -r g; do gr+=("$g"); done < <(executor_policies "$id")
+        is_member "$n" && gr+=("/controller|write|$id")
+      done
       echo "== grant on $n"
       python3 -I "$HERE/grant.py" "https://localhost:$(inst_field "$n" 4)/nifi-api" \
-        "$PEM/operator.crt" "$PEM/operator.key" "$PEM/ca.crt" "${gr[@]}" "${extra[@]}"
+        "$PEM/operator.crt" "$PEM/operator.key" "$PEM/ca.crt" "${gr[@]}" "${nginx[@]}"
     done ;;
   curl)
-    api "${names[0]}" "${names[1]}" "${names[2]:-monitor}"; echo ;;
+    api "${names[0]}" "${names[1]}" "${names[2]:-operator}"; echo ;;
   nginx)
     command -v nginx >/dev/null || { echo "nginx is not installed (sudo apt-get install -y nginx-light, then sudo systemctl disable --now nginx)"; exit 1; }
     case "$ncmd" in

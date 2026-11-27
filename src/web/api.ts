@@ -321,7 +321,9 @@ export const removeDraftItem = (id: string, item: string) => call<ServiceDraft>(
 export const reassessDraft = (id: string) => call<ServiceDraft>("POST", drafts(`/${encodeURIComponent(id)}/assess`), {});
 export const reviewDraft = (id: string) => call<ServiceDraft>("POST", drafts(`/${encodeURIComponent(id)}/review`), {});
 export const discardDraft = (id: string) => call<ServiceDraft>("POST", drafts(`/${encodeURIComponent(id)}/discard`), {});
-export const confirmDraft = (id: string) => call<{ draft: ServiceDraft; registered: string[]; reads: string[] }>("POST", drafts(`/${encodeURIComponent(id)}/confirm`), {});
+/** S40: certs, the library certificate each item's service executor connects with ({cert, version} by item id). */
+export const confirmDraft = (id: string, certs: Record<string, { cert: string; version: number }> = {}) =>
+  call<{ draft: ServiceDraft; registered: string[]; reads: string[]; unbound: string[] }>("POST", drafts(`/${encodeURIComponent(id)}/confirm`), { certs });
 // Phase 2 step 6 (§9.4, §15.3): a service's nginx address for Studio's nifi-ops graph, its check, the graph's runs.
 import type { GraphRun, NginxCheck } from "../server/store.ts";
 export type { GraphRun, NginxCheck };

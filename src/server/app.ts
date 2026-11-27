@@ -29,6 +29,7 @@ import { lineDiff } from "./ingress.ts";
 import { environmentStatus, hostStateOf, parseDockerPs, type Observer } from "./observe.ts";
 import { CertError, type ParsedKeystore, type ParsedTruststore } from "./certs/keystore.ts";
 import { checkForService, type OpenedUpload } from "./certs/check.ts";
+import { certRef, executorCert } from "./certs/issue.ts";
 import { currentPem, readUpload, sealVersion, UPLOAD_FILE_MAX, UPLOAD_FILES_MAX, type ReadUpload, type UploadedFile } from "./certs/library.ts";
 import { StoreError, type Actor, type ServiceConfigDraft, type Store } from "./store.ts";
 import { sealFile, STORE_FILES, withoutSealed } from "./services/config.ts";
@@ -237,7 +238,17 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     if (says !== kind) return reject(c, 409, "executor/kind-mismatch", `This token is for the ${kind} executor of ${host}, but a ${says} executor sent it: issue a ${says} executor token for ${host} on the Hosts page.`);
     handoff.heartbeat(host, beat, kind);
     // §15.2 P5: a service executor's reply carries what it samples, the installations registered on its host.
-    return c.json({ ok: true, host, executor: kind, deployer: DEPLOYER_VERSION, ...(kind === "service" ? { watch: watchList(store, host) } : {}) });
+    // S40: each entry names its service's certificate version, a reference only (no key in a heartbeat).
+    return c.json({ ok: true, host, executor: kind, deployer: DEPLOYER_VERSION, ...(kind === "service" ? { watch: watchList(store, host, undefined, undefined, (s) => certRef(store, takeover?.box, s)) } : {}) });
+  }));
+  // S40: the NiFi certificate of one service on this host (the bound library version: PEM chain, key and CA bundle),
+  // for its service executor only; another host's service is "not registered here", as an unknown one.
+  api.get("/executor/v1/nifi-certs/:service", executorRoute(async (c, host, kind) => {
+    if (kind !== "service") return reject(c, 409, "executor/service-only", "Only a service executor gets NiFi certificates.");
+    const got = executorCert(store, takeover?.box, host, c.req.param("service") ?? "");
+    if (!got.ok) return reject(c, got.status, got.code, got.message);
+    c.header("cache-control", "no-store");
+    return c.json(got.cert);
   }));
   // §15.3: the collector's samples, at most 20 a request; only those of what the host watches are kept.
   api.post("/executor/v1/samples", executorRoute(async (c, host, kind) => {
@@ -1810,7 +1821,9 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     if (p instanceof Response) return p;
     if (!takeover) return noTakeover(c);
     try {
-      const done = await takeover.confirm(c.req.param("id"), actorOf(p));
+      // S40: {certs: {<item id>: {cert, version}}}, the library certificate each service's executor connects with.
+      const body = await c.req.json().catch(() => ({})) as { certs?: unknown };
+      const done = await takeover.confirm(c.req.param("id"), actorOf(p), body?.certs);
       graph.schedule(`takeover of draft ${c.req.param("id")}`, actorOf(p));
       return c.json(done);
     } catch (error) { return takeoverFailed(c, error); }

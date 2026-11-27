@@ -7,6 +7,7 @@
 import type { Store } from "../store.ts";
 import { confDirOf, installKey, type ServiceMember } from "./draft.ts";
 import { discoveredKey } from "./assess.ts";
+import type { CertRef } from "../certs/issue.ts";
 
 export interface WatchEntry {
   /** The standalone instance's or the cluster's id. */
@@ -30,6 +31,9 @@ export interface WatchEntry {
    *  executor 0.9.7, flow-groups@1). Left out: nothing registered for the service yet, the whole canvas is read as
    *  before. []: another node of the cluster reads them (§7.7 question 6), or none is registered. */
   groups?: { id: string }[];
+  /** S40: the library version the executor connects to this NiFi with (a reference: the PEM comes from GET
+   *  /executor/v1/nifi-certs/<service>); null, none chosen. Left out when the caller gives no certOf (tests). */
+  cert?: CertRef | null;
 }
 
 /** S39 step 1: the capability a service executor names when it reads only the watch entry's groups. */
@@ -87,7 +91,13 @@ const jobs = new Map<string, Instance[]>();
 
 /** The watch list of one host's service executor. groupsOf: the registered groups of a service (registeredGroups;
  *  tests give their own). */
-export function watchList(store: Store, host: string, groupsOf: (service: string) => string[] | undefined = (s) => registeredGroups(store, s), now = Date.now()): WatchEntry[] {
+export function watchList(store: Store, host: string, groupsOf: (service: string) => string[] | undefined = (s) => registeredGroups(store, s), now = Date.now(),
+  certOf?: (service: string) => CertRef | null): WatchEntry[] {
+  const refs = new Map<string, CertRef | null>();
+  const refOf = (service: string) => {
+    if (!refs.has(service)) refs.set(service, certOf!(service));
+    return refs.get(service)!;
+  };
   const entry = (service: string, kind: WatchEntry["kind"], profile: string, m: ServiceMember, reader?: string): WatchEntry => {
     const d = discovered(store, jobs, m);
     const httpsHost = d?.properties?.["nifi.web.https.host"];
@@ -100,6 +110,7 @@ export function watchList(store: Store, host: string, groupsOf: (service: string
       files: store.serviceMemberFiles(service).filter((f) => f.member === installKey(m)).map((f) => ({ name: f.file, path: f.path })),
       flowHistory: !store.hasFlowCounts(service),
       ...(groups ? { groups: reader === undefined || reader === installKey(m) ? groups.map((id) => ({ id })) : [] } : {}),
+      ...(certOf ? { cert: refOf(service) } : {}),
     };
   };
   return [
