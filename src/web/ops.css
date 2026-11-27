@@ -187,3 +187,25 @@ dialog.ops-dialog .err { padding: 10px 12px; border-radius: 8px; background: #FD
 .ops .rg-chat .assistant-try { padding: 10px 18px; }
 .ops .rg-fallback { border-top: 1px solid #EFEFEA; }
 .fl .bz-draft { display: flex; flex-direction: column; gap: 10px; border: 2px solid #C98A1B; background: #FFFBF2; font-size: 15px; line-height: 1.6; }
+
+/* Configuration and changes (S41): status tiles, the page list on the left, the draft bar that follows edits. */
+.ops .cfg-page { display: flex; flex-direction: column; gap: 16px; padding-bottom: 72px; }
+.ops .cfg-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 230px), 1fr)); gap: 12px; }
+.ops .cfg-tile { text-align: left; display: flex; flex-direction: column; gap: 4px; padding: 14px 16px; background: #FFFFFF; border: 1px solid #E3E3DE; border-left: 5px solid #D6D6D0; border-radius: 12px; color: #1B1B1B; font: inherit; cursor: pointer; }
+.ops .cfg-tile:hover { border-color: #9AA3B5; }
+.ops .cfg-tile strong { font-size: 16px; }
+.ops .cfg-tile-label { font-size: 12px; font-weight: 600; color: #5B5B57; text-transform: uppercase; letter-spacing: .04em; }
+.ops .cfg-tile.tone-ok { border-left-color: #CFE3D5; }
+.ops .cfg-tile.tone-info { border-left-color: #1F4FB8; }
+.ops .cfg-tile.tone-warn { border-left-color: #C98A1B; }
+.ops .cfg-tile.tone-bad { border-left-color: #B3261E; }
+.ops .cfg-body { display: grid; grid-template-columns: 200px minmax(0, 1fr); gap: 20px; align-items: start; }
+.ops .cfg-nav { display: flex; flex-direction: column; gap: 4px; position: sticky; top: 16px; }
+.ops .cfg-nav button { display: flex; justify-content: space-between; align-items: center; gap: 8px; height: 40px; padding: 0 12px; border: 0; border-radius: 8px; background: transparent; color: #1B1B1B; font: inherit; text-align: left; cursor: pointer; }
+.ops .cfg-nav button:hover { background: #EEEEEA; }
+.ops .cfg-nav button[aria-current="page"] { background: #E3E3DE; font-weight: 600; }
+.ops .cfg-main { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.ops .pinned-change { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; }
+.ops .cfg-draftbar { position: fixed; left: 0; right: 0; bottom: 0; z-index: 20; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 24px; background: #1B1B1B; color: #FFFFFF; }
+.ops .cfg-draftbar button { height: 40px; padding: 0 16px; border: 0; border-radius: 8px; background: #FFFFFF; color: #1B1B1B; font-weight: 600; cursor: pointer; }
+@media (max-width: 800px) { .ops .cfg-body { grid-template-columns: minmax(0, 1fr); } .ops .cfg-nav { position: static; flex-direction: row; flex-wrap: wrap; } }

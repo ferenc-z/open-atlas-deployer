@@ -177,7 +177,7 @@ function DraftDetail({ draft, s, cfg, drafts, onSaved, onEdit }: { draft: Config
         <span className="muted small">by {draft.createdBy}{draft.via === "service" ? " (AI)" : ""} · {when(draft.updatedAt)}</span>
       </div>
       {draft.stale && <div className="banner warn inline">Someone saved a revision after this draft was made. Move it to r{cfg.revision} to save it: its changes are made again on that revision. {cfg.canDraft && <button onClick={move} disabled={busy}>Move to r{cfg.revision}</button>}</div>}
-      {draft.changes.length === 0 ? <p className="muted">No changes yet. {cfg.canDraft && <button className="link" onClick={onEdit}>Edit on the Configuration section</button>}</p> : <table className="props">
+      {draft.changes.length === 0 ? <p className="muted">No changes yet. {cfg.canDraft && <button className="link" onClick={onEdit}>Edit in Files</button>}</p> : <table className="props">
         <thead><tr><th>File</th>{s.kind === "cluster" && <th>Applies to</th>}<th>Key</th><th>New value</th>{cfg.canDraft && <th></th>}</tr></thead>
         <tbody>{draft.changes.map((c, i) => (
           <tr key={i}>
@@ -199,7 +199,7 @@ function DraftDetail({ draft, s, cfg, drafts, onSaved, onEdit }: { draft: Config
           <span className="muted small">Kept with the revision and shown on the timeline. Anything that looks like a password is masked.</span></label>
         <div className="row">
           <button className="primary" onClick={save} disabled={busy || draft.stale || !draft.changes.length || Boolean(problem)} title={draft.stale ? "Move it to the newest revision first" : undefined}>Save as revision {next}</button>
-          <button onClick={onEdit}>Edit on the Configuration section</button>
+          <button onClick={onEdit}>Edit in Files</button>
           <button onClick={discard} disabled={busy}>Discard</button>
         </div>
         <p className="muted small">Saving keeps a new revision here. The hosts keep their files until the revision is applied.</p>
@@ -209,7 +209,7 @@ function DraftDetail({ draft, s, cfg, drafts, onSaved, onEdit }: { draft: Config
   );
 }
 
-function Revisions({ s, cfg, desk, onSaved }: { s: ServiceStatus; cfg: ServiceConfigView; desk: ChangeDesk; onSaved: () => void }) {
+export function Revisions({ s, cfg, desk, onSaved }: { s: ServiceStatus; cfg: ServiceConfigView; desk: ChangeDesk; onSaved: () => void }) {
   const newest = cfg.revisions[0]?.revision ?? cfg.revision;
   const fromOf = useCallback((to: number) => cfg.revisions.find((r) => r.revision === to)?.base ?? (to > 1 ? to - 1 : to), [cfg.revisions]);
   const [to, setTo] = useState(newest);
@@ -298,7 +298,7 @@ function Revisions({ s, cfg, desk, onSaved }: { s: ServiceStatus; cfg: ServiceCo
 const DRIFT_STATE = { same: { label: "Same", tone: "ok" }, changed: { label: "Changed", tone: "warn" }, missing: { label: "Gone", tone: "bad" }, unknown: { label: "Unknown", tone: "muted" } } as const;
 
 /** Whether the files on the hosts still are what they should be, what differs, and keeping a host's file as a new revision. */
-function Drift({ s, cfg, desk, onSaved }: { s: ServiceStatus; cfg: ServiceConfigView; desk: ChangeDesk; onSaved: () => void }) {
+export function Drift({ s, cfg, desk, onSaved }: { s: ServiceStatus; cfg: ServiceConfigView; desk: ChangeDesk; onSaved: () => void }) {
   const [drift, setDrift] = useState<DriftAnswer | undefined>();
   const [open, setOpen] = useState<string | null>(null);
   const [shown, setShown] = useState<LiveDifferences | undefined>();
@@ -727,7 +727,7 @@ function ChangeRun({ c, s, desk, canSteer }: { c: ServiceChangeView; s: ServiceS
   );
 }
 
-function ChangeHistory({ s, desk, canSteer }: { s: ServiceStatus; desk: ChangeDesk; canSteer: boolean }) {
+export function ChangeHistory({ s, desk, canSteer }: { s: ServiceStatus; desk: ChangeDesk; canSteer: boolean }) {
   const [shown, setShown] = useState<string | null>(null);
   const [detail, setDetail] = useState<ServiceChangeView | undefined>();
   useEffect(() => {
@@ -740,7 +740,7 @@ function ChangeHistory({ s, desk, canSteer }: { s: ServiceStatus; desk: ChangeDe
   return (
     <section className="panel">
       <h3>Changes</h3>
-      {!ended.length ? <p className="muted">{desk.active ? "None has ended yet." : "None so far. A change starts from a revision below, Rolling restart at the top of the page, or the Nodes tab."}</p> : <table className="props revisions">
+      {!ended.length ? <p className="muted">{desk.active ? "None has ended yet." : "None so far. A change starts from Revisions, from Rolling restart at the top of the page, or from the buttons above."}</p> : <table className="props revisions">
         <thead><tr><th>Change</th><th>State</th><th>By</th><th>Started</th><th>Took</th><th>Why</th></tr></thead>
         <tbody>{ended.map((c) => {
           const st = CHANGE_STATE[c.state] ?? { label: c.state, tone: "muted" };
@@ -761,42 +761,62 @@ function ChangeHistory({ s, desk, canSteer }: { s: ServiceStatus; desk: ChangeDe
   );
 }
 
-export function ServiceChanges({ s, cfg, drafts, desk, onSaved, onEdit }: { s: ServiceStatus; cfg: ServiceConfigView; drafts: Drafts; desk: ChangeDesk; onSaved: () => void; onEdit: () => void }) {
+/** What stays on top of every sub page: the plan someone asked to see, and the change holding the service. Away from the
+ *  Changes page a running change is one line with an Open button; the buttons to steer it are on the Changes page. */
+export function PinnedChange({ s, cfg, desk, full, onOpen }: { s: ServiceStatus; cfg: ServiceConfigView; desk: ChangeDesk; full: boolean; onOpen: () => void }) {
+  const c = desk.active;
+  const st = c ? (CHANGE_STATE[c.state] ?? { label: c.state, tone: "muted" }) : undefined;
+  const nodes = c && c.mode !== "full" && c.plan.members.length > 1 ? ` · ${c.progress.done.length} of ${c.plan.members.length} nodes done` : "";
+  return (
+    <>
+      {desk.asked && <PlanPanel key={JSON.stringify(desk.asked)} s={s} desk={desk} request={desk.asked} canSteer={cfg.canDraft} />}
+      {c && st && (full ? <ChangeRun c={c} s={s} desk={desk} canSteer={cfg.canDraft} />
+        : <div className={`banner inline pinned-change ${st.tone}`}>
+          <span><strong>{changeName(c, s)}</strong> <span className={`badge ${st.tone}`}>{st.label}</span>{nodes}</span>
+          <button onClick={onOpen}>Open</button>
+        </div>)}
+    </>
+  );
+}
+
+/** r{n} is saved but a host does not have it yet, with the button for the plan. */
+export function PendingBar({ s, cfg, desk }: { s: ServiceStatus; cfg: ServiceConfigView; desk: ChangeDesk }) {
+  const notApplied = s.members.flatMap((m) => m.configPending.map((file) => ({ member: m.key, file })));
+  if (desk.active || desk.asked || !cfg.canDraft || !notApplied.length) return null;
+  const nodes = new Set(notApplied.map((x) => x.member)).size;
+  return (
+    <div className="banner info inline pending-bar">
+      <span>r{cfg.revision} is saved but not on the hosts yet: {notApplied.length} file{notApplied.length > 1 ? "s" : ""}{s.kind === "cluster" ? ` on ${nodes} node${nodes > 1 ? "s" : ""}` : ""}.</span>
+      <button className="primary" onClick={() => desk.plan({ kind: "apply", revision: cfg.revision })}>Plan applying r{cfg.revision}</button>
+    </div>
+  );
+}
+
+/** The Drafts page: the open drafts, and the one chosen with what it would change. */
+export function DraftsPage({ s, cfg, drafts, onSaved, onEdit }: { s: ServiceStatus; cfg: ServiceConfigView; drafts: Drafts; onSaved: () => void; onEdit: () => void }) {
   const { refresh } = drafts;
   useEffect(refresh, [refresh]);
   const current = drafts.active;
-  const notApplied = s.members.flatMap((m) => m.configPending.map((file) => ({ member: m.key, file })));
   return (
-    <>
-      <p className="muted small page-note">Drafts become revisions here, and a revision is kept until it is applied. Only a plan you confirm changes a host.</p>
-      {desk.asked && <PlanPanel key={JSON.stringify(desk.asked)} s={s} desk={desk} request={desk.asked} canSteer={cfg.canDraft} />}
-      {desk.active && <ChangeRun c={desk.active} s={s} desk={desk} canSteer={cfg.canDraft} />}
-      {!desk.active && !desk.asked && cfg.canDraft && notApplied.length > 0 && <div className="banner info inline pending-bar">
-        <span>r{cfg.revision} is saved but not on the hosts yet: {notApplied.length} file{notApplied.length > 1 ? "s" : ""}{s.kind === "cluster" ? ` on ${new Set(notApplied.map((x) => x.member)).size} node${new Set(notApplied.map((x) => x.member)).size > 1 ? "s" : ""}` : ""}.</span>
-        <button className="primary" onClick={() => desk.plan({ kind: "apply", revision: cfg.revision })}>Plan applying r{cfg.revision}</button>
-      </div>}
-      <ChangeHistory s={s} desk={desk} canSteer={cfg.canDraft} />
-      <Drift s={s} cfg={cfg} desk={desk} onSaved={onSaved} />
-      <section className="panel">
-        <h3>Drafts</h3>
-        {!drafts.list.length ? <p className="muted">No open drafts. {cfg.canDraft ? <>Edit a key on the <button className="link" onClick={onEdit}>Configuration section</button> to start one.</> : "You can see drafts here, but not make them."}</p> : <>
-          <table className="props revisions">
-            <thead><tr><th>Draft</th><th>On</th><th>Changes</th><th>Checks</th><th>By</th><th>Updated</th></tr></thead>
-            <tbody>{drafts.list.map((d) => (
-              <tr key={d.id} className={d.id === current?.id ? "selected" : ""}>
-                <td><button className="link mono" onClick={() => drafts.choose(d.id)} aria-pressed={d.id === current?.id}>{d.id}</button></td>
-                <td className="mono">r{d.base}{d.stale && <span className="badge warn">Old</span>}</td>
-                <td>{d.changes.length}</td>
-                <td>{findingCounts(d.findings).some(Boolean) ? findingCounts(d.findings) : <span className="muted">—</span>}</td>
-                <td>{d.createdBy}{d.via === "service" ? " (AI)" : ""}</td>
-                <td className="nowrap">{when(d.updatedAt)}</td>
-              </tr>
-            ))}</tbody>
-          </table>
-          {current && <DraftDetail key={current.id} draft={current} s={s} cfg={cfg} drafts={drafts} onSaved={onSaved} onEdit={onEdit} />}
-        </>}
-      </section>
-      <Revisions s={s} cfg={cfg} desk={desk} onSaved={onSaved} />
-    </>
+    <section className="panel">
+      <h3>Drafts</h3>
+      <p className="muted small">Drafts become revisions here, and a revision is kept until it is applied. Only a plan you confirm changes a host.</p>
+      {!drafts.list.length ? <p className="muted">No open drafts. {cfg.canDraft ? <>Edit a key in <button className="link" onClick={onEdit}>Files</button> to start one.</> : "You can see drafts here, but not make them."}</p> : <>
+        <table className="props revisions">
+          <thead><tr><th>Draft</th><th>On</th><th>Changes</th><th>Checks</th><th>By</th><th>Updated</th></tr></thead>
+          <tbody>{drafts.list.map((d) => (
+            <tr key={d.id} className={d.id === current?.id ? "selected" : ""}>
+              <td><button className="link mono" onClick={() => drafts.choose(d.id)} aria-pressed={d.id === current?.id}>{d.id}</button></td>
+              <td className="mono">r{d.base}{d.stale && <span className="badge warn">Old</span>}</td>
+              <td>{d.changes.length}</td>
+              <td>{findingCounts(d.findings).some(Boolean) ? findingCounts(d.findings) : <span className="muted">—</span>}</td>
+              <td>{d.createdBy}{d.via === "service" ? " (AI)" : ""}</td>
+              <td className="nowrap">{when(d.updatedAt)}</td>
+            </tr>
+          ))}</tbody>
+        </table>
+        {current && <DraftDetail key={current.id} draft={current} s={s} cfg={cfg} drafts={drafts} onSaved={onSaved} onEdit={onEdit} />}
+      </>}
+    </section>
   );
 }

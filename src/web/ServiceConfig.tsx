@@ -44,7 +44,7 @@ const samePlace = (a: DraftChangeInput, b: DraftChangeInput) => a.file === b.fil
 const failure = (e: unknown) => (e as Error).message;
 
 /** Which draft edits go into, and the way to the Changes section. */
-function DraftBar({ cfg, drafts, onReview }: { cfg: ServiceConfigView; drafts: Drafts; onReview: () => void }) {
+function DraftBar({ cfg, drafts }: { cfg: ServiceConfigView; drafts: Drafts }) {
   const a = drafts.active;
   if (!cfg.canDraft && !drafts.list.length) return null;
   return (
@@ -59,16 +59,15 @@ function DraftBar({ cfg, drafts, onReview }: { cfg: ServiceConfigView; drafts: D
         {a?.stale && <span className="badge warn">Old: the newest is r{cfg.revision}</span>}
         {a && findingCounts(a.findings)}
         <span className="spacer" />
-        {a && <button className={cfg.canDraft ? "primary" : ""} onClick={onReview}>{cfg.canDraft ? "Review and save" : "See it"}</button>}
       </div>
-      {cfg.canDraft && <p className="muted small">{a?.stale ? "This draft was made on an older revision: move it to the newest on the Changes section before editing it."
+      {cfg.canDraft && <p className="muted small">{a?.stale ? "This draft was made on an older revision: move it to the newest in Drafts before editing it."
         : a ? "Your edits go into this draft. They reach no host: saving makes a revision, and a revision is kept until it is applied."
         : "Use Edit on a key to start a draft. It reaches no host: saving makes a revision, and a revision is kept until it is applied."}</p>}
     </div>
   );
 }
 
-export function ServiceConfig({ cfg, status, drafts, onReview }: { cfg: ServiceConfigView | null | undefined; status: ServiceStatus; drafts: Drafts; onReview: () => void }) {
+export function ServiceConfig({ cfg, status, drafts }: { cfg: ServiceConfigView | null | undefined; status: ServiceStatus; drafts: Drafts }) {
   const cluster = status.kind === "cluster";
   const members = cfg?.body.members ?? [];
   const files = useMemo(() => { const n: string[] = []; for (const m of members) for (const f of m.files) if (!n.includes(f.name)) n.push(f.name); return n; }, [members]);
@@ -108,7 +107,7 @@ export function ServiceConfig({ cfg, status, drafts, onReview }: { cfg: ServiceC
   return (
     <div className="panel">
       <div className="muted small">Revision {cfg.revision} · {SOURCE[cfg.source] ?? cfg.source} · {when(cfg.savedAt)} by {cfg.savedBy} · secret values hidden</div>
-      <DraftBar cfg={cfg} drafts={drafts} onReview={onReview} />
+      <DraftBar cfg={cfg} drafts={drafts} />
       <div className="file-tabs" role="tablist" aria-label="Files">
         {files.map((f) => <button key={f} role="tab" aria-selected={f === name} className={`mono ${f === name ? "active" : ""}`} onClick={() => setFile(f)}>{f}</button>)}
       </div>
