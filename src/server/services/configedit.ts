@@ -5,9 +5,10 @@
 // refuses on a finding, only on a change that cannot be made. What reaches a page never holds a secret: changeView shows
 // a secret's change as hidden, and fileDiffs compares secrets here and names only the keys.
 
+import { createHash } from "node:crypto";
 import type { SecretBox } from "../secretbox.ts";
 import { lineDiff } from "../ingress.ts";
-import { openFile, redactedText, sealFile, type ConfigFileRecord, type ConfigLayers, type ConfigMember, type LayerFile, type ServiceConfigBody } from "./config.ts";
+import { binaryLine, openFile, redactedText, sealFile, type ConfigFileRecord, type ConfigLayers, type ConfigMember, type LayerFile, type ServiceConfigBody } from "./config.ts";
 import { checkConfig, openMembers, type ChangeAssessment, type CheckInput, type ConfigFinding } from "./configcheck.ts";
 import { ConfigDocError, decodeText, editProperties, editXml, effectiveProperties, encodeValue, HIDDEN, isSecretKey, parsePropertyEntries, redactXml, xmlSecrets } from "./configdoc.ts";
 import { installKey } from "./draft.ts";
@@ -16,22 +17,29 @@ import { PROFILES } from "./profiles.ts";
 
 interface Where { file: string; member: string | null }
 /** One change as a draft keeps it. member null: a standalone's one member, or a cluster's common layer. secret: the new
- *  value, sealed. sealed: an XML file's new bytes (base64), sealed, its "(hidden)" already back to their values. */
+ *  value, sealed. sealed: an XML file's new bytes (base64), sealed, its "(hidden)" already back to their values.
+ *  binary (S41): a key or trust store's new bytes (base64), sealed, replacing the file whole on one node (member always
+ *  named), with their sha256 and size, which are all the pages see of it. */
 export type DraftChange =
   | (Where & { key: string; value: string })
   | (Where & { key: string; unset: true })
   | (Where & { key: string; secret: string })
-  | (Where & { sealed: string });
+  | (Where & { sealed: string })
+  | (Where & { binary: string; sha256: string; size: number });
 
-/** A change as the pages get it. */
+/** A change as the pages get it. A binary one is sent back as {file, member, sha256} to keep it. */
 export type DraftChangeView =
   | (Where & { key: string; value: string })
   | (Where & { key: string; unset: true })
   | (Where & { key: string; hidden: true })
-  | (Where & { text: string });
+  | (Where & { text: string })
+  | (Where & { binary: { sha256: string; size: number } });
 
 const MAX_CHANGES = 500;
 const MAX_TEXT = 4 << 20;
+/** A store's size at most, as the service executor reads files (READ_FILE_MAX). */
+const MAX_BINARY = 1 << 20;
+const SHA256 = /^[0-9a-f]{64}$/;
 
 const refuse = (code: string, message: string): never => { throw new ConfigDocError(code, message); };
 
@@ -77,6 +85,20 @@ export function acceptChanges(raw: unknown, base: ServiceConfigBody, kind: "stan
     if (c.member !== undefined && c.member !== null && typeof c.member !== "string") return refuse("config/bad-change", "member is a member's key, or null");
     const where: Where = { file: c.file, member: (c.member as string | null | undefined) ?? null };
     const record = recordAt(edited, kind, where.file, where.member);
+    if (record.format === "binary") {
+      if (where.member === null) return refuse("config/bad-change", `${where.file} is replaced on each node: name the member`);
+      if (c.base64 === undefined) {
+        // Sent back as the page got it ({binary: {sha256, size}}), or by its sha256 alone.
+        const sha = typeof c.sha256 === "string" ? c.sha256 : (c.binary as { sha256?: unknown } | undefined)?.sha256;
+        const kept = typeof sha === "string" && SHA256.test(sha) ? previous.find((p) => "binary" in p && p.sha256 === sha && sameWhere(p, where)) : undefined;
+        return kept ?? refuse("config/bad-change", `${where.file} is replaced whole: give its new content (base64), or the sha256 of this draft's new one to keep it`);
+      }
+      if (typeof c.base64 !== "string" || !/^[A-Za-z0-9+/]*={0,2}$/.test(c.base64) || c.base64.length % 4) return refuse("config/bad-change", `${where.file}: base64 is the file's bytes in base64`);
+      const bytes = Buffer.from(c.base64, "base64");
+      if (!bytes.length || bytes.length > MAX_BINARY) return refuse("config/bad-change", `${where.file} is at most 1 MiB, and not empty`);
+      return { ...where, binary: box.seal(bytes.toString("base64")), sha256: createHash("sha256").update(bytes).digest("hex"), size: bytes.length };
+    }
+    if (c.base64 !== undefined) return refuse("config/not-editable", `${where.file} is not replaced as binary`);
     if (c.text !== undefined) {
       if (typeof c.text !== "string" || c.text.length > MAX_TEXT) return refuse("config/bad-change", "text is the file's text, at most 4 MiB");
       if (record.format !== "xml") return refuse("config/not-editable", `${where.file} is changed key by key, not as text`);
@@ -112,6 +134,8 @@ export function secretSubmitted(raw: unknown): string | null {
   for (const entry of Array.isArray(raw) ? raw : []) {
     const c = (entry && typeof entry === "object" ? entry : {}) as Record<string, unknown>;
     if (c.secret !== undefined || c.hidden === true) return typeof c.key === "string" ? c.key : String(c.file);
+    // A key or trust store holds a private key: a person brings it (S41).
+    if (c.base64 !== undefined) return String(c.file);
     if (typeof c.key === "string" && secretName(c.key)) return c.key;
   }
   return null;
@@ -131,6 +155,7 @@ export function xmlSecretChanged(changes: readonly DraftChange[], base: ServiceC
 export function changeView(c: DraftChange, box: SecretBox | undefined): DraftChangeView {
   const where = { file: c.file, member: c.member };
   if ("sealed" in c) return { ...where, text: box ? redactXml(decodeText(textBytes(c, box))).text : HIDDEN };
+  if ("binary" in c) return { ...where, binary: { sha256: c.sha256, size: c.size } };
   if ("secret" in c) return { ...where, key: c.key, hidden: true };
   return c;
 }
@@ -139,11 +164,15 @@ export function changeView(c: DraftChange, box: SecretBox | undefined): DraftCha
 export function changeSummary(c: DraftChange): Record<string, unknown> {
   const where = { file: c.file, member: c.member };
   if ("sealed" in c) return { ...where, op: "text" };
+  if ("binary" in c) return { ...where, op: "binary", sha256: c.sha256, size: c.size };
   return { ...where, key: c.key, op: "unset" in c ? "unset" : "secret" in c ? "secret" : "set" };
 }
 
+const binaryBytes = (c: { binary: string }, box: SecretBox) => Buffer.from(box.open(c.binary), "base64");
+
 function editedBytes(bytes: Buffer, c: DraftChange, box: SecretBox): Buffer {
   if ("sealed" in c) return textBytes(c, box);
+  if ("binary" in c) return binaryBytes(c, box);
   if ("unset" in c) return editProperties(bytes, [{ key: c.key, unset: true }]);
   return editProperties(bytes, [{ key: c.key, value: "secret" in c ? box.open(c.secret) : c.value }]);
 }
@@ -158,12 +187,15 @@ function applyToLayers(layers: ConfigLayers, c: DraftChange, box: SecretBox) {
   const own = (layers.nodes[c.member] ??= {});
   const mine = own[c.file];
   if (mine && "replace" in mine) {
-    own[c.file] = { replace: layerFile(c.file, editedBytes(bytesOf(mine.replace, box), c, box), box) };
+    const replace = layerFile(c.file, editedBytes(bytesOf(mine.replace, box), c, box), box);
+    // A whole file back to the common copy: the node no longer needs its own.
+    if (common && ("sealed" in c || "binary" in c) && replace.sha256 === common.sha256) delete own[c.file];
+    else own[c.file] = { replace };
     return;
   }
   if (!common) return refuse("config/unknown-file", `${c.member} has no ${c.file}`);
-  if ("sealed" in c) {
-    const replace = layerFile(c.file, textBytes(c, box), box);
+  if ("sealed" in c || "binary" in c) {
+    const replace = layerFile(c.file, "sealed" in c ? textBytes(c, box) : binaryBytes(c, box), box);
     if (replace.sha256 === common.sha256) delete own[c.file];
     else own[c.file] = { replace };
     return;
@@ -184,7 +216,7 @@ function overridden(layers: ConfigLayers, changes: readonly DraftChange[]): Conf
   const out: ConfigFinding[] = [];
   for (const c of changes) {
     if (c.member !== null) continue;
-    const key = "sealed" in c ? undefined : c.key;
+    const key = "key" in c ? c.key : undefined;
     for (const [node, files] of Object.entries(layers.nodes)) {
       const own = files[c.file];
       if (!own) continue;
@@ -294,6 +326,11 @@ function fileDiff(name: string, before: ConfigFileRecord | undefined, after: Con
   // Redacted anew when it can be: a kept copy from an older version may hide or show other keys than a new one would.
   const text = (f: ConfigFileRecord | undefined, bytes: Buffer | undefined) => (!f ? "" : opened && bytes ? redactedText(f.name, bytes) : f.redacted);
   const format = (after ?? before)!.format;
+  if (format === "binary") {
+    // Bytes are no text: what changed is the hash and the size (S41).
+    const line = (sign: string, f: ConfigFileRecord | undefined) => (f ? [`${sign}${binaryLine(f.sha256, f.size)}`] : []);
+    return { name, change: !before ? "added" : !after ? "removed" : "content", diff: [...line("- ", before), ...line("+ ", after)].join("\n"), secretsChanged: [], opened };
+  }
   const a = was && opened ? secretsOf(name, format, was) : new Map<string, string>(), b = now && opened ? secretsOf(name, format, now) : new Map<string, string>();
   const secretsChanged = opened ? [...new Set([...a.keys(), ...b.keys()])].filter((k) => a.get(k) !== b.get(k)) : [];
   return { name, change: !before ? "added" : !after ? "removed" : "content", diff: compact(lineDiff(text(before, was), text(after, now))), secretsChanged, opened };

@@ -126,7 +126,9 @@ export function ServiceConfig({ cfg, status, drafts }: { cfg: ServiceConfigView 
         : <>
           {cluster && format !== "properties" && (() => { const c = cfg.view?.compare?.find((x) => x.name === name); return c ? <p className={`small ${c.identical ? "muted" : "error"}`}>{c.identical ? "The same on every node." : "Differs between the nodes: pick a node above to see each."}</p> : null; })()}
           {format === "xml" && <XmlEdit key={`${name}:${memberAt}:${cfg.revision}`} file={name} text={record!.redacted} edit={edit} shared={compared?.identical ?? true} />}
-          <RawFile key={`${name}:${member}`} text={record!.redacted} format={format} />
+          {format === "binary"
+            ? <p className="small muted mono">Binary ({record!.size} bytes, sha256 {record!.sha256}): not shown, replaced only whole.</p>
+            : <RawFile key={`${name}:${member}`} text={record!.redacted} format={format} />}
           {format === "xml" && edit.canReveal && <XmlSecrets key={`s:${name}:${memberAt}:${cfg.revision}`} file={name} secrets={cfg.view?.rows[memberAt]?.xmlSecrets?.[name] ?? []} edit={edit} />}
         </>}
     </div>

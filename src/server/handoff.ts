@@ -11,13 +11,14 @@
 import { createHash, randomBytes } from "node:crypto";
 import type { Environment } from "../compose/generate.ts";
 import type { SecretBox } from "./secretbox.ts";
+import { STORE_FILES } from "./services/config.ts";
 import type { ExecutorKind, ExecutorStatus, Store } from "./store.ts";
 export { EXECUTOR_KINDS, type ExecutorKind } from "./store.ts";
 
 export const PROTOCOL = 2;
 /** §8.6: the executor releases this Deployer ships with, one per kind (deployer_executor.py and service_executor.py
  *  VERSION): each kind is offered an upgrade only when its own version moved. A change to executor_core.py moves both. */
-export const EXECUTOR_VERSIONS: Record<ExecutorKind, string> = { deploy: "0.9.8", service: "0.9.8" };
+export const EXECUTOR_VERSIONS: Record<ExecutorKind, string> = { deploy: "0.9.8", service: "0.9.9" };
 /** The deploy executor's release (EXECUTOR_VERSIONS.deploy). */
 export const EXECUTOR_VERSION = EXECUTOR_VERSIONS.deploy;
 
@@ -95,6 +96,13 @@ export function kindsNeeded(request: Record<string, unknown>): string[] {
   if (kind === "svc-read") {
     const home = String(request.installDir ?? "").replace(/\/+$/, "");
     if (request.confDir || (typeof request.bootstrapFile === "string" && request.bootstrapFile !== `${home}/conf/bootstrap.conf`)) out.push("svc-read@2");
+  }
+  // S41: the key and trust stores named among the files (svc-read@3 reads them, svc-write@2 writes them).
+  const files = Array.isArray(request.files) ? (request.files as unknown[]) : [];
+  const names = files.map((f) => (f && typeof f === "object" ? (f as { name?: unknown }).name : f));
+  if (names.some((n) => typeof n === "string" && STORE_FILES.has(n))) {
+    if (kind === "svc-read") out.push("svc-read@3");
+    if (kind === "svc-write") out.push("svc-write@2");
   }
   return out;
 }

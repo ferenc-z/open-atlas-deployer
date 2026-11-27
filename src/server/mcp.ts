@@ -18,6 +18,7 @@
 import { createHash } from "node:crypto";
 import type { Principal } from "./auth.ts";
 import type { Store } from "./store.ts";
+import { binaryLine } from "./services/config.ts";
 import { installKey } from "./services/draft.ts";
 import { LEVELS } from "./onboarding.ts";
 import { aiDiffs, aiFindings } from "./services/configreview.ts";
@@ -169,7 +170,7 @@ const memberMatches = (m: { host: string; installDir: string; confDir?: string }
 function configShape(body: Any, a: Record<string, unknown>) {
   const members = (body.body?.members ?? []).filter((m: any) => memberMatches(m, a.member)).map((m: any) => ({
     key: installKey(m), host: m.host, installDir: m.installDir, ...(m.confDir ? { confDir: m.confDir } : {}), missing: m.missing ?? [],
-    files: m.files.filter((f: Any) => !a.file || f.name === a.file).map((f: Any) => ({ name: f.name, path: f.path, format: f.format, sha256: f.sha256, modifiedAt: f.modifiedAt, hidden: f.secrets, text: f.format === "other" ? redactText(f.redacted) : f.redacted })),
+    files: m.files.filter((f: Any) => !a.file || f.name === a.file).map((f: Any) => ({ name: f.name, path: f.path, format: f.format, sha256: f.sha256, modifiedAt: f.modifiedAt, hidden: f.secrets, text: f.format === "binary" ? binaryLine(f.sha256, f.size) : f.format === "other" ? redactText(f.redacted) : f.redacted })),
   }));
   return { service: body.service, revision: body.revision, savedAt: body.savedAt, savedBy: body.savedBy, source: body.source, note: body.note, revisions: body.revisions ?? [], members };
 }
