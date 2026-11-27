@@ -19,7 +19,8 @@ export interface ConfigFileRecord {
   sha256: string;
   size: number;
   modifiedAt: string;
-  format: "properties" | "xml" | "other";
+  /** binary: STORE_FILES, whose redacted copy is empty. */
+  format: "properties" | "xml" | "other" | "binary";
   /** The whole file, sealed (SecretBox): its bytes in base64 when sealedAs says so; else, in revisions from before it,
    *  the bytes read as UTF-8, which is not always the file: see openFile. */
   sealed: string;
@@ -44,19 +45,28 @@ export interface ConfigLayers { common: Record<string, LayerFile>; nodes: Record
  *  its files as rendered, complete; layers (a cluster, once edited) is what they were rendered from. */
 export interface ServiceConfigBody { members: ConfigMember[]; layers?: ConfigLayers }
 
-const formatOf = (name: string): ConfigFileRecord["format"] => (/\.(properties|conf)$/.test(name) ? "properties" : /\.xml$/.test(name) ? "xml" : "other");
+/** S41: a NiFi's TLS key and trust stores, as the service executor names them (where nifi.properties points). Binary:
+ *  kept sealed like the rest, replaced only whole, and shown by hash and size, never as text. */
+export const STORE_FILES: ReadonlySet<string> = new Set(["keystore", "truststore"]);
 
-/** A file's bytes as they are kept: sealed whole, with a redacted copy. */
+const formatOf = (name: string): ConfigFileRecord["format"] => (STORE_FILES.has(name) ? "binary" : /\.(properties|conf)$/.test(name) ? "properties" : /\.xml$/.test(name) ? "xml" : "other");
+
+/** What the pages show of a binary file instead of its text. */
+export const binaryLine = (sha256: string, size: number) => `(binary, ${size} bytes, sha256 ${sha256})`;
+
+/** A file's bytes as they are kept: sealed whole, with a redacted copy (none of a binary file: its bytes are no text). */
 export function sealFile(f: Pick<ConfigFileRecord, "name" | "path" | "modifiedAt">, raw: Buffer, box: SecretBox): ConfigFileRecord {
-  const text = decodeText(raw);
   const format = formatOf(f.name);
+  const text = format === "binary" ? "" : decodeText(raw);
   const { text: redacted, secrets } = format === "properties" ? redactProperties(text) : format === "xml" ? redactXml(text) : { text, secrets: [] };
   return { name: f.name, path: f.path, sha256: createHash("sha256").update(raw).digest("hex"), size: raw.length, modifiedAt: f.modifiedAt, format, sealed: box.seal(raw.toString("base64")), sealedAs: "base64", redacted, secrets };
 }
 
 /** A file's text with its secrets hidden, the way a new kept copy would have it. */
 export function redactedText(name: string, raw: Buffer): string {
-  const text = decodeText(raw), format = formatOf(name);
+  const format = formatOf(name);
+  if (format === "binary") return "";
+  const text = decodeText(raw);
   return format === "properties" ? redactProperties(text).text : format === "xml" ? redactXml(text).text : text;
 }
 

@@ -130,6 +130,7 @@ function Assessment({ change, s }: { change: ChangeAssessment; s: ServiceStatus 
 export const changeValue = (c: DraftChangeView) => ("text" in c ? <span className="muted">The file&apos;s text</span>
   : "unset" in c ? <span className="muted">Removed</span>
   : "hidden" in c ? <span className="hidden-value">New secret value</span>
+  : "binary" in c ? <span className="muted mono">Replaced whole: {c.binary.size} bytes, sha256 {c.binary.sha256.slice(0, 12)}…</span>
   : c.value === "" ? <span className="muted">(empty)</span> : c.value);
 
 function DraftDetail({ draft, s, cfg, drafts, onSaved, onEdit }: { draft: ConfigDraft; s: ServiceStatus; cfg: ServiceConfigView; drafts: Drafts; onSaved: () => void; onEdit: () => void }) {

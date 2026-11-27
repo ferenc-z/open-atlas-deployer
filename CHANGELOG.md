@@ -3,6 +3,21 @@
 A tag `v<version>` publishes the image and the GitHub release (`.github/workflows/release.yml`); the release notes are
 the section of this file under `## <version>`. A version with a `-` (such as `0.1.0-rc.1`) is a pre-release.
 
+## 0.3.0-rc.17
+
+- S41 step 4a: a configuration draft can replace a NiFi's key or trust store whole (`keystore`, `truststore`, binary,
+  one node at a time). It is kept sealed like the other files; pages, diffs, the audit and the AI see only its sha256
+  and size, never its bytes. Applying, comparing, checks (a store change needs a restart, node by node), drift,
+  adopting and rolling back handle it like any other file. A store outside the conf directory cannot be written: the
+  plan says to move it into the conf directory first. Service executor 0.9.9: takeover and drift reads include the
+  stores where `nifi.security.keystore` / `nifi.security.truststore` name them (`svc-read@3`); it writes a store only
+  inside the conf directory, mode 600, owner as before, the old one backed up (`svc-write@2`).
+
+### After upgrading
+
+- [ ] Upgrade the service executors to 0.9.9 (the Executors page) before a draft replaces a key or trust store; a
+  service taken over before needs its stores read in (a new takeover read) before they can be changed.
+
 ## 0.3.0-rc.16
 
 - S39 §7.8 ⑦ (owner 2026-11-25): what a registered shared module receives (an error module's failures) is only the

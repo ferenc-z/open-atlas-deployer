@@ -101,7 +101,7 @@ class RegistrationTest(Base):
         beat = self.api.beats[-1]
         self.assertEqual(beat["executor"], "service")
         self.assertEqual(beat["protocols"], [2])
-        self.assertEqual(beat["kinds"], ["svc-discover", "svc-read", "svc-state", "log-read", "log-tail", "nifi-provenance", "nifi-groups", "svc-write", "svc-control", "executor-upgrade", "svc-discover@2", "svc-read@2", "nifi-provenance@1", "svc-state@1", "svc-write@1", "svc-control@1", "nifi-groups@1", "flow-groups@1"],
+        self.assertEqual(beat["kinds"], ["svc-discover", "svc-read", "svc-state", "log-read", "log-tail", "nifi-provenance", "nifi-groups", "svc-write", "svc-control", "executor-upgrade", "svc-discover@2", "svc-read@2", "svc-read@3", "nifi-provenance@1", "svc-state@1", "svc-write@1", "svc-write@2", "svc-control@1", "nifi-groups@1", "flow-groups@1"],
                          "the service jobs and what they can do (§15.2); never the deploy ones")
         name, root = sx.ServiceExecutor.user()
         self.assertEqual((beat["user"], beat["isRoot"]), (name, root))
@@ -595,6 +595,29 @@ class DiscoverTest(Base):
         self.assertEqual(sorted(f["name"] for f in self.api.status["svc-read-0002"]["result"]["files"]), ["bootstrap.conf", "logback.xml", "nifi.properties"])
         self.assertEqual(self.api.status["svc-read-0003"]["state"], "refused", "only the configuration files by name")
         self.assertEqual(self.api.status["svc-read-0004"]["state"], "refused", "not a NiFi installation")
+
+    def test_svc_read_reads_the_key_store_where_nifi_properties_names_it(self):
+        import base64
+        ks = b"\xfe\xed\xfe\xed\x00\x00\x00\x02a key store\xff\x00\x80"
+        (self.c250 / "conf" / "keystore.p12").write_bytes(ks)
+        ex = self.executor()
+        self.api.queue.append({"protocol": 2, "id": "svc-read-0011", "kind": "svc-read", "installDir": str(self.c250)})
+        self.api.queue.append({"protocol": 2, "id": "svc-read-0012", "kind": "svc-read", "installDir": str(self.c250), "files": ["keystore", "truststore"]})
+        for _ in range(2):
+            ex.run_once()
+        ex.wait_reads()
+        s = self.api.status["svc-read-0011"]
+        self.assertEqual(s["state"], "succeeded", s.get("message"))
+        got = {f["name"]: f for f in s["result"]["files"]}
+        self.assertEqual((got["keystore"]["path"], got["keystore"]["sha256"], got["keystore"]["size"]),
+                         (str(self.c250 / "conf" / "keystore.p12"), hashlib.sha256(ks).hexdigest(), len(ks)))
+        self.assertNotIn("truststore", got)
+        self.assertNotIn("truststore", s["result"]["missing"], "no truststore named: not looked for, not missing")
+        sent = {f["name"]: f for f in json.loads(self.api.env["svc-read-0011"])["files"]}
+        self.assertEqual(base64.b64decode(sent["keystore"]["content"]), ks)
+        self.assertNotIn(base64.b64encode(ks).decode(), json.dumps(s) + json.dumps(self.api.logs), "the content only over the content channel")
+        named = self.api.status["svc-read-0012"]
+        self.assertEqual(([f["name"] for f in named["result"]["files"]], named["result"]["missing"]), (["keystore"], ["truststore"]))
 
 
 def split_home(root, install, conf, version, props, conf_dir_value=None, data=None):
@@ -2182,6 +2205,59 @@ class SvcWriteTest(Base):
         self.assert_no_temp()
         self.assertEqual({f["name"]: (f["before"], f["after"]) for f in done["result"]["files"]},
                          {"nifi.properties": (sha(self.NEW), sha(self.OLD)), "state-management.xml": (sha(b"<x/>\n"), None)})
+
+    # --- S41: the key and trust stores ---
+
+    KS = b"\xfe\xed\xfe\xed\x00\x00\x00\x02the old store\xff\x00"
+    KS_NEW = b"\xfe\xed\xfe\xed\x00\x00\x00\x02the new store\x80\x01"
+
+    def with_store(self, path):
+        """nifi.properties names a keystore at path (written, mode 0644), registered as the watch entry's."""
+        self.props.write_bytes(self.OLD + f"nifi.security.keystore={path}\n".encode())
+        path.write_bytes(self.KS)
+        path.chmod(0o644)
+        self.watch_entry["files"].append({"name": "keystore", "path": str(path)})
+        self.ex.watch = sx.watch_entries(self.api.watch)
+        return self.entry(path, self.KS_NEW, self.KS, name="keystore")
+
+    def test_the_stores_are_in_the_heartbeat(self):
+        self.assertIn("svc-write@2", self.ex.KINDS)
+        self.assertIn("svc-read@3", self.ex.KINDS)
+
+    def test_a_keystore_is_written_600_with_its_owner_backed_up_and_restored(self):
+        ks = self.conf / "keystore.jks"
+        entry = self.with_store(ks)
+        st = ks.stat()
+        done = self.job("apply", [entry], {"keystore": self.KS_NEW})
+        self.assertEqual(done["state"], "succeeded", done.get("message"))
+        self.assertEqual(ks.read_bytes(), self.KS_NEW)
+        self.assertEqual(oct(ks.stat().st_mode & 0o7777), "0o600", "a store is 600, whatever it had")
+        self.assertEqual((ks.stat().st_uid, ks.stat().st_gid), (st.st_uid, st.st_gid))
+        self.assertEqual(done["result"]["files"][0]["mode"], "0600")
+        backup = self.backup_dir() / "keystore"
+        self.assertEqual(backup.read_bytes(), self.KS)
+        self.assertEqual(oct(backup.stat().st_mode & 0o777), "0o600")
+        log = json.dumps(getattr(self.api, "logs", {})) + self.out.read_text()
+        self.assertNotIn("the new store", log)
+        self.assertNotIn(sx.base64.b64encode(self.KS_NEW).decode(), json.dumps(done))
+        restored = self.job("restore")
+        self.assertEqual(restored["state"], "succeeded", restored.get("message"))
+        self.assertEqual(ks.read_bytes(), self.KS)
+        self.assertEqual(oct(ks.stat().st_mode & 0o7777), "0o644", "the original's mode comes back with it")
+
+    def test_a_keystore_outside_the_conf_directory_is_refused(self):
+        ks = self.outside / "keystore.jks"
+        entry = self.with_store(ks)
+        done = self.job("apply", [entry], {"keystore": self.KS_NEW})
+        self.assert_refused(done, "move it into the conf directory first")
+        self.assertEqual(ks.read_bytes(), self.KS)
+
+    def test_a_store_nifi_properties_does_not_name_is_refused(self):
+        ts = self.conf / "truststore.jks"
+        ts.write_bytes(self.KS)
+        done = self.job("apply", [self.entry(ts, self.KS_NEW, self.KS, name="truststore")], {"truststore": self.KS_NEW})
+        self.assert_refused(done, "not where this installation has truststore")
+        self.assertEqual(ts.read_bytes(), self.KS)
 
     def test_restore_twice_changes_nothing_the_second_time(self):
         self.apply()

@@ -86,7 +86,7 @@ from executor_core import (  # noqa: F401
     FINAL, ID_RE, PROTOCOLS, Failed, ProtocolExecutor, Refused, Restarting, load_env_file, now_iso, write_json)
 # <<< executor_core
 
-VERSION = "0.9.8"
+VERSION = "0.9.9"
 # The executor's release (§8.6): one directory in the archive, holding only these files.
 PACKAGE = "open-atlas-service-executor"
 PACKAGE_FILES = ("service_executor.py", "launch.sh", "switch", "install.sh", "open-atlas-service-executor.service", "service-executor.env.example")
@@ -170,7 +170,10 @@ NIFI_BOOTSTRAP = ("org.apache.nifi.bootstrap.RunNiFi", "org.apache.nifi.bootstra
 NIFI_MAIN = "org.apache.nifi.NiFi"
 # The configuration files fingerprinted (the profile's files, §5.1, and the ones beside them in conf/).
 NIFI_CONF_FILES = ("nifi.properties", "bootstrap.conf", "state-management.xml", "authorizers.xml", "login-identity-providers.xml",
-                   "logback.xml", "zookeeper.properties", "bootstrap-notification-services.xml")
+                   "logback.xml", "zookeeper.properties", "bootstrap-notification-services.xml", "keystore", "truststore")
+# S41: the TLS key and trust stores, binary files where nifi.properties names them (none when it names none). Written
+# only inside the conf directory, mode 600; their content never goes into a log or a status.
+STORE_FILE_KEYS = {"keystore": "nifi.security.keystore", "truststore": "nifi.security.truststore"}
 # Where NiFi is often unpacked; an instance there is found even when it does not run. EXECUTOR_SCAN_DIRS replaces them.
 COMMON_DIRS = ("/opt/nifi*", "/opt/*/nifi*", "/usr/local/nifi*", "/srv/nifi*")
 # The configuration files nifi.properties (or bootstrap.conf) names, resolved against the installation (NiFi's working
@@ -479,12 +482,22 @@ class Discovery:
     def conf_files(where, props=None, boot=None):
         """name -> path of the configuration files (NIFI_CONF_FILES): nifi.properties and bootstrap.conf as the layout
         says, the ones nifi.properties or bootstrap.conf name where they name them (same kind of file), the rest in
-        the conf directory."""
+        the conf directory. keystore and truststore only where nifi.properties names them, wherever that is."""
         conf = where["confDir"]
         out = {"nifi.properties": where["propertiesFile"], "bootstrap.conf": where["bootstrapFile"]}
         read = {"nifi.properties": props, "bootstrap.conf": boot}
         for name in NIFI_CONF_FILES:
             if name in out:
+                continue
+            if name in STORE_FILE_KEYS:
+                if read["nifi.properties"] is None:
+                    try:
+                        read["nifi.properties"] = read_properties(out["nifi.properties"])
+                    except OSError:
+                        read["nifi.properties"] = {}
+                value = (read["nifi.properties"].get(STORE_FILE_KEYS[name]) or "").strip()
+                if value:
+                    out[name] = Discovery.resolve(where["installDir"], value)
                 continue
             path = os.path.join(conf, name)
             if name in CONF_FILE_KEYS:
@@ -2842,11 +2855,13 @@ class ConfigWriter:
             raise Refused(f"files are names among {', '.join(NIFI_CONF_FILES)}")
         if not ok_path(path) or ".." in path.split("/") or os.path.normpath(path) != path:
             raise Refused(f"the path of {name} is not a plain absolute path")
-        if path != (self.registered.get(name) or Discovery.conf_files(self.where)[name]):
+        if path != (self.registered.get(name) or Discovery.conf_files(self.where).get(name)):
             raise Refused(f"{path} is not where this installation has {name}")
         real = os.path.realpath(path)
         roots = [self.conf_root, *([os.path.realpath(os.path.dirname(path))] if name == "bootstrap.conf" else [])]
         if not any(real.startswith(root.rstrip("/") + "/") for root in roots):
+            if name in STORE_FILE_KEYS:
+                raise Refused(f"the {name} {path} is outside the conf directory {self.where['confDir']}: move it into the conf directory first (and {STORE_FILE_KEYS[name]} with it)")
             raise Refused(f"{path} leads outside this installation's configuration")
         if not os.path.isdir(os.path.dirname(real)):
             raise Refused(f"the directory of {path} does not exist")
@@ -2983,6 +2998,12 @@ class ConfigWriter:
         if problem:
             raise Failed(f"{t.name}: {problem}")
 
+    def attrs_for(self, t, cur):
+        """What the file is written with: the present file's owner, mode and label (new_file_attrs when there is none);
+        a key or trust store always mode 600, whatever the file had."""
+        attrs = cur["attrs"] if cur else self.new_file_attrs()
+        return {**attrs, "mode": 0o600} if t.name in STORE_FILE_KEYS else attrs
+
     def new_file_attrs(self):
         """A file that does not exist yet: owner and label of nifi.properties, mode 0640."""
         try:
@@ -3104,7 +3125,7 @@ class ConfigWriter:
         empty = hashlib.sha256(b"").hexdigest()
         files = []
         for t in targets:
-            self.prepare(t, [], empty, cur[t.name]["attrs"] if cur[t.name] else self.new_file_attrs())
+            self.prepare(t, [], empty, self.attrs_for(t, cur[t.name]))
             self.discard([t])
             files.append(self.report(t, cur[t.name]["sha256"] if cur[t.name] else None))
             self.log(f"checked {t.name} ({files[-1]['before'] or 'no file'})")
@@ -3146,7 +3167,7 @@ class ConfigWriter:
         try:
             attrs = {}
             for t in todo:
-                attrs[t.name] = cur[t.name]["attrs"] if cur[t.name] else self.new_file_attrs()
+                attrs[t.name] = self.attrs_for(t, cur[t.name])
                 self.prepare(t, [data[t.name]], t.sha256, attrs[t.name])
             for t in todo:
                 self.install(t, t.sha256, attrs[t.name])
@@ -3671,7 +3692,8 @@ class ServiceExecutor(ProtocolExecutor):
     # svc-state@1, svc-write@1, svc-control@1: the jobs' first forms (§16.3), so the plain kind alone never counts.
     # 0.9.7 (S39 step 1): nifi-groups@1, the registered groups read now (nifi_groups); flow-groups@1, the collector reads
     # only a watch entry's groups when it has the key (Collector.flow), so the Deployer knows registering takes effect.
-    CAPABILITIES = ["svc-discover@2", "svc-read@2", "nifi-provenance@1", "svc-state@1", "svc-write@1", "svc-control@1", "nifi-groups@1", "flow-groups@1"]
+    # 0.9.9 (S41 step 4): svc-read@3 and svc-write@2, the key and trust stores (keystore, truststore) among the files.
+    CAPABILITIES = ["svc-discover@2", "svc-read@2", "svc-read@3", "nifi-provenance@1", "svc-state@1", "svc-write@1", "svc-write@2", "svc-control@1", "nifi-groups@1", "flow-groups@1"]
     # Where discovery looks (tests point these elsewhere; the directories scanned are the configuration's scan_dirs).
     PROC = "/proc"
     AUTOSTART_DIRS = AUTOSTART_DIRS
@@ -3819,6 +3841,7 @@ class ServiceExecutor(ProtocolExecutor):
             raise Refused("installDir is the absolute path of a NiFi installation")
         if conf is not None and (not isinstance(conf, str) or not conf.startswith("/") or "\0" in conf):
             raise Refused("confDir is the absolute path of the installation's conf directory")
+        asked = names is not None
         if names is None:
             names = list(NIFI_CONF_FILES)
         if not isinstance(names, list) or not all(n in NIFI_CONF_FILES for n in names):
@@ -3835,6 +3858,11 @@ class ServiceExecutor(ProtocolExecutor):
         paths = Discovery.conf_files(where)
         files, content, missing, total = [], [], [], 0
         for name in dict.fromkeys(names):
+            if name not in paths:
+                # A store nifi.properties does not name (no TLS): missing only when asked for by name.
+                if asked:
+                    missing.append(name)
+                continue
             path = pathlib.Path(paths[name])
             try:
                 data = path.read_bytes() if path.is_file() else None

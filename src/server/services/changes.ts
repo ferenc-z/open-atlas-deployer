@@ -18,7 +18,7 @@ import { assessChange, blockingFindings, checkConfig, openMembers, type ChangeMo
 import { hasDrifted, liveDifferences, readLive, DriftError, type LiveReadOptions } from "./configdrift.ts";
 import { effectiveProperties } from "./configdoc.ts";
 import { fileDiffs } from "./configedit.ts";
-import { openFile, type ConfigFileRecord, type ConfigMember } from "./config.ts";
+import { openFile, STORE_FILES, type ConfigFileRecord, type ConfigMember } from "./config.ts";
 import { confDirOf, filterStartEnvironment, installKey, type ServiceMember } from "./draft.ts";
 import { ownNode } from "./metrics.ts";
 import { profile as profileById } from "./profiles.ts";
@@ -343,7 +343,12 @@ export class ServiceChanges {
       for (const m of chosen) {
         const key = installKey(m), conf = confDirOf(m);
         for (const f of files.get(key) ?? []) {
-          if (f.name !== "bootstrap.conf" && !f.path.startsWith(`${conf}/`)) found.push({ severity: "error", code: "change/outside-conf", message: `${key}: ${f.name} is at ${f.path}, outside the conf directory ${conf}: it cannot be written from here.`, file: f.name, member: key, introduced: true });
+          if (f.name !== "bootstrap.conf" && !f.path.startsWith(`${conf}/`)) {
+            found.push({ severity: "error", code: "change/outside-conf", message: STORE_FILES.has(f.name)
+              ? `${key}: the ${f.name} is at ${f.path}, outside the conf directory ${conf}: move it into the conf directory first (and point nifi.properties at it), then read the configuration again.`
+              : `${key}: ${f.name} is at ${f.path}, outside the conf directory ${conf}: it cannot be written from here.`, file: f.name, member: key, introduced: true });
+          }
+          if (STORE_FILES.has(f.name) && this.handoff.missing(m.host, { kind: "svc-write", files: [{ name: f.name }] }, "service").includes("svc-write@2")) found.push({ severity: "error", code: "change/executor-old", message: `${key}: the service executor on ${m.host} cannot write the ${f.name} (it does not name svc-write@2): upgrade it first.`, file: f.name, member: key, introduced: true });
           const rec = kept(f.revision, key, f.name);
           if (rec && !openFile(rec, box).ok) found.push({ severity: "error", code: "config/reimport", message: `${key}: ${f.name} cannot be opened as kept: take the service over again to import it.`, file: f.name, member: key, introduced: true });
           if (f.name === "bootstrap.conf" && rec) {
