@@ -78,7 +78,7 @@ test("the watch names the bound version only; the PEM goes to the service execut
   services(store);
   const lib = library(store);
   const node1 = token("nifi-1", "service"), batch = token("batch", "service"), deploy = token("nifi-1", "deploy");
-  const beat = async (bearer: string) => (await (await call("POST", "/executor/v1/heartbeat", bearer, { executor: "service", version: "0.9.10", protocols: [2], kinds: [], busy: null })).json()).watch;
+  const beat = async (bearer: string) => (await (await call("POST", "/executor/v1/heartbeat", bearer, { executor: "service", version: "0.9.11", protocols: [2], kinds: [], busy: null })).json()).watch;
 
   // Unbound: the watch says null, the certificate answer says what to do.
   assert.deepEqual((await beat(node1)).map((w: { cert: unknown }) => w.cert), [null]);

@@ -2268,12 +2268,41 @@ class SvcWriteTest(Base):
         self.assertEqual(ks.read_bytes(), self.KS)
         self.assertEqual(oct(ks.stat().st_mode & 0o7777), "0o644", "the original's mode comes back with it")
 
-    def test_a_keystore_outside_the_conf_directory_is_refused(self):
+    def test_a_keystore_outside_the_conf_directory_is_written_and_backed_up(self):
         ks = self.outside / "keystore.jks"
         entry = self.with_store(ks)
         done = self.job("apply", [entry], {"keystore": self.KS_NEW})
-        self.assert_refused(done, "move it into the conf directory first")
-        self.assertEqual(ks.read_bytes(), self.KS)
+        self.assertEqual(done["state"], "succeeded", done.get("message"))
+        self.assertEqual(ks.read_bytes(), self.KS_NEW)
+        self.assertEqual(oct(ks.stat().st_mode & 0o7777), "0o600")
+        self.assertEqual((self.backup_dir() / "keystore").read_bytes(), self.KS)
+
+    def test_a_keystore_that_is_not_there_is_refused(self):
+        ks = self.outside / "keystore.jks"
+        entry = self.with_store(ks)
+        ks.unlink()
+        done = self.job("apply", [entry], {"keystore": self.KS_NEW})
+        self.assert_refused(done, "does not exist")
+        self.assertFalse(ks.exists())
+
+    def test_a_keystore_that_is_not_a_store_file_is_refused(self):
+        ks = self.outside / "keystore.jks"
+        self.with_store(ks)
+        ks.write_bytes(b"just some text, not a store\n")
+        done = self.job("apply", [self.entry(ks, self.KS_NEW, b"just some text, not a store\n", name="keystore")], {"keystore": self.KS_NEW})
+        self.assert_refused(done, "not a JKS or PKCS12 store")
+        self.assertEqual(ks.read_bytes(), b"just some text, not a store\n")
+
+    def test_a_keystore_that_is_a_link_is_refused(self):
+        real = self.outside / "real.jks"
+        real.write_bytes(self.KS)
+        ks = self.outside / "keystore.jks"
+        entry = self.with_store(ks)
+        ks.unlink()
+        ks.symlink_to(real)
+        done = self.job("apply", [entry], {"keystore": self.KS_NEW})
+        self.assert_refused(done, "a link")
+        self.assertEqual(real.read_bytes(), self.KS)
 
     def test_a_store_nifi_properties_does_not_name_is_refused(self):
         ts = self.conf / "truststore.jks"

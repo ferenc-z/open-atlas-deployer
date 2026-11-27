@@ -339,14 +339,12 @@ export class ServiceChanges {
           differences.set(key, liveDifferences(m, live, (name) => targets.find((f) => f.name === name), box).files.map(({ sha256: _s, ...d }) => d));
         }
       }
-      // §16.5 step 9: svc-write takes only the files of the conf directory, and bootstrap.conf where it was registered.
+      // §16.5 step 9: svc-write takes the files of the conf directory, bootstrap.conf where it was registered, and a key or trust store where nifi.properties names it.
       for (const m of chosen) {
         const key = installKey(m), conf = confDirOf(m);
         for (const f of files.get(key) ?? []) {
-          if (f.name !== "bootstrap.conf" && !f.path.startsWith(`${conf}/`)) {
-            found.push({ severity: "error", code: "change/outside-conf", message: STORE_FILES.has(f.name)
-              ? `${key}: the ${f.name} is at ${f.path}, outside the conf directory ${conf}: move it into the conf directory first (and point nifi.properties at it), then read the configuration again.`
-              : `${key}: ${f.name} is at ${f.path}, outside the conf directory ${conf}: it cannot be written from here.`, file: f.name, member: key, introduced: true });
+          if (f.name !== "bootstrap.conf" && !STORE_FILES.has(f.name) && !f.path.startsWith(`${conf}/`)) {
+            found.push({ severity: "error", code: "change/outside-conf", message: `${key}: ${f.name} is at ${f.path}, outside the conf directory ${conf}: it cannot be written from here.`, file: f.name, member: key, introduced: true });
           }
           if (STORE_FILES.has(f.name) && this.handoff.missing(m.host, { kind: "svc-write", files: [{ name: f.name }] }, "service").includes("svc-write@2")) found.push({ severity: "error", code: "change/executor-old", message: `${key}: the service executor on ${m.host} cannot write the ${f.name} (it does not name svc-write@2): upgrade it first.`, file: f.name, member: key, introduced: true });
           const rec = kept(f.revision, key, f.name);

@@ -14,10 +14,11 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
 - S41 step 4a: a configuration draft can replace a NiFi's key or trust store whole (`keystore`, `truststore`, binary,
   one node at a time). It is kept sealed like the other files; pages, diffs, the audit and the AI see only its sha256
   and size, never its bytes. Applying, comparing, checks (a store change needs a restart, node by node), drift,
-  adopting and rolling back handle it like any other file. A store outside the conf directory cannot be written: the
-  plan says to move it into the conf directory first. Service executor 0.9.9: takeover and drift reads include the
-  stores where `nifi.security.keystore` / `nifi.security.truststore` name them (`svc-read@3`); it writes a store only
-  inside the conf directory, mode 600, owner as before, the old one backed up (`svc-write@2`).
+  adopting and rolling back handle it like any other file. Service executor 0.9.9: takeover and drift reads include the
+  stores where `nifi.security.keystore` / `nifi.security.truststore` name them (`svc-read@3`); it writes a store
+  mode 600, owner as before, the old one backed up (`svc-write@2`). Service executor 0.9.11: the store is written where
+  `nifi.properties` names it, inside the conf directory or not, but only over a store that is already there: a plain
+  file (not a link) that is a JKS or PKCS12 as it stands; otherwise the executor refuses and says why.
 - S41 step 4b: a certificate library version becomes one configuration draft per picked service (Certificates:
   "Save vN and create N drafts", and for a renewal "Create N drafts for vN" for the services still on older versions;
   only services whose check passes get one). A draft holds the keystore and truststore on every node and in

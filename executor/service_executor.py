@@ -87,7 +87,7 @@ from executor_core import (  # noqa: F401
     FINAL, ID_RE, PROTOCOLS, Failed, ProtocolExecutor, Refused, Restarting, load_env_file, now_iso, write_json)
 # <<< executor_core
 
-VERSION = "0.9.10"
+VERSION = "0.9.11"
 # The executor's release (§8.6): one directory in the archive, holding only these files.
 PACKAGE = "open-atlas-service-executor"
 PACKAGE_FILES = ("service_executor.py", "launch.sh", "switch", "install.sh", "open-atlas-service-executor.service", "service-executor.env.example")
@@ -2883,6 +2883,35 @@ def attrs_problem(actual, expected):
     return None
 
 
+def store_problem(name, path):
+    """Refuse (Refused) unless `path` is an existing plain file, not a link, holding a JKS or a PKCS12 store."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        raise Refused(f"the {name} {path} does not exist: only a store that is already there can be replaced") from None
+    except OSError as e:
+        raise Refused(f"the {name} {path} cannot be opened as a plain file ({'a link' if e.errno == errno.ELOOP else e.strerror}): it is not replaced") from None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise Refused(f"the {name} {path} is not a plain file: it is not replaced")
+        head = os.read(fd, 8)
+    finally:
+        os.close(fd)
+    if head[:4] == b"\xfe\xed\xfe\xed":
+        return
+    if head[:1] == b"\x30" and len(head) >= 2:
+        if head[1] == 0x80:
+            return
+        if head[1] == 0x82 and len(head) >= 4 and 4 + int.from_bytes(head[2:4], "big") == st.st_size:
+            return
+        if head[1] == 0x81 and len(head) >= 3 and 3 + head[2] == st.st_size:
+            return
+        if head[1] < 0x80 and 2 + head[1] == st.st_size:
+            return
+    raise Refused(f"the {name} {path} is not a JKS or PKCS12 store as it stands: it is not replaced")
+
+
 @contextlib.contextmanager
 def directory(path):
     """A directory known by its resolved path, as a descriptor the job's file operations go through: a symbolic link
@@ -2937,12 +2966,16 @@ class ConfigWriter:
             raise Refused(f"the path of {name} is not a plain absolute path")
         if path != (self.registered.get(name) or Discovery.conf_files(self.where).get(name)):
             raise Refused(f"{path} is not where this installation has {name}")
-        real = os.path.realpath(path)
-        roots = [self.conf_root, *([os.path.realpath(os.path.dirname(path))] if name == "bootstrap.conf" else [])]
-        if not any(real.startswith(root.rstrip("/") + "/") for root in roots):
-            if name in STORE_FILE_KEYS:
-                raise Refused(f"the {name} {path} is outside the conf directory {self.where['confDir']}: move it into the conf directory first (and {STORE_FILE_KEYS[name]} with it)")
-            raise Refused(f"{path} leads outside this installation's configuration")
+        if name in STORE_FILE_KEYS:
+            # 0.9.11: a key or trust store is written where nifi.properties names it, in the conf directory or not,
+            # but only over a store that is already there: a plain file (no link), JKS or PKCS12 as it stands.
+            real = path
+            store_problem(name, path)
+        else:
+            real = os.path.realpath(path)
+            roots = [self.conf_root, *([os.path.realpath(os.path.dirname(path))] if name == "bootstrap.conf" else [])]
+            if not any(real.startswith(root.rstrip("/") + "/") for root in roots):
+                raise Refused(f"{path} leads outside this installation's configuration")
         if not os.path.isdir(os.path.dirname(real)):
             raise Refused(f"the directory of {path} does not exist")
         return WriteTarget(name, path, os.path.dirname(real), os.path.basename(real), base, sha256)
@@ -3758,6 +3791,7 @@ class ServiceExecutor(ProtocolExecutor):
     # 0.9.7 (S39 step 1): nifi-groups@1, the registered groups read now (nifi_groups); flow-groups@1, the collector reads
     # only a watch entry's groups when it has the key (Collector.flow), so the Deployer knows registering takes effect.
     # 0.9.9 (S41 step 4): svc-read@3 and svc-write@2, the key and trust stores (keystore, truststore) among the files.
+    # 0.9.11: a key or trust store is written where nifi.properties names it (conf or not), over an existing JKS/PKCS12 file, no link.
     # 0.9.10 (S40): nifi-certs@1, the NiFi certificate comes from the Deployer's library (NifiCerts), per service.
     CAPABILITIES = ["svc-discover@2", "svc-read@2", "svc-read@3", "nifi-provenance@1", "svc-state@1", "svc-write@1", "svc-write@2", "svc-control@1", "nifi-groups@1", "flow-groups@1", "nifi-certs@1"]
     # Where discovery looks (tests point these elsewhere; the directories scanned are the configuration's scan_dirs).
