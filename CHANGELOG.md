@@ -5,6 +5,8 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
 
 ## 0.3.0-rc.17
 
+- Executors 0.9.11: the deploy executor moves to 0.9.11 with no change of its own, so both executors go out in
+  one release (S18).
 - API keys page: an admin can create a check-up key ("Check-up key", for the Service Check-up agent's Vault); the
   form offered only personal and service keys, so the check-up's Vault held a service key and its calls failed.
 - S41 lab check fixes: the home page's Services card title shows the worst of the services and the certificate alerts
