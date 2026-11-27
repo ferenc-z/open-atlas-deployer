@@ -159,11 +159,12 @@ export class Takeover {
    * against what discovery fingerprinted (the assessment was made on those), sealed, and imported as revision 1 while
    * the items are registered, in one transaction. Nothing on the hosts changes.
    */
-  async confirm(draftId: string, actor: Actor): Promise<{ draft: ServiceDraft; registered: string[]; reads: string[] }> {
+  async confirm(draftId: string, actor: Actor, certsIn?: unknown): Promise<{ draft: ServiceDraft; registered: string[]; reads: string[]; unbound: string[] }> {
     if (!this.o.box) throw new TakeoverError(503, "confirm/no-key", "DEPLOYER_CREDENTIAL_ENCRYPTION_KEY is not set: the imported files hold secrets and cannot be kept unsealed.");
     const draft = this.draft(draftId);
     if (draft.state !== "open") throw new TakeoverError(409, "draft/closed", `Takeover draft ${draftId} is ${draft.state}.`);
     if (!draft.items.length) throw new TakeoverError(409, "draft/empty", `Takeover draft ${draftId} has no items.`);
+    const certs = this.certChoice(draft, certsIn);
     if (this.confirming.has(draftId)) throw new TakeoverError(409, "confirm/running", `Takeover draft ${draftId} is being confirmed already.`);
     const members = draft.items.flatMap((item) => (item.kind === "cluster" ? item.nodes : [item.member]).map((m) => ({ item: item.id, m })));
     const used = members.map(({ m }) => [m, this.o.store.serviceUsing(m.host, m.installDir, m.confDir)] as const).filter(([, s]) => s);
@@ -223,7 +224,9 @@ export class Takeover {
       const configs: Record<string, ServiceConfigBody> = Object.fromEntries([...byItem].map(([item, ms]) => [item, { members: ms }]));
       try {
         const registered = this.o.store.confirmServiceDraft(draftId, configs, actor, draft.updatedAt);
-        return { draft: this.o.store.serviceDraft(draftId)!, registered, reads: reads.map((r) => r.id) };
+        // S40: the chosen certificates; a service without one is registered, but its executor cannot call its NiFi yet.
+        for (const [item, c] of certs) this.o.store.bindServiceCert(item, c.cert, c.version, actor);
+        return { draft: this.o.store.serviceDraft(draftId)!, registered, reads: reads.map((r) => r.id), unbound: registered.filter((s) => !certs.has(s)) };
       } catch (error) {
         if (error instanceof StoreError) throw new TakeoverError(409, error.code, error.message, error.details);
         throw error;
@@ -231,6 +234,23 @@ export class Takeover {
     } finally {
       this.confirming.delete(draftId);
     }
+  }
+
+  /** S40: {<item id>: {cert, version}} checked against the draft's items and the certificate library. */
+  private certChoice(draft: ServiceDraft, value: unknown): Map<string, { cert: string; version: number }> {
+    const out = new Map<string, { cert: string; version: number }>();
+    if (value === undefined || value === null) return out;
+    if (typeof value !== "object" || Array.isArray(value)) throw new TakeoverError(400, "confirm/certs", "certs maps item ids to {cert, version}.");
+    const items = new Set(draft.items.map((i) => i.id));
+    for (const [item, c] of Object.entries(value as Record<string, unknown>)) {
+      if (c === null) continue;
+      const { cert, version } = (c ?? {}) as { cert?: unknown; version?: unknown };
+      if (!items.has(item)) throw new TakeoverError(400, "confirm/certs", `${item} is not an item of draft ${draft.id}.`);
+      if (typeof cert !== "string" || !Number.isInteger(version)) throw new TakeoverError(400, "confirm/certs", `${item}: a certificate is {cert, version}.`);
+      if (!this.o.store.nifiCert(cert)?.versions.some((v) => v.version === version)) throw new TakeoverError(400, "cert/unknown", `${item}: certificate ${cert} has no version ${String(version)}.`);
+      out.set(item, { cert, version: version as number });
+    }
+    return out;
   }
 
   /** Asks the Onboarding Assessor to explain the findings (P1, optional): 503 without OMA, and taking over goes on. */

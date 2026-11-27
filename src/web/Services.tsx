@@ -7,6 +7,7 @@
 import { useCallback, useEffect, useState } from "react";
 import * as api from "./api.ts";
 import type { DiscoveryView, DraftItem, DraftSummary, Finding, HostView, ServiceDraft, Skipped } from "./api.ts";
+import { copyText } from "./clipboard.ts";
 import { ask } from "./Confirm.tsx";
 import { Markdown } from "./Markdown.tsx";
 import { OverviewPage } from "./OverviewPage.tsx";
@@ -38,27 +39,30 @@ export function ServicesPage({ onTakeover, isAdmin, initialOpen, initialDraft }:
 
 // Takeover.
 
-// The manual step of a takeover (S11, S28): what operations give the monitor certificate's identity in each NiFi.
-const MONITOR_POLICIES: [string, string, string][] = [
+// The manual step of a takeover (S40, S28): what operations give the NiFi certificate's identity in each NiFi. The
+// service executor connects with the certificate chosen for the service from the certificate library (the one NiFi
+// itself uses), so there is one identity, its DN, read from the certificate.
+const NIFI_POLICIES: [string, string, string][] = [
   ["/flow", "view the user interface", "versions, flow status, bulletins, back pressure"],
   ["/system", "view system diagnostics", "heap, GC, threads, repositories"],
   ["/controller", "view the controller", "cluster nodes and the coordinator"],
+  ["/process-groups/<root group id>", "view the component (root group, inherited)", "group, port and processor names in the flow walk"],
   ["/provenance", "query provenance", "FlowFile trace"],
   ["/provenance-data/process-groups/<root group id>", "view provenance (root group, inherited)", "FlowFile trace events"],
-  ["/data/process-groups/<root group id>", "view the data (root group, inherited)", "the FlowFile attributes of trace events (on a cluster also every node's identity, see below)"],
+  ["/data/process-groups/<root group id>", "view the data (root group, inherited)", "the FlowFile attributes of trace events"],
+  ["/controller (write)", "modify the controller", "a cluster's rolling changes: disconnect, offload and connect a node"],
 ];
 
-function MonitorPolicies() {
+function NifiPolicies() {
   return (
     <details className="card">
-      <summary>Before the takeover: NiFi policies for each host's monitor certificate (done by operations)</summary>
-      <p className="muted small">Each NiFi server's service executor calls its local NiFi with that host's monitor certificate (EXECUTOR_NIFI_CLIENT_CERT). In NiFi, add the certificate's identity as a user and give it these policies, all <strong>read</strong> only (on a cluster once, any node passes it on). Without them the matching numbers or the FlowFile trace stay empty; nothing here writes to NiFi, and content is never read.</p>
+      <summary>Before the takeover: the NiFi certificate and its policies (done by operations)</summary>
+      <p className="muted small">Each NiFi server's service executor calls its local NiFi with the certificate chosen for the service from the certificate library (Services &gt; Certificates): the NiFi's own certificate, the one in its keystore. Upload it there first and choose it below for each item: <strong>until a certificate is chosen, the service executor cannot connect to that NiFi</strong> (no nodes, queues, bulletins, trace or rolling changes).</p>
+      <p className="muted small">In NiFi, give the certificate's DN these policies (on a cluster once, any node passes it on; the cluster's nodes usually exist as users already). <strong>On a standalone NiFi, first add the DN as a user</strong> (Users). NiFi matches the DN as written: copy it from the draft below, <span className="mono">CN=S2S,OU=NIFI</span> and <span className="mono">CN=S2S, OU=NIFI</span> are two different users. Content is never read; to stop one executor, revoke its executor token, not the policies (the nodes share them).</p>
       <table>
         <thead><tr><th>Resource</th><th>Policy in the NiFi UI</th><th>For</th></tr></thead>
-        <tbody>{MONITOR_POLICIES.map(([resource, policy, why]) => <tr key={resource}><td className="mono small">{resource}</td><td>{policy}</td><td className="muted small">{why}</td></tr>)}</tbody>
+        <tbody>{NIFI_POLICIES.map(([resource, policy, why]) => <tr key={resource}><td className="mono small">{resource}</td><td>{policy}</td><td className="muted small">{why}</td></tr>)}</tbody>
       </table>
-      <p className="muted small">On a cluster, also give every node's own identity (its certificate's, e.g. CN=node1, OU=NIFI) <strong>view the data</strong> on the root group: a node passes the request on to the node that holds the event as a proxy, and NiFi checks that policy for every identity on the way; without it the attributes stay hidden.</p>
-      <p className="muted small">Changes that restart a cluster (Changes section) also use an <strong>operator</strong> identity: the certificate in EXECUTOR_NIFI_OPERATOR_CERT on each host. In NiFi give it, besides the policies above, <strong>modify the controller</strong> (<span className="mono">/controller</span>, write): it is the only thing that disconnects, offloads and reconnects a node. A standalone instance does not need it. The monitor certificate never writes.</p>
     </details>
   );
 }
@@ -103,7 +107,7 @@ export function TakeoverPage({ isAdmin, onRegistered }: { isAdmin: boolean; onRe
         <span className="muted">1. Discover on each host's service executor (it only reads). 2. Make a draft: the Deployer groups what it found into clusters and standalone instances and lists differences between nodes and risks. 3. Edit the draft and confirm it: each installation's configuration files are read and kept as revision 1. Nothing on the hosts changes.</span>
       </div>
       <ProblemLine problem={problem} />
-      <MonitorPolicies />
+      <NifiPolicies />
       <h2>1 · Discover</h2>
       {!hosts.length ? <p className="muted">No host has a service executor yet: install one on the NiFi servers and issue its token on the Hosts page.</p> : (
         <table>
@@ -187,8 +191,12 @@ function DraftPanel({ id, isAdmin, onClose, onConfirmed }: { id: string; isAdmin
   const [d, setD] = useState<ServiceDraft | undefined>();
   const [problem, setProblem] = useState<Problem | undefined>();
   const [busy, setBusy] = useState("");
+  // S40: the certificate library and the version chosen for each item ("cert#version").
+  const [library, setLibrary] = useState<api.CertLibrary | null | undefined>();
+  const [certs, setCerts] = useState<Record<string, string>>({});
   const load = useCallback(() => { api.serviceDraft(id).then(setD, (e) => setProblem(problemOf(e))); }, [id]);
   useEffect(() => { load(); }, [load]);
+  useEffect(() => { if (isAdmin) api.nifiCerts().then(setLibrary, () => setLibrary(null)); }, [isAdmin]);
   // While the AI review runs, look again.
   useEffect(() => {
     if (d?.review?.state !== "running") return;
@@ -202,12 +210,14 @@ function DraftPanel({ id, isAdmin, onClose, onConfirmed }: { id: string; isAdmin
   if (!d) return <section className="card panel">{problem ? <ProblemLine problem={problem} /> : <p className="muted">Loading…</p>}</section>;
   const editable = isAdmin && d.state === "open";
   const errors = d.items.flatMap((i) => (i.findings ?? []) as Finding[]).filter((f) => f.severity === "error").length;
+  const unchosen = d.items.filter((i) => !certs[i.id]).map((i) => i.id);
   const confirm = async () => {
     const what = d.items.map((i) => `${i.kind === "cluster" ? "cluster" : "standalone"} ${i.id}`).join(", ");
     const question = `Confirm draft ${d.id}? It registers ${what}. Each installation's configuration files are read on its host and kept as revision 1; nothing on the hosts changes.${errors ? ` The draft still has ${errors} error finding(s).` : ""}`;
     if (!(await ask(question, { confirm: "Confirm takeover" }))) return;
     setProblem(undefined); setBusy("confirm");
-    api.confirmDraft(d.id).then(() => onConfirmed(), (e) => { setProblem(problemOf(e)); load(); }).finally(() => setBusy(""));
+    const chosen = Object.fromEntries(Object.entries(certs).map(([item, ref]) => { const [cert, version] = ref.split("#"); return [item, { cert: cert!, version: Number(version) }]; }));
+    api.confirmDraft(d.id, chosen).then(() => onConfirmed(), (e) => { setProblem(problemOf(e)); load(); }).finally(() => setBusy(""));
   };
   const discard = async () => {
     if (!(await ask(`Discard draft ${d.id}? Nothing is registered; discover and make a new draft to start again.`, { confirm: "Discard draft", danger: true }))) return;
@@ -233,7 +243,8 @@ function DraftPanel({ id, isAdmin, onClose, onConfirmed }: { id: string; isAdmin
         <span className="muted">from {d.sources.map((s) => s.host).join(", ")} · {when(d.createdAt)} by {d.createdBy}</span>
         <button className="link" onClick={onClose}>Close</button>
       </div>
-      {d.items.map((item) => <DraftItemCard key={item.id} item={item} editable={editable} busy={Boolean(busy)} onRemove={() => remove(item.id)} onSave={(next, note) => rename(item, next, note)} />)}
+      {d.items.map((item) => <DraftItemCard key={item.id} item={item} editable={editable} busy={Boolean(busy)} onRemove={() => remove(item.id)} onSave={(next, note) => rename(item, next, note)}
+        cert={editable ? <CertChoice library={library} value={certs[item.id] ?? ""} onChange={(v) => setCerts((was) => ({ ...was, [item.id]: v }))} /> : undefined} />)}
       {!d.items.length && <p className="muted">The draft has no items.</p>}
       {d.review && <div>
         <h3>AI review <span className={`badge ${d.review.state === "done" ? "ok" : d.review.state === "failed" ? "bad" : "info"}`}>{d.review.state}</span></h3>
@@ -242,7 +253,7 @@ function DraftPanel({ id, isAdmin, onClose, onConfirmed }: { id: string; isAdmin
       </div>}
       <ProblemLine problem={problem} />
       {editable && <div className="row">
-        <button className="primary" onClick={confirm} disabled={Boolean(busy) || !d.items.length}>{busy === "confirm" ? "Reading the files…" : "Confirm takeover"}</button>
+        <button className="primary" onClick={confirm} disabled={Boolean(busy) || !d.items.length || unchosen.length > 0} title={unchosen.length ? `Choose a certificate for ${unchosen.join(", ")} first` : undefined}>{busy === "confirm" ? "Reading the files…" : "Confirm takeover"}</button>
         <button onClick={() => act("assess", () => api.reassessDraft(d.id))} disabled={Boolean(busy)}>Assess again</button>
         <button onClick={() => act("review", () => api.reviewDraft(d.id))} disabled={Boolean(busy) || d.review?.state === "running"} title="Optional: needs OMA">Ask the AI to explain</button>
         <button className="link danger" onClick={discard} disabled={Boolean(busy)}>Discard draft</button>
@@ -251,7 +262,33 @@ function DraftPanel({ id, isAdmin, onClose, onConfirmed }: { id: string; isAdmin
   );
 }
 
-function DraftItemCard({ item, editable, busy, onRemove, onSave }: { item: ServiceDraft["items"][number]; editable: boolean; busy: boolean; onRemove: () => void; onSave: (id: string, note: string) => void }) {
+// S40: the step of the draft that says which library certificate the service executor connects with, and the DN to
+// give the policies to, as the certificate has it.
+function CertChoice({ library, value, onChange }: { library: api.CertLibrary | null | undefined; value: string; onChange: (v: string) => void }) {
+  const [copied, setCopied] = useState<boolean | undefined>();
+  if (library === undefined) return <p className="muted">Loading the certificate library…</p>;
+  if (library === null) return <p className="error">The certificate library cannot be read: the service executor cannot connect to this NiFi until a certificate is chosen.</p>;
+  const options = library.certs.flatMap((c) => c.versions.map((v) => ({ ref: `${c.id}#${v.version}`, label: `${c.name} v${v.version} · ${v.subject} · until ${v.notAfter.slice(0, 10)}`, subject: v.subject })));
+  const chosen = options.find((o) => o.ref === value);
+  return (
+    <div>
+      <div className="row">
+        <span>Certificate</span>
+        <select value={value} onChange={(e) => { setCopied(undefined); onChange(e.target.value); }} disabled={!options.length}>
+          <option value="">{options.length ? "Choose the NiFi's certificate…" : "No certificate in the library"}</option>
+          {options.map((o) => <option key={o.ref} value={o.ref}>{o.label}</option>)}
+        </select>
+      </div>
+      {!options.length && <p className="muted small">Upload the NiFi's keystore, truststore and config.json under Services &gt; Certificates first.</p>}
+      {!chosen && options.length > 0 && <p className="muted small">Until a certificate is chosen, the service executor cannot connect to this NiFi.</p>}
+      {chosen && <p className="small">Give this DN the policies above in NiFi (on a standalone NiFi add it as a user first): <code className="mono">{chosen.subject}</code>{" "}
+        <button type="button" className="link" onClick={() => { void copyText(chosen.subject).then(setCopied); }}>Copy</button>
+        {copied === true && <span className="muted"> copied</span>}{copied === false && <span className="error"> not copied: select it by hand</span>}</p>}
+    </div>
+  );
+}
+
+function DraftItemCard({ item, editable, busy, onRemove, onSave, cert }: { item: ServiceDraft["items"][number]; editable: boolean; busy: boolean; onRemove: () => void; onSave: (id: string, note: string) => void; cert?: React.ReactNode }) {
   const [id, setId] = useState(item.id);
   const [note, setNote] = useState(item.note ?? "");
   useEffect(() => { setId(item.id); setNote(item.note ?? ""); }, [item.id, item.note]);
@@ -281,6 +318,7 @@ function DraftItemCard({ item, editable, busy, onRemove, onSave }: { item: Servi
           {f.values && f.values.length > 0 && <ul className="small">{f.values.map((v) => <li key={`${v.host}:${v.installDir}`}><span className="mono">{v.host}:{v.installDir}</span> {v.value ?? <span className="muted">not set</span>}</li>)}</ul>}
         </li>
       ))}</ul> : <p className="ok">No findings</p>}
+      {cert}
       {editable && <div className="row">
         <input value={id} onChange={(e) => setId(e.target.value.trim())} placeholder="Id" title="Lowercase letters, digits and dashes: the id it is registered under" style={{ flex: "0 1 220px" }} />
         <input value={note} onChange={(e) => setNote(e.target.value)} placeholder="Note (optional)" />

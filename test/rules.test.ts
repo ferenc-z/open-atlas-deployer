@@ -146,8 +146,8 @@ test("collection: NiFi's REST API blind (no monitor certificate) for 5 minutes i
   assert.deepEqual(openRules(store), ["WARN collection 2"]);
   const r = row(store, now.t, "collection");
   assert.deepEqual([r.light, light(store, now.t).light], ["attention", "attention"], "not unknown: the executor itself is fine");
-  assert.match(r.text, /no monitor certificate/);
-  assert.deepEqual(todos(), [["monitor-cert:c250", "machine", "attention", "Add a monitoring certificate so Deployer can read NiFi"]], "one to-do, not one per check");
+  assert.match(r.text, /no certificate is chosen/);
+  assert.deepEqual(todos(), [["monitor-cert:c250", "machine", "attention", "Choose a NiFi certificate so Deployer can read NiFi"]], "one to-do, not one per check");
   // The executor offline meanwhile: cannot tell, the to-do stays.
   check(store, () => offline(30), "c250", now.t);
   assert.equal(todos().length, 1);

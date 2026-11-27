@@ -26,16 +26,17 @@ seconds) or packs (tar.gz, 50 MiB) the logs of a watched NiFi, sending the lines
 channel (PUT …/content); log-tail (§15.2 P7) follows one log file for up to 120 seconds by inode and offset, across a
 rollover, sending a chunk every second or two (POST …/chunk). Both read only below the log directories of what the
 Deployer watches here, compared after realpath (no `..`, no symbolic link out). nifi-provenance (S28, §9.5) reads a
-watched NiFi's provenance with the monitor certificate: events of a FlowFile UUID or a searchable field in a time range,
+watched NiFi's provenance with the service's NiFi certificate: events of a FlowFile UUID or a searchable field in a time range,
 a lineage, one event, the searchable fields; NiFi's queries are submitted, polled and always deleted, within 100 events,
 4 MiB per answer and 30 seconds; never replay, content or a flow change. The executor refuses any kind it does not
 know, deploy jobs included.
 
 Beside the jobs runs the collector (§9.1, §15.3): every EXECUTOR_COLLECT_SECONDS it samples each NiFi the Deployer
 watches on this machine (the watch list comes with every heartbeat reply, §15.2 P5; nothing else is sampled): the
-process and the host from /proc, the disks of the repositories and logs, the NiFi's REST API with the monitor
-certificate (EXECUTOR_NIFI_CLIENT_CERT/KEY/CA, S11, P6) and, once an hour, the expiry of the certificates in its
-keystore and truststore (keytool, the password passed in the environment) and of the monitor certificate (S27). Back
+process and the host from /proc, the disks of the repositories and logs, the NiFi's REST API with the service's NiFi
+certificate (S40: the version of the Deployer's certificate library the watch entry names, fetched with this executor's
+token and held in memory) and, once an hour, the expiry of the certificates in its keystore and truststore (keytool,
+the password passed in the environment; S27). Back
 pressure (the root group's recursive status, large on a large flow) is read only every EXECUTOR_BACKPRESSURE_SECONDS
 (default 300) and sent as a summary: how many connections are at their threshold and the fullest few. The
 samples go to POST /executor/v1/samples, at most 20 at a time; those the Deployer cannot take wait in memory up to 30
@@ -86,10 +87,16 @@ from executor_core import (  # noqa: F401
     FINAL, ID_RE, PROTOCOLS, Failed, ProtocolExecutor, Refused, Restarting, load_env_file, now_iso, write_json)
 # <<< executor_core
 
-VERSION = "0.9.9"
+VERSION = "0.9.10"
 # The executor's release (§8.6): one directory in the archive, holding only these files.
 PACKAGE = "open-atlas-service-executor"
 PACKAGE_FILES = ("service_executor.py", "launch.sh", "switch", "install.sh", "open-atlas-service-executor.service", "service-executor.env.example")
+
+
+# S40: the certificate settings of 0.9.9 and before (S11's monitor and operator certificates, their CA). The NiFi
+# certificate comes from the Deployer now; these are ignored, with one line at start naming those still set.
+RETIRED_ENV = ("EXECUTOR_NIFI_CLIENT_CERT", "EXECUTOR_NIFI_CLIENT_KEY", "EXECUTOR_NIFI_CA", "EXECUTOR_NIFI_CA_RELAXED",
+               "EXECUTOR_NIFI_OPERATOR_CERT", "EXECUTOR_NIFI_OPERATOR_KEY")
 
 
 def config(env_file=None, environ=None):
@@ -110,19 +117,11 @@ def config(env_file=None, environ=None):
         # The read channel: how many reads run at once, and the longest one may take.
         "read_slots": max(1, int(e.get("EXECUTOR_READ_SLOTS", "4"))),
         "read_timeout": max(1, int(e.get("EXECUTOR_READ_TIMEOUT", "120"))),
-        # The collector (§9.1, §15.3): how often it samples the NiFi the Deployer watches here (30 to 300 seconds), and
-        # the monitor certificate it calls their REST API with (S11, §15.2 P6; files of mode 600). Without the
-        # certificate it samples only /proc and the disks. EXECUTOR_NIFI_CA_RELAXED=1 accepts a CA whose Basic
-        # Constraints are not marked critical (Python 3.13+ refuses it under VERIFY_X509_STRICT; the lab's toolkit CA).
+        # The collector (§9.1, §15.3): how often it samples the NiFi the Deployer watches here (30 to 300 seconds). The
+        # certificate it calls their REST API with comes from the Deployer (S40, NifiCerts); the settings that named
+        # files for it before are ignored (retired_env: the ones set, for the hint at start).
         "collect_seconds": min(COLLECT_MAX, max(COLLECT_MIN, int(e.get("EXECUTOR_COLLECT_SECONDS", str(COLLECT_DEFAULT))))),
-        "nifi_client_cert": e.get("EXECUTOR_NIFI_CLIENT_CERT", "").strip(),
-        "nifi_client_key": e.get("EXECUTOR_NIFI_CLIENT_KEY", "").strip(),
-        "nifi_ca": e.get("EXECUTOR_NIFI_CA", "").strip(),
-        "nifi_ca_relaxed": e.get("EXECUTOR_NIFI_CA_RELAXED", "").strip().lower() in ("1", "true", "yes"),
-        # svc-control's node-* (S11, §16.3): the certificate that may disconnect and connect nodes. Only that branch loads
-        # it; the reads and the collector never get these settings.
-        "nifi_operator_cert": e.get("EXECUTOR_NIFI_OPERATOR_CERT", "").strip(),
-        "nifi_operator_key": e.get("EXECUTOR_NIFI_OPERATOR_KEY", "").strip(),
+        "retired_env": sorted(k for k in RETIRED_ENV if e.get(k, "").strip()),
         # Back pressure (owner 2026-11-07): the root group's recursive status every this many seconds (default 300,
         # from 30 up to 3600), summed up to the connections at their threshold and the fullest N queues
         # (EXECUTOR_BACKPRESSURE_TOP, default 5, 1 to 50); the samples between carry none.
@@ -774,8 +773,21 @@ def watch_entries(value):
             # The Deployer has no flow counts of this service yet: read NiFi's own status history (about 24 hours) once.
             "flowHistory": w.get("flowHistory") is True,
             **watch_groups(w),
+            "cert": watch_cert(w.get("cert")),
         })
     return out
+
+
+def watch_cert(value):
+    """S40: the library version the Deployer binds the service to ({cert, version, sha256, pending}: pending, the
+    version a running change puts on the nodes, whose CA is trusted too); None: none chosen (or an older Deployer)."""
+    def ref(v):
+        ok = isinstance(v, dict) and isinstance(v.get("cert"), str) and v["cert"] and isinstance(v.get("version"), int) and not isinstance(v["version"], bool)
+        return {"cert": v["cert"][:100], "version": v["version"]} if ok else None
+    head = ref(value)
+    if head is None:
+        return None
+    return {**head, "sha256": value["sha256"][:64] if isinstance(value.get("sha256"), str) else None, "pending": ref(value.get("pending"))}
 
 
 def watch_groups(w):
@@ -837,7 +849,7 @@ def keytool_error(text):
 
 
 def pem_certificate(path):
-    """A PEM certificate's subject, issuer and validity (the monitor certificate), without a library."""
+    """A PEM certificate's subject, issuer and validity, without a library."""
     try:
         decoded = ssl._ssl._test_decode_cert(str(path))  # noqa: SLF001 (the standard library's own PEM reader)
     except (AttributeError, OSError, ssl.SSLError) as e:
@@ -852,20 +864,97 @@ def pem_certificate(path):
     return {"subject": dn(decoded.get("subject")), "issuer": dn(decoded.get("issuer")), "notBefore": iso(decoded.get("notBefore")), "notAfter": iso(decoded.get("notAfter"))}
 
 
-def nifi_context(cfg):
-    """The TLS context of the collector's REST calls: the monitor certificate (S11), the CA it trusts, the host name
-    checked. (context, None), or (None, why not)."""
-    cert, key, ca = cfg.get("nifi_client_cert"), cfg.get("nifi_client_key"), cfg.get("nifi_ca")
-    if not cert or not key:
-        return None, "no monitor certificate (EXECUTOR_NIFI_CLIENT_CERT and EXECUTOR_NIFI_CLIENT_KEY are not set)"
+NO_CERT = "no certificate is chosen for this service: choose one from the Deployer's certificate library (S40)"
+
+
+def tls_context(certificate_pem, private_key_pem, ca_pem, scratch=None):
+    """S40: the TLS context of the calls to a NiFi: the service's certificate (the chain, leaf first, and its key), only
+    the CA bundle the Deployer sent trusted (no system CAs), the host name checked. VERIFY_X509_STRICT is off: CAs made
+    by nifi-toolkit (the lab's, and those of the NiFi this connects to) do not mark Basic Constraints critical, which
+    Python 3.13+ refuses under it; trust stays the bundle's alone. ssl reads a key only from a file, so it is written to
+    one of mode 600 (mkstemp, in scratch when that is a directory) for load_cert_chain and removed right after."""
+    if not isinstance(ca_pem, str) or "BEGIN CERTIFICATE" not in ca_pem:
+        raise ValueError("the Deployer sent no CA certificate")
+    if not isinstance(certificate_pem, str) or not isinstance(private_key_pem, str) or "PRIVATE KEY" not in private_key_pem:
+        raise ValueError("the Deployer sent no certificate or key")
+    ctx = ssl.create_default_context(cadata=ca_pem)
+    ctx.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)
+    fd, path = tempfile.mkstemp(prefix=".nifi-cert-", suffix=".pem", dir=str(scratch) if scratch and os.path.isdir(scratch) else None)
     try:
-        ctx = ssl.create_default_context(cafile=ca or None)
-        if cfg.get("nifi_ca_relaxed"):
-            ctx.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)
-        ctx.load_cert_chain(cert, key)
-    except (OSError, ssl.SSLError) as e:
-        return None, f"cannot load the monitor certificate: {getattr(e, 'strerror', None) or e}"
-    return ctx, None
+        with os.fdopen(fd, "w") as f:
+            f.write(private_key_pem.strip() + "\n" + certificate_pem.strip() + "\n")
+        ctx.load_cert_chain(path)
+    finally:
+        os.unlink(path)
+    return ctx
+
+
+class NifiCerts:
+    """S40: the NiFi certificate of each watched service, from the Deployer's certificate library. The watch entries name
+    the version (watch_cert); when that changes, GET /executor/v1/nifi-certs/<service> gives its PEM (with this
+    executor's token: only services registered on this host), made into an ssl context at once and kept only so. A
+    fetch that fails is tried again after RETRY_SECONDS, the previous context used meanwhile. context(service): (ctx,
+    None) or (None, why not)."""
+
+    RETRY_SECONDS = 60
+
+    def __init__(self, api, scratch=None, log=lambda text: None):
+        self.api, self.scratch, self.log = api, scratch, log
+        self.lock = threading.Lock()
+        self.held = {}  # service -> {"ref", "ctx", "error", "at", "subject"}
+
+    def sync(self, watch):
+        refs = {}
+        for w in watch:
+            refs.setdefault(w["service"], w.get("cert"))
+        todo = []
+        with self.lock:
+            for gone in [s for s in self.held if s not in refs]:
+                del self.held[gone]
+            for service, ref in refs.items():
+                h = self.held.get(service)
+                if ref is None:
+                    if not h or h["ref"] is not None:
+                        if h and h["ctx"] is not None:
+                            self.log(f"certificate: {service} has none chosen any more")
+                        self.held[service] = {"ref": None, "ctx": None, "error": NO_CERT, "at": time.monotonic(), "subject": None}
+                    continue
+                if h and h["ref"] == ref and (h["error"] is None or time.monotonic() - h["at"] < self.RETRY_SECONDS):
+                    continue
+                todo.append((service, ref, h))
+        for service, ref, h in todo:
+            self.fetch(service, ref, h)
+
+    def fetch(self, service, ref, was):
+        now = time.monotonic()
+        try:
+            got = self.api.call("GET", f"/executor/v1/nifi-certs/{urllib.parse.quote(service, safe='')}")
+            if not isinstance(got, dict):
+                raise ValueError("the Deployer answered with no certificate")
+            ctx = tls_context(got.get("certificatePem"), got.get("privateKeyPem"), got.get("caPem"), self.scratch)
+            entry = {"ref": ref, "ctx": ctx, "error": None, "at": now, "subject": got.get("subject")}
+            pending = ref.get("pending")
+            self.log(f"certificate: {service} uses {ref['cert']} version {ref['version']} ({got.get('subject')})"
+                     + (f", also trusting the CA of {pending['cert']} version {pending['version']} while a change runs" if pending else ""))
+        except Exception as e:  # noqa: BLE001 (any failure leaves the previous context and is tried again)
+            entry = {"ref": ref, "ctx": was["ctx"] if was else None, "error": f"cannot get the certificate of {service}: {e}"[:400], "at": now,
+                     "subject": was["subject"] if was else None}
+            self.log(f"certificate: {entry['error']}" + (" (the previous one is used meanwhile)" if entry["ctx"] else ""))
+        with self.lock:
+            self.held[service] = entry
+
+    def context(self, service):
+        with self.lock:
+            h = self.held.get(service)
+        if h and h["ctx"] is not None:
+            return h["ctx"], None
+        return None, (h["error"] if h and h["error"] else NO_CERT)
+
+    def summary(self):
+        """For the heartbeat: per service, the version in use and what failed (never a path, a key or a PEM)."""
+        with self.lock:
+            return {s: {"cert": h["ref"]["cert"] if h["ref"] else None, "version": h["ref"]["version"] if h["ref"] else None,
+                        "ready": h["ctx"] is not None, **({"error": h["error"]} if h["error"] else {})} for s, h in self.held.items()}
 
 
 class SniConnection(http.client.HTTPSConnection):
@@ -1540,11 +1629,13 @@ def file_attributes(path):
 
 
 class Collector:
-    """Samples the watched NiFi (§15.3): process and host from /proc, disks, the REST API with the monitor certificate,
-    the certificates' expiry (S27). Only reads; passwords and keys never leave the host. Tests replace fetch and keytool."""
+    """Samples the watched NiFi (§15.3): process and host from /proc, disks, the REST API with the service's NiFi
+    certificate (S40: tls, NifiCerts.context), the certificates' expiry (S27). Only reads; passwords and keys never leave
+    the host. Tests replace fetch and keytool."""
 
-    def __init__(self, cfg, proc="/proc", uid=None, log=lambda text: None):
+    def __init__(self, cfg, proc="/proc", uid=None, log=lambda text: None, tls=None):
         self.cfg = cfg
+        self.tls = tls or (lambda service: (None, NO_CERT))
         self.proc = pathlib.Path(proc)
         self.uid = uid
         self.log = log
@@ -1608,8 +1699,8 @@ class Collector:
 
     # --- REST ---
 
-    def context(self):
-        return nifi_context(self.cfg)
+    def context(self, service):
+        return self.tls(service)
 
     def fetch(self, ctx, connect, port, sni, path, timeout):
         """GET /nifi-api/<path>: (HTTP status, body). The Host header names the NiFi as it knows itself."""
@@ -1862,17 +1953,6 @@ class Collector:
             out.append(entry)
         return out
 
-    def monitor_cert(self):
-        cert = self.cfg.get("nifi_client_cert")
-        if not cert:
-            return []
-        entry = {"store": "monitor", "path": cert, "type": "PEM"}
-        try:
-            entry["certificates"] = [pem_certificate(cert)]
-        except Failed as e:
-            entry["error"] = str(e)
-        return [entry]
-
     def certificates(self, w, where, props, boot, proc):
         """The certificates, read again once an hour or when nifi.properties or a store changed."""
         def stamp(p):
@@ -1880,13 +1960,13 @@ class Collector:
                 return os.stat(p).st_mtime
             except OSError:
                 return None
-        files = [where["propertiesFile"], self.cfg.get("nifi_client_cert") or ""]
+        files = [where["propertiesFile"]]
         files += [Discovery.resolve(where["installDir"], (props.get(f"nifi.security.{s}") or "").strip()) for s in ("keystore", "truststore") if (props.get(f"nifi.security.{s}") or "").strip()]
         signature = [(f, stamp(f)) for f in files]
         cached = self.certs.get(w["member"])
         if cached and cached["signature"] == signature and time.monotonic() - cached["at"] < CERTS_EVERY and not cached.get("retry"):
             return cached["value"]
-        stores = self.store_certs(w["member"], where, props, boot, proc) + self.monitor_cert()
+        stores = self.store_certs(w["member"], where, props, boot, proc)
         value = {"readAt": now_iso(), "stores": stores}
         # A keytool not found while the NiFi is stopped is tried again next round, not in an hour.
         self.certs[w["member"]] = {"at": time.monotonic(), "signature": signature, "value": value,
@@ -2006,10 +2086,10 @@ class Collector:
         return {"nodes": table, "self": self_node(table, port, names)}
 
     def state_rest(self, w, props):
-        """svc-state's REST part, with the monitor certificate, within NIFI_BUDGET. state: ok, partial (it answered, but
+        """svc-state's REST part, with the service's NiFi certificate, within NIFI_BUDGET. state: ok, partial (it answered, but
         not everything: a 409 in an election), unreachable, no-certificate, no-https. A node that has not connected
         answers some of this with an error, which is an answer to wait on, not a failure of the job."""
-        ctx, why_not = self.context()
+        ctx, why_not = self.context(w["service"])
         if ctx is None:
             return {"state": "no-certificate", "error": why_not}
         target = nifi_target(w, props)
@@ -2087,10 +2167,10 @@ class Collector:
         if not watch:
             return []
         procs, host = self.running(), self.host()
-        ctx, why_not = self.context()
         samples = []
         for w in watch:
             try:
+                ctx, why_not = self.context(w["service"])
                 samples.append(self.sample(w, procs, host, ctx, why_not))
             except Exception as e:
                 samples.append({"service": w["service"], "member": w["member"], "at": now_iso(), "problems": [f"the collector failed: {e}"[:300]]})
@@ -2348,7 +2428,7 @@ class LogFiles:
         return {"dir": d, "files": out[:LIST_MAX], "more": max(0, len(out) - LIST_MAX)}
 
 
-# --- provenance (S28, §9.5): the Deployer's FlowFile trace, read from the local NiFi with the monitor certificate ------
+# --- provenance (S28, §9.5): the Deployer's FlowFile trace, read from the local NiFi with its NiFi certificate (S40) ---
 
 # Limits (as Studio's former nifi source had them): at most 100 events, 4 MiB per answer, 30 seconds per job; every
 # provenance and lineage query NiFi keeps is deleted when the job ends (finally), whatever happened.
@@ -2450,7 +2530,7 @@ class NifiAnswer(Exception):
 
 
 class ProvenanceQuery:
-    """One provenance read on a watched NiFi (S28, §9.5), with the monitor certificate, straight to the local node.
+    """One provenance read on a watched NiFi (S28, §9.5), with the service's NiFi certificate, straight to the local node.
     op provenance: events of a FlowFile UUID, or of a searchable field's value, between from and to (both required),
     at most 100; lineage: a FlowFile's lineage (uuid) or an event's parents or children (eventId, direction), its
     event nodes given their component; event: one event's details (attributes included when NiFi shows them to this
@@ -2481,7 +2561,7 @@ class ProvenanceQuery:
         if not 200 <= status < 300:
             text = data[:300].decode("utf-8", "replace").strip()
             if status in (401, 403):
-                raise Failed(f"NiFi refused the monitor certificate (HTTP {status}: {text}); its identity needs \"query provenance\" "
+                raise Failed(f"NiFi refused the service's certificate (HTTP {status}: {text}); its identity needs \"query provenance\" "
                              "(/provenance, read) and \"view provenance\" on the components (/provenance-data/..., read)")
             raise NifiAnswer(status, text)
         try:
@@ -3278,23 +3358,6 @@ NODE_ACTIONS = {"node-disconnect": ("DISCONNECTING", ("DISCONNECTED", "OFFLOADED
 LIMIT_RESOURCES = {"nofile": getattr(resource, "RLIMIT_NOFILE", None), "nproc": getattr(resource, "RLIMIT_NPROC", None)}
 
 
-def operator_context(cfg):
-    """The TLS context of the node-* calls: the operator certificate (S11), which may change a cluster. Only
-    ServiceControl's node branch calls this; the reads and the collector use nifi_context, and never see these settings
-    (make_collector). (context, None), or (None, why not)."""
-    cert, key, ca = cfg.get("nifi_operator_cert"), cfg.get("nifi_operator_key"), cfg.get("nifi_ca")
-    if not cert or not key:
-        return None, "no operator certificate (EXECUTOR_NIFI_OPERATOR_CERT and EXECUTOR_NIFI_OPERATOR_KEY are not set)"
-    try:
-        ctx = ssl.create_default_context(cafile=ca or None)
-        if cfg.get("nifi_ca_relaxed"):
-            ctx.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)
-        ctx.load_cert_chain(cert, key)
-    except (OSError, ssl.SSLError) as e:
-        return None, f"cannot load the operator certificate: {getattr(e, 'strerror', None) or e}"
-    return ctx, None
-
-
 def nifi_caller(ctx, connect, sni, port, limit=REST_MAX):
     """call(method, path, body, timeout) -> (status, bytes) on one NiFi's REST API, with the given certificate."""
     def call(method, path, body, timeout):
@@ -3342,8 +3405,10 @@ class ServiceControl:
     nothing was touched. The script's arguments hold the start environment, so it runs without Protocol's sh (which logs
     its commands); the status and the log carry names, pids and an exit code. Nothing here kills a NiFi but do_kill."""
 
-    def __init__(self, cfg, w, who, proc="/proc", cgroup_file=PROC_CGROUP, log=lambda text: None):
+    def __init__(self, cfg, w, who, proc="/proc", cgroup_file=PROC_CGROUP, log=lambda text: None, tls=None):
         self.cfg, self.w, self.log, self.cgroup_file = cfg, w, log, cgroup_file
+        # S40: node-* use the service's NiFi certificate, the same the reads use (S11's operator certificate is gone).
+        self.tls = tls or (lambda service: (None, NO_CERT))
         self.user_name, self.root = who
         self.where = Discovery.layout(w["installDir"], conf=w["confDir"])
         self.discovery = Discovery(proc, uid=None if self.root else os.geteuid())
@@ -3609,7 +3674,7 @@ class ServiceControl:
 
     def node(self, request, action):
         """§8, S11: asks the cluster, through this member's REST API, to change a node's state, and waits for it. The
-        operator certificate is loaded here and nowhere else; the monitor certificate is no fallback. Done already:
+        service's NiFi certificate (S40, the one the reads use) needs "modify the controller". Done already:
         nothing is sent, so a retry is safe. A node that does not answer yet is waited for; NiFi's refusal (4xx) ends it."""
         node_id = request.get("nodeId")
         if not isinstance(node_id, str) or not NIFI_ID_RE.match(node_id):
@@ -3624,7 +3689,7 @@ class ServiceControl:
         target = nifi_target(self.w, props)
         if not target:
             raise Refused("nifi.web.https.port is not set: NiFi is only called over HTTPS")
-        ctx, why_not = operator_context(self.cfg)
+        ctx, why_not = self.tls(self.w["service"])
         if ctx is None:
             raise Refused(why_not)
         call = nifi_caller(ctx, *target)
@@ -3693,7 +3758,8 @@ class ServiceExecutor(ProtocolExecutor):
     # 0.9.7 (S39 step 1): nifi-groups@1, the registered groups read now (nifi_groups); flow-groups@1, the collector reads
     # only a watch entry's groups when it has the key (Collector.flow), so the Deployer knows registering takes effect.
     # 0.9.9 (S41 step 4): svc-read@3 and svc-write@2, the key and trust stores (keystore, truststore) among the files.
-    CAPABILITIES = ["svc-discover@2", "svc-read@2", "svc-read@3", "nifi-provenance@1", "svc-state@1", "svc-write@1", "svc-write@2", "svc-control@1", "nifi-groups@1", "flow-groups@1"]
+    # 0.9.10 (S40): nifi-certs@1, the NiFi certificate comes from the Deployer's library (NifiCerts), per service.
+    CAPABILITIES = ["svc-discover@2", "svc-read@2", "svc-read@3", "nifi-provenance@1", "svc-state@1", "svc-write@1", "svc-write@2", "svc-control@1", "nifi-groups@1", "flow-groups@1", "nifi-certs@1"]
     # Where discovery looks (tests point these elsewhere; the directories scanned are the configuration's scan_dirs).
     PROC = "/proc"
     AUTOSTART_DIRS = AUTOSTART_DIRS
@@ -3714,6 +3780,10 @@ class ServiceExecutor(ProtocolExecutor):
         self.stopping = threading.Event()
         self.collector = None
         self.kill_mode_seen = None  # (monotonic time, KillMode) for the heartbeat; a start asks systemd itself
+        # S40: the NiFi certificate of each watched service, from the Deployer (on_beat_reply keeps it current).
+        self.nifi_certs = NifiCerts(self.api, scratch=cfg.get("work"), log=self.say)
+        if cfg.get("retired_env"):
+            self.say(f"ignored: {', '.join(cfg['retired_env'])} (S40: the NiFi certificate comes from the Deployer's certificate library; remove them from the environment file)")
 
     # --- the collector (§9.1, §15.3) ---
 
@@ -3726,12 +3796,11 @@ class ServiceExecutor(ProtocolExecutor):
             self.watch = watch
         if changed:
             self.say(f"collector: watching {len(watch)} NiFi" + (f" ({', '.join(w['service'] for w in watch)})" if watch else ""))
+        self.nifi_certs.sync(watch)
 
     def make_collector(self):
         name, root = self.user()
-        # S11: reads and samples never hold the operator certificate, not even its paths.
-        reads = {k: v for k, v in self.cfg.items() if not k.startswith("nifi_operator")}
-        return Collector(reads, proc=self.PROC, uid=None if root else os.geteuid(), log=self.say)
+        return Collector(self.cfg, proc=self.PROC, uid=None if root else os.geteuid(), log=self.say, tls=self.nifi_certs.context)
 
     def collect_once(self):
         """One round: a sample of each watched NiFi into the backlog, then as much of the backlog as the Deployer takes."""
@@ -4171,7 +4240,7 @@ class ServiceExecutor(ProtocolExecutor):
             raise Refused(f"action is one of {', '.join(CONTROL_ACTIONS)}")
         if not isinstance(change, str) or not CHANGE_RE.match(change):
             raise Refused("change is the id of the change this job belongs to")
-        control = ServiceControl(self.cfg, self.watched(req.get("member")), self.user(), proc=self.PROC, cgroup_file=self.CGROUP, log=self.log)
+        control = ServiceControl(self.cfg, self.watched(req.get("member")), self.user(), proc=self.PROC, cgroup_file=self.CGROUP, log=self.log, tls=self.nifi_certs.context)
         self.step(status, action)
         try:
             message = control.run(req)
@@ -4184,14 +4253,20 @@ class ServiceExecutor(ProtocolExecutor):
         seen = self.kill_mode_seen
         if seen is None or time.monotonic() - seen[0] > KILL_MODE_SECONDS:
             seen = self.kill_mode_seen = (time.monotonic(), kill_mode(self.CGROUP))
-        return {"operatorCert": bool(self.cfg.get("nifi_operator_cert") and self.cfg.get("nifi_operator_key")), "killMode": seen[1], "runuser": bool(shutil.which("runuser"))}
+        # operatorCert (the Deployer's name from S11): node-* can be called, i.e. every watched service has its certificate.
+        return {"operatorCert": self.certs_ready(), "killMode": seen[1], "runuser": bool(shutil.which("runuser"))}
+
+    def certs_ready(self):
+        with self.watch_lock:
+            services = {w["service"] for w in self.watch or []}
+        return bool(services) and all(self.nifi_certs.context(s)[0] is not None for s in services)
 
     def nifi_call(self, w, props):
         """(call(method, path, body, timeout) -> (status, bytes), whether it is a cluster node) for a watched NiFi's
-        REST API with the monitor certificate, the TLS name and Host header as the collector uses them."""
-        ctx, why_not = nifi_context(self.cfg)
+        REST API with the service's NiFi certificate, the TLS name and Host header as the collector uses them."""
+        ctx, why_not = self.nifi_certs.context(w["service"])
         if ctx is None:
-            raise Failed(f"provenance needs the monitor certificate: {why_not}")
+            raise Failed(f"provenance needs the service's NiFi certificate: {why_not}")
         target = nifi_target(w, props)
         if not target:
             raise Failed("nifi.web.https.port is not set: provenance is only read over HTTPS")
@@ -4221,7 +4296,7 @@ class ServiceExecutor(ProtocolExecutor):
 
     def nifi_groups(self, job):
         """nifi-groups (S39 step 1, §7.4): request.member (a watched installation) and request.groups (1 to
-        NIFI_GROUPS_MAX group ids), read now with the monitor certificate, as the collector reads registered groups:
+        NIFI_GROUPS_MAX group ids), read now with the service's NiFi certificate, as the collector reads registered groups:
         each group with its subgroups and one hop out. The answer: per group (in the order asked) exists, name, parent,
         path, ports, ends, S2S, sizes, pieces and neighbors (group_report), and the whole scoped topology (topology), the
         same body the collector sends, for a preview before the groups are registered. Within request.timeoutSeconds
@@ -4239,9 +4314,9 @@ class ServiceExecutor(ProtocolExecutor):
             props = read_properties(where["propertiesFile"])
         except OSError as e:
             raise Failed(f"cannot read {where['propertiesFile']}: {e.strerror or e}")
-        ctx, why_not = nifi_context(self.cfg)
+        ctx, why_not = self.nifi_certs.context(w["service"])
         if ctx is None:
-            raise Failed(f"reading groups needs the monitor certificate: {why_not}")
+            raise Failed(f"reading groups needs the service's NiFi certificate: {why_not}")
         target = nifi_target(w, props)
         if not target:
             raise Failed("nifi.web.https.port is not set: groups are only read over HTTPS")
@@ -4282,7 +4357,7 @@ class ServiceExecutor(ProtocolExecutor):
         body["collector"] = {"seconds": self.cfg.get("collect_seconds", COLLECT_DEFAULT),
                              "backpressureSeconds": self.cfg.get("backpressure_seconds", BACKPRESSURE_DEFAULT),
                              "watching": watching, "backlog": backlog,
-                             "certificate": bool(self.cfg.get("nifi_client_cert") and self.cfg.get("nifi_client_key"))}
+                             "certificate": self.certs_ready(), "certificates": self.nifi_certs.summary()}
         body["control"] = self.control_state()
         return body
 
