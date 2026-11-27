@@ -12,11 +12,22 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   plan says to move it into the conf directory first. Service executor 0.9.9: takeover and drift reads include the
   stores where `nifi.security.keystore` / `nifi.security.truststore` name them (`svc-read@3`); it writes a store only
   inside the conf directory, mode 600, owner as before, the old one backed up (`svc-write@2`).
+- S41 step 4b: a certificate library version becomes one configuration draft per picked service (Certificates:
+  "Save vN and create N drafts", and for a renewal "Create N drafts for vN" for the services still on older versions;
+  only services whose check passes get one). A draft holds the keystore and truststore on every node and in
+  `nifi.properties` the store paths (as they are), `keystoreType`/`truststoreType` (as the files are) and the three
+  passwords (secrets: hidden on pages, never for the AI). A service's binding follows the keystore it should have, by
+  sha256: applying a draft, rolling back or adopting a file moves it; a keystore that is no library version shows as
+  the service's own certificate. The service's Certificates page shows where its certificate comes from, offers a
+  newer version of its entry as a draft, binds the certificate in use with no draft and no restart (reading the stores
+  from the hosts first when no revision has them, a new revision "read"), and takes an upload (kept in the library,
+  then bound if it is what the hosts have, else drafted). Admins only.
 
 ### After upgrading
 
 - [ ] Upgrade the service executors to 0.9.9 (the Executors page) before a draft replaces a key or trust store; a
-  service taken over before needs its stores read in (a new takeover read) before they can be changed.
+  service taken over before needs its stores read in before they can be changed: on its Certificates page, "Read the
+  stores and find the certificate in use".
 
 ## 0.3.0-rc.16
 

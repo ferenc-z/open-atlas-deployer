@@ -296,6 +296,7 @@ CREATE TABLE IF NOT EXISTS nifi_cert_versions (
 CREATE TABLE IF NOT EXISTS service_cert_bindings (
   service TEXT PRIMARY KEY, cert TEXT NOT NULL, version INTEGER NOT NULL, bound_at TEXT NOT NULL, bound_by TEXT NOT NULL,
   FOREIGN KEY (cert, version) REFERENCES nifi_cert_versions(cert, version));
+CREATE TABLE IF NOT EXISTS service_cert_own (service TEXT PRIMARY KEY, sha256 TEXT, marked_at TEXT NOT NULL);
 `;
 
 /** queued: waiting for the host's executor to claim it; the rest are the executor's states. */
@@ -1248,6 +1249,12 @@ export class Store {
    * already has it. Nothing on the host changes. It must still be the drift that was looked at: expected and the base.
    */
   adoptServiceFile(service: string, a: { member: string; file: string; base: number; expected: string; sha256: string; split: ServiceConfigBody | null; body: ServiceConfigBody | null; findings: ConfigFinding[]; note: string | null }, actor: Actor): number {
+    const revision = this.adoptServiceFileRow(service, a, actor);
+    this.keptFilesChanged(service);
+    return revision;
+  }
+
+  private adoptServiceFileRow(service: string, a: { member: string; file: string; base: number; expected: string; sha256: string; split: ServiceConfigBody | null; body: ServiceConfigBody | null; findings: ConfigFinding[]; note: string | null }, actor: Actor): number {
     return this.inTransaction(() => {
       const latest = (this.db.prepare("SELECT MAX(revision) AS n FROM service_configs WHERE service = ?").get(service) as Row).n as number | null;
       if (latest !== a.base) throw new StoreError("drift/stale", `The configuration of ${service} is at revision ${latest} now: look at the differences again.`);
@@ -1276,6 +1283,7 @@ export class Store {
   /** A member's files as a change has just left them (§16.3): what they should be from now on, and what they are, so that no older sample calls it drift. */
   setMemberFilesApplied(service: string, member: string, files: { file: string; path: string; sha256: string; revision: number }[], change: string) {
     this.inTransaction(() => this.upsertMemberFiles(service, member, files, change));
+    this.keptFilesChanged(service);
   }
 
   private upsertMemberFiles(service: string, member: string, files: { file: string; path: string; sha256: string; revision: number }[], change: string) {
@@ -1292,6 +1300,7 @@ export class Store {
       for (const e of events) this.insertServiceEvent(e);
       this.updateServiceChange(c.id, c);
     });
+    this.keptFilesChanged(c.service);
   }
 
   /** How a member is started from now on (§16.3): what the running process had. */
@@ -1797,6 +1806,63 @@ export class Store {
   unbindServiceCert(service: string, actor: Actor) {
     this.db.prepare("DELETE FROM service_cert_bindings WHERE service = ?").run(service);
     this.insertAudit(actor, "cert.unbound", service, {});
+  }
+
+  /** S41 step 4b: services whose keystore is in no library version ("own certificate"), with the keystore's sha256
+   *  (null: the nodes have different keystores). */
+  serviceCertOwnMarks(): { service: string; sha256: string | null; markedAt: string }[] {
+    return (this.db.prepare("SELECT * FROM service_cert_own ORDER BY service").all() as Row[]).map((r) => ({ service: r.service, sha256: r.sha256 ?? null, markedAt: r.marked_at }));
+  }
+
+  /** Where a service's certificate comes from now, as its kept keystore says: a library version, or none of them
+   *  (own: the sha256). Only a difference is written and audited. */
+  setServiceCertSource(service: string, to: { cert: string; version: number } | { own: string | null }, actor: Actor): boolean {
+    const bound = this.db.prepare("SELECT cert, version FROM service_cert_bindings WHERE service = ?").get(service) as Row | undefined;
+    const own = this.db.prepare("SELECT sha256 FROM service_cert_own WHERE service = ?").get(service) as Row | undefined;
+    if ("cert" in to) {
+      if (bound?.cert === to.cert && bound.version === to.version && !own) return false;
+      this.inTransaction(() => {
+        this.db.prepare("DELETE FROM service_cert_own WHERE service = ?").run(service);
+        this.bindServiceCert(service, to.cert, to.version, actor);
+      });
+      return true;
+    }
+    if (!bound && own && (own.sha256 ?? null) === to.own) return false;
+    this.inTransaction(() => {
+      if (bound) this.unbindServiceCert(service, actor);
+      this.db.prepare("INSERT OR REPLACE INTO service_cert_own (service, sha256, marked_at) VALUES (?, ?, ?)").run(service, to.own, this.now().toISOString());
+      this.insertAudit(actor, "cert.own", service, { sha256: to.own });
+    });
+    return true;
+  }
+
+  /** Called after what a service's files should be has changed (a change applied them, a file adopted, the stores read):
+   *  the certificate binding follows the keystore (S41 step 4b). Set by the app; a failure here fails nothing. */
+  onKeptFilesChanged: ((service: string) => void) | null = null;
+  private keptFilesChanged(service: string) {
+    try { this.onKeptFilesChanged?.(service); } catch (error) { console.error("certificate binding:", error); }
+  }
+
+  /**
+   * S41 step 4b: a service taken over before the stores were read gets them from a new read: a revision with the
+   * keystore and truststore added (nothing else changed), and those files kept as what each member should have.
+   */
+  addServiceStoreFiles(service: string, r: { base: number; body: ServiceConfigBody; files: { member: string; file: string; path: string; sha256: string }[] }, actor: Actor): number {
+    const revision = this.inTransaction(() => {
+      const latest = (this.db.prepare("SELECT MAX(revision) AS n FROM service_configs WHERE service = ?").get(service) as Row).n as number | null;
+      if (latest !== r.base) throw new StoreError("config-read/stale", `The configuration of ${service} is at revision ${latest} now: read again.`);
+      const at = this.stamp(), next = latest + 1;
+      this.db.prepare("INSERT INTO service_configs (service, revision, body, source, saved_at, saved_by, via, note, base, findings) VALUES (?, ?, ?, 'read', ?, ?, ?, ?, ?, NULL)")
+        .run(service, next, JSON.stringify(r.body), at, actor.id, actor.via, "Key and trust stores read from the hosts", latest);
+      const upsert = this.db.prepare(`INSERT INTO service_member_files (service, member, file, path, expected_sha256, revision, applied_at, change, actual_sha256, actual_at) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+        ON CONFLICT (service, member, file) DO UPDATE SET path = excluded.path, expected_sha256 = excluded.expected_sha256, revision = excluded.revision, applied_at = excluded.applied_at, change = NULL, actual_sha256 = excluded.actual_sha256, actual_at = excluded.actual_at`);
+      for (const f of r.files) upsert.run(service, f.member, f.file, f.path, f.sha256, next, at, f.sha256, at);
+      this.insertServiceEvent({ service, member: null, at, kind: "config-saved", detail: { text: `Configuration revision ${next} saved: key and trust stores read from the hosts`, by: actor.id, revision: next } });
+      this.insertAudit(actor, "service.config-stores-read", `${service}#${next}`, { files: r.files.map((f) => `${f.member} ${f.file} ${f.sha256.slice(0, 12)}`) });
+      return next;
+    });
+    this.keptFilesChanged(service);
+    return revision;
   }
 
   serviceCerts(service: string): ServiceCert[] {

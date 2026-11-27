@@ -344,7 +344,7 @@ export const putThresholds = (id: string, overrides: Record<string, number>) => 
 export type NifiCertView = import("../server/store.ts").NifiCert;
 export type CertVersionView = import("../server/store.ts").CertVersion;
 export type CertCheckItem = import("../server/certs/check.ts").CheckItem;
-export type CertServiceView = { id: string; hosts: string[]; bound: { cert: string; version: number } | null };
+export type CertServiceView = { id: string; hosts: string[]; bound: { cert: string; version: number } | null; own?: boolean };
 export type CertLibrary = { keyConfigured: boolean; certs: NifiCertView[]; services: CertServiceView[] };
 export type CertUploadCheck = {
   passwordsRead: true;
@@ -364,3 +364,18 @@ export const nifiCerts = () => call<CertLibrary>("GET", "nifi-certs");
 export const checkNifiCert = (files: File[]) => uploadCall<CertUploadCheck>("nifi-certs/check", {}, files);
 export const saveNifiCert = (files: File[], target: { name: string } | { cert: string }) => uploadCall<{ cert: string; version: number }>("nifi-certs", target, files);
 export const removeNifiCertVersion = (cert: string, version: number) => call<{ removed: true }>("DELETE", `nifi-certs/${encodeURIComponent(cert)}/versions/${version}`);
+// S41 step 4b: drafts from a version, and a service's certificate (where it comes from, binding, upload).
+export type CertDraftsResult = { drafts: { service: string; draft: string }[]; skipped: { service: string; code: string; message: string }[] };
+export const certDrafts = (cert: string, version: number, services: string[]) => call<CertDraftsResult>("POST", `nifi-certs/${encodeURIComponent(cert)}/versions/${version}/drafts`, { services });
+export type ServiceCertState = {
+  service: string; storesKept: boolean; keyConfigured: boolean; canManage: boolean;
+  source: { library: { cert: string; name: string; ownService: string | null; version: number; subject: string | null; notAfter: string | null; others: string[];
+    newer: { version: number; subject: string; notAfter: string; ok: boolean; items: CertCheckItem[] } | null } } | { own: { sameOnEveryNode: boolean } } | null;
+  drafts: { id: string; note: string | null }[];
+  versions: { cert: string; name: string; version: number; subject: string; notAfter: string }[];
+};
+export const serviceCertificate = (id: string) => call<ServiceCertState>("GET", `services/${encodeURIComponent(id)}/certificate`);
+export const bindServiceCertificate = (id: string, target: { cert: string; version: number } | Record<string, never> = {}) =>
+  call<{ read: boolean; source: { cert: string; version: number } | { own: string | null } | null }>("POST", `services/${encodeURIComponent(id)}/certificate/bind`, target);
+export type ServiceCertUpload = { cert: string; version: number; saved: boolean; bound?: true; draft?: string; skipped?: { code: string; message: string } };
+export const uploadServiceCertificate = (id: string, files: File[]) => uploadCall<ServiceCertUpload>(`services/${encodeURIComponent(id)}/certificate`, {}, files);

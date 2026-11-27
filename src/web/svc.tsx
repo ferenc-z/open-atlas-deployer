@@ -19,7 +19,7 @@ export const STATE: Record<MemberStatus["state"], { label: string; tone: string;
 };
 
 /** How a configuration revision came to be. */
-export const SOURCE: Record<string, string> = { import: "imported from the hosts at takeover", edit: "edited", split: "split into layers (the same files)", adopt: "adopted from a host", rollback: "back to an earlier revision" };
+export const SOURCE: Record<string, string> = { import: "imported from the hosts at takeover", edit: "edited", split: "split into layers (the same files)", adopt: "adopted from a host", rollback: "back to an earlier revision", read: "key and trust stores read from the hosts" };
 
 export const SEVERITY: Record<Finding["severity"], { tone: string; mark: string }> = { error: { tone: "bad", mark: "✕" }, warning: { tone: "warn", mark: "!" }, info: { tone: "info", mark: "i" } };
 

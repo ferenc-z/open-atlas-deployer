@@ -31,7 +31,9 @@ import { CertError, type ParsedKeystore, type ParsedTruststore } from "./certs/k
 import { checkForService, type OpenedUpload } from "./certs/check.ts";
 import { currentPem, readUpload, sealVersion, UPLOAD_FILE_MAX, UPLOAD_FILES_MAX, type ReadUpload, type UploadedFile } from "./certs/library.ts";
 import { StoreError, type Actor, type ServiceConfigDraft, type Store } from "./store.ts";
-import { withoutSealed } from "./services/config.ts";
+import { sealFile, STORE_FILES, withoutSealed } from "./services/config.ts";
+import { CertDraftError, certDraftChanges, CertSources, openedVersion, openVersion, sha256Of } from "./certs/services.ts";
+import { layerFile } from "./services/layers.ts";
 import { ConfigDocError } from "./services/configdoc.ts";
 import { redactText } from "./services/redact.ts";
 import { acceptChanges, changeSummary, changeView, fileDiffs, outcomeOf, revealValue, sameFiles, secretSubmitted, xmlSecretChanged, type DraftChange } from "./services/configedit.ts";
@@ -902,8 +904,8 @@ export function createApp({ config, store, sessions, observer, deployments, vers
   api.get("/api/nifi-certs", async (c) => {
     const p = await authenticate(c, "admin");
     if (p instanceof Response) return p;
-    const bound = certBound();
-    return c.json({ keyConfigured: !!takeover?.box, certs: store.nifiCerts(), services: certTargets().map((t) => ({ ...t, bound: bound.has(t.id) ? { cert: bound.get(t.id)!.cert, version: bound.get(t.id)!.version } : null })) });
+    const bound = certBound(), own = new Set(store.serviceCertOwnMarks().map((m) => m.service));
+    return c.json({ keyConfigured: !!takeover?.box, certs: store.nifiCerts(), services: certTargets().map((t) => ({ ...t, bound: bound.has(t.id) ? { cert: bound.get(t.id)!.cert, version: bound.get(t.id)!.version } : null, own: own.has(t.id) })) });
   });
   api.get("/api/nifi-certs/:id", async (c) => {
     const p = await authenticate(c, "admin");
@@ -1329,6 +1331,183 @@ export function createApp({ config, store, sessions, observer, deployments, vers
       check(store, (h) => handoff.executor(h, "service"), cfg.id);
       return c.json({ revision, saved: Boolean(out.body), findings }, out.body ? 201 : 200);
     } catch (error) { return driftFailed(c, error); }
+  });
+  // S41 step 4b: the library and the services. A version becomes one draft per service (only where its check passes);
+  // the binding follows the keystore each member should have (CertSources.sync, after a change, an adopt, a read).
+  // Everything that changes something is for admins; files, passwords and keys never come back.
+  type Registered = NonNullable<ReturnType<typeof registeredService>>;
+  const hostsOf = (id: string) => certTargets().find((t) => t.id === id)?.hosts ?? [];
+  const versionCheck = (secret: ReturnType<typeof openVersion>, v: { keystoreType: string; truststoreType: string }, service: string) => {
+    const b = store.serviceCertBindings().find((x) => x.service === service);
+    const sealed = b && store.nifiCertSealed(b.cert, b.version);
+    const current = sealed && takeover?.box ? currentPem(sealed, takeover.box) : undefined;
+    return checkForService(openedVersion(secret, v), { hosts: hostsOf(service), ...(current ? { current } : {}) });
+  };
+  /** One draft that puts a library version on a service: refused (CertDraftError) when its check fails or the kept
+   *  configuration cannot take it (no stores yet, no TLS). */
+  const certDraft = (id: string, cert: string, version: number, p: Principal) => {
+    const box = takeover!.box!;
+    const service = registeredService(id);
+    if (!service) throw new CertDraftError("service/unknown", `No standalone instance or cluster ${id}.`);
+    const latest = store.serviceConfig(id);
+    if (!latest) throw new CertDraftError("service-config/none", `No configuration is kept for ${id}.`);
+    const entry = store.nifiCert(cert), v = entry?.versions.find((x) => x.version === version), sealed = store.nifiCertSealed(cert, version);
+    if (!entry || !v || !sealed) throw new CertDraftError("cert/unknown", "No such certificate version.");
+    const secret = openVersion(sealed, box);
+    const checked = versionCheck(secret, v, id);
+    if (!checked.ok) throw new CertDraftError("cert-draft/check", checked.items.filter((i) => !i.ok).map((i) => i.message).join(" "));
+    const changes = acceptChanges(certDraftChanges(latest.body, service.kind, box, secret, v), latest.body, service.kind, box);
+    const { findings } = outcomeOf(latest.body, changes, box, checkContext(service));
+    return store.createServiceConfigDraft({ service: id, base: latest.revision, changes, note: `Certificate ${entry.name} v${version}`, findings, audit: changes.map(changeSummary) }, actorOf(p));
+  };
+  const certSources = takeover?.box ? new CertSources(store, takeover.box) : null;
+  if (certSources) store.onKeptFilesChanged = (service) => { certSources.sync(service); };
+  /** A service taken over before the stores were read: they are read from each member's host into a new revision. */
+  const ensureStores = async (id: string, service: Registered, p: Principal) => {
+    const box = takeover!.box!;
+    const latest = store.serviceConfig(id)!;
+    const lacking = latest.body.members.filter((m) => [...STORE_FILES].some((n) => !m.files.some((f) => f.name === n)));
+    if (!lacking.length) return false;
+    const holding = store.activeServiceChange(id);
+    if (holding) throw new DriftError(409, "drift/change-active", `Change ${holding.id} is ${holding.state}: read the stores when it has ended.`);
+    const rows = store.serviceMemberFiles(id);
+    const body = structuredClone(latest.body);
+    const files: { member: string; file: string; path: string; sha256: string }[] = [];
+    for (const km of lacking) {
+      const key = installKey(km);
+      const m = serviceMembers(service).find((x) => installKey(x) === key);
+      if (!m) throw new DriftError(404, "drift/unknown-file", `${key} is not a member of ${id} any more.`);
+      const want = [...STORE_FILES].filter((n) => !km.files.some((f) => f.name === n));
+      const live = await readLive(handoff, m, rows.filter((f) => f.member === key), want, p.id, deps.liveRead);
+      const target = body.members.find((x) => installKey(x) === key)!;
+      for (const f of live) {
+        if (!f.bytes || !f.sha256) throw new DriftError(409, "cert/no-stores", `${key}: the host has no ${f.name} (nifi.properties names none: this service does not use TLS yet).`);
+        target.files.push(sealFile({ name: f.name, path: f.path, modifiedAt: f.modifiedAt }, f.bytes, box));
+        target.missing = target.missing.filter((n) => n !== f.name);
+        if (body.layers) (body.layers.nodes[key] ??= {})[f.name] = { replace: layerFile(f.name, f.bytes, box) };
+        files.push({ member: key, file: f.name, path: f.path, sha256: f.sha256 });
+      }
+    }
+    store.addServiceStoreFiles(id, { base: latest.revision, body, files }, actorOf(p));
+    return true;
+  };
+  const certService = (c: Context) => {
+    const id = c.req.param("id")!;
+    const service = registeredService(id);
+    if (!service) return reject(c, 404, "service/unknown", `No standalone instance or cluster ${id}.`);
+    if (!store.serviceConfig(id)) return reject(c, 404, "service-config/none", `No configuration is kept for ${id}.`);
+    if (!takeover?.box || !certSources) return reject(c, 503, "cert/no-key", "DEPLOYER_CREDENTIAL_ENCRYPTION_KEY is not set: certificates cannot be used.");
+    return { id, service, box: takeover.box, sources: certSources };
+  };
+  const certFailed = (c: Context, error: unknown) => {
+    if (error instanceof CertDraftError) return reject(c, 409, error.code, error.message);
+    if (error instanceof StoreError && error.code.startsWith("cert/")) return reject(c, error.code === "cert/unknown" ? 404 : 409, error.code, error.message);
+    return driftFailed(c, error);
+  };
+  api.post("/api/nifi-certs/:id/versions/:version/drafts", async (c) => {
+    const p = await authenticate(c, "admin");
+    if (p instanceof Response) return p;
+    if (!takeover?.box) return reject(c, 503, "cert/no-key", "DEPLOYER_CREDENTIAL_ENCRYPTION_KEY is not set: certificates cannot be used.");
+    const cert = c.req.param("id")!, version = Number(c.req.param("version"));
+    if (!store.nifiCert(cert)?.versions.some((v) => v.version === version)) return reject(c, 404, "cert/unknown", "No such certificate version.");
+    const body = await c.req.json().catch(() => ({})) as { services?: unknown };
+    if (!Array.isArray(body.services) || !body.services.length || body.services.some((s) => typeof s !== "string")) return reject(c, 400, "cert-draft/invalid", "Give services: the ids to create a draft for.");
+    const drafts: { service: string; draft: string }[] = [], skipped: { service: string; code: string; message: string }[] = [];
+    for (const id of new Set(body.services as string[])) {
+      try { drafts.push({ service: id, draft: certDraft(id, cert, version, p).id }); } catch (error) {
+        if (error instanceof CertDraftError || error instanceof ConfigDocError || error instanceof StoreError) skipped.push({ service: id, code: error.code, message: error.message });
+        else throw error;
+      }
+    }
+    store.audit(actorOf(p), "cert.drafts", `${cert}#${version}`, { drafts: drafts.map((d) => d.service), skipped: skipped.map((s) => s.service) });
+    return c.json({ drafts, skipped }, drafts.length ? 201 : 200);
+  });
+  // Where the service's certificate comes from, and a newer version of its library entry with that version's check.
+  api.get("/api/services/:id/certificate", async (c) => {
+    const p = await authenticate(c, "view");
+    if (p instanceof Response) return p;
+    const id = c.req.param("id")!;
+    if (!registeredService(id)) return reject(c, 404, "service/unknown", `No standalone instance or cluster ${id}.`);
+    const latest = store.serviceConfig(id);
+    const storesKept = !!latest && latest.body.members.every((m) => [...STORE_FILES].every((n) => m.files.some((f) => f.name === n)));
+    const source = certSources ? (certSources.current(id) ?? certSources.sync(id)) : null;
+    const isAdmin = p.permissions.includes("admin");
+    const entries = store.nifiCerts();
+    let library: Record<string, unknown> | null = null;
+    if (source && "cert" in source) {
+      const e = entries.find((x) => x.id === source.cert), v = e?.versions.find((x) => x.version === source.version), newest = e?.versions[0];
+      let newer: Record<string, unknown> | null = null;
+      if (e && newest && newest.version > source.version && takeover?.box) {
+        const sealed = store.nifiCertSealed(e.id, newest.version);
+        const checked = sealed ? versionCheck(openVersion(sealed, takeover.box), newest, id) : null;
+        newer = { version: newest.version, subject: newest.subject, notAfter: newest.notAfter, ok: checked?.ok ?? false, items: checked?.items ?? [] };
+      }
+      library = { cert: source.cert, name: e?.name ?? source.cert, ownService: e?.ownService ?? null, version: source.version, subject: v?.subject ?? null, notAfter: v?.notAfter ?? null, others: (v?.usedBy ?? []).filter((s) => s !== id), newer };
+    }
+    const drafts = store.serviceConfigDrafts(id, "open").filter((d) => d.note?.startsWith("Certificate ")).map((d) => ({ id: d.id, note: d.note }));
+    return c.json({
+      service: id, storesKept, keyConfigured: !!takeover?.box, canManage: isAdmin && !!takeover?.box,
+      source: library ? { library } : source && "own" in source ? { own: { sameOnEveryNode: source.own !== null } } : null,
+      drafts,
+      versions: isAdmin ? entries.flatMap((e) => e.versions.map((v) => ({ cert: e.id, name: e.name, version: v.version, subject: v.subject, notAfter: v.notAfter }))) : [],
+    });
+  });
+  // Binds the certificate in use without changing anything on a host: the stores are read first when no revision has
+  // them; then {cert, version} binds when that version's keystore is what every member has, and {} finds the version.
+  api.post("/api/services/:id/certificate/bind", async (c) => {
+    const p = await authenticate(c, "admin");
+    if (p instanceof Response) return p;
+    const s = certService(c);
+    if (s instanceof Response) return s;
+    const body = await c.req.json().catch(() => ({})) as { cert?: unknown; version?: unknown };
+    if (body.cert !== undefined && (typeof body.cert !== "string" || !Number.isInteger(body.version))) return reject(c, 400, "cert-bind/invalid", "Give cert and version, or neither.");
+    try {
+      const read = await ensureStores(s.id, s.service, p);
+      const drifted = store.serviceMemberFiles(s.id).filter((f) => f.file === "keystore" && f.actualSha256 && f.actualSha256 !== f.expectedSha256).map((f) => f.member);
+      if (drifted.length) return reject(c, 409, "cert/drift", `The keystore on ${drifted.join(", ")} is not what is kept: adopt or overwrite it first.`);
+      if (body.cert === undefined) return c.json({ read, source: s.sources.sync(s.id, actorOf(p)) });
+      const cert = body.cert as string, version = body.version as number;
+      const entry = store.nifiCert(cert);
+      if (!entry?.versions.some((v) => v.version === version)) return reject(c, 404, "cert/unknown", "No such certificate version.");
+      const sha = s.sources.keystoreSha(cert, version);
+      const kept = s.sources.keptKeystores(s.id);
+      const differ = [...kept].filter(([, x]) => x !== sha).map(([m]) => m);
+      if (!kept.size || differ.length) return reject(c, 409, "cert/not-in-use", `The keystore on ${differ.join(", ") || "the hosts"} is not ${entry.name} v${version}: nothing was bound. Create a draft to move the service to it.`);
+      store.setServiceCertSource(s.id, { cert, version }, actorOf(p));
+      return c.json({ read, source: { cert, version } });
+    } catch (error) { return certFailed(c, error); }
+  });
+  // An upload on the service's page: kept in the library (a new version of the entry the service uses, of its own entry,
+  // or as given by cert or name), then bound when it is what the hosts have, else a draft (if its check passes).
+  api.post("/api/services/:id/certificate", async (c) => {
+    const p = await authenticate(c, "admin");
+    if (p instanceof Response) return p;
+    const s = certService(c);
+    if (s instanceof Response) return s;
+    const u = await certForm(c);
+    if (u instanceof Response) return u;
+    try {
+      await ensureStores(s.id, s.service, p);
+      const sha = sha256Of(u.upload.keystoreBytes);
+      const bound = store.serviceCertBindings().find((b) => b.service === s.id);
+      let target = s.sources.versionWithKeystore(sha, bound?.cert);
+      const saved = !target;
+      if (!target) {
+        const sealed = sealVersion(u.upload, s.box);
+        const name = (u.fields.name ?? "").trim();
+        const into = u.fields.cert || (name ? undefined : bound?.cert ?? store.nifiCerts().find((e) => e.ownService === s.id)?.id);
+        target = into ? { cert: into, version: store.addNifiCertVersion(into, sealed, actorOf(p)) } : store.addNifiCert(name || s.id, name ? null : s.id, sealed, actorOf(p));
+      }
+      const kept = s.sources.keptKeystores(s.id);
+      if (kept.size && [...kept.values()].every((x) => x === sha)) {
+        store.setServiceCertSource(s.id, target, actorOf(p));
+        return c.json({ ...target, saved, bound: true });
+      }
+      try { return c.json({ ...target, saved, draft: certDraft(s.id, target.cert, target.version, p).id }, 201); } catch (error) {
+        if (error instanceof CertDraftError || error instanceof ConfigDocError) return c.json({ ...target, saved, skipped: { code: error.code, message: error.message } });
+        throw error;
+      }
+    } catch (error) { return certFailed(c, error); }
   });
   api.get("/api/services/drafts", async (c) => {
     const p = await authenticate(c, "view");

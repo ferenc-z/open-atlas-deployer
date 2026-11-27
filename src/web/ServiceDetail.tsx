@@ -4,7 +4,8 @@
 // turned them down (pages-rethink §9.2) and the Status tab was replaced by Health (§10, step 6a): resolveTab() sends every id
 // of a removed page to Health.
 
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { draftsText } from "./Certificates.tsx";
 import * as api from "./api.ts";
 import type { MemberStatus, ServiceConfigView, ServiceStatus } from "./api.ts";
 import { ChangeHistory, Drift, DraftsPage, memberName, PendingBar, PinnedChange, Revisions, useChanges, useDrafts, type ChangeDesk, type Drafts } from "./ServiceChanges.tsx";
@@ -137,7 +138,7 @@ function ConfigAndChanges(l: Loaded) {
             <ServiceConfig cfg={cfg} status={s} drafts={drafts} />
             <InstallPanel s={s} reload={l.reload} />
           </>}
-          {sub === "certs" && <CertsPage s={s} />}
+          {sub === "certs" && <CertsPage s={s} onDrafted={() => { l.saved(); l.open("drafts"); }} />}
           {sub === "drafts" && (cfg ? <DraftsPage s={s} cfg={cfg} drafts={drafts} onSaved={l.saved} onEdit={() => l.open("files")} /> : <p className="muted">No configuration is kept for this service yet.</p>)}
           {sub === "changes" && <>
             {cfg && <PendingBar s={s} cfg={cfg} desk={desk} />}
@@ -162,14 +163,32 @@ function ConfigAndChanges(l: Loaded) {
 
 const CHANGE_RUNNING: Record<string, string> = { running: "Running", paused: "Paused", stopped: "Stopped, waiting" };
 
-/** Certificates: what each node's keystore and truststore hold now. The certificate library and uploading come later. */
-function CertsPage({ s }: { s: ServiceStatus }) {
+/** Certificates (S41): where the certificate comes from (a library version, or the service's own), what each node's
+ *  stores hold now, and replacing it: a newer library version as a draft, binding the one in use, or an upload. */
+function CertsPage({ s, onDrafted }: { s: ServiceStatus; onDrafted: () => void }) {
   const cluster = s.kind === "cluster";
   const name = (key: string) => (cluster ? memberName(s, key) : (s.members.find((m) => m.key === key)?.host ?? key));
   const rows = [...s.certs].sort((a, b) => (a.member === b.member ? 0 : a.member < b.member ? -1 : 1));
+  const [state, setState] = useState<api.ServiceCertState | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const load = useCallback(() => { api.serviceCertificate(s.id).then(setState).catch((e: Error) => setNote(e.message)); }, [s.id]);
+  useEffect(load, [load]);
+  const act = async (work: () => Promise<string | null>) => {
+    setBusy(true); setNote(null);
+    try { const text = await work(); if (text) setNote(text); load(); } catch (e) { setNote((e as Error).message); } finally { setBusy(false); }
+  };
+  const lib = state?.source && "library" in state.source ? state.source.library : null;
+  const own = state?.source && "own" in state.source ? state.source.own : null;
   return (
+    <>
     <section className="panel">
-      <h3>Certificates in use</h3>
+      <div className="cert-title">
+        <h3>Certificates in use</h3>
+        <span className="small">{!state ? "…" : lib ? <>From the library: <strong>{lib.name} v{lib.version}</strong>{lib.ownService === s.id ? " · this service's own certificate" : lib.others.length ? ` · also on ${lib.others.length} other service${lib.others.length === 1 ? "" : "s"}` : ""}</>
+          : own ? "Own certificate: the keystore kept for this service is in no library version" : state.storesKept ? "Not bound to a library version yet" : "Not bound: the key and trust stores have not been read from the hosts yet"}</span>
+      </div>
+      {own && <div className="banner warn inline">{own.sameOnEveryNode ? "The keystore this service now has (after a change, a rollback or an adopted file) is not in the certificate library." : "The nodes have different keystores, none of them a library version."} Upload it below to keep it in the library, or create a draft from a library version.</div>}
       {!rows.length ? <p className="muted">No certificate has been read from the hosts yet.</p> : <table className="props">
         <thead><tr>{cluster && <th>Node</th>}<th>Store</th><th>Subject</th><th>Expires</th></tr></thead>
         <tbody>{rows.map((c, i) => {
@@ -184,7 +203,77 @@ function CertsPage({ s }: { s: ServiceStatus }) {
           );
         })}</tbody>
       </table>}
-      <p className="muted small">Coming soon: a certificate library, so one certificate can be kept once, checked, and rolled out to several services, and uploading a new one here.</p>
+    </section>
+    {state && <CertReplace s={s} state={state} lib={lib} busy={busy} note={note} act={act} onDrafted={onDrafted} />}
+    </>
+  );
+}
+
+function CertReplace({ s, state, lib, busy, note, act, onDrafted }: { s: ServiceStatus; state: api.ServiceCertState; lib: Extract<NonNullable<api.ServiceCertState["source"]>, { library: unknown }>["library"] | null; busy: boolean; note: string | null; act: (work: () => Promise<string | null>) => Promise<void>; onDrafted: () => void }) {
+  const [files, setFiles] = useState<File[] | null>(null);
+  const [check, setCheck] = useState<api.CertUploadCheck | null>(null);
+  const [pickVersion, setPickVersion] = useState("");
+  const input = useRef<HTMLInputElement>(null);
+  if (!state.canManage) return <section className="panel"><p className="muted small">{state.keyConfigured ? "Only administrators replace or bind certificates." : "DEPLOYER_CREDENTIAL_ENCRYPTION_KEY is not set: certificates cannot be used."}</p></section>;
+  const mine = check?.services.find((x) => x.id === s.id);
+  const drafted = (r: api.CertDraftsResult) => { if (r.drafts.length) onDrafted(); return draftsText(r); };
+  const picked = state.versions.find((v) => `${v.cert}#${v.version}` === pickVersion);
+  const take = (list: FileList | null) => {
+    const got = Array.from(list ?? []);
+    if (!got.length) return;
+    void act(async () => { const r = await api.checkNifiCert(got); setFiles(got); setCheck(r); return null; });
+  };
+  return (
+    <section className="panel">
+      <h3>Replace certificates</h3>
+      {state.drafts.length > 0 && <p className="small">Open certificate draft{state.drafts.length === 1 ? "" : "s"}: {state.drafts.map((d) => `${d.id} (${d.note})`).join(", ")}</p>}
+      {lib?.newer && !check && (
+        <div className="cert-stage">
+          <strong>{lib.name} v{lib.newer.version} is in the library</strong>
+          <span className="small">Valid until {lib.newer.notAfter.slice(0, 10)} · {lib.newer.ok ? "checks for this service passed" : `checks for this service fail: ${lib.newer.items.filter((i) => !i.ok).map((i) => i.message).join(" ")}`}</span>
+          <div className="row"><button className="primary" disabled={busy || !lib.newer.ok} onClick={() => void act(async () => drafted(await api.certDrafts(lib.cert, lib.newer!.version, [s.id])))}>Use v{lib.newer.version} · create draft</button></div>
+        </div>
+      )}
+      {!check && <>
+        <span className="small">{state.storesKept ? "" : "The stores are read from the hosts first (a new revision, nothing changes on a host). "}Bind the certificate in use: when a library version is what the hosts have, the service is bound to it with no draft and no restart.</span>
+        <div className="row">
+          <button disabled={busy} onClick={() => void act(async () => { const r = await api.bindServiceCertificate(s.id); return r.source && "cert" in r.source ? `Bound to ${state.versions.find((v) => v.cert === (r.source as { cert: string }).cert)?.name ?? r.source.cert} v${r.source.version}.` : "The keystore on the hosts is in no library version: upload it below to keep it."; })}>{state.storesKept ? "Find the certificate in use" : "Read the stores and find the certificate in use"}</button>
+          {state.versions.length > 0 && <>
+            <select value={pickVersion} onChange={(e) => setPickVersion(e.target.value)} aria-label="Library version">
+              <option value="">A library version…</option>
+              {state.versions.map((v) => <option key={`${v.cert}#${v.version}`} value={`${v.cert}#${v.version}`}>{v.name} v{v.version} · until {v.notAfter.slice(0, 10)}</option>)}
+            </select>
+            <button disabled={busy || !picked} onClick={() => void act(async () => { await api.bindServiceCertificate(s.id, { cert: picked!.cert, version: picked!.version }); return `Bound to ${picked!.name} v${picked!.version}.`; })}>Bind (it is in use)</button>
+            <button disabled={busy || !picked} onClick={() => void act(async () => drafted(await api.certDrafts(picked!.cert, picked!.version, [s.id])))}>Create draft</button>
+          </>}
+        </div>
+        <span className="small">Or upload a new one. It is saved to the library, so other services can use it too.</span>
+        <button className="cert-drop" disabled={busy} onClick={() => input.current?.click()} onDragOver={(e) => e.preventDefault()} onDrop={(e) => { e.preventDefault(); take(e.dataTransfer.files); }}>
+          <span className="cert-drop-title">{busy ? "Checking…" : "Drop the TLS toolkit output here"}</span>
+          <span className="muted">keystore, truststore and config.json (passwords are read from config.json). Pick all three files together.</span>
+          <input ref={input} type="file" multiple hidden onChange={(e) => { take(e.target.files); e.target.value = ""; }} />
+        </button>
+      </>}
+      {check && files && (
+        <div className="cert-stage">
+          <strong>{check.version.subject} · valid until {check.version.notAfter.slice(0, 10)} · passwords read from config.json ✓</strong>
+          {mine && (mine.ok ? <span className="cert-ok">✓ Checks passed{mine.items.some((i) => i.code === "san" && i.ok) ? ` · SAN covers ${mine.hosts.join(", ")}` : ""}</span> : mine.items.filter((i) => !i.ok).map((i) => <div key={i.code} className="cert-bad">✕ {i.message}</div>))}
+          {mine?.items.filter((i) => i.ok && i.notice).map((i) => <div key={i.code} className="cert-notice small">{i.message}</div>)}
+          <span className="small">The draft will hold the keystore and truststore on each node (kept 600, owner as the old files, old files backed up) and in nifi.properties <span className="mono">nifi.security.keystore</span>, <span className="mono">keystoreType</span>, <span className="mono">keystorePasswd</span>, <span className="mono">keyPasswd</span>, <span className="mono">truststore</span>, <span className="mono">truststoreType</span>, <span className="mono">truststorePasswd</span>. config.json itself is not copied to the hosts. When it is what the hosts already have, it is only bound.</span>
+          <div className="row">
+            <button className="primary" disabled={busy} onClick={() => void act(async () => {
+              const r = await api.uploadServiceCertificate(s.id, files);
+              setFiles(null); setCheck(null);
+              const where = `${r.saved ? "Saved to the library" : "Already in the library"} as v${r.version}.`;
+              if (r.bound) return `${where} It is what the hosts have: bound, nothing to roll out.`;
+              if (r.draft) { onDrafted(); return `${where} Draft ${r.draft} created.`; }
+              return `${where} No draft: ${r.skipped?.message ?? ""}`;
+            })}>Save and create draft</button>
+            <button disabled={busy} onClick={() => { setFiles(null); setCheck(null); }}>Discard upload</button>
+          </div>
+        </div>
+      )}
+      {note && <div className="cert-saved"><strong>{note}</strong></div>}
     </section>
   );
 }

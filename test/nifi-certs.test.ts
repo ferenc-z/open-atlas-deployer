@@ -2,6 +2,7 @@
 // before it is kept, a version in use cannot be deleted, and the read-only MCP tool.
 
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -189,4 +190,149 @@ test("the MCP tool lists subject, hosts, expiry and users, and the audit never h
   assert.equal(v.subject, "CN=S2S, OU=NIFI");
   assert.deepEqual(v.usedBy, ["strays"]);
   assert.ok(v.san.includes("nifi-1.lab") && v.notAfter);
+});
+
+// S41 step 4b: drafts from the library, binding the certificate in use, the binding following the kept keystore.
+const sha = (b: Buffer) => createHash("sha256").update(b).digest("hex");
+const TLS_PROPS = ["keystore=./conf/keystore.jks", "keystoreType=JKS", "keystorePasswd=old-pass-1", "keyPasswd=old-pass-1", "truststore=./conf/truststore.jks", "truststoreType=JKS", "truststorePasswd=old-pass-2"].map((l) => `nifi.security.${l}`).join("\n") + "\nnifi.web.https.port=8443\n";
+const OLD_KS = Buffer.from("old keystore bytes"), OLD_TS = Buffer.from("old truststore bytes");
+/** "fits" (2 nodes, covered by the toolkit certificate) and "same" (already on the toolkit keystore) keep their stores;
+ *  "strays" is not covered; "bare" has no stores kept (taken over before they were read). */
+function storeServices(store: Store) {
+  const files = (dir: string, ks: Buffer, ts: Buffer, stores = true) => [
+    sealFile({ name: "nifi.properties", path: `${dir}/conf/nifi.properties`, modifiedAt: "2026-11-01T00:00:00Z" }, Buffer.from(TLS_PROPS), box),
+    ...(stores ? [sealFile({ name: "keystore", path: `${dir}/conf/keystore.jks`, modifiedAt: "2026-11-01T00:00:00Z" }, ks, box), sealFile({ name: "truststore", path: `${dir}/conf/truststore.jks`, modifiedAt: "2026-11-01T00:00:00Z" }, ts, box)] : []),
+  ];
+  const m = (host: string, dir: string, ks = OLD_KS, ts = OLD_TS, stores = true) => ({ host, installDir: dir, missing: [], files: files(dir, ks, ts, stores) });
+  const fits = { kind: "cluster", id: "fits", service: "nifi", profile: "nifi-2.x", version: "2.5.0", webUrl: null, zookeeper: "zk:2181", zookeeperRoot: "/f", nodes: [member("nifi-1", "/opt/a", "nifi-1.lab"), member("nifi-2", "/opt/b", "nifi-2.lab")] } as DraftCluster;
+  const same = { kind: "standalone", id: "same", service: "nifi", profile: "nifi-2.x", version: "2.0.0", webUrl: "https://nifi-1.lab:8443/nifi", member: member("nifi-1", "/opt/s") } as DraftStandalone;
+  const strays = { kind: "standalone", id: "strays", service: "nifi", profile: "nifi-2.x", version: "2.0.0", webUrl: "https://batch-01.corp:8443/nifi", member: member("batch", "/opt/c") } as DraftStandalone;
+  const bare = { kind: "standalone", id: "bare", service: "nifi", profile: "nifi-2.x", version: "2.0.0", webUrl: "https://nifi-2.lab:8443/nifi", member: member("nifi-2", "/opt/d") } as DraftStandalone;
+  const draft = store.createServiceDraft("uat", [], [fits, same, strays, bare], cli);
+  store.confirmServiceDraft(draft.id, {
+    fits: { members: [m("nifi-1", "/opt/a"), m("nifi-2", "/opt/b")] },
+    same: { members: [m("nifi-1", "/opt/s", dataFile("keystore.jks"), dataFile("truststore.jks"))] },
+    strays: { members: [m("batch", "/opt/c")] },
+    bare: { members: [m("nifi-2", "/opt/d", OLD_KS, OLD_TS, false)] },
+  }, cli);
+}
+
+test("drafts from a library version: only where the check passes, the two stores on every node and the TLS keys, passwords hidden", async () => {
+  const t = setup();
+  storeServices(t.store);
+  const { cert } = await (await t.call("POST", "/api/nifi-certs", ADMIN, upload({ name: "corp-nifi" }))).json() as { cert: string };
+  const r = await t.call("POST", `/api/nifi-certs/${cert}/versions/1/drafts`, ADMIN, JSON.stringify({ services: ["fits", "strays", "bare"] }));
+  assert.equal(r.status, 201);
+  const out = await r.json() as { drafts: { service: string; draft: string }[]; skipped: { service: string; code: string }[] };
+  assert.deepEqual(out.drafts.map((d) => d.service), ["fits"]);
+  assert.deepEqual(out.skipped.map((s) => [s.service, s.code]), [["strays", "cert-draft/check"], ["bare", "cert-draft/no-stores"]]);
+  const text = await (await t.call("GET", `/api/services/fits/config/drafts/${out.drafts[0]!.draft}`, ADMIN)).text();
+  LEAK(text);
+  assert.ok(!text.includes("old-pass"));
+  const d = JSON.parse(text) as { note: string; changes: { file: string; member: string | null; key?: string; value?: string; hidden?: true; binary?: { sha256: string } }[] };
+  assert.equal(d.note, "Certificate corp-nifi v1");
+  const stores = d.changes.filter((c) => c.binary);
+  assert.deepEqual(stores.map((c) => `${c.member?.split(":")[0]} ${c.file}`).sort(), ["nifi-1 keystore", "nifi-1 truststore", "nifi-2 keystore", "nifi-2 truststore"]);
+  assert.ok(stores.filter((c) => c.file === "keystore").every((c) => c.binary!.sha256 === sha(dataFile("keystore.jks"))));
+  const keys = d.changes.filter((c) => c.file === "nifi.properties");
+  assert.equal(keys.length, 14);
+  const node1 = Object.fromEntries(keys.filter((c) => c.member?.startsWith("nifi-1")).map((c) => [c.key, c.hidden ? "(hidden)" : c.value]));
+  assert.deepEqual(node1, {
+    "nifi.security.keystore": "./conf/keystore.jks", "nifi.security.keystoreType": "JKS", "nifi.security.keystorePasswd": "(hidden)", "nifi.security.keyPasswd": "(hidden)",
+    "nifi.security.truststore": "./conf/truststore.jks", "nifi.security.truststoreType": "JKS", "nifi.security.truststorePasswd": "(hidden)",
+  });
+  // The sealed password is the version's, from config.json.
+  const kept = t.store.serviceConfigDraft("fits", out.drafts[0]!.draft)!.changes.find((c) => "secret" in c && c.key === "nifi.security.keystorePasswd") as { secret: string };
+  assert.equal(box.open(kept.secret), PASSWORD);
+  // Nothing passes: no draft, each service with its reason.
+  const none = await t.call("POST", `/api/nifi-certs/${cert}/versions/1/drafts`, ADMIN, JSON.stringify({ services: ["strays"] }));
+  assert.equal(none.status, 200);
+  assert.deepEqual(((await none.json()) as { drafts: unknown[] }).drafts, []);
+  assert.equal((await t.call("POST", `/api/nifi-certs/${cert}/versions/9/drafts`, ADMIN, JSON.stringify({ services: ["fits"] }))).status, 404);
+});
+
+test("binding the certificate in use compares the keystore's sha256 and changes nothing on a host", async () => {
+  const t = setup();
+  storeServices(t.store);
+  const { cert } = await (await t.call("POST", "/api/nifi-certs", ADMIN, upload({ name: "corp-nifi" }))).json() as { cert: string };
+  // A service on other keystores: not bound to this version.
+  const refused = await t.call("POST", "/api/services/fits/certificate/bind", ADMIN, JSON.stringify({ cert, version: 1 }));
+  assert.equal(refused.status, 409);
+  assert.equal(((await refused.json()) as { error: string }).error, "cert/not-in-use");
+  assert.equal(t.store.serviceCertBindings().length, 0);
+  // Its keystore is in no library version: own certificate.
+  const own = await (await t.call("POST", "/api/services/fits/certificate/bind", ADMIN, JSON.stringify({}))).json() as { source: unknown };
+  assert.deepEqual(own.source, { own: sha(OLD_KS) });
+  // "same" has the toolkit keystore: bound, with no draft and no new revision.
+  const before = t.store.serviceConfig("same")!.revision;
+  const ok = await t.call("POST", "/api/services/same/certificate/bind", ADMIN, JSON.stringify({ cert, version: 1 }));
+  assert.equal(ok.status, 200);
+  assert.deepEqual(t.store.serviceCertBindings().map((b) => [b.service, b.cert, b.version]), [["same", cert, 1]]);
+  assert.equal(t.store.serviceConfig("same")!.revision, before);
+  assert.equal(t.store.serviceConfigDrafts("same").length, 0);
+  const view = await (await t.call("GET", "/api/services/same/certificate", { as: "viewer" })).json() as { source: { library: { name: string; version: number } }; storesKept: boolean; canManage: boolean; versions: unknown[] };
+  assert.equal(view.source.library.name, "corp-nifi");
+  assert.equal(view.source.library.version, 1);
+  assert.equal(view.storesKept, true);
+  assert.equal(view.canManage, false);
+  assert.deepEqual(view.versions, []);
+  // An upload on the service's page that is what the host has: found in the library, bound, nothing saved again.
+  const up = await (await t.call("POST", "/api/services/same/certificate", ADMIN, upload())).json() as { saved: boolean; bound: boolean };
+  assert.deepEqual([up.saved, up.bound], [false, true]);
+  // On "fits" the same upload is a new certificate there: kept (as fits' own entry) and a draft.
+  t.store.setServiceCertSource("fits", { own: null }, cli);
+  const drafted = await t.call("POST", "/api/services/fits/certificate", ADMIN, upload());
+  assert.equal(drafted.status, 201);
+  const dj = await drafted.json() as { cert: string; saved: boolean; draft: string };
+  assert.equal(dj.cert, cert);
+  assert.equal(dj.saved, false);
+  assert.ok(t.store.serviceConfigDraft("fits", dj.draft));
+});
+
+test("the binding follows the kept keystore: stores read, applied, rolled back", async () => {
+  const t = setup();
+  storeServices(t.store);
+  const { cert } = await (await t.call("POST", "/api/nifi-certs", ADMIN, upload({ name: "corp-nifi" }))).json() as { cert: string };
+  const keystoreOf = (member: string) => t.store.serviceMemberFiles("fits").find((f) => f.member === member && f.file === "keystore")!;
+  const members = [...new Set(t.store.serviceMemberFiles("fits").map((f) => f.member))];
+  const land = (bytes: Buffer, revision: number) => {
+    for (const m of members) t.store.setMemberFilesApplied("fits", m, [{ file: "keystore", path: keystoreOf(m).path, sha256: sha(bytes), revision }], "chg_x");
+  };
+  // The draft's revision applied on every node: bound to the version.
+  land(dataFile("keystore.jks"), 3);
+  assert.deepEqual(t.store.serviceCertBindings().map((b) => [b.service, b.cert, b.version]), [["fits", cert, 1]]);
+  // Back to the revision before: its keystore is no library version, so the service is on its own certificate again.
+  land(OLD_KS, 4);
+  assert.equal(t.store.serviceCertBindings().length, 0);
+  assert.deepEqual(t.store.serviceCertOwnMarks().map((m) => [m.service, m.sha256]), [["fits", sha(OLD_KS)]]);
+  const view = await (await t.call("GET", "/api/services/fits/certificate", ADMIN)).json() as { source: unknown };
+  assert.deepEqual(view.source, { own: { sameOnEveryNode: true } });
+  // Nodes on different keystores with no change running: own, with no single sha256.
+  t.store.setMemberFilesApplied("fits", members[0]!, [{ file: "keystore", path: keystoreOf(members[0]!).path, sha256: sha(dataFile("keystore.jks")), revision: 5 }], "chg_y");
+  assert.deepEqual(t.store.serviceCertOwnMarks().map((m) => [m.service, m.sha256]), [["fits", null]]);
+  const list = await (await t.call("GET", "/api/nifi-certs", ADMIN)).json() as { services: { id: string; own: boolean }[] };
+  assert.equal(list.services.find((s) => s.id === "fits")!.own, true);
+  // A service taken over before the stores were read: once they are read into a revision, the binding is found from them.
+  const bare = t.store.serviceConfig("bare")!, key = t.store.serviceMemberFiles("bare")[0]!.member;
+  const body = structuredClone(bare.body);
+  const read = [["keystore", dataFile("keystore.jks")], ["truststore", dataFile("truststore.jks")]] as const;
+  for (const [name, bytes] of read) body.members[0]!.files.push(sealFile({ name, path: `/opt/d/conf/${name}.jks`, modifiedAt: "2026-11-01T00:00:00Z" }, bytes, box));
+  const revision = t.store.addServiceStoreFiles("bare", { base: bare.revision, body, files: read.map(([name, bytes]) => ({ member: key, file: name, path: `/opt/d/conf/${name}.jks`, sha256: sha(bytes) })) }, cli);
+  assert.equal(revision, bare.revision + 1);
+  assert.equal(t.store.serviceConfig("bare")!.source, "read");
+  assert.deepEqual(t.store.serviceCertBindings().find((b) => b.service === "bare")?.version, 1);
+});
+
+test("only an admin creates certificate drafts, binds or uploads on a service", async () => {
+  const t = setup();
+  storeServices(t.store);
+  for (const who of [{ as: "viewer" }, { as: "uat" }, { key: "dpk_uat" }, {}]) {
+    for (const [method, path, body] of [["POST", "/api/nifi-certs/x/versions/1/drafts", JSON.stringify({ services: ["fits"] })], ["POST", "/api/services/fits/certificate/bind", "{}"], ["POST", "/api/services/fits/certificate", upload()]] as [string, string, BodyInit][]) {
+      const r = await t.call(method, path, who, body);
+      assert.ok([401, 403].includes(r.status), `${method} ${path} as ${JSON.stringify(who)}: ${r.status}`);
+    }
+  }
+  assert.equal((await t.call("GET", "/api/services/fits/certificate", {})).status, 401);
+  assert.equal(t.store.nifiCerts().length, 0);
+  assert.equal(t.store.serviceConfigDrafts("fits").length, 0);
 });

@@ -99,10 +99,11 @@ export async function readLive(handoff: Handoff, m: ServiceMember, rows: readonl
   let sent: { files: ReadFile[] };
   try { sent = JSON.parse(content); } catch { throw new DriftError(409, "drift/read", `${installKey(m)}: unreadable answer`); }
   return names.map((name): LiveFile => {
-    const row = rows.find((f) => f.file === name)!;
+    // No row: a file not kept yet (S41: the stores of a service taken over before they were read).
+    const row = rows.find((f) => f.file === name);
     const f = sent.files.find((x) => x.name === name);
-    if (!f) return { name, path: row.path, bytes: null, modifiedAt: row.appliedAt, sha256: null };
-    if (f.path !== row.path) throw new DriftError(409, "drift/read", `${name} was read at ${f.path}, not at ${row.path} where it was imported from.`);
+    if (!f) return { name, path: row?.path ?? "", bytes: null, modifiedAt: row?.appliedAt ?? "", sha256: null };
+    if (row && f.path !== row.path) throw new DriftError(409, "drift/read", `${name} was read at ${f.path}, not at ${row.path} where it was imported from.`);
     const bytes = Buffer.from(f.content, "base64");
     if (createHash("sha256").update(bytes).digest("hex") !== f.sha256) throw new DriftError(409, "drift/read", `${f.path} does not match its sha256`);
     return { name, path: f.path, bytes, modifiedAt: f.modifiedAt, sha256: f.sha256 };

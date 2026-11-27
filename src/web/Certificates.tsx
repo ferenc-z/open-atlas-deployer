@@ -13,6 +13,11 @@ const inDays = (iso: string) => { const d = daysLeft(iso); return d < 0 ? `Expir
 const names = (v: Pick<CertVersionView, "san">) => v.san.map((e) => e.value).join(", ") || "—";
 /** The version a service uses, as the library lists it. */
 const versionOf = (c: NifiCertView, n: number) => c.versions.find((v) => v.version === n);
+/** What creating drafts did: one draft per service, and why the others got none. */
+export const draftsText = (r: api.CertDraftsResult) => [
+  r.drafts.length ? `Draft${r.drafts.length === 1 ? "" : "s"} created for ${r.drafts.map((d) => d.service).join(", ")}: review and save ${r.drafts.length === 1 ? "it" : "each"} on the service's Drafts page.` : "No draft created.",
+  ...r.skipped.map((s) => `${s.service}: ${s.message}`),
+].join(" ");
 
 export function CertificatesPage({ isAdmin, onOpenService }: { isAdmin: boolean; onOpenService: (id: string) => void }) {
   const [lib, setLib] = useState<CertLibrary | null>(null);
@@ -54,6 +59,9 @@ function CertCard({ cert, lib, reload, onOpenService }: { cert: NifiCertView; li
   const d = daysLeft(current.notAfter);
   const edge = used.length ? (d <= 7 ? "var(--bad)" : d <= 30 ? "var(--warn)" : "var(--ok)") : "var(--border)";
   const [saved, setSaved] = useState<string | null>(null);
+  const [renewing, setRenewing] = useState(false);
+  const newest = cert.versions[0]!;
+  const behind = users.filter((s) => s.bound!.version < newest.version);
   return (
     <section className="card cert-card" style={{ borderTop: `6px solid ${edge}` }}>
       <div className="cert-title">
@@ -85,8 +93,21 @@ function CertCard({ cert, lib, reload, onOpenService }: { cert: NifiCertView; li
         </tbody>
       </table>
 
+      {behind.length > 0 && (
+        <div className="cert-stage">
+          <strong>{behind.length} service{behind.length === 1 ? " is" : "s are"} still on an older version: {behind.map((s) => `${s.id} (v${s.bound!.version})`).join(", ")}</strong>
+          <span className="small">One draft per service puts v{newest.version} on it; a service whose check fails gets none and stays on its version.</span>
+          <div className="row"><button className="primary" disabled={renewing} onClick={async () => {
+            setRenewing(true);
+            try { setSaved(draftsText(await api.certDrafts(cert.id, newest.version, behind.map((s) => s.id)))); reload(); }
+            catch (e) { setSaved((e as Error).message); }
+            finally { setRenewing(false); }
+          }}>Create {behind.length} draft{behind.length === 1 ? "" : "s"} for v{newest.version}</button></div>
+        </div>
+      )}
+
       <UploadStage lib={lib} target={{ cert }} nextVersion={next} onSaved={(t) => { setSaved(t); reload(); }} />
-      {saved && <div className="cert-saved"><strong>{saved}</strong><span className="small">Nothing changes on a host: this only keeps the version in the library.</span></div>}
+      {saved && <div className="cert-saved"><strong>{saved}</strong><span className="small">Nothing changes on a host until a draft is saved and its change is run.</span></div>}
 
       <div className="cert-versions">
         <strong>Versions</strong>
@@ -128,13 +149,15 @@ function UploadStage({ lib, target, nextVersion, onSaved }: { lib: CertLibrary; 
     catch (e) { setFiles(null); setError((e as Error).message); }
     finally { setBusy(false); }
   };
-  const save = async () => {
+  const save = async (withDrafts: boolean) => {
     if (!files) return;
     setBusy(true); setError(null);
     try {
       const r = await api.saveNifiCert(files, target.cert ? { cert: target.cert.id } : { name: name.trim() });
+      const services = withDrafts ? rows.filter((s) => s.ok && pick[s.id]).map((s) => s.id) : [];
+      const drafted = services.length ? await api.certDrafts(r.cert, r.version, services) : null;
       reset(); setName("");
-      onSaved(`v${r.version} saved.`);
+      onSaved(`v${r.version} saved.${drafted ? ` ${draftsText(drafted)}` : ""}`);
     } catch (e) { setError((e as Error).message); }
     finally { setBusy(false); }
   };
@@ -184,8 +207,8 @@ function UploadStage({ lib, target, nextVersion, onSaved }: { lib: CertLibrary; 
             </tbody>
           </table>
           <div className="row">
-            <button disabled title="Drafts come with a later step; for now save the version only." >{target.cert ? `Save ${label} and create ${picked} drafts` : "Create drafts"} (not available yet)</button>
-            <button className="primary" disabled={busy || (!target.cert && !name.trim())} onClick={() => void save()}>{target.cert ? `Save ${label} only` : "Save certificate"}</button>
+            {target.cert && <button className="primary" disabled={busy || picked === 0} onClick={() => void save(true)}>{`Save ${label} and create ${picked} draft${picked === 1 ? "" : "s"}`}</button>}
+            <button className={target.cert ? undefined : "primary"} disabled={busy || (!target.cert && !name.trim())} onClick={() => void save(false)}>{target.cert ? `Save ${label} only` : "Save certificate"}</button>
             <button disabled={busy} onClick={reset}>Discard</button>
           </div>
         </div>
@@ -200,7 +223,7 @@ function AddCertificate({ lib, reload }: { lib: CertLibrary; reload: () => void 
   return (
     <section className="card cert-add">
       <div className="cert-title">
-        <span className="small">A service can also use a certificate of its own. Add a certificate to the library here; moving a service to it comes with the next step.</span>
+        <span className="small">A service can also use a certificate of its own. Add a certificate to the library here, then bind it or create a draft from the service's Certificates page.</span>
         {!open && <button onClick={() => setOpen(true)}>Add a certificate</button>}
       </div>
       {open && <UploadStage lib={lib} target={{}} nextVersion={1} onSaved={(t) => { setSaved(t); setOpen(false); reload(); }} />}
