@@ -380,8 +380,25 @@ function changeFindings(input: CheckInput & { base: CheckMember[] }, change: Cha
 
 const idOf = (f: Found) => [f.code, f.file, f.key, f.member, f.code === "ports/conflict" ? f.message : ""].join("|");
 
+/** A keystore or truststore whose file name says one format and whose content is the other (a toolkit PKCS12 replaced
+ *  by a JKS, the path kept): NiFi goes by the type key, so this only tells. */
+const STORE_KEYS = { keystore: "nifi.security.keystore", truststore: "nifi.security.truststore" } as const;
+const nameFormat = (path: string) => /\.(p12|pfx|pkcs12)\s*$/i.test(path) ? "PKCS12" : /\.jks\s*$/i.test(path) ? "JKS" : null;
+const contentFormat = (b: Buffer) => b.length >= 4 && b.readUInt32BE(0) === 0xfeedfeed ? "JKS" : b.length > 0 && b[0] === 0x30 ? "PKCS12" : null;
+function storeNameFindings(m: CheckMember): Found[] {
+  const member = installKey(m), props = m.files.find((f) => f.name === "nifi.properties");
+  if (!props?.bytes) return [];
+  const have = effectiveProperties(props.bytes), out: Found[] = [];
+  for (const [store, key] of Object.entries(STORE_KEYS)) {
+    const path = have.get(key)?.value ?? "", file = m.files.find((f) => f.name === store);
+    const named = nameFormat(path), actual = file?.bytes ? contentFormat(file.bytes) : null;
+    if (named && actual && named !== actual) out.push({ severity: "info", code: "config/store-name-format", file: store, key, member, message: `${member}: the ${store} ${path}: file name says ${named}, content is ${actual}; NiFi reads it by the type key.` });
+  }
+  return out;
+}
+
 function stateFindings(input: CheckInput, members: CheckMember[]): Found[] {
-  return [...members.flatMap((m) => memberFindings(input, m)), ...(input.kind === "cluster" ? clusterFindings(input, members) : []), ...portFindings(input, members)];
+  return [...members.flatMap((m) => [...memberFindings(input, m), ...storeNameFindings(m)]), ...(input.kind === "cluster" ? clusterFindings(input, members) : []), ...portFindings(input, members)];
 }
 
 /** The findings of a configuration, worst first, and what the change means when there is a base. Same code, same key and

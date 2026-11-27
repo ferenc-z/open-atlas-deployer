@@ -89,13 +89,20 @@ export function ServicesSummaryCard({ onServices, onOpen }: { onServices: () => 
   if (!data?.services.length) return null;
   const { failing, attention, waiting } = summaryParts(data.services);
   const unknown = data.services.filter((s) => cardLight(s) === "unknown").length;
-  const tone = failing ? "bad" : attention ? "warn" : unknown ? "muted" : "ok";
+  // Certificate alerts count too: the title shows the worst of the services and the certificates.
+  const certFailing = data.certAlerts?.filter((a) => a.light === "failing").length ?? 0;
+  const certAttention = (data.certAlerts?.length ?? 0) - certFailing;
+  const plural = (n: number) => (n === 1 ? "" : "s");
+  const tone = failing || certFailing ? "bad" : attention || certAttention ? "warn" : unknown ? "muted" : "ok";
+  const title = failing ? `${failing} failing` : certFailing ? `${certFailing} certificate${plural(certFailing)} failing`
+    : attention ? `${attention} need${attention === 1 ? "s" : ""} attention` : certAttention ? `${certAttention} certificate alert${plural(certAttention)}`
+    : unknown ? `${unknown} unknown` : "Healthy";
   const todos = data.services.reduce((n, s) => n + s.todoCount, 0);
   return (
     <section className="card">
       <div className="toolbar">
         <h2>Services</h2>
-        <span className={`badge ${tone}`}>{failing ? `${failing} failing` : attention ? `${attention} need${attention === 1 ? "s" : ""} attention` : unknown ? `${unknown} unknown` : "Healthy"}</span>
+        <span className={`badge ${tone}`}>{title}</span>
         <span className="muted small">{data.services.length} service{data.services.length === 1 ? "" : "s"} · {todos} to-do{todos === 1 ? "" : "s"}{waiting ? ` · ${waiting} waiting for you` : ""}</span>
         <span className="spacer" />
         <button className="link" onClick={onServices}>All services</button>

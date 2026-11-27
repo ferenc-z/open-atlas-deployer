@@ -5,6 +5,10 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
 
 ## 0.3.0-rc.17
 
+- S41 lab check fixes: the home page's Services card title shows the worst of the services and the certificate alerts
+  (it said "Healthy" with a certificate failing or needing attention). A keystore or truststore whose file name says
+  PKCS12 or JKS and whose content is the other (a PKCS12 replaced by a JKS, the path kept) gets an info finding on
+  drafts and plans: "file name says PKCS12, content is JKS; NiFi reads it by the type key". The path is not changed.
 - S41 step 4a: a configuration draft can replace a NiFi's key or trust store whole (`keystore`, `truststore`, binary,
   one node at a time). It is kept sealed like the other files; pages, diffs, the audit and the AI see only its sha256
   and size, never its bytes. Applying, comparing, checks (a store change needs a restart, node by node), drift,

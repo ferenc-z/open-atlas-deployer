@@ -367,3 +367,19 @@ test("a change on the whole 1.12.1 sample: secrets unseen, the format of the res
   assert.deepEqual(blockingFindings(r.findings), []);
   assert.ok(!JSON.stringify(r).includes("fake-"));
 });
+
+test("a store whose file name says one format and whose content is the other gets an info finding", () => {
+  const jks = Buffer.from([0xfe, 0xed, 0xfe, 0xed, 0, 0, 0, 2]), p12 = Buffer.from([0x30, 0x82, 0x01, 0x00]);
+  const m = member("n", {
+    "nifi.properties": props("nifi.security.keystore=./conf/keystore.pkcs12", "nifi.security.keystoreType=JKS", "nifi.security.truststore=./conf/truststore.jks"),
+    keystore: jks, truststore: jks,
+  });
+  const r = checkConfig(input({ kind: "standalone", members: [m] }));
+  const f = one(r, "config/store-name-format");
+  assert.equal(f.length, 1);
+  assert.equal(f[0]!.severity, "info");
+  assert.equal(f[0]!.file, "keystore");
+  assert.match(f[0]!.message, /file name says PKCS12, content is JKS; NiFi reads it by the type key/);
+  const ok = member("n", { "nifi.properties": props("nifi.security.keystore=./conf/keystore.p12", "nifi.security.truststore=./conf/truststore.jks"), keystore: p12, truststore: jks });
+  assert.equal(one(checkConfig(input({ kind: "standalone", members: [ok] })), "config/store-name-format").length, 0);
+});
