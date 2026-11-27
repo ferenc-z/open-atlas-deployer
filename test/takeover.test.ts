@@ -2,6 +2,8 @@
 // confirmation that imports each installation's configuration as revision 1, and the optional AI review.
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { readUpload, sealVersion } from "../src/server/certs/library.ts";
 import { test } from "node:test";
 import { Handoff } from "../src/server/handoff.ts";
 import type { OmaSessions } from "../src/server/oma.ts";
@@ -216,7 +218,7 @@ test("confirming registers every item and its revision 1 in one transaction (tra
 });
 
 /** A Takeover over a real store and handoff; the "executor" answers svc-read jobs whenever the confirmation waits. */
-function harness(o: { box?: boolean; oma?: OmaSessions; alter?: (path: string, text: string) => string; kinds?: string[]; found?: Discovered[]; ignoreConf?: boolean } = {}) {
+function harness(o: { box?: boolean; oma?: OmaSessions; alter?: (path: string, text: string) => string; kinds?: string[]; found?: Discovered[]; ignoreConf?: boolean; keystore?: Buffer } = {}) {
   const store = new Store(":memory:");
   const handoff = new Handoff(store);
   const box = o.box === false ? undefined : new SecretBox(randomBytes(32).toString("base64"));
@@ -238,12 +240,23 @@ function harness(o: { box?: boolean; oma?: OmaSessions; alter?: (path: string, t
       const conf = !o.ignoreConf && typeof job.confDir === "string" ? job.confDir : `${dir}/conf`;
       const content = (o.alter ?? ((_p, t) => t))(dir, text(conf));
       const meta = { name: "nifi.properties", path: `${conf}/nifi.properties`, sha256: createHash("sha256").update(content).digest("hex"), size: content.length, modifiedAt: "t" };
-      handoff.putEnvContent(String(job.id), JSON.stringify({ installDir: dir, files: [{ ...meta, content: Buffer.from(content).toString("base64") }] }));
+      const store_ = o.keystore ? [{ name: "keystore", path: `${conf}/keystore.jks`, sha256: createHash("sha256").update(o.keystore).digest("hex"), size: o.keystore.length, modifiedAt: "t", content: o.keystore.toString("base64") }] : [];
+      handoff.putEnvContent(String(job.id), JSON.stringify({ installDir: dir, files: [{ ...meta, content: Buffer.from(content).toString("base64") }, ...store_] }));
       handoff.putStatus(String(job.id), { state: "succeeded", steps: [], result: { installDir: dir, files: [meta], missing: ["authorizers.xml"] } as never });
     }
   };
   const takeover = new Takeover({ store, handoff, ...(box ? { box } : {}), ...(o.oma ? { oma: o.oma } : {}), environment: () => "UAT", hosts: () => ["local"], sleep: answer, readTimeoutMs: 2000, pollMs: 1 });
-  return { store, handoff, takeover, box, requests };
+  // The library certificate every confirmation chooses unless the test passes its own.
+  const lib = box ? libraryCert(store, box) : undefined;
+  const confirm = takeover.confirm.bind(takeover);
+  takeover.confirm = (id, actor, certs) => confirm(id, actor, certs !== undefined || !lib ? certs : Object.fromEntries(store.serviceDraft(id)!.items.map((i) => [i.id, { cert: lib.cert, version: lib.version }])));
+  return { store, handoff, takeover, box, requests, lib };
+}
+
+const certFile = (name: string) => readFileSync(new URL(`../testdata/certs/toolkit-client/${name}`, import.meta.url));
+function libraryCert(store: Store, box: SecretBox) {
+  const v = sealVersion(readUpload([{ name: "keystore.jks", bytes: certFile("keystore.jks") }, { name: "truststore.jks", bytes: certFile("truststore.jks") }, { name: "config.json", bytes: certFile("config.json") }] as never), box);
+  return store.addNifiCert("corp-nifi", null, v, admin);
 }
 
 /** The owner's layout: one NiFi unpacked in /webapp/install, run twice with conf directories under /webapp/deploy. */
@@ -327,6 +340,32 @@ test("confirming refuses files changed since discovery, a missing key, or an exe
   await assert.rejects(nokey.takeover.confirm(nokey.takeover.createDraft(admin).draft.id, admin), (e: TakeoverError) => e.status === 503 && e.code === "confirm/no-key");
   const old = harness({ kinds: ["svc-discover"] });
   await assert.rejects(old.takeover.confirm(old.takeover.createDraft(admin).draft.id, admin), (e: TakeoverError) => e.code === "confirm/executor");
+});
+
+test("S41 step 6: confirming needs a certificate for every item, and a keystore on the host must be the chosen version's file", async () => {
+  const bare = harness();
+  const { draft } = bare.takeover.createDraft(admin);
+  const none = (e: TakeoverError) => e.status === 400 && e.code === "confirm/certs";
+  await assert.rejects(Object.getPrototypeOf(bare.takeover).confirm.call(bare.takeover, draft.id, admin), none, "no certs at all");
+  await assert.rejects(Object.getPrototypeOf(bare.takeover).confirm.call(bare.takeover, draft.id, admin, {}), none, "an empty choice");
+  const some = { [draft.items[0]!.id]: { cert: bare.lib!.cert, version: bare.lib!.version } };
+  await assert.rejects(Object.getPrototypeOf(bare.takeover).confirm.call(bare.takeover, draft.id, admin, some), (e: TakeoverError) => none(e) && /missing for/.test(e.message), "one item without");
+  assert.equal(bare.store.serviceDraft(draft.id)!.state, "open");
+  bare.store.close();
+
+  // The host's keystore is another file than the chosen version's: refused, nothing registered, and the reason says which.
+  const other = harness({ keystore: Buffer.from("some other keystore") });
+  const d = other.takeover.createDraft(admin).draft;
+  await assert.rejects(other.takeover.confirm(d.id, admin), (e: TakeoverError) => e.status === 409 && e.code === "confirm/read" && /the keystore on the host .* is not corp-nifi v1/.test(e.details.join()));
+  assert.deepEqual([other.store.serviceDraft(d.id)!.state, other.store.clusters().length], ["open", 0]);
+  other.store.close();
+
+  // The same file: accepted, and the certificate is bound.
+  const same = harness({ keystore: certFile("keystore.jks") });
+  const ok = await same.takeover.confirm(same.takeover.createDraft(admin).draft.id, admin);
+  assert.equal(ok.draft.state, "confirmed");
+  assert.equal(same.store.serviceCertBindings().length, ok.registered.length);
+  same.store.close();
 });
 
 test("the AI review is optional: without OMA it is refused, with OMA it explains on top of the rules", async () => {

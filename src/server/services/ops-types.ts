@@ -62,6 +62,8 @@ export type ConfigChange = Record<string, unknown> & { current?: string };
 // 1 GET /api/services/overview
 export interface ServicesOverview {
   services: ServiceCard[];                  // worst first (the server sorts)
+  /** S41 step 6: certificate warnings, one per library certificate version in use (not per service), plus a host keystore that is not the bound one. */
+  certAlerts?: { text: string; light: "attention" | "failing"; cert: string }[];
   lastCheckup: { at: string; trigger: AnalysisTrigger; state: AnalysisState } | null;
   running: boolean;                         // a round is running: Check now is greyed
 }

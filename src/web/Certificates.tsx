@@ -43,6 +43,7 @@ export function CertificatesPage({ isAdmin, onOpenService }: { isAdmin: boolean;
         <h1>Certificates</h1>
         <p><strong className={`cert-head ${tone}`}>{headline}</strong></p>
         <p className="muted small">Upload a certificate once, use it on many services. NiFi and the service executor on each host both use it. Files and passwords are kept encrypted in the Deployer: nobody can download them here, and the AI only sees subject, hosts and dates.</p>
+        {(lib.warnings?.alerts.length || lib.warnings?.mismatches.length) ? <ul className="findings">{[...lib.warnings.alerts.map((a) => ({ k: `${a.cert}#${a.version}`, light: a.light, text: a.text })), ...lib.warnings.mismatches.map((m) => ({ k: `${m.service}/${m.cert}`, light: "attention", text: m.text }))].map((f) => <li key={f.k}><span className={`badge ${f.light === "failing" ? "bad" : "warn"}`}>{f.light === "failing" ? "Failing" : "Attention"}</span> {f.text}</li>)}</ul> : null}
         {!lib.keyConfigured && <div className="banner bad inline">DEPLOYER_CREDENTIAL_ENCRYPTION_KEY is not set: certificates cannot be kept until it is.</div>}
       </section>
       {lib.certs.map((c) => <CertCard key={c.id} cert={c} lib={lib} reload={load} onOpenService={onOpenService} />)}

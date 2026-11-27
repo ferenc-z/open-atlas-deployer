@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { createApp } from "../src/server/app.ts";
+import { readUpload, sealVersion } from "../src/server/certs/library.ts";
 import { opsBusinessHooks, opsPageSources } from "../src/server/services/page-views.ts";
 import { hashPassword, permissionsFor, verifyPassword, WorkbenchSessions } from "../src/server/auth.ts";
 import type { Config } from "../src/server/config.ts";
@@ -932,7 +933,10 @@ test("service ops step 5: a takeover draft from discovery, confirmed with each i
   assert.equal((await post(t, `/api/services/drafts/${draft.id}/review`, "admin", {})).status, 503, "no OMA: no AI review, the rest works");
 
   // Confirming: the executor reads each installation's files while the request waits.
-  const confirming = post(t, `/api/services/drafts/${draft.id}/confirm`, "admin", {});
+  assert.equal((await post(t, `/api/services/drafts/${draft.id}/confirm`, "admin", {})).status, 400, "S41 step 6: no certificate chosen");
+  const toolkit = (name: string) => ({ name, bytes: readFileSync(new URL(`../testdata/certs/toolkit-client/${name}`, import.meta.url)) });
+  const lib = t.store.addNifiCert("corp-nifi", null, sealVersion(readUpload(["config.json", "keystore.jks", "truststore.jks"].map(toolkit)), t.box), { id: "t", via: "cli" });
+  const confirming = post(t, `/api/services/drafts/${draft.id}/confirm`, "admin", { certs: { "prod-flow": { cert: lib.cert, version: lib.version } } });
   for (let answered = 0; answered < 2;) {
     const next = await call("/executor/v1/jobs/next", service);
     if (next.status !== 200) { await new Promise((r) => setTimeout(r, 5)); continue; }

@@ -11,6 +11,8 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { createApp } from "../src/server/app.ts";
 import { WorkbenchSessions } from "../src/server/auth.ts";
+import { certWarnings } from "../src/server/certs/expiry.ts";
+import { servicesOverview } from "../src/server/services/page-views.ts";
 import { certRef, executorCert, joinPem, UNBOUND_MESSAGE } from "../src/server/certs/issue.ts";
 import { readUpload, sealVersion } from "../src/server/certs/library.ts";
 import type { Config } from "../src/server/config.ts";
@@ -148,5 +150,56 @@ test("the takeover binds the certificate chosen for each item, and refuses one n
   await assert.rejects(takeover.confirm(draft.id, cli, { solo: { cert: lib.cert, version: 9 } }), (e: Error & { code?: string }) => e.code === "cert/unknown");
   await assert.rejects(takeover.confirm(draft.id, cli, { other: { cert: lib.cert, version: lib.version } }), (e: Error & { code?: string }) => e.code === "confirm/certs");
   await assert.rejects(takeover.confirm(draft.id, cli, "solo"), (e: Error & { code?: string }) => e.code === "confirm/certs");
+  store.close();
+});
+
+test("S41 step 6: confirming without a certificate is a 400", async () => {
+  const { store, takeover } = setup();
+  const solo: DraftStandalone = { kind: "standalone", id: "solo", service: "nifi", profile: "nifi-2.x", version: "2.0.0", webUrl: null, member: member("batch", "/opt/c") } as DraftStandalone;
+  const draft = store.createServiceDraft("uat", [], [solo], cli);
+  for (const certs of [undefined, null, {}, { solo: null }]) {
+    await assert.rejects(takeover.confirm(draft.id, cli, certs), (e: Error & { code?: string; status?: number }) => e.status === 400 && e.code === "confirm/certs");
+  }
+  store.close();
+});
+
+test("S41 step 6: one expiry warning per certificate version, however many services use it; thresholds as the certificate rule", () => {
+  const { store } = setup();
+  services(store);
+  const lib = library(store);
+  const notAfter = Date.parse(store.nifiCert(lib.cert)!.versions[0]!.notAfter);
+  const at = (days: number) => new Date(notAfter - days * 86_400_000 - 3_600_000);
+  assert.deepEqual(certWarnings(store, at(12)), { alerts: [], mismatches: [] }, "nobody uses it yet");
+  store.bindServiceCert("flow", lib.cert, lib.version, cli);
+  store.bindServiceCert("solo", lib.cert, lib.version, cli);
+  assert.deepEqual(certWarnings(store, at(31)).alerts, [], "outside the 30 days");
+  const soon = certWarnings(store, at(12)).alerts;
+  assert.equal(soon.length, 1, "two services, one alert");
+  assert.deepEqual([soon[0]!.light, soon[0]!.days, soon[0]!.usedBy], ["attention", 12, ["flow", "solo"]]);
+  assert.match(soon[0]!.text, /^corp-nifi v1 expires in 12 days, used by 2 services$/);
+  assert.equal(certWarnings(store, at(30)).alerts[0]!.light, "attention");
+  assert.equal(certWarnings(store, at(5)).alerts[0]!.light, "failing", "within 7 days");
+  const gone = certWarnings(store, new Date(notAfter + 3 * 86_400_000 + 3_600_000)).alerts[0]!;
+  assert.deepEqual([gone.light, gone.days], ["failing", -4]);
+  assert.match(gone.text, /expired 4 days ago, used by 2 services/);
+  // The overview carries them too.
+  const overview = servicesOverview(store, () => ({ online: false } as never), {}, at(12));
+  assert.deepEqual(overview.certAlerts?.map((a) => a.text), [soon[0]!.text]);
+  store.close();
+});
+
+test("S41 step 6: a keystore read on the host that is not the bound version's certificate is a finding of its own", () => {
+  const { store } = setup();
+  services(store);
+  const lib = library(store);
+  store.bindServiceCert("solo", lib.cert, lib.version, cli);
+  const v = store.nifiCert(lib.cert)!.versions[0]!;
+  const row = (notAfter: string) => ({ store: "keystore", path: "/k", type: "JKS", alias: "a", chain: null, subject: "CN=x", issuer: "CN=ca", notBefore: "2020-01-01T00:00:00Z", notAfter, readAt: "t", error: null });
+  const put = (rows: ReturnType<typeof row>[]) => (store as any).db.prepare("DELETE FROM service_certs WHERE service = 'solo'").run() && rows.forEach((r) => (store as any).db.prepare("INSERT INTO service_certs (service, member, store, path, type, alias, chain, subject, issuer, not_before, not_after, read_at, error) VALUES ('solo', 'batch', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(r.store, r.path, r.type, r.alias, r.chain, r.subject, r.issuer, r.notBefore, r.notAfter, r.readAt, r.error));
+  put([row(v.notAfter)]);
+  assert.deepEqual(certWarnings(store, new Date(Date.parse(v.notAfter) - 400 * 86_400_000)).mismatches, []);
+  put([row("2031-01-01T00:00:00.000Z")]);
+  const m = certWarnings(store, new Date(Date.parse(v.notAfter) - 400 * 86_400_000)).mismatches;
+  assert.deepEqual([m.length, m[0]!.service, m[0]!.cert], [1, "solo", lib.cert]);
   store.close();
 });

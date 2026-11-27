@@ -347,7 +347,8 @@ export type NifiCertView = import("../server/store.ts").NifiCert;
 export type CertVersionView = import("../server/store.ts").CertVersion;
 export type CertCheckItem = import("../server/certs/check.ts").CheckItem;
 export type CertServiceView = { id: string; hosts: string[]; bound: { cert: string; version: number } | null; own?: boolean };
-export type CertLibrary = { keyConfigured: boolean; certs: NifiCertView[]; services: CertServiceView[] };
+export type CertWarnings = { alerts: { cert: string; version: number; light: "attention" | "failing"; text: string }[]; mismatches: { service: string; cert: string; text: string }[] };
+export type CertLibrary = { keyConfigured: boolean; certs: NifiCertView[]; services: CertServiceView[]; warnings?: CertWarnings };
 export type CertUploadCheck = {
   passwordsRead: true;
   version: Omit<CertVersionView, "cert" | "version" | "uploadedAt" | "uploadedBy" | "usedBy">;

@@ -100,6 +100,7 @@ export function ServicesSummaryCard({ onServices, onOpen }: { onServices: () => 
         <span className="spacer" />
         <button className="link" onClick={onServices}>All services</button>
       </div>
+      {data.certAlerts?.length ? <ul className="findings">{data.certAlerts.map((a, i) => <li key={i}><span className={`badge ${a.light === "failing" ? "bad" : "warn"}`}>{a.light === "failing" ? "Failing" : "Attention"}</span> {a.text}</li>)}</ul> : null}
       <ul className="findings">{data.services.slice(0, 5).map((s) => {
         const light = cardLight(s);
         return (

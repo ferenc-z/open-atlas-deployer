@@ -33,6 +33,7 @@ import { certRef, executorCert } from "./certs/issue.ts";
 import { currentPem, readUpload, sealVersion, UPLOAD_FILE_MAX, UPLOAD_FILES_MAX, type ReadUpload, type UploadedFile } from "./certs/library.ts";
 import { StoreError, type Actor, type ServiceConfigDraft, type Store } from "./store.ts";
 import { sealFile, STORE_FILES, withoutSealed } from "./services/config.ts";
+import { certWarnings } from "./certs/expiry.ts";
 import { CertDraftError, certDraftChanges, CertSources, openedVersion, openVersion, sha256Of } from "./certs/services.ts";
 import { layerFile } from "./services/layers.ts";
 import { ConfigDocError } from "./services/configdoc.ts";
@@ -916,7 +917,7 @@ export function createApp({ config, store, sessions, observer, deployments, vers
     const p = await authenticate(c, "admin");
     if (p instanceof Response) return p;
     const bound = certBound(), own = new Set(store.serviceCertOwnMarks().map((m) => m.service));
-    return c.json({ keyConfigured: !!takeover?.box, certs: store.nifiCerts(), services: certTargets().map((t) => ({ ...t, bound: bound.has(t.id) ? { cert: bound.get(t.id)!.cert, version: bound.get(t.id)!.version } : null, own: own.has(t.id) })) });
+    return c.json({ keyConfigured: !!takeover?.box, certs: store.nifiCerts(), warnings: certWarnings(store), services: certTargets().map((t) => ({ ...t, bound: bound.has(t.id) ? { cert: bound.get(t.id)!.cert, version: bound.get(t.id)!.version } : null, own: own.has(t.id) })) });
   });
   api.get("/api/nifi-certs/:id", async (c) => {
     const p = await authenticate(c, "admin");

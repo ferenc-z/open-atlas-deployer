@@ -4,6 +4,7 @@
 // revision 1 and registers the items, in one transaction. The AI review is optional: without OMA, taking over works
 // the same.
 
+import { CertSources } from "../certs/services.ts";
 import { randomBytes } from "node:crypto";
 import type { Handoff } from "../handoff.ts";
 import { newJobId } from "../handoff.ts";
@@ -220,6 +221,17 @@ export class Takeover {
           byItem.set(r.item, [...(byItem.get(r.item) ?? []), { host: r.m.host, installDir: r.m.installDir, confDir: confDirOf(r.m), files, missing }]);
         } catch (error) { problems.push(`${install(r.m)}: ${(error as Error).message}`); }
       }
+      // S41 step 6: a keystore read from a host must be the chosen version's file (the executor and NiFi use one certificate).
+      if (!problems.length) {
+        const sources = new CertSources(this.o.store, this.o.box);
+        for (const [item, ms] of byItem) {
+          const c = certs.get(item)!, want = sources.keystoreSha(c.cert, c.version);
+          for (const m of ms) {
+            const k = m.files.find((f) => f.name === "keystore");
+            if (k && want && k.sha256 !== want) problems.push(`${item} ${m.host}: the keystore on the host (sha256 ${k.sha256.slice(0, 12)}) is not ${this.o.store.nifiCert(c.cert)?.name ?? c.cert} v${c.version} (sha256 ${want.slice(0, 12)}); choose the certificate the host really uses, or upload it to the library first`);
+          }
+        }
+      }
       if (problems.length) throw new TakeoverError(409, "confirm/read", "The configuration could not be imported from every installation; nothing was registered.", problems);
       const configs: Record<string, ServiceConfigBody> = Object.fromEntries([...byItem].map(([item, ms]) => [item, { members: ms }]));
       try {
@@ -239,8 +251,7 @@ export class Takeover {
   /** S40: {<item id>: {cert, version}} checked against the draft's items and the certificate library. */
   private certChoice(draft: ServiceDraft, value: unknown): Map<string, { cert: string; version: number }> {
     const out = new Map<string, { cert: string; version: number }>();
-    if (value === undefined || value === null) return out;
-    if (typeof value !== "object" || Array.isArray(value)) throw new TakeoverError(400, "confirm/certs", "certs maps item ids to {cert, version}.");
+    if (typeof value !== "object" || value === null || Array.isArray(value)) throw new TakeoverError(400, "confirm/certs", "certs maps item ids to {cert, version}.");
     const items = new Set(draft.items.map((i) => i.id));
     for (const [item, c] of Object.entries(value as Record<string, unknown>)) {
       if (c === null) continue;
@@ -250,6 +261,8 @@ export class Takeover {
       if (!this.o.store.nifiCert(cert)?.versions.some((v) => v.version === version)) throw new TakeoverError(400, "cert/unknown", `${item}: certificate ${cert} has no version ${String(version)}.`);
       out.set(item, { cert, version: version as number });
     }
+    const none = draft.items.filter((i) => !out.has(i.id)).map((i) => i.id);
+    if (none.length) throw new TakeoverError(400, "confirm/certs", `Choose a certificate from the library for every item (certs): missing for ${none.join(", ")}.`);
     return out;
   }
 

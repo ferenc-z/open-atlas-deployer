@@ -11,6 +11,7 @@ import { flowCard, type GraphExtras } from "./flow-views.ts";
 import { LIGHT_ORDER, type AnalysisState, type AnalysisTrigger, type AnalysisView, type Anomaly, type FlowNote, type BusinessLightView, type FlowCard, type FlowDetail, type FlowProblem, type FlowRow, type GateVerdict, type Light, type Lights, type ServiceCard, type ServicePage, type ServicesOverview, type TodoView, type UnknownReason } from "./ops-types.ts";
 import type { BusinessHooks } from "./ops-routes.ts";
 import { machineLight } from "./rules.ts";
+import { certWarnings } from "../certs/expiry.ts";
 import { opsReads, type AiSentences } from "./todos.ts";
 import { CUES, type Cue } from "./trace/model.ts";
 
@@ -91,7 +92,9 @@ export function servicesOverview(store: Store, executor: Executor, src: PageSour
   }
   const worst = (c: ServiceCard) => Math.min(LIGHT_ORDER[c.machine.light], LIGHT_ORDER[c.business.light]);
   cards.sort((a, b) => worst(a) - worst(b) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-  return { services: cards, lastCheckup: src.analyses?.lastCheckup() ?? null, running: src.analyses?.running() ?? false };
+  const { alerts, mismatches } = certWarnings(store, now);
+  const certAlerts = [...alerts.map((a) => ({ text: a.text, light: a.light, cert: a.cert })), ...mismatches.map((m) => ({ text: m.text, light: "attention" as const, cert: m.cert }))];
+  return { services: cards, certAlerts, lastCheckup: src.analyses?.lastCheckup() ?? null, running: src.analyses?.running() ?? false };
 }
 
 /** #2 GET /api/services/:id/page; undefined for an unknown service. */

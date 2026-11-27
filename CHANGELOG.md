@@ -37,6 +37,13 @@ the section of this file under `## <version>`. A version with a `-` (such as `0.
   `EXECUTOR_NIFI_CA_RELAXED` are ignored, with one line at start naming those still set; `VERIFY_X509_STRICT` is
   always off for the NiFi connection (nifi-toolkit CAs do not mark Basic Constraints critical; only the bundle is
   trusted and the host name is checked). The lab's `lab.sh grant` gives the policies to each NiFi's node identity.
+- S41 step 6: certificate expiry warnings are by certificate: every library version in use gets one line ("corp-nifi v2
+  expires in 12 days, used by 5 services", attention within the certificate rule's warning days, failing within the
+  critical days or expired; the largest of the services using it), on the Certificates page and in the Services
+  summary on the home page, never one per service. S27's reading of the keystore on the hosts stays as the cross-check:
+  a host keystore that does not expire when the bound version does is a finding of its own. Taking over now needs a
+  certificate for every item (the API answers 400 `confirm/certs` without), and a keystore read from a host must be
+  the chosen version's file, else the confirmation is refused and says which host differs.
 
 ### After upgrading
 
